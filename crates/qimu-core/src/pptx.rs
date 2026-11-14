@@ -188,13 +188,45 @@ pub fn slides(pkg: &Package) -> PptxResult<Vec<SlideRef>> {
 /// Per-page fingerprint: slide XML plus its relationship table, so a page
 /// whose media/layout links change is a different page.
 pub fn page_fingerprint(pkg: &Package, slide_part: &str) -> String {
+    // Fingerprint = slide XML + the CONTENT of everything the slide
+    // directly references (by relationship type). It deliberately does
+    // not hash relationship target NAMES: assembly renames parts when
+    // merging fragments, and a rename must not make a page look
+    // "modified". Changing a referenced part's content (media, layout,
+    // chart) does change the fingerprint.
     let mut h = Sha256::new();
     if let Some(bytes) = pkg.parts.get(slide_part) {
         h.update(bytes);
     }
     let rels_name = rels_part_name(slide_part);
     if let Some(bytes) = pkg.parts.get(&rels_name) {
-        h.update(bytes);
+        let text = String::from_utf8_lossy(bytes);
+        let mut entries: Vec<String> = parse_rels(&text)
+            .iter()
+            .map(|r| {
+                let ty = attr(&r.raw, "Type").unwrap_or("");
+                if r.external {
+                    format!("{ty}|ext|{}", r.target)
+                } else {
+                    let abs = resolve_target(slide_part, &r.target);
+                    let content_hash = pkg
+                        .parts
+                        .get(&abs)
+                        .map(|b| {
+                            let mut hh = Sha256::new();
+                            hh.update(b);
+                            format!("{:x}", hh.finalize())
+                        })
+                        .unwrap_or_default();
+                    format!("{ty}|{content_hash}")
+                }
+            })
+            .collect();
+        entries.sort();
+        for e in entries {
+            h.update(e.as_bytes());
+            h.update(b"\n");
+        }
     }
     format!("{:x}", h.finalize())
 }
