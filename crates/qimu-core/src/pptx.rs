@@ -66,7 +66,7 @@ impl Package {
             .ok_or_else(|| format!("missing part {name}"))
     }
 
-    fn get_text(&self, name: &str) -> PptxResult<String> {
+    pub fn get_text(&self, name: &str) -> PptxResult<String> {
         String::from_utf8(self.get(name)?.to_vec())
             .map_err(|_| format!("part {name} is not valid UTF-8"))
     }
@@ -88,7 +88,7 @@ pub struct SlideRef {
 /// Extract `<tag ... />` (or `<tag ...>...</tag>` start-tag) spans containing
 /// `marker`, returning each element's raw text. POC-grade string scanning;
 /// attribute order inside an element is not assumed.
-fn scan_elements<'a>(xml: &'a str, open: &str) -> Vec<&'a str> {
+pub(crate) fn scan_elements<'a>(xml: &'a str, open: &str) -> Vec<&'a str> {
     let mut out = Vec::new();
     let mut rest = xml;
     while let Some(pos) = rest.find(open) {
@@ -106,7 +106,7 @@ fn scan_elements<'a>(xml: &'a str, open: &str) -> Vec<&'a str> {
     out
 }
 
-fn attr<'a>(element: &'a str, name: &str) -> Option<&'a str> {
+pub(crate) fn attr<'a>(element: &'a str, name: &str) -> Option<&'a str> {
     let pat = format!("{name}=\"");
     let start = element.find(&pat)? + pat.len();
     let end = element[start..].find('"')? + start;
@@ -114,7 +114,7 @@ fn attr<'a>(element: &'a str, name: &str) -> Option<&'a str> {
 }
 
 /// Resolve a relationship target against the directory of its source part.
-fn resolve_target(source_part: &str, target: &str) -> String {
+pub(crate) fn resolve_target(source_part: &str, target: &str) -> String {
     if let Some(stripped) = target.strip_prefix('/') {
         return normalize_path(stripped);
     }
@@ -146,14 +146,14 @@ fn normalize_path(p: &str) -> String {
     out.join("/")
 }
 
-struct Rel {
-    id: String,
-    target: String,
-    external: bool,
-    raw: String,
+pub(crate) struct Rel {
+    pub id: String,
+    pub target: String,
+    pub external: bool,
+    pub raw: String,
 }
 
-fn parse_rels(xml: &str) -> Vec<Rel> {
+pub(crate) fn parse_rels(xml: &str) -> Vec<Rel> {
     scan_elements(xml, "<Relationship")
         .into_iter()
         .filter_map(|el| {
@@ -259,17 +259,60 @@ pub fn split(pkg: &Package) -> PptxResult<Vec<Package>> {
 
     let mut fragments = Vec::new();
     for (i, s) in deck_slides.iter().enumerate() {
-        let mut removed: BTreeSet<String> = BTreeSet::new();
-        for other in &deck_slides {
-            if other.part != s.part {
-                removed.insert(other.part.clone());
-                removed.insert(rels_part_name(&other.part));
-                if let Some(Some(note)) = notes_of.get(&other.part) {
-                    removed.insert(note.clone());
-                    removed.insert(rels_part_name(note));
+        // Keep only what this slide actually reaches through its
+        // relationship closure (layout/master/theme chain, media,
+        // charts, notes) plus package scaffolding. Everything else —
+        // above all other slides' media — is pruned, so a fragment is
+        // proportional to its own page, not to the whole deck.
+        let mut keep: BTreeSet<String> = BTreeSet::new();
+        let mut stack = vec![s.part.clone()];
+        // The notes master is scaffolding (kept below), but its own
+        // relationship closure (its theme) must come with it.
+        for name in pkg.parts.keys() {
+            if name.starts_with("ppt/notesMasters/") && name.ends_with(".xml") {
+                stack.push(name.clone());
+            }
+        }
+        while let Some(p) = stack.pop() {
+            if !keep.insert(p.clone()) {
+                continue;
+            }
+            let rels_name = rels_part_name(&p);
+            if let Some(bytes) = pkg.parts.get(&rels_name) {
+                keep.insert(rels_name.clone());
+                let text = String::from_utf8_lossy(bytes);
+                for r in parse_rels(&text) {
+                    if !r.external {
+                        let t = resolve_target(&p, &r.target);
+                        if pkg.parts.contains_key(&t) {
+                            stack.push(t);
+                        }
+                    }
                 }
             }
         }
+        for name in pkg.parts.keys() {
+            if name == CONTENT_TYPES
+                || name == "_rels/.rels"
+                || name.starts_with("docProps/")
+                || name == PRESENTATION
+                || name == PRESENTATION_RELS
+                || name == "ppt/presProps.xml"
+                || name == "ppt/viewProps.xml"
+                || name == "ppt/tableStyles.xml"
+                || name.starts_with("ppt/notesMasters/")
+                || name.starts_with("ppt/fonts/")
+            {
+                keep.insert(name.clone());
+            }
+        }
+        let _ = &notes_of;
+        let removed: BTreeSet<String> = pkg
+            .parts
+            .keys()
+            .filter(|k| !keep.contains(*k))
+            .cloned()
+            .collect();
 
         let mut parts: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         for (name, bytes) in &pkg.parts {

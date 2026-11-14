@@ -5,9 +5,14 @@
 //! what makes full CLI/API parity — and therefore full AI takeover —
 //! possible.
 
+pub mod assemble;
+pub mod auth;
+pub mod manifest;
 pub mod model;
 pub mod pptx;
 pub mod semver;
+pub mod store;
+pub mod text;
 
 pub use model::*;
 pub use semver::{Increment, SemVer};

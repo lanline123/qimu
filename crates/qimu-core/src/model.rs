@@ -117,6 +117,11 @@ pub struct IndexEntry {
     pub unit_id: Id,
     pub rendition_id: Id,
     pub policy: EntryPolicy,
+    /// Display number captured when the entry was locked; used only for
+    /// deletion substitution (find the nearest surviving version at or
+    /// above this number if the locked version itself is deleted).
+    #[serde(default)]
+    pub locked_semver: Option<String>,
     /// Excerpted-page bindings: when only a subset of a multi-page
     /// version's pages is used, the picked slot IDs are recorded here.
     pub excerpt_slots: Option<Vec<String>>,
