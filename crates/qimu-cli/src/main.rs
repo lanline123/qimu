@@ -418,6 +418,10 @@ enum FoldersCommand {
         #[arg(long)]
         name: String,
     },
+    /// Delete an empty folder (server refuses non-empty ones).
+    Delete {
+        id: String,
+    },
     /// Designate the folder's main index (omit --index to clear).
     SetMain {
         id: String,
@@ -572,6 +576,7 @@ impl Ctx {
             "GET" => ureq::get(&url),
             "PUT" => ureq::put(&url),
             "PATCH" => ureq::patch(&url),
+            "DELETE" => ureq::delete(&url),
             _ => ureq::post(&url),
         };
         if let Some(t) = &self.token {
@@ -802,10 +807,11 @@ fn deck_apply(ctx: &Ctx, path: &str) -> Result<i32, String> {
     let mut new_manifest = manifest.clone();
     new_manifest.bindings = new_bindings;
     let out_bytes = qimu_core::manifest::embed_manifest(&merged.to_bytes()?, &new_manifest)?;
-    // Atomic in-place write: same path, via temp file + rename.
-    let tmp = format!("{path}.qimu-tmp");
-    std::fs::write(&tmp, &out_bytes).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+    // Atomic in-place write: same path, crash-safe replace via craft-atomic
+    // (storytold/craft-libs, MIT OR Apache-2.0): stage beside the target,
+    // sync, rename over it — readers never see a partial file.
+    craft_atomic::atomic_write(std::path::Path::new(path), &out_bytes)
+        .map_err(|e| e.to_string())?;
 
     print(&json!({
         "applied": applied,
@@ -1284,6 +1290,11 @@ fn run() -> Result<i32, String> {
                     "POST",
                     &format!("/v1/folders/{id}/rename"),
                     Some(json!({ "name": name })),
+                )?),
+                FoldersCommand::Delete { id } => print(&ctx.call(
+                    "DELETE",
+                    &format!("/v1/folders/{id}"),
+                    None,
                 )?),
                 FoldersCommand::SetMain { id, index } => print(&ctx.call(
                     "POST",

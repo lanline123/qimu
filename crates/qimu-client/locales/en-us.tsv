@@ -1,0 +1,26 @@
+# English (en-US) interface catalog for 启幕 (qimu).
+# Columns, separated by a TAB:  context <TAB> source text <TAB> translation
+# Covers the strings routed through craft-i18n so far (the app chrome:
+# top bar, login, settings navigation). A missing entry shows the
+# Chinese source text. Format per storytold/craft-i18n (MIT OR Apache-2.0).
+@id	language.name	English (US)
+	演示厅	Showroom
+	内容页	Content
+	索引页	Indexes
+	设置	Settings
+	刷新	Refresh
+	退出	Log out
+	服务器：{name}	Server: {name}
+	PPT 内容管理与更新系统	PPT content management & update system
+	服务器	Server
+	账号	Account
+	密码	Password
+	登录	Log in
+	个人资料	Profile
+	组织管理	Organization
+	内容组与授权	Groups & permissions
+	公司公共资料	Company profile
+	内容语言	Content languages
+	AI 翻译	AI translation
+	离线缓存策略	Offline cache policy
+	离线缓存	Offline cache

@@ -1,5 +1,16 @@
 [workspace]
 resolver = "2"
+# vendor/ holds independent storytold workspaces (see design/组件接入台账.md);
+# excluding their roots keeps their workspace inheritance (edition 2024,
+# rust-version, version) resolving against their own workspace manifests.
+exclude = [
+    "vendor/craft-libs",
+    "vendor/pdfcraft",
+    "vendor/deckcraft",
+    "vendor/craft-ai-integrations",
+    "vendor/craft-i18n",
+    "vendor/figcraft-src",
+]
 members = [
     "crates/qimu-core",
     "crates/qimu-server",
@@ -11,3 +22,34 @@ members = [
 [workspace.package]
 edition = "2021"
 license = "MIT OR Apache-2.0"
+
+# storytold vendored patches, mirrored from pdfcraft's own
+# [patch.crates-io] (a [patch] only applies from the build's root
+# workspace, so it must be restated here): pdfcraft-render's stack only
+# builds against these patched copies — e.g. the vendored hayro-jbig2
+# adds charge_reading/decode_within, which craft-stream-codecs calls and
+# crates.io 0.3.0 does not have.
+# Step 6: the egui family is patched to the storytold fork at the
+# ecosystem's locked rev (same pins as craft-libs/deckcraft), incl. the
+# storytold winit fork eframe builds against.
+[patch.crates-io]
+hayro = { git = "https://github.com/storytold/pdfcraft", rev = "27287c297d25d505a8720ea6da2e7af38693bfa9" }
+hayro-interpret = { git = "https://github.com/storytold/pdfcraft", rev = "27287c297d25d505a8720ea6da2e7af38693bfa9" }
+hayro-syntax = { git = "https://github.com/storytold/pdfcraft", rev = "27287c297d25d505a8720ea6da2e7af38693bfa9" }
+hayro-cmap = { git = "https://github.com/storytold/pdfcraft", rev = "27287c297d25d505a8720ea6da2e7af38693bfa9" }
+hayro-postscript = { git = "https://github.com/storytold/pdfcraft", rev = "27287c297d25d505a8720ea6da2e7af38693bfa9" }
+hayro-jbig2 = { git = "https://github.com/storytold/pdfcraft", rev = "27287c297d25d505a8720ea6da2e7af38693bfa9" }
+lopdf = { git = "https://github.com/storytold/pdfcraft", rev = "27287c297d25d505a8720ea6da2e7af38693bfa9" }
+vello_common = { git = "https://github.com/storytold/pdfcraft", rev = "27287c297d25d505a8720ea6da2e7af38693bfa9" }
+vello_cpu = { git = "https://github.com/storytold/pdfcraft", rev = "27287c297d25d505a8720ea6da2e7af38693bfa9" }
+ecolor = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+emath = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+epaint = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+epaint_default_fonts = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+egui = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+egui-winit = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+egui-wgpu = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+egui_glow = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+egui_extras = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+eframe = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+winit = { git = "https://github.com/storytold/winit.git", rev = "a517b3846ee8457d84ee4975110bfda6797c44dc" }

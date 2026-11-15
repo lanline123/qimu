@@ -12,3 +12,5 @@ serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 argon2 = "0.5"
 rand = "0.8"
+# storytold/craft-libs (MIT OR Apache-2.0), pinned git rev — see design/组件接入台账.md
+craft-atomic = { git = "https://github.com/storytold/craft-libs", rev = "0c144b7d983899d4b5b281046dd03a8b1ab35fbb" }

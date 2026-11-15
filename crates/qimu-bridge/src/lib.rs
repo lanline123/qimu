@@ -67,6 +67,19 @@ pub trait PowerPointBridge {
         expected_path: &str,
         replacements: &[SlideReplacement],
     ) -> Result<ReplaceReport, String>;
+
+    /// Capture the slides the user has copied in PowerPoint (§5.9) as a
+    /// standalone .pptx fragment in a temp location, so the client can
+    /// publish them as a new content block's first version.
+    ///
+    /// `Ok(None)` means "nothing capturable right now" (no running
+    /// PowerPoint, or the clipboard holds no slides) — callers must say
+    /// so in one line and must NOT silently create an empty block.
+    /// The default implementation reports exactly that; the Windows COM
+    /// implementation overrides it.
+    fn capture_copied_slides(&self) -> Result<Option<std::path::PathBuf>, String> {
+        Ok(None)
+    }
 }
 
 #[cfg(windows)]

@@ -15,4 +15,8 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
-ureq = { version = "2", features = ["json"] }
+# craft-ai-integrations (storytold@db30646, MIT OR Apache-2.0): the
+# OpenAI-compatible provider adapter + core contract drive the AI
+# translation provider layer (step 4 of design/组件接入台账.md).
+craft-ai-core = { git = "https://github.com/storytold/craft-ai-integrations", rev = "db30646d9df2ae5d36d74f3feed6dc6f00d3ef6b" }
+craft-ai-openai = { git = "https://github.com/storytold/craft-ai-integrations", rev = "db30646d9df2ae5d36d74f3feed6dc6f00d3ef6b" }

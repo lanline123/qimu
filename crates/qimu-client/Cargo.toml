@@ -10,11 +10,33 @@ path = "src/main.rs"
 
 [dependencies]
 qimu-core = { path = "../qimu-core" }
-eframe = "0.29"
-egui = "0.29"
+qimu-bridge = { path = "../qimu-bridge" }
+# eframe with the glow renderer only (as in the 0.29 era): the 0.37
+# default set pulls in wgpu, whose dx12 backend does not compile for
+# x86_64-pc-windows-gnu (windows-crate version skew inside wgpu-hal),
+# which is the trial package's toolchain.
+eframe = { version = "0.37", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "glow", "wayland", "x11"] }
+egui = "0.37"
 serde_json = "1"
 ureq = { version = "2", features = ["json"] }
 base64 = "0.22"
 rfd = "0.15"
+# craft-i18n (storytold/craft-libs@0c144b7, MIT OR Apache-2.0): the
+# source-keyed localization runtime; catalogs live in locales/*.tsv in
+# the storytold/craft-i18n TSV format.
+craft-i18n = { git = "https://github.com/storytold/craft-libs", rev = "0c144b7d983899d4b5b281046dd03a8b1ab35fbb" }
+# craft-ui (storytold/craft-libs@0c144b7, MIT OR Apache-2.0): the Craft
+# component library on the egui fork; adopted component by component
+# with its native interaction model (step 6b: buttons::IconButton).
+craft-ui = { git = "https://github.com/storytold/craft-libs", rev = "0c144b7d983899d4b5b281046dd03a8b1ab35fbb" }
 aes-gcm = "0.10"
 image = "0.25"
+# storytold/craft-libs (MIT OR Apache-2.0), pinned git rev — see design/组件接入台账.md
+craft-atomic = { git = "https://github.com/storytold/craft-libs", rev = "0c144b7d983899d4b5b281046dd03a8b1ab35fbb" }
+# PdfCraft page rasterizer (storytold/pdfcraft@27287c2, MIT OR Apache-2.0):
+# renders attachment PDFs to page images for the in-client preview.
+pdfcraft-render = { git = "https://github.com/storytold/pdfcraft", rev = "27287c297d25d505a8720ea6da2e7af38693bfa9" }
+# craft-update protocol layer (storytold/craft-libs@0c144b7, MIT OR
+# Apache-2.0): parse_github_release_list + offers_update +
+# download_url_under_mirror drive the LAN update-mirror check (prompt only).
+craft-update = { git = "https://github.com/storytold/craft-libs", rev = "0c144b7d983899d4b5b281046dd03a8b1ab35fbb" }

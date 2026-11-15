@@ -408,7 +408,10 @@ impl Store {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
-            std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+            // Crash-safe write via craft-atomic (storytold/craft-libs,
+            // MIT OR Apache-2.0): content-addressed readers never see a
+            // partially written file.
+            craft_atomic::atomic_write(&path, bytes).map_err(|e| e.to_string())?;
         }
         Ok(hash)
     }
@@ -685,6 +688,33 @@ impl Store {
         self.conn
             .execute("UPDATE folders SET name=?2 WHERE id=?1", params![id, name])
             .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Delete a folder only when it is completely empty: no child
+    /// folders, no content units and no indexes homed in it.
+    pub fn delete_folder(&self, id: &str) -> SResult<()> {
+        let count = |sql: &str| -> SResult<i64> {
+            self.conn
+                .query_row(sql, params![id], |r| r.get(0))
+                .map_err(db_err)
+        };
+        if count("SELECT COUNT(*) FROM folders WHERE parent_id=?1")? > 0 {
+            return Err("文件夹下还有子文件夹，不能删除".into());
+        }
+        if count("SELECT COUNT(*) FROM units WHERE folder_id=?1")? > 0 {
+            return Err("文件夹内还有内容块，不能删除".into());
+        }
+        if count("SELECT COUNT(*) FROM indexes_tbl WHERE folder_id=?1")? > 0 {
+            return Err("文件夹内还有索引，不能删除".into());
+        }
+        let n = self
+            .conn
+            .execute("DELETE FROM folders WHERE id=?1", params![id])
+            .map_err(db_err)?;
+        if n == 0 {
+            return Err("文件夹不存在".into());
+        }
         Ok(())
     }
 

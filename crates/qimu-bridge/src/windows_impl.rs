@@ -226,4 +226,54 @@ impl PowerPointBridge for WindowsBridge {
             slides_after: after,
         })
     }
+
+    /// Clipboard capture route (chosen for robustness over driving the
+    /// user's own selection, which would mutate their open deck):
+    ///   1. `Presentations.Add(msoFalse)` creates a hidden throwaway
+    ///      presentation — the user's open files are never touched.
+    ///   2. `Slides.Paste()` pastes whatever slides are on the clipboard.
+    ///      It raises when the clipboard holds no slides (e.g. plain
+    ///      text), which maps to `Ok(None)` — "nothing copied".
+    ///   3. `Presentation.SaveAs(path, ppSaveAsOpenXMLPresentation = 24)`
+    ///      writes the fragment; `Close()` discards the throwaway deck.
+    /// The copied slides keep their original design because Paste into a
+    /// new presentation carries the source theme with the slides.
+    /// NOTE: written against the documented object model; like the rest
+    /// of this bridge it has NOT yet run on a real Windows + PowerPoint
+    /// machine (first live check pending).
+    fn capture_copied_slides(&self) -> Result<Option<std::path::PathBuf>, String> {
+        let _com = ComGuard::new()?;
+        let app = match active_powerpoint() {
+            Ok(a) => a,
+            Err(_) => return Ok(None),
+        };
+        let presentations = get_obj(&app, "Presentations")?;
+        // Add(WithWindow = msoFalse = 0): no window for the temp deck.
+        let added = call(&presentations, "Add", &mut [VARIANT::from(0i32)])?;
+        let pres = IDispatch::try_from(&added)
+            .map_err(|e| format!("新建临时演示失败: {e}"))?;
+        let slides = get_obj(&pres, "Slides")?;
+        if call(&slides, "Paste", &mut []).is_err()
+            || get_i32(&slides, "Count").unwrap_or(0) == 0
+        {
+            let _ = call(&pres, "Close", &mut []);
+            return Ok(None);
+        }
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!("qimu-paste-{stamp}.pptx"));
+        let saved = call(
+            &pres,
+            "SaveAs",
+            &mut [
+                VARIANT::from(BSTR::from(path.to_string_lossy().as_ref())),
+                VARIANT::from(24i32), // ppSaveAsOpenXMLPresentation
+            ],
+        );
+        let _ = call(&pres, "Close", &mut []);
+        saved?;
+        Ok(Some(path))
+    }
 }

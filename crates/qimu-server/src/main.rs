@@ -6,7 +6,7 @@
 use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, StatusCode},
-    routing::{get, patch, post},
+    routing::{delete, get, patch, post},
     Json, Router,
 };
 use base64::Engine;
@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex};
 
 struct AppState {
     store: Mutex<Store>,
+    data_dir: std::path::PathBuf,
 }
 
 type St = Arc<AppState>;
@@ -428,11 +429,104 @@ async fn put_ai_settings(
     Ok(Json(json!({ "ok": true })))
 }
 
-/// OpenAI-compatible chat-completions provider.
+/// OpenAI-compatible chat-completions provider, driven through the
+/// craft-ai-integrations adapter layer (storytold/craft-ai-integrations
+/// @db30646, MIT OR Apache-2.0; step 4 of design/组件接入台账.md): the
+/// provider owns the HTTP call, request shaping and job lifecycle; this
+/// struct only maps qimu's settings + translation prompt contract onto
+/// its `text.complete` capability. The settings keys and the prompt /
+/// JSON-array contract are unchanged from the previous hand-rolled ureq
+/// implementation. (The ecosystem's AiClient/ToolDesk orchestration is
+/// a desktop-launcher layer — shared store + OS keychain + consent —
+/// and does not fit a server process; the adapter layer is the part
+/// that replaces our provider code.)
 struct OpenAiCompat {
     endpoint: String, // base URL, e.g. https://api.openai.com
     api_key: String,
     model: String,
+}
+
+impl OpenAiCompat {
+    fn complete(&self, system: &str, user: &str) -> Result<String, String> {
+        use craft_ai_core::{
+            CapabilityId, CapabilitySpec, Features, InputRole, JobState, ModelId, ModelInfo,
+            Payload, Provider, Request, SecretString,
+        };
+        // The configured model may be any OpenAI-compatible id, known to
+        // the adapter's catalog or not: declare it as a chat model with
+        // the same text.complete spec the catalog builds for known ids.
+        let cap = CapabilityId::parse("text.complete").map_err(|e| e.to_string())?;
+        let spec = CapabilitySpec::new(cap.clone())
+            .accepting(InputRole::Prompt, 64)
+            .requiring(InputRole::Prompt)
+            .accepting(InputRole::Context, 64)
+            .accepting(InputRole::System, 1)
+            .with_features(Features {
+                streaming: true,
+                tools: true,
+                structured_output: true,
+            });
+        let model_id = ModelId::new(self.model.clone()).map_err(|e| format!("模型名不合法：{e}"))?;
+        let mut info = ModelInfo::new(model_id.clone(), self.model.clone());
+        info.capabilities = vec![spec];
+        let config = craft_ai_openai::OpenAiConfig::new(format!(
+            "{}/v1",
+            self.endpoint.trim_end_matches('/')
+        ))
+        .with_key(SecretString::new(self.api_key.clone()))
+        .with_models(vec![info]);
+        let provider = craft_ai_openai::OpenAiProvider::new(config)
+            .map_err(|e| format!("翻译服务配置不合法：{e}"))?;
+        let request = Request::new(cap)
+            .with_input(InputRole::System, Payload::text(system))
+            .with_input(InputRole::Prompt, Payload::text(user))
+            .with_param("temperature", json!(0.2));
+        let job = provider
+            .submit(&model_id, &request)
+            .map_err(|e| format!("翻译服务请求失败：{e}"))?;
+        // The adapter runs the request on its own worker; poll to a
+        // terminal state (its request timeout bounds the wait). Poll
+        // events are incremental: a plain chat reply arrives as
+        // TextDelta events (a structured one as a JSON output), so the
+        // text is accumulated across polls.
+        let mut text = String::new();
+        for _ in 0..6000 {
+            let snap = provider
+                .poll(&job)
+                .map_err(|e| format!("翻译服务请求失败：{e}"))?;
+            for ev in &snap.events {
+                match ev {
+                    craft_ai_core::Event::TextDelta { text: delta } => text.push_str(delta),
+                    craft_ai_core::Event::Output(o) => match &o.payload {
+                        Payload::Text { text: t } => text.push_str(t),
+                        Payload::Inline { data, .. } => {
+                            if let Ok(s) = std::str::from_utf8(data) {
+                                text.push_str(s);
+                            }
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+            match snap.state {
+                JobState::Succeeded => {
+                    if text.is_empty() {
+                        return Err("翻译服务返回格式异常".into());
+                    }
+                    return Ok(text);
+                }
+                JobState::Failed { error } => {
+                    return Err(format!("翻译服务请求失败：{error}"));
+                }
+                JobState::Cancelled => {
+                    return Err("翻译服务请求失败：任务被取消".into());
+                }
+                _ => std::thread::sleep(std::time::Duration::from_millis(200)),
+            }
+        }
+        Err("翻译服务请求失败：等待结果超时".into())
+    }
 }
 
 impl Translator for OpenAiCompat {
@@ -454,23 +548,8 @@ impl Translator for OpenAiCompat {
              Never translate these terms differently: {gloss}. \
              If a string is empty or whitespace, return it unchanged."
         );
-        let body = json!({
-            "model": self.model,
-            "messages": [
-                { "role": "system", "content": system },
-                { "role": "user", "content": serde_json::to_string(texts).unwrap_or_default() },
-            ],
-            "temperature": 0.2,
-        });
-        let url = format!("{}/v1/chat/completions", self.endpoint.trim_end_matches('/'));
-        let resp = ureq::post(&url)
-            .set("Authorization", &format!("Bearer {}", self.api_key))
-            .send_json(body)
-            .map_err(|e| format!("翻译服务请求失败：{e}"))?;
-        let v: Value = resp.into_json().map_err(|e| e.to_string())?;
-        let content = v["choices"][0]["message"]["content"]
-            .as_str()
-            .ok_or("翻译服务返回格式异常")?;
+        let user = serde_json::to_string(texts).unwrap_or_default();
+        let content = self.complete(&system, &user)?;
         let content = content.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
         let out: Vec<String> = serde_json::from_str(content)
             .map_err(|e| format!("翻译服务未返回 JSON 数组：{e}"))?;
@@ -667,6 +746,19 @@ async fn rename_folder(
     let _ = auth(&st, &headers)?;
     let store = st.store.lock().unwrap();
     store.rename_folder(&id, &req.name).map_err(bad)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// DELETE /v1/folders/:id — empty folders only (the store refuses
+/// non-empty ones with a specific reason).
+async fn delete_folder(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Api<Value> {
+    let _ = auth(&st, &headers)?;
+    let store = st.store.lock().unwrap();
+    store.delete_folder(&id).map_err(bad)?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -1078,10 +1170,101 @@ async fn version_fragment(
     Ok(Json(json!({ "version": ver, "data_base64": b64e(&bytes) })))
 }
 
+/// Thumbnail renderer selection (step 3 of the storytold integration
+/// ledger): DeckCraft by default — the pilot (tools/pilot_deckcraft_
+/// render.py) rendered Redwood 17/17, Case2 7/7 and Case2b 1/1 pages with
+/// mean abs pixel diff vs LibreOffice <= 4.8 per deck (worst page 8.2, a
+/// chart page) at ~4x the speed. QIMU_THUMB_RENDERER=libreoffice pins
+/// the old pipeline; a DeckCraft failure also falls back to it per render.
+/// The on-disk cache is namespaced by this name (see version_thumb).
+fn thumb_renderer() -> &'static str {
+    match std::env::var("QIMU_THUMB_RENDERER").as_deref() {
+        Ok("libreoffice") => "libreoffice",
+        _ => "deckcraft",
+    }
+}
+
+fn render_thumbs(root: &std::path::Path, version_id: &str, frag: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    if thumb_renderer() == "deckcraft" {
+        match render_thumbs_deckcraft(root, version_id, frag) {
+            Ok(pages) => return Ok(pages),
+            Err(e) => {
+                eprintln!("[thumb] DeckCraft 渲染失败，回退 LibreOffice（{version_id}）: {e}");
+            }
+        }
+    }
+    render_thumbs_lo(root, version_id, frag)
+}
+
+/// Render a fragment PPTX to per-slide PNGs with the DeckCraft CLI
+/// (storytold/deckcraft, MIT OR Apache-2.0). Binary resolution:
+/// $QIMU_DECKCRAFT_CLI, then a deckcraft-cli sitting next to this server
+/// executable, then PATH. Scale 0.75 lands near the old pipeline's
+/// 55-DPI page size (733px wide for a 16:9 deck).
+fn render_thumbs_deckcraft(root: &std::path::Path, version_id: &str, frag: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    let bin = std::env::var("QIMU_DECKCRAFT_CLI")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            let name = format!("deckcraft-cli{}", std::env::consts::EXE_SUFFIX);
+            std::env::current_exe()
+                .ok()
+                .map(|exe| exe.with_file_name(name))
+                .filter(|p| p.exists())
+                .map(|p| p.display().to_string())
+        })
+        .unwrap_or_else(|| "deckcraft-cli".to_string());
+    let work = root.join("thumbs").join(format!(".work-dc-{version_id}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+    let cleanup = |work: &std::path::Path| {
+        let _ = std::fs::remove_dir_all(work);
+    };
+    let pptx = work.join("frag.pptx");
+    std::fs::write(&pptx, frag).map_err(|e| e.to_string())?;
+    let outdir = work.join("dc");
+    let out = std::process::Command::new(&bin)
+        .arg("render")
+        .arg(&pptx)
+        .arg("--all")
+        .arg(&outdir)
+        .args(["--scale", "0.75"])
+        .output()
+        .map_err(|e| format!("启动 deckcraft-cli 失败（{bin}）: {e}"))?;
+    if !out.status.success() {
+        cleanup(&work);
+        return Err(format!(
+            "deckcraft-cli 渲染失败: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    let mut pages: Vec<(u32, Vec<u8>)> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&outdir) {
+        for ent in rd.flatten() {
+            let name = ent.file_name().to_string_lossy().to_string();
+            if let Some(num) = name
+                .strip_prefix("slide-")
+                .and_then(|n| n.strip_suffix(".png"))
+                .and_then(|n| n.parse::<u32>().ok())
+            {
+                if let Ok(bytes) = std::fs::read(ent.path()) {
+                    pages.push((num, bytes));
+                }
+            }
+        }
+    }
+    pages.sort_by_key(|(n, _)| *n);
+    cleanup(&work);
+    if pages.is_empty() {
+        return Err("DeckCraft 渲染未产出任何页面".into());
+    }
+    Ok(pages.into_iter().map(|(_, b)| b).collect())
+}
+
 /// Render a fragment PPTX to per-slide PNGs with LibreOffice headless
 /// (PPTX -> PDF -> pdftoppm). Runs in a private temp dir with its own LO
 /// profile so concurrent renders don't fight over the default profile.
-fn render_thumbs(root: &std::path::Path, version_id: &str, frag: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+fn render_thumbs_lo(root: &std::path::Path, version_id: &str, frag: &[u8]) -> Result<Vec<Vec<u8>>, String> {
     let work = root.join("thumbs").join(format!(".work-{version_id}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
@@ -1173,7 +1356,7 @@ async fn version_thumb(
         let frag = store.file_get(&ver.fragment_hash).map_err(bad)?;
         (store.root().to_path_buf(), frag)
     };
-    let cache_dir = root.join("thumbs").join(&id);
+    let cache_dir = root.join("thumbs").join(thumb_renderer()).join(&id);
     let cache_file = cache_dir.join(format!("{page}.png"));
     if !cache_file.exists() {
         let root2 = root.clone();
@@ -2073,6 +2256,53 @@ async fn update_package(
     Ok(Json(json!({ "diff": diff, "pages": pages })))
 }
 
+// ---------------- LAN update mirror (craft-update local-mirror) ----------------
+// The server host doubles as the LAN update mirror: drop release files
+// under <data>/update-mirror/ — a releases.json in the GitHub /releases
+// list shape, plus one folder per tag holding that release's assets.
+// Clients poll it with craft-update's protocol layer and only *prompt*
+// (no silent download/install). Read-only and unauthenticated, like a
+// static file host; the JSON is inert metadata and assets are installers
+// the user still runs manually.
+
+async fn update_releases(
+    State(st): State<St>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let path = st.data_dir.join("update-mirror").join("releases.json");
+    let bytes = std::fs::read(&path).unwrap_or_else(|_| b"[]".to_vec());
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        bytes,
+    )
+        .into_response()
+}
+
+async fn update_asset(
+    State(st): State<St>,
+    Path((tag, name)): Path<(String, String)>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    // Path segments cannot contain '/', but refuse traversal spellings.
+    if tag.contains("..")
+        || name.contains("..")
+        || name.contains('\\')
+        || tag.is_empty()
+        || name.is_empty()
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let path = st.data_dir.join("update-mirror").join(&tag).join(&name);
+    match std::fs::read(&path) {
+        Ok(bytes) => (
+            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 // ---------------- attachments / showroom / assemblies ----------------
 
 #[derive(Deserialize)]
@@ -2569,12 +2799,141 @@ async fn export_assembly(
     })))
 }
 
+// ---------------- LAN discovery (§4: clients auto-find servers) -------
+
+/// UDP port answering discovery broadcasts; the HTTP port stays 8730.
+const DISCOVERY_PORT: u16 = 8731;
+const DISCOVERY_MAGIC: &[u8] = b"QIMU_DISCOVER_V1";
+
+fn machine_name() -> String {
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "启幕服务器".to_string())
+}
+
+/// The discovery protocol core: a `QIMU_DISCOVER_V1` datagram earns a
+/// JSON hello naming this server and its HTTP port; anything else earns
+/// silence. Pure, so the protocol is unit-testable without a network.
+fn discovery_reply(payload: &[u8], http_port: u16) -> Option<String> {
+    if payload != DISCOVERY_MAGIC {
+        return None;
+    }
+    Some(
+        json!({
+            "app": "qimu",
+            "name": machine_name(),
+            "port": http_port,
+            "version": env!("CARGO_PKG_VERSION"),
+        })
+        .to_string(),
+    )
+}
+
+/// Answer discovery broadcasts with a unicast JSON hello so clients on
+/// the LAN can list this server without knowing its address.
+/// Best-effort: any failure is logged and never affects the HTTP service.
+async fn discovery_task(http_port: u16) {
+    let sock = match tokio::net::UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT)).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("discovery: cannot bind UDP {DISCOVERY_PORT}: {e}");
+            return;
+        }
+    };
+    println!("qimu-server discovery on udp://0.0.0.0:{DISCOVERY_PORT}");
+    let mut buf = [0u8; 512];
+    loop {
+        match sock.recv_from(&mut buf).await {
+            Ok((n, src)) => {
+                if let Some(hello) = discovery_reply(&buf[..n], http_port) {
+                    let _ = sock.send_to(hello.as_bytes(), src).await;
+                }
+            }
+            Err(e) => {
+                eprintln!("discovery: recv error: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+
+    #[test]
+    fn magic_gets_a_hello() {
+        let hello = discovery_reply(DISCOVERY_MAGIC, 8730).expect("reply");
+        let v: Value = serde_json::from_str(&hello).unwrap();
+        assert_eq!(v["app"], "qimu");
+        assert_eq!(v["port"], 8730);
+        assert!(v["name"].as_str().is_some_and(|n| !n.is_empty()));
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn anything_else_gets_silence() {
+        assert!(discovery_reply(b"QIMU_DISCOVER_V2", 8730).is_none());
+        assert!(discovery_reply(b"", 8730).is_none());
+        assert!(discovery_reply(b" QIMU_DISCOVER_V1", 8730).is_none());
+    }
+}
+
 // ---------------- main ----------------
+
+fn dir_writable(p: &std::path::Path) -> bool {
+    if std::fs::create_dir_all(p).is_err() {
+        return false;
+    }
+    let probe = p.join(".qimu-write-probe");
+    match std::fs::write(&probe, b"ok") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Data directory resolution: $QIMU_DATA_DIR wins; otherwise a `qimu-data`
+/// folder beside the executable when writable (installed layouts, e.g.
+/// D:\Program Files\启幕); otherwise a per-user/system fallback so a
+/// read-only install dir (C:\Program Files) still works.
+fn resolve_data_dir() -> std::path::PathBuf {
+    if let Ok(d) = std::env::var("QIMU_DATA_DIR") {
+        if !d.trim().is_empty() {
+            return std::path::PathBuf::from(d);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let cand = dir.join("qimu-data");
+            if dir_writable(&cand) {
+                return cand;
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Ok(pd) = std::env::var("ProgramData") {
+            let cand = std::path::PathBuf::from(pd).join("启幕").join("data");
+            if dir_writable(&cand) {
+                return cand;
+            }
+        }
+    }
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
+    std::path::PathBuf::from(home).join(".qimu").join("server-data")
+}
 
 #[tokio::main]
 async fn main() {
-    let data_dir = std::env::var("QIMU_DATA_DIR").unwrap_or_else(|_| "qimu-data".to_string());
-    let store = Store::open(std::path::Path::new(&data_dir)).expect("open data dir");
+    let data_dir = resolve_data_dir();
+    let store = Store::open(&data_dir).expect("open data dir");
     if store.user_count().map(|c| c == 0).unwrap_or(false) {
         let pw = std::env::var("QIMU_ADMIN_PASSWORD").unwrap_or_else(|_| "admin12345".to_string());
         store.ensure_seed(&pw).expect("seed");
@@ -2582,9 +2941,12 @@ async fn main() {
     }
     let state: St = Arc::new(AppState {
         store: Mutex::new(store),
+        data_dir: data_dir.clone(),
     });
     let app = Router::new()
         .route("/health", get(|| async { Json(json!({ "status": "ok", "service": "qimu-server" })) }))
+        .route("/update/releases.json", get(update_releases))
+        .route("/update/:tag/:name", get(update_asset))
         .route("/v1/auth/login", post(login))
         .route("/v1/auth/logout", post(logout))
         .route("/v1/me", get(me))
@@ -2603,6 +2965,7 @@ async fn main() {
         .route("/v1/units/:id/translate", post(translate_unit))
         .route("/v1/folders", get(folders).post(create_folder))
         .route("/v1/folders/:id/rename", post(rename_folder))
+        .route("/v1/folders/:id", delete(delete_folder))
         .route("/v1/folders/:id/main-index", post(set_folder_main_index))
         .route("/v1/units", get(list_units).post(create_unit))
         .route("/v1/units/:id", get(get_unit).patch(patch_unit))
@@ -2669,6 +3032,10 @@ async fn main() {
         .unwrap_or(8730);
     let addr = format!("0.0.0.0:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
-    println!("qimu-server listening on http://{addr} (data dir: {data_dir})");
+    println!(
+        "qimu-server listening on http://{addr} (data dir: {})",
+        data_dir.display()
+    );
+    tokio::spawn(discovery_task(port));
     axum::serve(listener, app).await.expect("serve");
 }

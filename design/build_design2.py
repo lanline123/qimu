@@ -2,7 +2,7 @@
 """启幕 design boards v2 — current layouts (folder tree left, content right).
 Built in FigCraft via control channel :7991. Boards: 登录 / 演示厅 / 内容页 /
 索引总览 / 索引详情 / 设置. Saves qimu-ui.figcraft + renders PNGs."""
-import socket, json
+import socket, json, os
 
 S = socket.create_connection(('127.0.0.1', 7991), timeout=120)
 F = S.makefile('rw', encoding='utf-8', newline='\n')
@@ -95,19 +95,28 @@ def slide_art(fid, x, y, w, kind):
     return h
 
 def folder_panel(fid, selected, primary=None):
-    """Left resident folder tree (220 wide)."""
+    """Left resident folder tree (220 wide). The primary action pill is
+    pinned to the panel BOTTOM (James 2026-11-15); the tree sits above."""
     rect(fid, 0, 53, 220, 847, PANEL)
     y = 65
-    if primary:
-        rect(fid, 10, y, 200, 34, ACCENT, r=17)
-        text(fid, 62, y + 8, primary, 13, "#FFFFFF", weight=600)
-        y += 46
     rows = [("全部", None), ("公司介绍", 0), ("公司技术", 0), ("公司案例", 0)]
     for name, _ in rows:
         sel = (name == selected)
         if sel: rect(fid, 8, y, 204, 32, SEL, r=8)
         text(fid, 20, y + 7, name, 13.5, T1 if sel else T2)
         y += 38
+    if primary:
+        rect(fid, 10, 856, 200, 34, ACCENT, r=17)
+        text(fid, 62, 864, primary, 13, "#FFFFFF", weight=600)
+
+def tree_rows(fid, y, selected):
+    rows = [("全部", None), ("公司介绍", 0), ("公司技术", 0), ("公司案例", 0)]
+    for name, _ in rows:
+        sel = (name == selected)
+        if sel: rect(fid, 8, y, 204, 32, SEL, r=8)
+        text(fid, 20, y + 7, name, 13.5, T1 if sel else T2)
+        y += 38
+    return y
 
 # ---------------- 登录 ----------------
 def screen_login(ox):
@@ -128,18 +137,23 @@ def screen_login(ox):
     return fid
 
 # ---------------- 演示厅 ----------------
+def showroom_panel(fid, zone="广场", folder="全部"):
+    """Showroom left panel (F): the four zones as vertical rows on top,
+    the folder tree below them, separated by a hairline."""
+    rect(fid, 0, 53, 220, 847, PANEL)
+    y = 65
+    for z in ["广场", "我的库", "收到的分享", "群组空间"]:
+        if z == zone: rect(fid, 8, y, 204, 32, SEL, r=8)
+        text(fid, 20, y + 7, z, 13.5, T1 if z == zone else T2)
+        y += 38
+    rect(fid, 16, y + 2, 188, 1, "#2A2A2A")
+    tree_rows(fid, y + 12, folder)
+
 def screen_showroom(ox):
     fid = frame(ox, "演示厅")
     topbar(fid, "演示厅")
-    folder_panel(fid, "全部")
+    showroom_panel(fid)
     text(fid, 244, 66, "演示厅", 19, T1, weight=600)
-    x = 340
-    for z in ["广场", "我的库", "收到的分享", "群组空间"]:
-        c = T1 if z == "广场" else T2
-        text(fid, x, 70, z, 13.5, c, weight=600 if z == "广场" else None)
-        if z == "广场":
-            rect(fid, x, 94, 17 * len(z), 2, ACCENT)
-        x += 17 * len(z) + 26
     cards = [
         ("Redwood 来访介绍", "电池回收技术交流 · 17 页", "超级管理员 · 2026-11-15", "cover"),
         ("公司介绍 2026", "公司整体介绍 · 24 页", "超级管理员 · 2026-11-12", "table"),
@@ -177,9 +191,6 @@ def screen_content(ox):
     text(fid, 748, 71, "导入到组", 13, T1)
     rect(fid, 824, 65, 150, 32, FIELD, r=8)
     text(fid, 836, 73, "公司介绍", 12, T2)
-    rect(fid, 244, 109, 300, 32, FIELD, r=8)
-    text(fid, 260, 117, "新建内容块", 12, T3)
-    rect(fid, 556, 109, 64, 32, BTN2, r=8); text(fid, 572, 116, "创建", 12, T1)
     cards = [
         ("开场部分", "1.0.0", 6, "公司介绍 · 超级管理员", "cover"),
         ("技术部分", "1.1.0", 5, "公司介绍 · 超级管理员", "table"),
@@ -189,7 +200,12 @@ def screen_content(ox):
         ("封面模板", "1.0.0", 6, "· 超级管理员", "cover"),
     ]
     for i, (t, v, p, m, k) in enumerate(cards):
-        content_card(fid, 244 + (i % 3) * 316, 157 + (i // 3) * 274, t, v, p, m, k)
+        content_card(fid, 244 + (i % 3) * 316, 113 + (i // 3) * 274, t, v, p, m, k)
+    # I: the new-block entry is a same-size add card at the grid's end
+    ax, ay = 244, 113 + 2 * 274
+    rect(fid, ax, ay, 300, 258, BG, r=10, stroke=BORDER)
+    text(fid, ax + 138, ay + 96, "+", 36, T3)
+    text(fid, ax + 112, ay + 148, "新建内容块", 13, T2)
     return fid
 
 # ---------------- 索引总览 ----------------
@@ -227,7 +243,7 @@ def entry_card(fid, x, y, num, name, ver, pages, locked, strip):
     for i in range(1, pages):
         col, row = (i - 1) % 3, (i - 1) // 3
         slide_art(fid, x + 260 + col * 92, y + 30 + row * 56, 86, kinds[i % len(kinds)])
-    text(fid, x + 16, y + 168, f"共 {pages} 页", 11, T3)
+    # (A: no page-count caption on entry cards — James 2026-11-15)
     ix = x + 560
     text(fid, ix, y + 14, name, 15, T1, weight=600)
     text(fid, ix + 17 * len(name) + 12, y + 17, f"标准 · en · v{ver}", 12, T2)
@@ -310,6 +326,130 @@ def screen_settings(ox):
     rect(fid, 814, 190, 90, 60, "#B8C4D4")
     return fid
 
+# ---------------- 演示厅整稿（H） ----------------
+ICON_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                        "crates", "qimu-client", "assets", "icons")
+
+def icon(fid, x, y, name):
+    """Place an IconPark PNG (the same asset the client embeds)."""
+    return ex("image.place", {"parent": fid, "x": x, "y": y, "width": 20,
+                              "height": 20, "name": "icon-" + name,
+                              "path": os.path.join(ICON_DIR, name + ".png")})
+
+def screen_deck(ox):
+    fid = frame(ox, "演示厅整稿")
+    topbar(fid, "演示厅")
+    showroom_panel(fid)
+    X = 244
+    # James 2026-11-15: no "‹ 返回" text, no text actions — the five
+    # actions are IconPark icons at the top-right (back in red). The
+    # 缓存到本地 action exists only as the download icon.
+    text(fid, X, 88, "Redwood 来访介绍", 19, T1, weight=600)
+    text(fid, X + 190, 93, "来源索引 Redwood 来访介绍 · 超级管理员", 12, T2)
+    for i, name in enumerate(["play", "share", "export", "download", "back"]):
+        icon(fid, 1256 + i * 34, 90, name)
+    kinds = ["cover", "table", "smart", "chart", "table", "cover",
+             "smart", "table", "chart", "cover", "table", "smart",
+             "table", "chart", "cover", "table"]
+    for n, k in enumerate(kinds):
+        cx = X + (n % 5) * 232
+        cy = 156 + (n // 5) * 168
+        slide_art(fid, cx, cy, 216, k)
+        text(fid, cx, cy + 128, f"第 {n + 1} 页", 11, T3)
+    return fid
+
+# ---------------- 设置 · 服务器 ----------------
+def conn_card(fid, x, y, w, name, url_user, status, status_color, active):
+    rect(fid, x, y, w, 64, CARD, r=10, stroke=BORDER)
+    text(fid, x + 14, y + 10, name, 14, T1, weight=600)
+    if active:
+        text(fid, x + 14 + 15 * len(name) + 8, y + 13, "当前", 11, ACCENT)
+    text(fid, x + 14, y + 38, url_user, 12, T2)
+    text(fid, x + 14 + 11 * len(url_user) + 16, y + 38, status, 12, status_color)
+    bx = x + w - 14
+    for label in ["删除", "断开", "设为当前"]:
+        tw = 13 * len(label) + 16
+        bx -= tw
+        rect(fid, bx, y + 12, tw, 26, BTN2, r=8)
+        text(fid, bx + 8, y + 17, label, 12, T1)
+        bx -= 8
+
+def screen_settings_servers(ox):
+    fid = frame(ox, "设置服务器")
+    topbar(fid, "设置")
+    rect(fid, 0, 53, 208, 847, PANEL)
+    items = ["服务器", "个人资料", "组织管理", "内容组与授权", "公司公共资料",
+             "内容语言", "AI 翻译", "离线缓存策略"]
+    for i, name in enumerate(items):
+        if i == 0: rect(fid, 8, 65 + i * 40, 192, 34, SEL, r=8)
+        text(fid, 20, 72 + i * 40, name, 13, T1 if i == 0 else T2)
+    X = 232
+    text(fid, X, 68, "服务器", 19, T1, weight=600)
+    text(fid, X, 108, "已保存的服务器", 14, T1, weight=600)
+    conn_card(fid, X, 132, 900, "192.168.1.10", "http://192.168.1.10:8730 · admin",
+              "已连接", GREEN, True)
+    conn_card(fid, X, 206, 900, "127.0.0.1", "http://127.0.0.1:8730 · admin",
+              "连接失败", RED, False)
+    text(fid, X, 292, "添加服务器", 14, T1, weight=600)
+    for i, (lb, val) in enumerate([("服务器地址", "http://192.168.1.20:8730"),
+                                   ("账号", "admin"), ("密码", "••••••••")]):
+        y = 322 + i * 44
+        text(fid, X, y + 7, lb, 13, T2)
+        rect(fid, X + 96, y, 380, 32, FIELD, r=8)
+        text(fid, X + 108, y + 8, val, 13, T1)
+    rect(fid, X + 96, 322 + 3 * 44, 120, 32, ACCENT, r=16)
+    text(fid, X + 124, 322 + 3 * 44 + 8, "登录并添加", 12.5, "#FFFFFF", weight=600)
+    y = 322 + 3 * 44 + 52
+    text(fid, X, y, "局域网发现", 14, T1, weight=600)
+    rect(fid, X + 96, y - 6, 150, 30, BTN2, r=8)
+    text(fid, X + 112, y, "搜索局域网服务器", 12, T1)
+    for j, (nm, url) in enumerate([("QIMU-HOST", "http://192.168.1.10:8730 · v0.1.0"),
+                                   ("NAS-01", "http://192.168.1.30:8730 · v0.1.0")]):
+        cy = y + 36 + j * 56
+        rect(fid, X, cy, 900, 48, CARD, r=10, stroke=BORDER)
+        text(fid, X + 14, cy + 15, nm, 13, T1)
+        text(fid, X + 130, cy + 16, url, 12, T2)
+        rect(fid, X + 900 - 110, cy + 10, 96, 28, BTN2, r=8)
+        text(fid, X + 900 - 96, cy + 15, "添加并登录", 12, T1)
+    y2 = y + 36 + 2 * 56 + 18
+    rect(fid, X, y2, 900, 1, "#2A2A2A")
+    text(fid, X, y2 + 14, "缓存路径（本机设置）", 14, T1, weight=600)
+    text(fid, X, y2 + 42, "当前生效：D:\\Program Files\\启幕\\cache · 3 条缓存 · 12.4 MB", 12, T2)
+    rect(fid, X, y2 + 66, 460, 32, FIELD, r=8)
+    text(fid, X + 12, y2 + 74, "D:\\Program Files\\启幕\\cache", 12.5, T1)
+    rect(fid, X + 472, y2 + 66, 84, 32, BTN2, r=8); text(fid, X + 488, y2 + 73, "保存路径", 12, T1)
+    rect(fid, X + 564, y2 + 66, 84, 32, BTN2, r=8); text(fid, X + 580, y2 + 73, "恢复默认", 12, T1)
+    return fid
+
+# ---------------- 内容页选页模式（B/C） ----------------
+def screen_pick(ox):
+    fid = frame(ox, "内容页选页模式")
+    topbar(fid, "内容页")
+    folder_panel(fid, "公司介绍")
+    X = 244
+    # context bar: accent-tinted strip with the mode's confirm/cancel
+    rect(fid, X, 62, 1172, 40, ACCENT_TILE, r=8)
+    text(fid, X + 14, 74, "为索引「Redwood 来访介绍」选页 · 技术部分", 13, T1, weight=600)
+    rect(fid, X + 1172 - 196, 68, 84, 28, ACCENT, r=14)
+    text(fid, X + 1172 - 172, 74, "确认选页", 12, "#FFFFFF", weight=600)
+    rect(fid, X + 1172 - 100, 68, 84, 28, BTN2, r=14)
+    text(fid, X + 1172 - 66, 74, "取消", 12, T1)
+    text(fid, X, 122, "技术部分", 17, T1, weight=600)
+    text(fid, X + 86, 126, "标准 · en · v1.1.0（当前解析版本）", 12, T2)
+    kinds = ["table", "cover", "smart", "chart", "table"]
+    checked = [True, True, False, False, False]
+    for n, k in enumerate(kinds):
+        cx = X + (n % 4) * 232
+        cy = 156 + (n // 4) * 190
+        slide_art(fid, cx, cy, 216, k)
+        if checked[n]:
+            rect(fid, cx, cy + 134, 16, 16, ACCENT, r=4)
+            text(fid, cx + 3, cy + 134, "✓", 11, "#FFFFFF")
+        else:
+            rect(fid, cx, cy + 134, 16, 16, BG, r=4, stroke=BORDER)
+        text(fid, cx + 24, cy + 135, f"第 {n + 1} 页", 12, T1 if checked[n] else T2)
+    return fid
+
 if __name__ == "__main__":
     ex("file.new")
     boards = []
@@ -319,6 +459,9 @@ if __name__ == "__main__":
     boards.append(("索引总览.png", screen_overview(4500)))
     boards.append(("索引详情.png", screen_detail(6000)))
     boards.append(("设置.png", screen_settings(7500)))
+    boards.append(("演示厅整稿.png", screen_deck(9000)))
+    boards.append(("设置服务器.png", screen_settings_servers(10500)))
+    boards.append(("内容页选页模式.png", screen_pick(12000)))
     for name, fid in boards:
         r = call("ui.render", {"path": f"/home/hatch/workspace/qimu/design/{name}",
                                "scale": 1, "ids": [fid]})

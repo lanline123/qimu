@@ -1,0 +1,163 @@
+{
+ "Redwood_Visit_Revised_4tph_0_6vcr": {
+  "deck": "/home/hatch/workspace/user/files/Redwood_Visit_Revised_4tph_0_6vcr.pptx",
+  "pages_lo": 17,
+  "pages_dc": 17,
+  "lo_seconds": 15.9,
+  "dc_seconds": 3.9,
+  "dc_error": null,
+  "pages": [
+   {
+    "page": 1,
+    "mean_abs_diff": 4.08,
+    "hot_frac": 0.0424
+   },
+   {
+    "page": 2,
+    "mean_abs_diff": 5.92,
+    "hot_frac": 0.0615
+   },
+   {
+    "page": 3,
+    "mean_abs_diff": 4.24,
+    "hot_frac": 0.0462
+   },
+   {
+    "page": 4,
+    "mean_abs_diff": 6.09,
+    "hot_frac": 0.0808
+   },
+   {
+    "page": 5,
+    "mean_abs_diff": 6.21,
+    "hot_frac": 0.069
+   },
+   {
+    "page": 6,
+    "mean_abs_diff": 1.1,
+    "hot_frac": 0.01
+   },
+   {
+    "page": 7,
+    "mean_abs_diff": 5.99,
+    "hot_frac": 0.0618
+   },
+   {
+    "page": 8,
+    "mean_abs_diff": 6.63,
+    "hot_frac": 0.0725
+   },
+   {
+    "page": 9,
+    "mean_abs_diff": 3.18,
+    "hot_frac": 0.0378
+   },
+   {
+    "page": 10,
+    "mean_abs_diff": 4.41,
+    "hot_frac": 0.0438
+   },
+   {
+    "page": 11,
+    "mean_abs_diff": 5.7,
+    "hot_frac": 0.0558
+   },
+   {
+    "page": 12,
+    "mean_abs_diff": 5.76,
+    "hot_frac": 0.0633
+   },
+   {
+    "page": 13,
+    "mean_abs_diff": 4.46,
+    "hot_frac": 0.047
+   },
+   {
+    "page": 14,
+    "mean_abs_diff": 5.81,
+    "hot_frac": 0.068
+   },
+   {
+    "page": 15,
+    "mean_abs_diff": 3.57,
+    "hot_frac": 0.0415
+   },
+   {
+    "page": 16,
+    "mean_abs_diff": 4.13,
+    "hot_frac": 0.046
+   },
+   {
+    "page": 17,
+    "mean_abs_diff": 4.17,
+    "hot_frac": 0.0431
+   }
+  ],
+  "mean_abs_diff_avg": 4.79,
+  "mean_abs_diff_max": 6.63
+ },
+ "Case2_Charts_Animation": {
+  "deck": "/home/hatch/workspace/user/files/Case2_Charts_Animation.pptx",
+  "pages_lo": 7,
+  "pages_dc": 7,
+  "lo_seconds": 3.4,
+  "dc_seconds": 0.5,
+  "dc_error": null,
+  "pages": [
+   {
+    "page": 1,
+    "mean_abs_diff": 4.49,
+    "hot_frac": 0.0312
+   },
+   {
+    "page": 2,
+    "mean_abs_diff": 8.21,
+    "hot_frac": 0.063
+   },
+   {
+    "page": 3,
+    "mean_abs_diff": 6.84,
+    "hot_frac": 0.0482
+   },
+   {
+    "page": 4,
+    "mean_abs_diff": 4.08,
+    "hot_frac": 0.032
+   },
+   {
+    "page": 5,
+    "mean_abs_diff": 2.9,
+    "hot_frac": 0.0212
+   },
+   {
+    "page": 6,
+    "mean_abs_diff": 3.6,
+    "hot_frac": 0.0217
+   },
+   {
+    "page": 7,
+    "mean_abs_diff": 2.85,
+    "hot_frac": 0.0171
+   }
+  ],
+  "mean_abs_diff_avg": 4.71,
+  "mean_abs_diff_max": 8.21
+ },
+ "Case2b_SmartArt": {
+  "deck": "/home/hatch/workspace/user/files/Case2b_SmartArt.pptx",
+  "pages_lo": 1,
+  "pages_dc": 1,
+  "lo_seconds": 2.6,
+  "dc_seconds": 0.0,
+  "dc_error": null,
+  "pages": [
+   {
+    "page": 1,
+    "mean_abs_diff": 0.42,
+    "hot_frac": 0.0057
+   }
+  ],
+  "mean_abs_diff_avg": 0.42,
+  "mean_abs_diff_max": 0.42
+ }
+}
