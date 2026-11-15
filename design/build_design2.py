@@ -193,13 +193,15 @@ def screen_content(ox):
     return fid
 
 # ---------------- 索引总览 ----------------
-def overview_card(fid, x, y, title, tag, meta, kind, border, hist=False):
+def overview_card(fid, x, y, title, tag, meta, kind, border, hist=False, main=False):
     rect(fid, x, y, 300, 284, CARD, r=10, stroke=border)
     slide_art(fid, x, y, 300, kind)
     text(fid, x + 14, y + 184, title, 15, T1, weight=600)
     cx = x + 14
     if tag:
         cx += chip(fid, cx, y + 214, "V" + tag, ACCENT, ACCENT_TILE) + 8
+    if main:
+        cx += chip(fid, cx, y + 214, "主索引", ACCENT, ACCENT_TILE) + 8
     if hist:
         chip(fid, cx, y + 214, "历史", T2, BTN2)
     text(fid, x + 14, y + 244, meta, 11, T3)
@@ -210,7 +212,7 @@ def screen_overview(ox):
     folder_panel(fid, "公司介绍", primary="＋ 新建索引")
     text(fid, 244, 66, "公司介绍", 22, T1, weight=600)
     overview_card(fid, 244, 110, "Redwood 来访介绍", "1.0.0",
-                  "超级管理员 · 2026-11-15", "cover", ACCENT)
+                  "超级管理员 · 2026-11-15", "cover", ACCENT, main=True)
     overview_card(fid, 560, 110, "公司介绍 2025", "3.2.0",
                   "超级管理员 · 2026-10-30", "table", BORDER, hist=True)
     return fid

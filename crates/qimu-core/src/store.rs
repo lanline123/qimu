@@ -45,6 +45,10 @@ pub struct FolderRec {
     pub name: String,
     pub parent_id: Option<String>,
     pub sort: i64,
+    /// The folder's designated main index (主索引 = repo + main branch),
+    /// spec §3.10. Points at an index whose home folder is this folder.
+    #[serde(default)]
+    pub main_index_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -329,7 +333,7 @@ CREATE TABLE IF NOT EXISTS departments(id TEXT PRIMARY KEY, name TEXT NOT NULL, 
 CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, display_name TEXT NOT NULL, password_hash TEXT NOT NULL, dept_id TEXT, role TEXT NOT NULL DEFAULT 'member', disabled INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS user_depts(user_id TEXT NOT NULL, dept_id TEXT NOT NULL, PRIMARY KEY(user_id, dept_id));
 CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, user_id TEXT NOT NULL, created_ms INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS folders(id TEXT PRIMARY KEY, name TEXT NOT NULL, parent_id TEXT, sort INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS folders(id TEXT PRIMARY KEY, name TEXT NOT NULL, parent_id TEXT, sort INTEGER NOT NULL DEFAULT 0, main_index_id TEXT);
 CREATE TABLE IF NOT EXISTS groups_tbl(id TEXT PRIMARY KEY, name TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS group_grants(id TEXT PRIMARY KEY, group_id TEXT NOT NULL, subject_type TEXT NOT NULL, subject_id TEXT NOT NULL, capability TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS units(id TEXT PRIMARY KEY, name TEXT NOT NULL, folder_id TEXT, group_id TEXT NOT NULL, maintainer TEXT NOT NULL, lead_lang TEXT NOT NULL DEFAULT 'zh', description TEXT NOT NULL DEFAULT '', current_revision INTEGER NOT NULL DEFAULT 1, created_ms INTEGER NOT NULL);
@@ -369,6 +373,7 @@ impl Store {
             ("exports", "deck_id", "TEXT NOT NULL DEFAULT ''"),
             ("exports", "manifest_json", "TEXT NOT NULL DEFAULT ''"),
             ("versions", "scripts_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("folders", "main_index_id", "TEXT"),
         ] {
             let has: bool = conn
                 .prepare(&format!("PRAGMA table_info({table})"))
@@ -651,13 +656,14 @@ impl Store {
             name: name.into(),
             parent_id: parent_id.map(|s| s.to_string()),
             sort,
+            main_index_id: None,
         })
     }
 
     pub fn list_folders(&self) -> SResult<Vec<FolderRec>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, name, parent_id, sort FROM folders ORDER BY sort, name")
+            .prepare("SELECT id, name, parent_id, sort, main_index_id FROM folders ORDER BY sort, name")
             .map_err(db_err)?;
         let rows = stmt
             .query_map([], |r| {
@@ -666,6 +672,7 @@ impl Store {
                     name: r.get(1)?,
                     parent_id: r.get(2)?,
                     sort: r.get(3)?,
+                    main_index_id: r.get(4)?,
                 })
             })
             .map_err(db_err)?
@@ -677,6 +684,18 @@ impl Store {
     pub fn rename_folder(&self, id: &str, name: &str) -> SResult<()> {
         self.conn
             .execute("UPDATE folders SET name=?2 WHERE id=?1", params![id, name])
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Designate (or clear, with None) the folder's main index. The
+    /// caller validates that the index's home folder is this folder.
+    pub fn set_folder_main_index(&self, folder_id: &str, index_id: Option<&str>) -> SResult<()> {
+        self.conn
+            .execute(
+                "UPDATE folders SET main_index_id=?2 WHERE id=?1",
+                params![folder_id, index_id],
+            )
             .map_err(db_err)?;
         Ok(())
     }

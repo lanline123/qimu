@@ -3134,6 +3134,23 @@ impl App {
                                                         CHIP_BLUE_BG,
                                                     );
                                                 }
+                                                // 主索引 capsule: this index is
+                                                // its home folder's designated
+                                                // main index (spec §3.10).
+                                                let home = s(&x, "folder_id");
+                                                let is_main = !home.is_empty()
+                                                    && self.folders.iter().any(|f| {
+                                                        s(f, "id") == home
+                                                            && s(f, "main_index_id") == xid
+                                                    });
+                                                if is_main {
+                                                    chip(
+                                                        ui,
+                                                        "主索引",
+                                                        ACCENT_DEEP,
+                                                        CHIP_BLUE_BG,
+                                                    );
+                                                }
                                                 match s(&x, "lifecycle").as_str() {
                                                     "history" => chip(
                                                         ui,

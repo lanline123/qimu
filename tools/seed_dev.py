@@ -51,6 +51,8 @@ idx = call("POST", "/v1/indexes", tok, {
 print("index:", idx["id"])
 call("POST", f"/v1/indexes/{idx['id']}/tags", tok, {"branch": "main", "name": "1.0.0"})
 print("tagged V1.0.0")
+call("POST", f"/v1/folders/{fid}/main-index", tok, {"index_id": idx["id"]})
+print("main index of folder", fid, "->", idx["id"])
 
 tech = by_name["技术部分"]["unit"]["id"]
 tail_ver = by_name["收尾部分"]["renditions"][0]["latest"]["id"]

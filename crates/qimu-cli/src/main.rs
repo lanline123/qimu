@@ -418,6 +418,12 @@ enum FoldersCommand {
         #[arg(long)]
         name: String,
     },
+    /// Designate the folder's main index (omit --index to clear).
+    SetMain {
+        id: String,
+        #[arg(long)]
+        index: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1278,6 +1284,11 @@ fn run() -> Result<i32, String> {
                     "POST",
                     &format!("/v1/folders/{id}/rename"),
                     Some(json!({ "name": name })),
+                )?),
+                FoldersCommand::SetMain { id, index } => print(&ctx.call(
+                    "POST",
+                    &format!("/v1/folders/{id}/main-index"),
+                    Some(json!({ "index_id": index })),
                 )?),
             }
             Ok(0)

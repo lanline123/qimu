@@ -670,6 +670,38 @@ async fn rename_folder(
     Ok(Json(json!({ "ok": true })))
 }
 
+#[derive(Deserialize)]
+struct MainIndexReq {
+    index_id: Option<String>,
+}
+
+/// Designate the folder's main index (主索引, spec §3.10). The index
+/// must live in this folder; pass index_id=null to clear.
+async fn set_folder_main_index(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<MainIndexReq>,
+) -> Api<Value> {
+    let _ = auth(&st, &headers)?;
+    let store = st.store.lock().unwrap();
+    if let Some(xid) = req.index_id.as_deref() {
+        let idx = store.get_index(xid).map_err(bad)?;
+        if idx.folder_id.as_deref() != Some(id.as_str()) {
+            return Err(bad("主索引必须属于该文件夹".to_string()));
+        }
+    }
+    store
+        .set_folder_main_index(&id, req.index_id.as_deref())
+        .map_err(bad)?;
+    let folder = store
+        .list_folders()
+        .map_err(bad)?
+        .into_iter()
+        .find(|f| f.id == id);
+    Ok(Json(json!(folder)))
+}
+
 // ---------------- content library ----------------
 
 fn unit_json(st: &St, unit: &UnitRec, with_versions: bool) -> Value {
@@ -2571,6 +2603,7 @@ async fn main() {
         .route("/v1/units/:id/translate", post(translate_unit))
         .route("/v1/folders", get(folders).post(create_folder))
         .route("/v1/folders/:id/rename", post(rename_folder))
+        .route("/v1/folders/:id/main-index", post(set_folder_main_index))
         .route("/v1/units", get(list_units).post(create_unit))
         .route("/v1/units/:id", get(get_unit).patch(patch_unit))
         .route("/v1/units/:id/bump-revision", post(|State(st): State<St>, headers: HeaderMap, Path(id): Path<String>| async move {
