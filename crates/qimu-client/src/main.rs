@@ -313,6 +313,15 @@ fn save_cache_index(entries: &[Value]) {
 }
 
 /// Short human label for one index entry's version policy (merge view).
+fn semver_key(v: &str) -> (u64, u64, u64) {
+    let mut it = v.split('.').map(|x| x.parse::<u64>().unwrap_or(0));
+    (
+        it.next().unwrap_or(0),
+        it.next().unwrap_or(0),
+        it.next().unwrap_or(0),
+    )
+}
+
 fn entry_label(e: &Value) -> String {
     if e.is_null() {
         return "（无此条目）".into();
@@ -415,6 +424,10 @@ struct IndexState {
     include_notes: bool,
     excerpt_for: Option<usize>,
     excerpt_sel: Vec<bool>,
+    unit_versions: std::collections::HashMap<String, Vec<Value>>, // rendition_id -> versions, semver desc
+    more_for: Option<usize>,
+    insert_at: Option<usize>,
+    insert_units: Vec<Value>,
 }
 
 #[derive(Default)]
@@ -788,6 +801,46 @@ impl App {
             Ok(v) => self.index.detail = Some(v),
             Err(e) => self.msg = format!("打开索引失败：{e}"),
         }
+        // prefetch version history per rendition for the quick-switch strips
+        self.index.unit_versions.clear();
+        let mut seen_units: Vec<String> = Vec::new();
+        if let Some(d) = self.index.detail.clone() {
+            if let Some(arr) = d.get("resolved_entries").and_then(|r| r.as_array()) {
+                for re in arr {
+                    if let Some(e) = re.get("entry") {
+                        let uid = s(e, "unit_id");
+                        if !uid.is_empty() && !seen_units.contains(&uid) {
+                            seen_units.push(uid);
+                        }
+                    }
+                }
+            }
+        }
+        for uid in seen_units {
+            if let Ok(u) = self.call("GET", &format!("/v1/units/{uid}"), None) {
+                if let Some(rends) = u.get("renditions").and_then(|r| r.as_array()) {
+                    for r in rends {
+                        let rid = r
+                            .get("rendition")
+                            .map(|x| s(x, "id"))
+                            .unwrap_or_default();
+                        let mut vs: Vec<Value> = r
+                            .get("versions")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|v| {
+                                let st = s(v, "status");
+                                st.is_empty() || st == "normal"
+                            })
+                            .collect();
+                        vs.sort_by(|a, b| semver_key(&s(b, "semver")).cmp(&semver_key(&s(a, "semver"))));
+                        self.index.unit_versions.insert(rid, vs);
+                    }
+                }
+            }
+        }
         if let Ok(v) = self.call("GET", &format!("/v1/indexes/{id}/commits?branch={branch}"), None) {
             self.index.commits = Some(v);
         }
@@ -1096,6 +1149,57 @@ impl App {
                     });
             });
         }
+    }
+
+    /// Clickable thumbnail (quick-switch strip / version popup). The
+    /// currently resolved version gets an accent outline.
+    fn thumb_button(
+        &mut self,
+        ui: &mut egui::Ui,
+        version_id: &str,
+        page: usize,
+        width: f32,
+        current: bool,
+    ) -> bool {
+        let h = width * 9.0 / 16.0;
+        let (rect, resp) =
+            ui.allocate_exact_size(egui::vec2(width, h), egui::Sense::click());
+        if let Some(tex) = self.thumb(version_id, page) {
+            ui.painter().image(
+                tex.id(),
+                rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        } else {
+            ui.painter().rect_filled(rect, 0.0, HOVER_BG);
+        }
+        if current {
+            ui.painter()
+                .rect_stroke(rect, 0.0, egui::Stroke::new(1.5, ACCENT));
+        } else if resp.hovered() {
+            ui.painter()
+                .rect_stroke(rect, 0.0, egui::Stroke::new(1.0, TEXT_WEAK));
+        }
+        resp.clicked()
+    }
+
+    /// Switch one index entry to a specific version: picking the latest
+    /// restores follow-latest; a historical pick locks the entry.
+    fn switch_entry_version(&mut self, pos: usize, version_id: &str, semver: &str, is_latest: bool) {
+        let mut es = self.current_entries();
+        if pos >= es.len() {
+            return;
+        }
+        if is_latest {
+            es[pos]["policy"] = json!("follow_latest");
+            es[pos]["locked_semver"] = Value::Null;
+        } else {
+            es[pos]["policy"] = json!({ "locked": { "version_id": version_id } });
+            es[pos]["locked_semver"] = json!(semver);
+        }
+        self.index.more_for = None;
+        self.commit_entries(es, "切换版本");
     }
 
     /// Export the open index to a user-chosen file. kind: personal|company
@@ -2765,7 +2869,24 @@ impl App {
                     .get("policy")
                     .map(|p| p.get("locked").is_some())
                     .unwrap_or(false);
-                card_frame_square().show(ui, |ui| {
+                if pos > 0 {
+                    ui.vertical_centered(|ui| {
+                        if ui.small_button("+ 插入条目").clicked() {
+                            self.index.insert_at = Some(pos);
+                            if let Ok(v) = self.call("GET", "/v1/units", None) {
+                                self.index.insert_units = v
+                                    .get("units")
+                                    .and_then(|u| u.as_array())
+                                    .cloned()
+                                    .unwrap_or_default();
+                            }
+                        }
+                    });
+                    ui.add_space(2.0);
+                }
+                card_frame_square()
+                    .inner_margin(egui::Margin::same(20.0))
+                    .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
                             ui.label(format!("#{}", pos + 1));
@@ -2816,6 +2937,20 @@ impl App {
                                         .strong()
                                         .size(15.0),
                                 );
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{} · {} · {}",
+                                        re.get("form").and_then(|x| x.as_str()).unwrap_or(""),
+                                        re.get("lang").and_then(|x| x.as_str()).unwrap_or(""),
+                                        if ver.is_object() {
+                                            format!("v{}", s(&ver, "semver"))
+                                        } else {
+                                            "无版本".into()
+                                        }
+                                    ))
+                                    .size(12.5)
+                                    .color(TEXT_WEAK),
+                                );
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
@@ -2831,6 +2966,18 @@ impl App {
                                             let mut es = entries.clone();
                                             es.remove(pos);
                                             self.commit_entries(es, "删除条目");
+                                            return;
+                                        }
+                                        if ui.button("↓").clicked() && pos + 1 < entries.len() {
+                                            let mut es = entries.clone();
+                                            es.swap(pos, pos + 1);
+                                            self.commit_entries(es, "调整顺序");
+                                            return;
+                                        }
+                                        if ui.button("↑").clicked() && pos > 0 {
+                                            let mut es = entries.clone();
+                                            es.swap(pos, pos - 1);
+                                            self.commit_entries(es, "调整顺序");
                                             return;
                                         }
                                         if ui.button("选页").clicked() {
@@ -2886,16 +3033,6 @@ impl App {
                                     },
                                 );
                             });
-                            ui.label(format!(
-                                "{} · {} · {}",
-                                re.get("form").and_then(|x| x.as_str()).unwrap_or(""),
-                                re.get("lang").and_then(|x| x.as_str()).unwrap_or(""),
-                                if ver.is_object() {
-                                    format!("v{}", s(&ver, "semver"))
-                                } else {
-                                    "无版本".into()
-                                }
-                            ));
                             ui.horizontal(|ui| {
                                 if let Some(slots) =
                                     entry.get("excerpt_slots").and_then(|x| x.as_array())
@@ -2910,19 +3047,51 @@ impl App {
                                 if re.get("substituted").and_then(|x| x.as_bool()) == Some(true) {
                                     chip(ui, "原版已删 · 已替代", CHIP_ORANGE_FG, CHIP_ORANGE_BG);
                                 }
-                                if ui.button("↑").clicked() && pos > 0 {
-                                    let mut es = entries.clone();
-                                    es.swap(pos, pos - 1);
-                                    self.commit_entries(es, "调整顺序");
-                                    return;
-                                }
-                                if ui.button("↓").clicked() && pos + 1 < entries.len() {
-                                    let mut es = entries.clone();
-                                    es.swap(pos, pos + 1);
-                                    self.commit_entries(es, "调整顺序");
-                                    return;
-                                }
                             });
+                            // quick-switch strip: history versions, newest
+                            // first; last item opens the full-history popup
+                            if let Some(versions) = self
+                                .index
+                                .unit_versions
+                                .get(&s(&entry, "rendition_id"))
+                                .cloned()
+                            {
+                                if versions.len() > 1 {
+                                    let cur_id = if ver.is_object() {
+                                        s(&ver, "id")
+                                    } else {
+                                        String::new()
+                                    };
+                                    let latest_id = s(&versions[0], "id");
+                                    ui.horizontal_wrapped(|ui| {
+                                        for v in versions.iter().take(7) {
+                                            let vid = s(v, "id");
+                                            let is_cur = vid == cur_id;
+                                            ui.vertical(|ui| {
+                                                if self.thumb_button(ui, &vid, 0, 54.0, is_cur) {
+                                                    self.switch_entry_version(
+                                                        pos,
+                                                        &vid,
+                                                        &s(v, "semver"),
+                                                        vid == latest_id,
+                                                    );
+                                                }
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "v{}",
+                                                        s(v, "semver")
+                                                    ))
+                                                    .small()
+                                                    .color(if is_cur { ACCENT } else { TEXT_WEAK }),
+                                                );
+                                            });
+                                        }
+                                        if ui.button("更多").clicked() {
+                                            self.index.more_for = Some(pos);
+                                        }
+                                    });
+                                }
+                            }
                         });
                     });
                 });
@@ -3115,6 +3284,127 @@ impl App {
                         ui.label(format!("还剩 {unresolved} 条未裁决"));
                     }
                 });
+            }
+            // full-history popup (opened from a strip's 「更多」)
+            if let Some(pos) = self.index.more_for {
+                let entries_now = self.current_entries();
+                let rid = entries_now
+                    .get(pos)
+                    .map(|e| s(e, "rendition_id"))
+                    .unwrap_or_default();
+                let versions = self
+                    .index
+                    .unit_versions
+                    .get(&rid)
+                    .cloned()
+                    .unwrap_or_default();
+                let cur_id = self
+                    .index
+                    .detail
+                    .as_ref()
+                    .and_then(|d| d.get("resolved_entries"))
+                    .and_then(|r| r.as_array())
+                    .and_then(|a| a.get(pos))
+                    .and_then(|re| re.get("resolved"))
+                    .map(|v| s(v, "id"))
+                    .unwrap_or_default();
+                let latest_id = versions.first().map(|v| s(v, "id")).unwrap_or_default();
+                let mut open = true;
+                let mut switch: Option<(String, String, bool)> = None;
+                egui::Window::new("全部历史版本")
+                    .open(&mut open)
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                    .show(ui.ctx(), |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height(430.0)
+                            .show(ui, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    for v in &versions {
+                                        let vid = s(v, "id");
+                                        let is_cur = vid == cur_id;
+                                        ui.vertical(|ui| {
+                                            if self.thumb_button(ui, &vid, 0, 110.0, is_cur) {
+                                                switch = Some((
+                                                    vid.clone(),
+                                                    s(v, "semver"),
+                                                    vid == latest_id,
+                                                ));
+                                            }
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "v{} · {} 页",
+                                                    s(v, "semver"),
+                                                    i(v, "page_count")
+                                                ))
+                                                .small()
+                                                .color(if is_cur { ACCENT } else { TEXT_WEAK }),
+                                            );
+                                        });
+                                    }
+                                });
+                            });
+                    });
+                if !open {
+                    self.index.more_for = None;
+                }
+                if let Some((vid, sv, is_latest)) = switch {
+                    self.switch_entry_version(pos, &vid, &sv, is_latest);
+                }
+            }
+            // insert-entry popup (opened from a between-cards insert row)
+            if let Some(pos) = self.index.insert_at {
+                let units = self.index.insert_units.clone();
+                let mut open = true;
+                let mut chosen: Option<(String, String)> = None;
+                egui::Window::new("插入条目")
+                    .open(&mut open)
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                    .show(ui.ctx(), |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height(430.0)
+                            .show(ui, |ui| {
+                                for u in &units {
+                                    let unit = u.get("unit").cloned().unwrap_or(json!({}));
+                                    if let Some(rends) =
+                                        u.get("renditions").and_then(|r| r.as_array())
+                                    {
+                                        for r in rends {
+                                            let rend =
+                                                r.get("rendition").cloned().unwrap_or(json!({}));
+                                            if r.get("latest")
+                                                .map(|l| l.is_object())
+                                                .unwrap_or(false)
+                                            {
+                                                let label = format!(
+                                                    "{} · {} · {}",
+                                                    s(&unit, "name"),
+                                                    s(&rend, "form"),
+                                                    s(&rend, "lang")
+                                                );
+                                                if ui.button(label).clicked() {
+                                                    chosen =
+                                                        Some((s(&unit, "id"), s(&rend, "id")));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            });
+                    });
+                if !open {
+                    self.index.insert_at = None;
+                }
+                if let Some((uid, rid)) = chosen {
+                    let mut es = self.current_entries();
+                    let at = pos.min(es.len());
+                    es.insert(at, json!({ "unit_id": uid, "rendition_id": rid }));
+                    self.index.insert_at = None;
+                    self.commit_entries(es, "插入条目");
+                }
             }
             ui.separator();
             ui.label(egui::RichText::new("提交历史").strong());
