@@ -592,6 +592,41 @@ async fn translate_unit(
     })))
 }
 
+async fn get_cache_policy(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
+    let _ = auth(&st, &headers)?;
+    let store = st.store.lock().unwrap();
+    let raw = store.get_setting("cache_policy").map_err(bad)?;
+    let policy: Value = raw
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({ "allowed": true, "max_mb": 500 }));
+    Ok(Json(policy))
+}
+
+#[derive(Deserialize)]
+struct CachePolicyReq {
+    allowed: bool,
+    max_mb: i64,
+}
+
+async fn put_cache_policy(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Json(req): Json<CachePolicyReq>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    if user.role != "super" {
+        return Err(forbidden());
+    }
+    let store = st.store.lock().unwrap();
+    store
+        .set_setting(
+            "cache_policy",
+            &json!({ "allowed": req.allowed, "max_mb": req.max_mb }).to_string(),
+        )
+        .map_err(bad)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
 // ---------------- folders ----------------
 
 async fn folders(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
@@ -2520,6 +2555,7 @@ async fn main() {
         .route("/v1/company-profile", get(company_profile).put(put_company_profile))
         .route("/v1/settings/languages", get(languages).put(put_languages))
         .route("/v1/settings/glossary", get(get_glossary).put(put_glossary))
+        .route("/v1/settings/cache-policy", get(get_cache_policy).put(put_cache_policy))
         .route("/v1/settings/ai", get(get_ai_settings).put(put_ai_settings))
         .route("/v1/units/:id/translate", post(translate_unit))
         .route("/v1/folders", get(folders).post(create_folder))

@@ -56,6 +56,9 @@ GUI + CLI + 服务端），设计规格见 `docs/`。
 - [x] AI 翻译骨架（§3.13）：术语表（服务端设置）+ 可插拔 provider（内置 stub 供开发/测试；OpenAI 兼容接口已实现，设置里配 endpoint/model/key 后启用）→ 生成目标语言形态的草稿版本（待校对）、逐页 ai 绑定记录配对、讲稿一并翻译；图表内部缓存标签不在 run 级翻译范围内
 - [x] 导入提块（§5.8）：POST /v1/import/propose 给出分块建议（当前为确定性启发式 proposer，接口即 AI 提块的接入点），CLI `import-propose` / `import --propose`、GUI「智能分块导入」，导入者确认后落库
 - [x] 修复：组装改写 .rels 时元素扫描前缀碰撞（<Relationship 误匹配 <Relationships 根元素）曾使全部导出稿的 .rels 部件畸形（LibreOffice 宽容未报错，严格读取器拒绝）；已修复并加回归断言，导出稿现可通过 python-pptx 严格加载、全部部件 XML 良构
+- [x] 索引条目摘录选页 GUI：图墙条目「选页」打开页缩略图勾选（全选/清空），保存即提交（全选自动清除摘录标记），卡面显示「摘录 N 页」
+- [x] 离线缓存策略与加密：管理员策略（允许开关 + 容量上限，服务端设置、客户端执行、CLI cache-policy）；缓存快照 AES-256-GCM 加密落盘（本机密钥 ~/.qimu/cache.key），打开时解密到临时副本；策略区仅超级管理员可见
+- [x] 演示厅「开始演示」：广场条目一键物化整稿并以系统默认演示应用打开（DeckCraft 全屏接入点已留）
 - [ ] DeckCraft 往返保真验证（需实机打开 DeckCraft）
 - [ ] COM 桥原地替换回路（Windows PowerPoint 实机）
 

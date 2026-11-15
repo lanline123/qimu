@@ -16,4 +16,5 @@ serde_json = "1"
 ureq = { version = "2", features = ["json"] }
 base64 = "0.22"
 rfd = "0.15"
+aes-gcm = "0.10"
 image = "0.25"

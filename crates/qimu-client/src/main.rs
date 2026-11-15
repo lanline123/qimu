@@ -53,6 +53,81 @@ fn load_cache_index() -> Vec<Value> {
         .unwrap_or_default()
 }
 
+/// At-rest encryption for the offline cache (§3.17: 静态加密必需）:
+/// AES-256-GCM with a per-machine key kept in ~/.qimu/cache.key.
+fn cache_key() -> Option<[u8; 32]> {
+    use aes_gcm::aead::OsRng;
+    use aes_gcm::aead::rand_core::RngCore;
+    let dir = cache_dir();
+    let path = dir.join("..").join("cache.key");
+    if let Ok(hex) = std::fs::read_to_string(&path) {
+        let hex = hex.trim();
+        if hex.len() == 64 {
+            let mut key = [0u8; 32];
+            let mut ok = true;
+            for i in 0..32 {
+                match u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16) {
+                    Ok(b) => key[i] = b,
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                return Some(key);
+            }
+        }
+    }
+    let mut key = [0u8; 32];
+    OsRng.fill_bytes(&mut key);
+    let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+    let _ = std::fs::create_dir_all(&dir);
+    if std::fs::write(&path, hex).is_ok() {
+        Some(key)
+    } else {
+        None
+    }
+}
+
+fn encrypt_bytes(key: &[u8; 32], plain: &[u8]) -> Option<Vec<u8>> {
+    use aes_gcm::aead::{Aead, OsRng};
+    use aes_gcm::aead::rand_core::RngCore;
+    use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    let mut nonce = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce);
+    let ct = cipher.encrypt(Nonce::from_slice(&nonce), plain).ok()?;
+    let mut out = nonce.to_vec();
+    out.extend_from_slice(&ct);
+    Some(out)
+}
+
+fn decrypt_bytes(key: &[u8; 32], data: &[u8]) -> Option<Vec<u8>> {
+    use aes_gcm::aead::Aead;
+    use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
+    if data.len() < 12 {
+        return None;
+    }
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    cipher
+        .decrypt(Nonce::from_slice(&data[..12]), &data[12..])
+        .ok()
+}
+
+fn spawn_open(path: &std::path::Path) -> std::io::Result<std::process::Child> {
+    if cfg!(target_os = "windows") {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", ""])
+            .arg(path)
+            .spawn()
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(path).spawn()
+    } else {
+        std::process::Command::new("xdg-open").arg(path).spawn()
+    }
+}
+
 fn save_cache_index(entries: &[Value]) {
     let dir = cache_dir();
     let _ = std::fs::create_dir_all(&dir);
@@ -163,6 +238,8 @@ struct IndexState {
     merge_preview: Option<Value>,
     merge_resolutions: std::collections::HashMap<String, String>,
     include_notes: bool,
+    excerpt_for: Option<usize>,
+    excerpt_sel: Vec<bool>,
 }
 
 #[derive(Default)]
@@ -212,6 +289,7 @@ struct App {
     new_team_name: String,
     team_member_pick: String,
     cache_entries: Vec<Value>,
+    cache_policy: Value,
     content: ContentState,
     index: IndexState,
     settings: SettingsState,
@@ -269,6 +347,7 @@ impl App {
             new_team_name: String::new(),
             team_member_pick: String::new(),
             cache_entries: load_cache_index(),
+            cache_policy: json!({ "allowed": true, "max_mb": 500 }),
             content: ContentState {
                 publish_bump: 1, // default preselect: minor （小版本）
                 ..Default::default()
@@ -383,6 +462,9 @@ impl App {
                 .and_then(|f| f.as_array())
                 .cloned()
                 .unwrap_or_default();
+        }
+        if let Ok(v) = self.call("GET", "/v1/settings/cache-policy", None) {
+            self.cache_policy = v;
         }
         if let Ok(v) = self.call("GET", "/v1/shares/inbox", None) {
             self.inbox = v.get("shares").and_then(|f| f.as_array()).cloned().unwrap_or_default();
@@ -783,7 +865,36 @@ impl App {
     }
 
     /// Write an adopted snapshot into the local offline cache (§3.17).
+    /// Administrator policy wins: caching can be disabled server-side and
+    /// is capacity-capped; snapshots are stored AES-256-GCM encrypted.
     fn cache_deck(&mut self, key: &str, title: &str, bytes: &[u8], page_count: i64) {
+        if self.cache_policy.get("allowed").and_then(|v| v.as_bool()) == Some(false) {
+            self.msg = "管理员已关闭离线缓存".into();
+            return;
+        }
+        let max_mb = self
+            .cache_policy
+            .get("max_mb")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(500);
+        let used: i64 = self
+            .cache_entries
+            .iter()
+            .filter(|e| s(e, "key") != key)
+            .map(|e| i(e, "bytes"))
+            .sum();
+        if used + bytes.len() as i64 > max_mb * 1024 * 1024 {
+            self.msg = format!("超过管理员设定的缓存容量上限（{max_mb} MB）");
+            return;
+        }
+        let Some(ck) = cache_key() else {
+            self.msg = "无法创建本地缓存密钥".into();
+            return;
+        };
+        let Some(enc) = encrypt_bytes(&ck, bytes) else {
+            self.msg = "缓存加密失败".into();
+            return;
+        };
         let dir = cache_dir();
         let _ = std::fs::create_dir_all(&dir);
         let safe: String = key
@@ -796,8 +907,8 @@ impl App {
                 }
             })
             .collect();
-        let file = format!("{safe}.pptx");
-        match std::fs::write(dir.join(&file), bytes) {
+        let file = format!("{safe}.pptx.enc");
+        match std::fs::write(dir.join(&file), &enc) {
             Ok(_) => {
                 self.cache_entries.retain(|e| s(e, "key") != key);
                 self.cache_entries.push(json!({
@@ -805,10 +916,12 @@ impl App {
                     "title": title,
                     "page_count": page_count,
                     "file": file,
+                    "bytes": bytes.len() as i64,
+                    "enc": true,
                     "cached_ms": qimu_core::auth::now_ms(),
                 }));
                 save_cache_index(&self.cache_entries);
-                self.msg = format!("已缓存到本地：{title}");
+                self.msg = format!("已缓存到本地（加密）：{title}");
             }
             Err(e) => self.msg = format!("缓存失败：{e}"),
         }
@@ -837,7 +950,31 @@ impl App {
         else {
             return;
         };
-        let path = cache_dir().join(s(&e, "file"));
+        let stored = cache_dir().join(s(&e, "file"));
+        // encrypted entries are decrypted to a scratch copy for opening
+        let path = if e.get("enc").and_then(|v| v.as_bool()) == Some(true) {
+            let Some(ck) = cache_key() else {
+                self.msg = "缺少本地缓存密钥，无法打开".into();
+                return;
+            };
+            let data = match std::fs::read(&stored).ok().and_then(|d| decrypt_bytes(&ck, &d)) {
+                Some(d) => d,
+                None => {
+                    self.msg = "缓存解密失败".into();
+                    return;
+                }
+            };
+            let open_dir = cache_dir().join("open");
+            let _ = std::fs::create_dir_all(&open_dir);
+            let p = open_dir.join(format!("{}.pptx", s(&e, "title")));
+            if std::fs::write(&p, data).is_err() {
+                self.msg = "写出临时副本失败".into();
+                return;
+            }
+            p
+        } else {
+            stored
+        };
         let r = if cfg!(target_os = "windows") {
             std::process::Command::new("cmd")
                 .args(["/C", "start", ""])
@@ -852,6 +989,40 @@ impl App {
             Ok(_) => format!("已打开本地副本：{}", path.display()),
             Err(e) => format!("打开失败：{e}（文件在 {}）", path.display()),
         };
+    }
+
+    /// 开始演示 (§3.17/场景 38): materialize the deck and open it in the
+    /// system presentation app. (DeckCraft fullscreen takes over here
+    /// once it is deployed on the machine.)
+    fn present_showroom(&mut self, item_id: &str, title: &str) {
+        match self.call(
+            "POST",
+            &format!("/v1/showroom/{item_id}/export"),
+            Some(json!({ "kind": "personal" })),
+        ) {
+            Ok(v) => {
+                if let Some(data) = v.get("data_base64").and_then(|x| x.as_str()) {
+                    if let Ok(bytes) = b64d(data) {
+                        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+                        let dir = std::path::Path::new(&home).join(".qimu").join("present");
+                        let _ = std::fs::create_dir_all(&dir);
+                        let path = dir.join(format!("{title}.pptx"));
+                        match std::fs::write(&path, bytes) {
+                            Ok(_) => match spawn_open(&path) {
+                                Ok(_) => {
+                                    self.msg = format!("已打开演示：{title}（系统默认演示应用）")
+                                }
+                                Err(e) => {
+                                    self.msg = format!("演示文件已生成（{}），打开失败：{e}", path.display())
+                                }
+                            },
+                            Err(e) => self.msg = format!("生成演示文件失败：{e}"),
+                        }
+                    }
+                }
+            }
+            Err(e) => self.msg = format!("演示失败：{e}"),
+        }
     }
 
     fn library_view(&mut self, ui: &mut egui::Ui) {
@@ -1282,10 +1453,15 @@ impl App {
                                 .small()
                                 .weak(),
                             );
-                            if ui.small_button("分享").clicked() {
-                                self.share_for = Some(s(&item, "id"));
-                                self.share_target.clear();
-                            }
+                            ui.horizontal(|ui| {
+                                if ui.small_button("开始演示").clicked() {
+                                    self.present_showroom(&s(&item, "id"), &s(&item, "title"));
+                                }
+                                if ui.small_button("分享").clicked() {
+                                    self.share_for = Some(s(&item, "id"));
+                                    self.share_target.clear();
+                                }
+                            });
                             let src = s(&item, "source_index_id");
                             if !src.is_empty() {
                                 if ui.small_button("缓存到本地").clicked() {
@@ -2297,6 +2473,13 @@ impl App {
                                     "无版本".into()
                                 }
                             ));
+                            if let Some(slots) = entry.get("excerpt_slots").and_then(|x| x.as_array()) {
+                                ui.label(
+                                    egui::RichText::new(format!("摘录 {} 页", slots.len()))
+                                        .small()
+                                        .color(egui::Color32::from_rgb(30, 120, 200)),
+                                );
+                            }
                             if re.get("substituted").and_then(|x| x.as_bool()) == Some(true) {
                                 ui.label(
                                     egui::RichText::new("原版已删 · 已替代")
@@ -2305,6 +2488,26 @@ impl App {
                             }
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("选页").clicked() {
+                                let total = i(&ver, "page_count") as usize;
+                                let mut sel = vec![true; total];
+                                if let Some(slots) =
+                                    entry.get("excerpt_slots").and_then(|x| x.as_array())
+                                {
+                                    sel = vec![false; total];
+                                    for sl in slots {
+                                        if let Some(n) =
+                                            sl.as_str().and_then(|x| x.parse::<usize>().ok())
+                                        {
+                                            if n < total {
+                                                sel[n] = true;
+                                            }
+                                        }
+                                    }
+                                }
+                                self.index.excerpt_sel = sel;
+                                self.index.excerpt_for = Some(pos);
+                            }
                             if ui.button("删除").clicked() {
                                 let mut es = entries.clone();
                                 es.remove(pos);
@@ -2358,6 +2561,70 @@ impl App {
                         });
                     });
                 });
+                if self.index.excerpt_for == Some(pos) {
+                    let ver2 = re.get("resolved").cloned().unwrap_or(Value::Null);
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.label(egui::RichText::new("摘录选页（只导出勾选的页）").strong());
+                        if ver2.is_object() {
+                            let vid = s(&ver2, "id");
+                            let total = i(&ver2, "page_count") as usize;
+                            ui.horizontal_wrapped(|ui| {
+                                for p in 0..total {
+                                    ui.vertical(|ui| {
+                                        self.thumb_ui(ui, &vid, p, 110.0);
+                                        if p < self.index.excerpt_sel.len() {
+                                            ui.checkbox(
+                                                &mut self.index.excerpt_sel[p],
+                                                format!("第 {} 页", p + 1),
+                                            );
+                                        }
+                                    });
+                                }
+                            });
+                        }
+                        ui.horizontal(|ui| {
+                            if ui.small_button("全选").clicked() {
+                                for b in self.index.excerpt_sel.iter_mut() {
+                                    *b = true;
+                                }
+                            }
+                            if ui.small_button("清空").clicked() {
+                                for b in self.index.excerpt_sel.iter_mut() {
+                                    *b = false;
+                                }
+                            }
+                            if ui.button("保存选页").clicked() {
+                                let chosen: Vec<usize> = self
+                                    .index
+                                    .excerpt_sel
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, b)| **b)
+                                    .map(|(n, _)| n)
+                                    .collect();
+                                if chosen.is_empty() {
+                                    self.msg = "至少选一页".into();
+                                } else {
+                                    let mut es = entries.clone();
+                                    if chosen.len() == self.index.excerpt_sel.len() {
+                                        es[pos]["excerpt_slots"] = Value::Null;
+                                    } else {
+                                        es[pos]["excerpt_slots"] = json!(chosen
+                                            .iter()
+                                            .map(|n| n.to_string())
+                                            .collect::<Vec<_>>());
+                                    }
+                                    self.index.excerpt_for = None;
+                                    self.commit_entries(es, "摘录选页");
+                                    return;
+                                }
+                            }
+                            if ui.button("取消").clicked() {
+                                self.index.excerpt_for = None;
+                            }
+                        });
+                    });
+                }
                 ui.add_space(4.0);
             }
             ui.separator();
@@ -2542,6 +2809,39 @@ impl App {
                     Ok(_) => self.msg = "已保存".into(),
                     Err(e) => self.msg = e,
                 }
+            }
+            if self.role() == "super" {
+                ui.separator();
+                ui.heading("离线缓存策略");
+                let mut allowed = self
+                    .cache_policy
+                    .get("allowed")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let mut max_mb = self
+                    .cache_policy
+                    .get("max_mb")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(500);
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut allowed, "允许离线缓存");
+                    ui.label("容量上限（MB）");
+                    ui.add(egui::DragValue::new(&mut max_mb).range(10..=100000));
+                    if ui.button("保存策略").clicked() {
+                        match self.call(
+                            "PUT",
+                            "/v1/settings/cache-policy",
+                            Some(json!({ "allowed": allowed, "max_mb": max_mb })),
+                        ) {
+                            Ok(_) => {
+                                self.cache_policy =
+                                    json!({ "allowed": allowed, "max_mb": max_mb });
+                                self.msg = "缓存策略已保存".into();
+                            }
+                            Err(e) => self.msg = e,
+                        }
+                    }
+                });
             }
             if self.role() == "member" {
                 return;
@@ -2743,4 +3043,21 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )
+}
+
+#[cfg(test)]
+mod cache_crypto_tests {
+    use super::*;
+
+    #[test]
+    fn encrypt_decrypt_round_trip() {
+        let key = [7u8; 32];
+        let plain = b"PK\x03\x04 fake pptx bytes for round trip";
+        let enc = encrypt_bytes(&key, plain).expect("encrypt");
+        assert_ne!(&enc[12..], &plain[..]);
+        let back = decrypt_bytes(&key, &enc).expect("decrypt");
+        assert_eq!(back, plain.to_vec());
+        let wrong = [8u8; 32];
+        assert!(decrypt_bytes(&wrong, &enc).is_none());
+    }
 }

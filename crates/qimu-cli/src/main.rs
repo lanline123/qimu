@@ -137,6 +137,13 @@ enum Command {
         #[command(subcommand)]
         cmd: AssembliesCommand,
     },
+    /// Show or set the offline-cache policy (set: super admin).
+    CachePolicy {
+        #[arg(long)]
+        allowed: Option<bool>,
+        #[arg(long)]
+        max_mb: Option<i64>,
+    },
     /// Show the AI-translation glossary, or replace it from a JSON file
     /// (array of {"src","dst"}).
     Glossary {
@@ -969,6 +976,22 @@ fn run() -> Result<i32, String> {
                     &format!("/v1/units/{id}/translate"),
                     Some(json!({ "version_id": version, "target_lang": to })),
                 )?),
+            }
+            Ok(0)
+        }
+        Command::CachePolicy { allowed, max_mb } => {
+            if allowed.is_none() && max_mb.is_none() {
+                print(&ctx.call("GET", "/v1/settings/cache-policy", None)?);
+            } else {
+                let cur = ctx.call("GET", "/v1/settings/cache-policy", None)?;
+                print(&ctx.call(
+                    "PUT",
+                    "/v1/settings/cache-policy",
+                    Some(json!({
+                        "allowed": allowed.unwrap_or_else(|| cur.get("allowed").and_then(|v| v.as_bool()).unwrap_or(true)),
+                        "max_mb": max_mb.unwrap_or_else(|| cur.get("max_mb").and_then(|v| v.as_i64()).unwrap_or(500)),
+                    })),
+                )?);
             }
             Ok(0)
         }
