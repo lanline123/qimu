@@ -141,6 +141,9 @@ struct ContentState {
     bind_from: String,
     bind_to: String,
     bind_from_slot: Option<i64>,
+    scripts_for: Option<String>, // version id whose 讲稿 is being edited
+    scripts_edit: Vec<String>,
+    translate_to: String,
 }
 
 #[derive(Default)]
@@ -159,6 +162,7 @@ struct IndexState {
     merge_from: String,
     merge_preview: Option<Value>,
     merge_resolutions: std::collections::HashMap<String, String>,
+    include_notes: bool,
 }
 
 #[derive(Default)]
@@ -195,8 +199,18 @@ struct App {
     showroom_pending: Vec<Value>,
     sr_title: String,
     sr_index: String,
-    sr_zone: String, // plaza | library
+    sr_zone: String, // plaza | library | inbox | groups
     my_assemblies: Vec<Value>,
+    inbox: Vec<Value>,
+    group_spaces: Vec<Value>,
+    my_teams: Vec<Value>,
+    library_refs: Vec<Value>,
+    my_id: String,
+    share_for: Option<String>, // showroom item id being shared
+    share_kind: String,        // user | dept | group
+    share_target: String,
+    new_team_name: String,
+    team_member_pick: String,
     cache_entries: Vec<Value>,
     content: ContentState,
     index: IndexState,
@@ -244,6 +258,16 @@ impl App {
             sr_index: String::new(),
             sr_zone: std::env::var("QIMU_ZONE").unwrap_or_else(|_| "plaza".into()),
             my_assemblies: vec![],
+            inbox: vec![],
+            group_spaces: vec![],
+            my_teams: vec![],
+            library_refs: vec![],
+            my_id: String::new(),
+            share_for: None,
+            share_kind: "user".into(),
+            share_target: String::new(),
+            new_team_name: String::new(),
+            team_member_pick: String::new(),
             cache_entries: load_cache_index(),
             content: ContentState {
                 publish_bump: 1, // default preselect: minor （小版本）
@@ -360,8 +384,23 @@ impl App {
                 .cloned()
                 .unwrap_or_default();
         }
+        if let Ok(v) = self.call("GET", "/v1/shares/inbox", None) {
+            self.inbox = v.get("shares").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+        }
+        if let Ok(v) = self.call("GET", "/v1/group-space", None) {
+            self.group_spaces = v.get("spaces").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+        }
+        if let Ok(v) = self.call("GET", "/v1/custom-groups", None) {
+            self.my_teams = v.get("groups").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+        }
+        if let Ok(v) = self.call("GET", "/v1/library", None) {
+            self.library_refs = v.get("entries").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+        }
         self.cache_entries = load_cache_index();
         if let Ok(v) = self.call("GET", "/v1/me", None) {
+            if let Some(u) = v.get("user") {
+                self.my_id = s(u, "id");
+            }
             if let Some(p) = v.get("profile").and_then(|p| p.as_object()) {
                 self.settings.profile = p
                     .iter()
@@ -719,7 +758,11 @@ impl App {
         let r = self.call(
             "POST",
             &format!("/v1/indexes/{id}/export"),
-            Some(json!({ "branch": self.index.branch, "kind": kind })),
+            Some(json!({
+                "branch": self.index.branch,
+                "kind": kind,
+                "include_notes": self.index.include_notes,
+            })),
         );
         match r {
             Ok(v) => {
@@ -812,6 +855,62 @@ impl App {
     }
 
     fn library_view(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("我的收藏").strong());
+        if self.library_refs.is_empty() {
+            ui.label(egui::RichText::new("暂无收藏。从收到的分享里保存进来。").weak());
+        }
+        for e in self.library_refs.clone() {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(s(&e, "title")).strong());
+                let folder = s(&e, "folder");
+                if !folder.is_empty() {
+                    ui.label(egui::RichText::new(folder).small().weak());
+                }
+                if s(&e, "item_kind") == "showroom" {
+                    if ui.small_button("导出 PPT").clicked() {
+                        let item_id = s(&e, "item_id");
+                        let title = s(&e, "title");
+                        if let Some(path) = rfd::FileDialog::new()
+                            .set_file_name(format!("{title}.pptx"))
+                            .save_file()
+                        {
+                            match self.call(
+                                "POST",
+                                &format!("/v1/showroom/{item_id}/export"),
+                                Some(json!({ "kind": "personal" })),
+                            ) {
+                                Ok(v) => {
+                                    if let Some(data) =
+                                        v.get("data_base64").and_then(|x| x.as_str())
+                                    {
+                                        if let Ok(bytes) = b64d(data) {
+                                            let _ = std::fs::write(&path, bytes);
+                                            self.msg = "已导出".into();
+                                        }
+                                    }
+                                }
+                                Err(e2) => self.msg = format!("导出失败：{e2}"),
+                            }
+                        }
+                    }
+                }
+                if ui.small_button("移除").clicked() {
+                    let lid = s(&e, "id");
+                    match self.call(
+                        "POST",
+                        &format!("/v1/library/{lid}/delete"),
+                        Some(json!({})),
+                    ) {
+                        Ok(_) => {
+                            self.msg = "已移除".into();
+                            self.refresh_all();
+                        }
+                        Err(e2) => self.msg = format!("移除失败：{e2}"),
+                    }
+                }
+            });
+        }
+        ui.separator();
         ui.label(egui::RichText::new("本地缓存（离线可用）").strong());
         if self.cache_entries.is_empty() {
             ui.label(egui::RichText::new("暂无缓存。在广场或我的组装里点「缓存到本地」。").weak());
@@ -869,6 +968,259 @@ impl App {
         }
     }
 
+    fn share_panel(&mut self, ui: &mut egui::Ui) {
+        let item_id = self.share_for.clone().unwrap_or_default();
+        let title = self
+            .showroom_live
+            .iter()
+            .find(|x| s(x, "id") == item_id)
+            .map(|x| s(x, "title"))
+            .unwrap_or_default();
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(format!("分享「{title}」")).strong());
+                if ui.small_button("关闭").clicked() {
+                    self.share_for = None;
+                }
+            });
+            ui.horizontal(|ui| {
+                for (k, label) in [("user", "给个人"), ("dept", "给部门"), ("group", "给群组")] {
+                    if ui.selectable_label(self.share_kind == k, label).clicked() {
+                        self.share_kind = k.into();
+                        self.share_target.clear();
+                    }
+                }
+            });
+            let users = self
+                .org
+                .get("users")
+                .and_then(|u| u.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let depts = self
+                .org
+                .get("departments")
+                .and_then(|u| u.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let (options, current): (Vec<(String, String)>, String) = match self.share_kind.as_str() {
+                "dept" => (
+                    depts.iter().map(|d| (s(d, "id"), s(d, "name"))).collect(),
+                    depts
+                        .iter()
+                        .find(|d| s(d, "id") == self.share_target)
+                        .map(|d| s(d, "name"))
+                        .unwrap_or_else(|| "选择部门".into()),
+                ),
+                "group" => (
+                    self.my_teams.iter().map(|g| (s(g, "id"), s(g, "name"))).collect(),
+                    self.my_teams
+                        .iter()
+                        .find(|g| s(g, "id") == self.share_target)
+                        .map(|g| s(g, "name"))
+                        .unwrap_or_else(|| "选择群组".into()),
+                ),
+                _ => (
+                    users.iter().map(|u| (s(u, "id"), s(u, "display_name"))).collect(),
+                    users
+                        .iter()
+                        .find(|u| s(u, "id") == self.share_target)
+                        .map(|u| s(u, "display_name"))
+                        .unwrap_or_else(|| "选择同事".into()),
+                ),
+            };
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt("share_target")
+                    .selected_text(current)
+                    .show_ui(ui, |ui| {
+                        for (id, name) in options {
+                            ui.selectable_value(&mut self.share_target, id, name);
+                        }
+                    });
+                if ui.button("发送分享").clicked() && !self.share_target.is_empty() {
+                    match self.call(
+                        "POST",
+                        "/v1/shares",
+                        Some(json!({
+                            "item_kind": "showroom", "item_id": item_id,
+                            "target_kind": self.share_kind, "target_id": self.share_target,
+                        })),
+                    ) {
+                        Ok(_) => {
+                            self.msg = "已分享".into();
+                            self.share_for = None;
+                            self.refresh_all();
+                        }
+                        Err(e) => self.msg = format!("分享失败：{e}"),
+                    }
+                }
+            });
+        });
+        ui.add_space(6.0);
+    }
+
+    fn inbox_view(&mut self, ui: &mut egui::Ui) {
+        if self.inbox.is_empty() {
+            ui.label(egui::RichText::new("暂无收到的分享").weak());
+            return;
+        }
+        for sh in self.inbox.clone() {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(s(&sh, "title")).strong());
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} · {}",
+                        s(&sh, "from_name"),
+                        fmt_time(i(&sh, "created_ms"))
+                    ))
+                    .small()
+                    .weak(),
+                );
+                if sh.get("in_library").and_then(|v| v.as_bool()) == Some(true) {
+                    ui.label(egui::RichText::new("已在我的库").weak());
+                } else if ui.small_button("保存到我的库").clicked() {
+                    let sid = s(&sh, "id");
+                    match self.call(
+                        "POST",
+                        &format!("/v1/shares/{sid}/accept"),
+                        Some(json!({})),
+                    ) {
+                        Ok(_) => {
+                            self.msg = "已保存到我的库".into();
+                            self.refresh_all();
+                        }
+                        Err(e) => self.msg = format!("保存失败：{e}"),
+                    }
+                }
+            });
+        }
+    }
+
+    fn groups_view(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("新建群组");
+            ui.text_edit_singleline(&mut self.new_team_name);
+            if ui.button("建组").clicked() && !self.new_team_name.trim().is_empty() {
+                let name = self.new_team_name.clone();
+                match self.call("POST", "/v1/custom-groups", Some(json!({ "name": name }))) {
+                    Ok(_) => {
+                        self.new_team_name.clear();
+                        self.msg = "群组已创建".into();
+                        self.refresh_all();
+                    }
+                    Err(e) => self.msg = format!("建组失败：{e}"),
+                }
+            }
+        });
+        ui.add_space(6.0);
+        let users = self
+            .org
+            .get("users")
+            .and_then(|u| u.as_array())
+            .cloned()
+            .unwrap_or_default();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for space in self.group_spaces.clone() {
+                let g = space.get("group").cloned().unwrap_or(json!({}));
+                let gid = s(&g, "id");
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} · 组长 {}",
+                        s(&g, "name"),
+                        s(&g, "owner_name")
+                    ))
+                    .strong(),
+                );
+                let members = g
+                    .get("members")
+                    .and_then(|m| m.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .map(|m| s(m, "name"))
+                            .collect::<Vec<_>>()
+                            .join("、")
+                    })
+                    .unwrap_or_default();
+                ui.label(egui::RichText::new(format!("成员：{members}")).small().weak());
+                // owner can add members
+                if s(&g, "owner_id") == self.my_id {
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt(format!("tm_{gid}"))
+                            .selected_text(
+                                users
+                                    .iter()
+                                    .find(|u| s(u, "id") == self.team_member_pick)
+                                    .map(|u| s(u, "display_name"))
+                                    .unwrap_or_else(|| "选择同事".into()),
+                            )
+                            .show_ui(ui, |ui| {
+                                for u in &users {
+                                    ui.selectable_value(
+                                        &mut self.team_member_pick,
+                                        s(u, "id"),
+                                        s(u, "display_name"),
+                                    );
+                                }
+                            });
+                        if ui.small_button("加成员").clicked()
+                            && !self.team_member_pick.is_empty()
+                        {
+                            let pick = self.team_member_pick.clone();
+                            match self.call(
+                                "POST",
+                                &format!("/v1/custom-groups/{gid}/members"),
+                                Some(json!({ "user_id": pick })),
+                            ) {
+                                Ok(_) => {
+                                    self.msg = "成员已加入".into();
+                                    self.refresh_all();
+                                }
+                                Err(e) => self.msg = format!("加成员失败：{e}"),
+                            }
+                        }
+                    });
+                }
+                if let Some(items) = space.get("items").and_then(|v| v.as_array()) {
+                    if items.is_empty() {
+                        ui.label(egui::RichText::new("暂无分享到本组的内容").weak());
+                    }
+                    for it in items {
+                        ui.horizontal(|ui| {
+                            ui.label(s(it, "title"));
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} · {}",
+                                    s(it, "from_name"),
+                                    fmt_time(i(it, "created_ms"))
+                                ))
+                                .small()
+                                .weak(),
+                            );
+                            if ui.small_button("保存到我的库").clicked() {
+                                let sid = s(it, "id");
+                                match self.call(
+                                    "POST",
+                                    &format!("/v1/shares/{sid}/accept"),
+                                    Some(json!({})),
+                                ) {
+                                    Ok(_) => {
+                                        self.msg = "已保存到我的库".into();
+                                        self.refresh_all();
+                                    }
+                                    Err(e) => self.msg = format!("保存失败：{e}"),
+                                }
+                            }
+                        });
+                    }
+                }
+                ui.separator();
+            }
+            if self.group_spaces.is_empty() {
+                ui.label(egui::RichText::new("还没加入任何群组").weak());
+            }
+        });
+    }
+
     fn page_showroom(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading("演示厅");
@@ -884,10 +1236,33 @@ impl App {
             {
                 self.sr_zone = "library".into();
             }
+            if ui
+                .selectable_label(self.sr_zone == "inbox", "收到的分享")
+                .clicked()
+            {
+                self.sr_zone = "inbox".into();
+            }
+            if ui
+                .selectable_label(self.sr_zone == "groups", "群组空间")
+                .clicked()
+            {
+                self.sr_zone = "groups".into();
+            }
         });
         if self.sr_zone == "library" {
             self.library_view(ui);
             return;
+        }
+        if self.sr_zone == "inbox" {
+            self.inbox_view(ui);
+            return;
+        }
+        if self.sr_zone == "groups" {
+            self.groups_view(ui);
+            return;
+        }
+        if self.share_for.is_some() {
+            self.share_panel(ui);
         }
         ui.add_space(6.0);
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -907,6 +1282,10 @@ impl App {
                                 .small()
                                 .weak(),
                             );
+                            if ui.small_button("分享").clicked() {
+                                self.share_for = Some(s(&item, "id"));
+                                self.share_target.clear();
+                            }
                             let src = s(&item, "source_index_id");
                             if !src.is_empty() {
                                 if ui.small_button("缓存到本地").clicked() {
@@ -1039,6 +1418,57 @@ impl App {
                 match self.call("GET", &format!("/v1/search?q={}", self.content.search_text), None) {
                     Ok(v) => self.content.search_hits = Some(v),
                     Err(e) => self.msg = e,
+                }
+            }
+            if ui.button("智能分块导入").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("PowerPoint", &["pptx"])
+                    .pick_file()
+                {
+                    if let Ok(bytes) = std::fs::read(&path) {
+                        let name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        match self.call(
+                            "POST",
+                            "/v1/import/propose",
+                            Some(json!({ "data_base64": b64e(&bytes) })),
+                        ) {
+                            Ok(p) => {
+                                let blocks = p.get("blocks").cloned().unwrap_or(json!([]));
+                                let names: Vec<String> = blocks
+                                    .as_array()
+                                    .map(|arr| {
+                                        arr.iter().map(|b| s(b, "name")).collect()
+                                    })
+                                    .unwrap_or_default();
+                                let r = self.call(
+                                    "POST",
+                                    "/v1/import",
+                                    Some(json!({
+                                        "filename": name,
+                                        "data_base64": b64e(&bytes),
+                                        "folder_id": self.content.folder_filter,
+                                        "group_id": self.content.import_group,
+                                        "blocks": blocks,
+                                    })),
+                                );
+                                match r {
+                                    Ok(_) => {
+                                        self.msg = format!(
+                                            "智能分块导入完成：{} 块（{}）",
+                                            names.len(),
+                                            names.join("、")
+                                        );
+                                        self.refresh_all();
+                                    }
+                                    Err(e) => self.msg = format!("导入失败：{e}"),
+                                }
+                            }
+                            Err(e) => self.msg = format!("提块失败：{e}"),
+                        }
+                    }
                 }
             }
             if ui.button("导入 PPT").clicked() {
@@ -1251,6 +1681,23 @@ impl App {
                                         }
                                     }
                                 }
+                                if ui.button("讲稿").clicked() {
+                                    let mut scripts: Vec<String> = v
+                                        .get("scripts")
+                                        .and_then(|x| x.as_array())
+                                        .map(|arr| {
+                                            arr.iter()
+                                                .map(|t| t.as_str().unwrap_or("").to_string())
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
+                                    let pages = i(v, "page_count") as usize;
+                                    while scripts.len() < pages {
+                                        scripts.push(String::new());
+                                    }
+                                    self.content.scripts_edit = scripts;
+                                    self.content.scripts_for = Some(s(v, "id"));
+                                }
                                 if s(v, "status") != "recalled" && ui.button("撤回").clicked() {
                                     let _ = self.call(
                                         "POST",
@@ -1264,6 +1711,98 @@ impl App {
                             });
                         }
                     }
+                }
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("AI 翻译（生成草稿）").strong());
+                let cur_to = if self.content.translate_to.is_empty() {
+                    "zh".to_string()
+                } else {
+                    self.content.translate_to.clone()
+                };
+                egui::ComboBox::from_id_salt("translate_to")
+                    .selected_text(match cur_to.as_str() {
+                        "en" => "英语",
+                        "ja" => "日语",
+                        _ => "中文",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.content.translate_to, "zh".into(), "中文");
+                        ui.selectable_value(&mut self.content.translate_to, "en".into(), "英语");
+                        ui.selectable_value(&mut self.content.translate_to, "ja".into(), "日语");
+                    });
+                if ui.button("翻译最新版本").clicked() {
+                    // latest version of the first rendition in the detail
+                    let first_version = self.content.detail.as_ref().and_then(|d| {
+                        d.get("renditions")
+                            .and_then(|r| r.as_array())
+                            .and_then(|arr| arr.first())
+                            .and_then(|r| r.get("versions"))
+                            .and_then(|v| v.as_array())
+                            .and_then(|arr| arr.first())
+                            .map(|v| s(v, "id"))
+                    });
+                    match (self.content.selected_unit.clone(), first_version) {
+                        (Some(uid), Some(vid)) => {
+                            let to = if self.content.translate_to.is_empty() {
+                                "zh".to_string()
+                            } else {
+                                self.content.translate_to.clone()
+                            };
+                            match self.call(
+                                "POST",
+                                &format!("/v1/units/{uid}/translate"),
+                                Some(json!({ "version_id": vid, "target_lang": to })),
+                            ) {
+                                Ok(v) => {
+                                    self.msg = format!(
+                                        "译文草稿已生成（{} 个文本，待校对）",
+                                        i(&v, "translated_runs")
+                                    );
+                                    self.open_unit_detail(&uid);
+                                }
+                                Err(e) => self.msg = format!("翻译失败：{e}"),
+                            }
+                        }
+                        _ => self.msg = "暂无可翻译的版本".into(),
+                    }
+                }
+            });
+            if let Some(vid) = self.content.scripts_for.clone() {
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("逐页讲稿（保存不升版本）").strong());
+                    if ui.button("保存讲稿").clicked() {
+                        let scripts = self.content.scripts_edit.clone();
+                        match self.call(
+                            "PUT",
+                            &format!("/v1/versions/{vid}/scripts"),
+                            Some(json!({ "scripts": scripts })),
+                        ) {
+                            Ok(_) => {
+                                self.msg = "讲稿已保存".into();
+                                if let Some(uid) = self.content.selected_unit.clone() {
+                                    self.open_unit_detail(&uid);
+                                }
+                            }
+                            Err(e) => self.msg = format!("保存讲稿失败：{e}"),
+                        }
+                    }
+                    if ui.button("关闭").clicked() {
+                        self.content.scripts_for = None;
+                    }
+                });
+                let n = self.content.scripts_edit.len();
+                for idx in 0..n {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("第 {} 页", idx + 1));
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.content.scripts_edit[idx])
+                                .desired_width(560.0)
+                                .desired_rows(2),
+                        );
+                    });
                 }
             }
             ui.separator();
@@ -1660,6 +2199,7 @@ impl App {
             }
         });
         ui.horizontal(|ui| {
+            ui.checkbox(&mut self.index.include_notes, "添加备注");
             if ui.button("导出（个人版）").clicked() {
                 self.export_index_file(&index, "personal");
             }

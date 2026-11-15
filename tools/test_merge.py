@@ -3,6 +3,8 @@
 import copy, json, urllib.request, urllib.error
 
 BASE = "http://127.0.0.1:8730"
+import time
+RUN = str(int(time.time()))[-5:]  # unique branch names per run (idempotent reruns)
 
 def call(method, path, token=None, body=None, expect_error=False):
     req = urllib.request.Request(BASE + path, method=method)
@@ -43,38 +45,38 @@ def lock(entries, version_id, semver):
     return es
 
 # --- round 1: one-sided change merges cleanly
-call("POST", f"/v1/indexes/{idx}/branches", tok, {"name": "feature", "from": "main"})
+call("POST", f"/v1/indexes/{idx}/branches", tok, {"name": f"feature-{RUN}", "from": "main"})
 call("POST", f"/v1/indexes/{idx}/commits", tok, {
-    "branch": "feature", "message": "锁定技术部分到 1.0.0", "entries": lock(base_entries, v100, "1.0.0"),
+    "branch": f"feature-{RUN}", "message": "锁定技术部分到 1.0.0", "entries": lock(base_entries, v100, "1.0.0"),
 })
-p = call("POST", f"/v1/indexes/{idx}/merge/preview", tok, {"from": "feature", "into": "main"})
+p = call("POST", f"/v1/indexes/{idx}/merge/preview", tok, {"from": f"feature-{RUN}", "into": "main"})
 assert p["clean"] and not p["conflicts"], p
 assert p["merged"][tech_pos]["policy"] == {"locked": {"version_id": v100}}, p["merged"][tech_pos]
-call("POST", f"/v1/indexes/{idx}/merge", tok, {"from": "feature", "into": "main"})
+call("POST", f"/v1/indexes/{idx}/merge", tok, {"from": f"feature-{RUN}", "into": "main"})
 d2 = call("GET", f"/v1/indexes/{idx}", tok)
 assert d2["head"]["entries"][tech_pos]["policy"] == {"locked": {"version_id": v100}}
 print("round 1 clean merge OK")
 
 # --- round 2: both sides change the same entry -> conflict, adjudicate
 main_entries = d2["head"]["entries"]
-call("POST", f"/v1/indexes/{idx}/branches", tok, {"name": "feature2", "from": "main"})
+call("POST", f"/v1/indexes/{idx}/branches", tok, {"name": f"feature2-{RUN}", "from": "main"})
 call("POST", f"/v1/indexes/{idx}/commits", tok, {
-    "branch": "feature2", "message": "改锁 1.1.0", "entries": lock(main_entries, v110, "1.1.0"),
+    "branch": f"feature2-{RUN}", "message": "改锁 1.1.0", "entries": lock(main_entries, v110, "1.1.0"),
 })
 es = copy.deepcopy(main_entries)
 es[tech_pos]["excerpt_slots"] = ["0"]
 call("POST", f"/v1/indexes/{idx}/commits", tok, {
     "branch": "main", "message": "技术部分只用第一页", "entries": es,
 })
-p = call("POST", f"/v1/indexes/{idx}/merge/preview", tok, {"from": "feature2", "into": "main"})
+p = call("POST", f"/v1/indexes/{idx}/merge/preview", tok, {"from": f"feature2-{RUN}", "into": "main"})
 assert not p["clean"] and len(p["conflicts"]) == 1, p
 key = p["conflicts"][0]["key"]
 print("conflict key:", key)
-err = call("POST", f"/v1/indexes/{idx}/merge", tok, {"from": "feature2", "into": "main"}, expect_error=True)
+err = call("POST", f"/v1/indexes/{idx}/merge", tok, {"from": f"feature2-{RUN}", "into": "main"}, expect_error=True)
 assert "冲突" in err.get("error", ""), err
 print("unresolved merge blocked OK:", err["error"][:60])
 call("POST", f"/v1/indexes/{idx}/merge", tok, {
-    "from": "feature2", "into": "main", "resolutions": {key: "theirs"},
+    "from": f"feature2-{RUN}", "into": "main", "resolutions": {key: "theirs"},
 })
 d3 = call("GET", f"/v1/indexes/{idx}", tok)
 assert d3["head"]["entries"][tech_pos]["policy"] == {"locked": {"version_id": v110}}, d3["head"]["entries"][tech_pos]

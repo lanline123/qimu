@@ -11,9 +11,11 @@ pub mod manifest;
 pub mod model;
 pub mod personalize;
 pub mod pptx;
+pub mod propose;
 pub mod semver;
 pub mod store;
 pub mod text;
+pub mod translate;
 
 pub use model::*;
 pub use semver::{Increment, SemVer};

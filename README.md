@@ -51,9 +51,13 @@ GUI + CLI + 服务端），设计规格见 `docs/`。
 - [x] 离线缓存（§3.17）：演示厅「我的库」——广场条目 / 我的组装一键缓存
       整稿快照到本地（~/.qimu/cache），离线可打开 / 移除
 - [x] 场景 13 保真（可自动化部分）：自制案例 2 稿（原生图表×3+内嵌数据、表格、动画 timing、切换、备注、嵌入视频）与真 SmartArt 稿（Apache POI 夹具）经导入→导出后部件齐全、LibreOffice 渲染逐页像素一致（tools/test_fidelity.py）；清单存活：LibreOffice 打开→保存会剥离自定义属性与镜像部件，已加固为三路承载——核心属性关键词中的 deck 标识（编辑器会把冒号规范化为空格，读取端兼容）在 LO 往返后存活，CLI 可凭标识从服务器导出台账恢复完整清单并正常检查更新
+- [x] 演示厅分享与群组空间（§3.17/§7.7）：自定义组（建组/成员管理）、三类指定分享（个人→收件箱、部门→含子部门与后来加入者、自定义组→群组空间）、保存到我的库（引用）、条目级导出授权（分享即授权、离组即撤销），store/API/CLI/GUI 四层齐全，E2E 见 tools/test_shares.py
+- [x] 讲稿（§3.16）：版本逐页讲稿（导入时由备注生成）可在线编辑且不升版本；导出勾选「添加备注」把讲稿写回备注页（tools/test_scripts.py）
+- [x] AI 翻译骨架（§3.13）：术语表（服务端设置）+ 可插拔 provider（内置 stub 供开发/测试；OpenAI 兼容接口已实现，设置里配 endpoint/model/key 后启用）→ 生成目标语言形态的草稿版本（待校对）、逐页 ai 绑定记录配对、讲稿一并翻译；图表内部缓存标签不在 run 级翻译范围内
+- [x] 导入提块（§5.8）：POST /v1/import/propose 给出分块建议（当前为确定性启发式 proposer，接口即 AI 提块的接入点），CLI `import-propose` / `import --propose`、GUI「智能分块导入」，导入者确认后落库
+- [x] 修复：组装改写 .rels 时元素扫描前缀碰撞（<Relationship 误匹配 <Relationships 根元素）曾使全部导出稿的 .rels 部件畸形（LibreOffice 宽容未报错，严格读取器拒绝）；已修复并加回归断言，导出稿现可通过 python-pptx 严格加载、全部部件 XML 良构
 - [ ] DeckCraft 往返保真验证（需实机打开 DeckCraft）
 - [ ] COM 桥原地替换回路（Windows PowerPoint 实机）
-- [ ] 演示厅分享 / 群组空间子区、AI 翻译、导入 AI 提块、讲稿编辑
 
 ## 构建与运行
 

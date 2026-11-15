@@ -92,6 +92,20 @@ pub(crate) fn scan_elements<'a>(xml: &'a str, open: &str) -> Vec<&'a str> {
     let mut out = Vec::new();
     let mut rest = xml;
     while let Some(pos) = rest.find(open) {
+        // Guard against prefix collisions: "<Relationship" must not match
+        // the "<Relationships" root, "<p:sldId" must not match
+        // "<p:sldIdLst". A tag name continuing with a letter/digit means
+        // this is a different, longer element — skip the occurrence.
+        let after_open = &rest[pos + open.len()..];
+        if after_open
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphanumeric())
+            .unwrap_or(false)
+        {
+            rest = after_open;
+            continue;
+        }
         let start = pos;
         let after = &rest[start..];
         // Element ends at "/>" for empty elements (Relationship, Override,
@@ -584,6 +598,95 @@ pub fn package_fingerprint(pkg: &Package) -> String {
         h.update(bytes);
     }
     format!("{:x}", h.finalize())
+}
+
+fn xml_escape_text(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Write speaker notes (讲稿) into the notes page of the slide at
+/// `slide_idx` (0-based, deck order). Only works when the slide already
+/// has a notes page with a body placeholder — returns false otherwise
+/// (callers treat notes as best-effort on export).
+pub fn set_notes_text(pkg: &mut Package, slide_idx: usize, text: &str) -> bool {
+    let slide_refs = match slides(pkg) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let slide_part = match slide_refs.get(slide_idx) {
+        Some(s) => s.part.clone(),
+        None => return false,
+    };
+    let (dir, file) = match slide_part.rfind('/') {
+        Some(i) => (&slide_part[..i], &slide_part[i + 1..]),
+        None => return false,
+    };
+    let rels_part = format!("{dir}/_rels/{file}.rels");
+    let rels_xml = match pkg.get_text(&rels_part) {
+        Ok(x) => x,
+        Err(_) => return false,
+    };
+    let rels = parse_rels(&rels_xml);
+    let notes_rel = match rels.iter().find(|r| r.raw.contains("/notesSlide")) {
+        Some(r) => r,
+        None => return false,
+    };
+    let notes_part = resolve_target(&slide_part, &notes_rel.target);
+    let xml = match pkg.get_text(&notes_part) {
+        Ok(x) => x,
+        Err(_) => return false,
+    };
+    // locate the body placeholder's <p:sp> block
+    let mut search_from = 0;
+    let (sp_start, sp_end) = loop {
+        let Some(rel_s) = xml[search_from..].find("<p:sp>") else {
+            return false;
+        };
+        let s = search_from + rel_s;
+        let Some(rel_e) = xml[s..].find("</p:sp>") else {
+            return false;
+        };
+        let e = s + rel_e + "</p:sp>".len();
+        if xml[s..e].contains("type=\"body\"") {
+            break (s, e);
+        }
+        search_from = e;
+    };
+    let block = &xml[sp_start..sp_end];
+    let Some(tb_rel) = block.find("<p:txBody>") else {
+        return false;
+    };
+    let tb_start = sp_start + tb_rel;
+    let Some(tb_close_rel) = xml[tb_start..].find("</p:txBody>") else {
+        return false;
+    };
+    let tb_close = tb_start + tb_close_rel;
+    // keep everything inside txBody before the first paragraph
+    // (a:bodyPr, a:lstStyle), replace the paragraphs
+    let inner = &xml[tb_start + "<p:txBody>".len()..tb_close];
+    let keep_len = inner
+        .find("<a:p>")
+        .or_else(|| inner.find("<a:p/>"))
+        .unwrap_or(inner.len());
+    let mut paras = String::new();
+    for line in text.split('\n') {
+        if line.is_empty() {
+            paras.push_str("<a:p/>");
+        } else {
+            paras.push_str(&format!(
+                "<a:p><a:r><a:rPr lang=\"zh-CN\" dirty=\"0\"/><a:t>{}</a:t></a:r><a:endParaRPr lang=\"zh-CN\" dirty=\"0\"/></a:p>",
+                xml_escape_text(line)
+            ));
+        }
+    }
+    let mut out = String::with_capacity(xml.len() + paras.len());
+    out.push_str(&xml[..tb_start + "<p:txBody>".len() + keep_len]);
+    out.push_str(&paras);
+    out.push_str(&xml[tb_close..]);
+    pkg.parts.insert(notes_part, out.into_bytes());
+    true
 }
 
 #[cfg(test)]

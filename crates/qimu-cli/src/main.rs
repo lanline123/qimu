@@ -43,6 +43,13 @@ enum Command {
         /// block with all pages, named after the file.
         #[arg(long)]
         blocks: Option<String>,
+        /// Use the server's block proposal (§5.8) instead of one block.
+        #[arg(long)]
+        propose: bool,
+    },
+    /// Propose content blocks for a deck without importing (§5.8).
+    ImportPropose {
+        path: String,
     },
     Units {
         #[command(subcommand)]
@@ -97,9 +104,44 @@ enum Command {
         #[command(subcommand)]
         cmd: ShowroomCommand,
     },
+    /// Custom groups (custom teams, §7.7).
+    Teams {
+        #[command(subcommand)]
+        cmd: TeamsCommand,
+    },
+    /// Share a showroom item or assembly to a user / department / team.
+    Share {
+        /// showroom | assembly
+        item_kind: String,
+        item_id: String,
+        #[arg(long)]
+        to_user: Option<String>,
+        #[arg(long)]
+        to_dept: Option<String>,
+        #[arg(long)]
+        to_team: Option<String>,
+    },
+    /// Shares addressed to me (direct + my departments).
+    Inbox {
+        #[command(subcommand)]
+        cmd: Option<InboxCommand>,
+    },
+    /// My library (references I accepted).
+    Library {
+        #[command(subcommand)]
+        cmd: Option<LibraryCommand>,
+    },
+    /// Group spaces of my custom teams.
+    GroupSpace,
     Assemblies {
         #[command(subcommand)]
         cmd: AssembliesCommand,
+    },
+    /// Show the AI-translation glossary, or replace it from a JSON file
+    /// (array of {"src","dst"}).
+    Glossary {
+        #[arg(long)]
+        set: Option<String>,
     },
     /// Set personal profile fields (key=value, repeatable).
     Profile {
@@ -171,6 +213,14 @@ enum UnitsCommand {
         #[arg(long)]
         binding: String,
     },
+    /// AI-translate one version into a target language (draft rendition).
+    Translate {
+        id: String,
+        #[arg(long)]
+        version: String,
+        #[arg(long)]
+        to: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -186,6 +236,17 @@ enum VersionsCommand {
     Tag {
         #[command(subcommand)]
         cmd: TagCommand,
+    },
+    /// Show a version (incl. per-page speaker scripts).
+    Get {
+        id: String,
+    },
+    /// Replace a version's per-page scripts from a JSON file (array of
+    /// strings). Never bumps the version.
+    SetScripts {
+        id: String,
+        #[arg(long)]
+        file: String,
     },
 }
 
@@ -284,6 +345,9 @@ enum IndexCommand {
         tag: Option<String>,
         #[arg(long)]
         kind: Option<String>,
+        /// Write per-page speaker scripts into the notes pages.
+        #[arg(long)]
+        notes: bool,
         #[arg(short, long)]
         out: String,
     },
@@ -388,6 +452,46 @@ enum ShowroomCommand {
         id: String,
         #[arg(long)]
         state: String,
+    },
+    Export {
+        id: String,
+        #[arg(long, default_value = "personal")]
+        kind: String,
+        #[arg(short, long)]
+        out: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum TeamsCommand {
+    List,
+    Create {
+        name: String,
+    },
+    AddMember {
+        id: String,
+        user_id: String,
+    },
+    RemoveMember {
+        id: String,
+        user_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum InboxCommand {
+    /// Save a received share into my library.
+    Accept {
+        share_id: String,
+        #[arg(long)]
+        folder: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum LibraryCommand {
+    Remove {
+        id: String,
     },
 }
 
@@ -773,16 +877,38 @@ fn run() -> Result<i32, String> {
             }
             DeckCommand::Apply { path } => deck_apply(&ctx, &path),
         },
+        Command::ImportPropose { path } => {
+            let bytes = read_deck(&path)?;
+            print(&ctx.call(
+                "POST",
+                "/v1/import/propose",
+                Some(json!({ "data_base64": b64e(&bytes) })),
+            )?);
+            Ok(0)
+        }
         Command::Import {
             path,
             group,
             folder,
             blocks,
+            propose,
         } => {
             let bytes = read_deck(&path)?;
-            let blocks_v: Option<Value> = match blocks {
-                Some(s) => Some(serde_json::from_str(&s).map_err(|e| e.to_string())?),
-                None => None,
+            let blocks_v: Option<Value> = match (blocks, propose) {
+                (Some(s), _) => Some(serde_json::from_str(&s).map_err(|e| e.to_string())?),
+                (None, true) => {
+                    let p = ctx.call(
+                        "POST",
+                        "/v1/import/propose",
+                        Some(json!({ "data_base64": b64e(&bytes) })),
+                    )?;
+                    Some(
+                        p.get("blocks")
+                            .cloned()
+                            .ok_or("提块结果缺少 blocks")?,
+                    )
+                }
+                (None, false) => None,
             };
             let r = ctx.call(
                 "POST",
@@ -838,6 +964,25 @@ fn run() -> Result<i32, String> {
                     &format!("/v1/units/{id}/page-bindings/{binding}/delete"),
                     None,
                 )?),
+                UnitsCommand::Translate { id, version, to } => print(&ctx.call(
+                    "POST",
+                    &format!("/v1/units/{id}/translate"),
+                    Some(json!({ "version_id": version, "target_lang": to })),
+                )?),
+            }
+            Ok(0)
+        }
+        Command::Glossary { set } => {
+            if let Some(file) = set {
+                let text = std::fs::read_to_string(&file).map_err(|e| e.to_string())?;
+                let pairs: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+                print(&ctx.call(
+                    "PUT",
+                    "/v1/settings/glossary",
+                    Some(json!({ "pairs": pairs })),
+                )?);
+            } else {
+                print(&ctx.call("GET", "/v1/settings/glossary", None)?);
             }
             Ok(0)
         }
@@ -900,6 +1045,19 @@ fn run() -> Result<i32, String> {
                         print(&ctx.call("GET", &format!("/v1/versions/{version}/tags"), None)?)
                     }
                 },
+                VersionsCommand::Get { id } => {
+                    print(&ctx.call("GET", &format!("/v1/versions/{id}"), None)?)
+                }
+                VersionsCommand::SetScripts { id, file } => {
+                    let text = std::fs::read_to_string(&file).map_err(|e| e.to_string())?;
+                    let scripts: Value =
+                        serde_json::from_str(&text).map_err(|e| e.to_string())?;
+                    print(&ctx.call(
+                        "PUT",
+                        &format!("/v1/versions/{id}/scripts"),
+                        Some(json!({ "scripts": scripts })),
+                    )?)
+                }
             }
             Ok(0)
         }
@@ -1004,12 +1162,13 @@ fn run() -> Result<i32, String> {
                     branch,
                     tag,
                     kind,
+                    notes,
                     out,
                 } => {
                     let r = ctx.call(
                         "POST",
                         &format!("/v1/indexes/{id}/export"),
-                        Some(json!({ "branch": branch, "tag": tag, "kind": kind })),
+                        Some(json!({ "branch": branch, "tag": tag, "kind": kind, "include_notes": notes })),
                     )?;
                     let data = r
                         .get("data_base64")
@@ -1150,7 +1309,86 @@ fn run() -> Result<i32, String> {
                     &format!("/v1/showroom/{id}/review"),
                     Some(json!({ "state": state })),
                 )?),
+                ShowroomCommand::Export { id, kind, out } => {
+                    let r = ctx.call(
+                        "POST",
+                        &format!("/v1/showroom/{id}/export"),
+                        Some(json!({ "kind": kind })),
+                    )?;
+                    let data = r
+                        .get("data_base64")
+                        .and_then(|v| v.as_str())
+                        .ok_or("响应缺少文件数据")?;
+                    std::fs::write(&out, b64d(data)?).map_err(|e| e.to_string())?;
+                    print(&json!({ "ok": true, "out": out, "page_count": r.get("page_count") }));
+                }
             }
+            Ok(0)
+        }
+        Command::Teams { cmd } => {
+            match cmd {
+                TeamsCommand::List => print(&ctx.call("GET", "/v1/custom-groups", None)?),
+                TeamsCommand::Create { name } => {
+                    print(&ctx.call("POST", "/v1/custom-groups", Some(json!({ "name": name })))?)
+                }
+                TeamsCommand::AddMember { id, user_id } => print(&ctx.call(
+                    "POST",
+                    &format!("/v1/custom-groups/{id}/members"),
+                    Some(json!({ "user_id": user_id })),
+                )?),
+                TeamsCommand::RemoveMember { id, user_id } => print(&ctx.call(
+                    "POST",
+                    &format!("/v1/custom-groups/{id}/members/remove"),
+                    Some(json!({ "user_id": user_id })),
+                )?),
+            }
+            Ok(0)
+        }
+        Command::Share {
+            item_kind,
+            item_id,
+            to_user,
+            to_dept,
+            to_team,
+        } => {
+            let (target_kind, target_id) = match (to_user, to_dept, to_team) {
+                (Some(u), None, None) => ("user", u),
+                (None, Some(d), None) => ("dept", d),
+                (None, None, Some(g)) => ("group", g),
+                _ => return Err("必须且只能给出一个分享目标：--to-user / --to-dept / --to-team".into()),
+            };
+            print(&ctx.call(
+                "POST",
+                "/v1/shares",
+                Some(json!({
+                    "item_kind": item_kind, "item_id": item_id,
+                    "target_kind": target_kind, "target_id": target_id,
+                })),
+            )?);
+            Ok(0)
+        }
+        Command::Inbox { cmd } => {
+            match cmd {
+                None => print(&ctx.call("GET", "/v1/shares/inbox", None)?),
+                Some(InboxCommand::Accept { share_id, folder }) => print(&ctx.call(
+                    "POST",
+                    &format!("/v1/shares/{share_id}/accept"),
+                    Some(json!({ "folder": folder })),
+                )?),
+            }
+            Ok(0)
+        }
+        Command::Library { cmd } => {
+            match cmd {
+                None => print(&ctx.call("GET", "/v1/library", None)?),
+                Some(LibraryCommand::Remove { id }) => {
+                    print(&ctx.call("POST", &format!("/v1/library/{id}/delete"), Some(json!({})))?)
+                }
+            }
+            Ok(0)
+        }
+        Command::GroupSpace => {
+            print(&ctx.call("GET", "/v1/group-space", None)?);
             Ok(0)
         }
         Command::Assemblies { cmd } => {

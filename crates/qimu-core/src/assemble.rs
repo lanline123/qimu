@@ -396,6 +396,20 @@ mod debug_tests {
         }
         assert_eq!(all.len(), 17);
         let merged = assemble(&all).unwrap();
+        // Regression: rewritten .rels parts must be well-formed — exactly
+        // one <Relationships root (a prefix-collision in scan_elements
+        // once doubled it, which strict readers reject).
+        for (name, bytes) in &merged.parts {
+            if name.ends_with(".rels") {
+                let text = String::from_utf8_lossy(bytes);
+                assert_eq!(
+                    text.matches("<Relationships").count(),
+                    1,
+                    "doubled Relationships root in {name}"
+                );
+                assert!(text.trim_end().ends_with("</Relationships>"), "unterminated rels in {name}");
+            }
+        }
         let report = split_reassemble_verify(&merged).unwrap();
         println!("verify: slides={} fp_match={} errors={:?}", report.slide_count, report.fingerprints_match, report.structural_errors);
         let errs = crate::pptx::structural_errors(&merged);

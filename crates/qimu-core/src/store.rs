@@ -10,7 +10,7 @@ use crate::model::IndexEntry;
 use crate::pptx::Package;
 use crate::semver::SemVer;
 use crate::text::{slide_full_text, slide_title};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -102,6 +102,10 @@ pub struct VersionRec {
     pub page_count: i64,
     pub pages: Vec<PageInfo>,
     pub status: String, // normal | recalled | draft
+    /// Per-page speaker scripts (讲稿), aligned with `pages`. Imported
+    /// from the fragment's notes; editable without bumping the version.
+    #[serde(default)]
+    pub scripts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -330,7 +334,7 @@ CREATE TABLE IF NOT EXISTS groups_tbl(id TEXT PRIMARY KEY, name TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS group_grants(id TEXT PRIMARY KEY, group_id TEXT NOT NULL, subject_type TEXT NOT NULL, subject_id TEXT NOT NULL, capability TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS units(id TEXT PRIMARY KEY, name TEXT NOT NULL, folder_id TEXT, group_id TEXT NOT NULL, maintainer TEXT NOT NULL, lead_lang TEXT NOT NULL DEFAULT 'zh', description TEXT NOT NULL DEFAULT '', current_revision INTEGER NOT NULL DEFAULT 1, created_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS renditions(id TEXT PRIMARY KEY, unit_id TEXT NOT NULL, form TEXT NOT NULL, lang TEXT NOT NULL, UNIQUE(unit_id, form, lang));
-CREATE TABLE IF NOT EXISTS versions(id TEXT PRIMARY KEY, rendition_id TEXT NOT NULL, semver TEXT NOT NULL, major INTEGER NOT NULL, minor INTEGER NOT NULL, patch INTEGER NOT NULL, basis_revision INTEGER NOT NULL, author TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', created_ms INTEGER NOT NULL, fragment_hash TEXT NOT NULL, page_count INTEGER NOT NULL, pages_json TEXT NOT NULL, text_all TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'normal');
+CREATE TABLE IF NOT EXISTS versions(id TEXT PRIMARY KEY, rendition_id TEXT NOT NULL, semver TEXT NOT NULL, major INTEGER NOT NULL, minor INTEGER NOT NULL, patch INTEGER NOT NULL, basis_revision INTEGER NOT NULL, author TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', created_ms INTEGER NOT NULL, fragment_hash TEXT NOT NULL, page_count INTEGER NOT NULL, pages_json TEXT NOT NULL, text_all TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'normal', scripts_json TEXT NOT NULL DEFAULT '[]');
 CREATE TABLE IF NOT EXISTS indexes_tbl(id TEXT PRIMARY KEY, name TEXT NOT NULL, folder_id TEXT, group_id TEXT NOT NULL, maintainer TEXT NOT NULL, lifecycle TEXT NOT NULL DEFAULT 'active', scope TEXT NOT NULL DEFAULT 'company', created_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS index_branches(index_id TEXT NOT NULL, name TEXT NOT NULL, head_commit TEXT, PRIMARY KEY(index_id, name));
 CREATE TABLE IF NOT EXISTS index_commits(id TEXT PRIMARY KEY, index_id TEXT NOT NULL, branch TEXT NOT NULL, parent_id TEXT, author TEXT NOT NULL, message TEXT NOT NULL, created_ms INTEGER NOT NULL, entries_json TEXT NOT NULL);
@@ -341,6 +345,10 @@ CREATE TABLE IF NOT EXISTS version_tags(id TEXT PRIMARY KEY, version_id TEXT NOT
 CREATE TABLE IF NOT EXISTS showroom(id TEXT PRIMARY KEY, title TEXT NOT NULL, intro TEXT NOT NULL DEFAULT '', source_index_id TEXT, commit_id TEXT, submitted_by TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending', created_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS assemblies(id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, entries_json TEXT NOT NULL, created_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS page_bindings(id TEXT PRIMARY KEY, unit_id TEXT NOT NULL, from_version_id TEXT NOT NULL, from_slot INTEGER NOT NULL, to_version_id TEXT NOT NULL, to_slot INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'manual', author TEXT NOT NULL, created_ms INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS custom_groups(id TEXT PRIMARY KEY, name TEXT NOT NULL, owner_id TEXT NOT NULL, created_ms INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS custom_group_members(group_id TEXT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY(group_id, user_id));
+CREATE TABLE IF NOT EXISTS shares(id TEXT PRIMARY KEY, item_kind TEXT NOT NULL, item_id TEXT NOT NULL, title TEXT NOT NULL, from_user TEXT NOT NULL, target_kind TEXT NOT NULL, target_id TEXT NOT NULL, created_ms INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS library_entries(id TEXT PRIMARY KEY, user_id TEXT NOT NULL, item_kind TEXT NOT NULL, item_id TEXT NOT NULL, title TEXT NOT NULL, folder TEXT NOT NULL DEFAULT '', added_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS profile_fields(user_id TEXT NOT NULL, field TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(user_id, field));
 CREATE TABLE IF NOT EXISTS company_profile(field TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -357,19 +365,20 @@ impl Store {
         let conn = Connection::open(root.join("qimu.db")).map_err(db_err)?;
         conn.execute_batch(SCHEMA).map_err(db_err)?;
         // migrations for databases created before these columns existed
-        for (col, decl) in [
-            ("deck_id", "TEXT NOT NULL DEFAULT ''"),
-            ("manifest_json", "TEXT NOT NULL DEFAULT ''"),
+        for (table, col, decl) in [
+            ("exports", "deck_id", "TEXT NOT NULL DEFAULT ''"),
+            ("exports", "manifest_json", "TEXT NOT NULL DEFAULT ''"),
+            ("versions", "scripts_json", "TEXT NOT NULL DEFAULT '[]'"),
         ] {
             let has: bool = conn
-                .prepare("PRAGMA table_info(exports)")
+                .prepare(&format!("PRAGMA table_info({table})"))
                 .and_then(|mut s| {
                     let rows = s.query_map([], |r| r.get::<_, String>(1))?;
                     Ok(rows.collect::<Result<Vec<_>, _>>()?.iter().any(|n| n == col))
                 })
                 .unwrap_or(false);
             if !has {
-                conn.execute_batch(&format!("ALTER TABLE exports ADD COLUMN {col} {decl}"))
+                conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {col} {decl}"))
                     .map_err(db_err)?;
             }
         }
@@ -984,6 +993,7 @@ impl Store {
 
     fn row_to_version(r: &rusqlite::Row) -> rusqlite::Result<VersionRec> {
         let pages_json: String = r.get(9)?;
+        let scripts_json: String = r.get(11)?;
         Ok(VersionRec {
             id: r.get(0)?,
             rendition_id: r.get(1)?,
@@ -996,10 +1006,11 @@ impl Store {
             page_count: r.get(8)?,
             pages: serde_json::from_str(&pages_json).unwrap_or_default(),
             status: r.get(10)?,
+            scripts: serde_json::from_str(&scripts_json).unwrap_or_default(),
         })
     }
 
-    const VERSION_COLS: &'static str = "id, rendition_id, semver, basis_revision, author, note, created_ms, fragment_hash, page_count, pages_json, status";
+    const VERSION_COLS: &'static str = "id, rendition_id, semver, basis_revision, author, note, created_ms, fragment_hash, page_count, pages_json, status, scripts_json";
 
     /// Insert a version from a fragment PPTX: computes per-page fingerprints,
     /// titles and searchable text from the fragment itself.
@@ -1017,6 +1028,7 @@ impl Store {
         let slide_refs = crate::pptx::slides(&pkg)?;
         let mut pages = Vec::new();
         let mut texts = Vec::new();
+        let mut scripts = Vec::new();
         for s in &slide_refs {
             let xml = pkg.get_text(&s.part)?;
             pages.push(PageInfo {
@@ -1024,12 +1036,13 @@ impl Store {
                 title: slide_title(&xml),
             });
             texts.push(slide_full_text(&xml));
+            scripts.push(crate::text::notes_text(&pkg, &s.part));
         }
         let hash = self.file_put(fragment)?;
         let id = new_id("ver");
         self.conn
             .execute(
-                "INSERT INTO versions(id, rendition_id, semver, major, minor, patch, basis_revision, author, note, created_ms, fragment_hash, page_count, pages_json, text_all, status) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                "INSERT INTO versions(id, rendition_id, semver, major, minor, patch, basis_revision, author, note, created_ms, fragment_hash, page_count, pages_json, text_all, status, scripts_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
                 params![
                     id,
                     rendition_id,
@@ -1045,11 +1058,24 @@ impl Store {
                     pages.len() as i64,
                     serde_json::to_string(&pages).unwrap_or_default(),
                     texts.join("\n"),
-                    status
+                    status,
+                    serde_json::to_string(&scripts).unwrap_or_default()
                 ],
             )
             .map_err(db_err)?;
         self.get_version(&id)
+    }
+
+    /// Replace a version's per-page scripts. Editing scripts never bumps
+    /// the version or the content revision (§3.16).
+    pub fn set_version_scripts(&self, version_id: &str, scripts: &[String]) -> SResult<()> {
+        self.conn
+            .execute(
+                "UPDATE versions SET scripts_json=?2 WHERE id=?1",
+                params![version_id, serde_json::to_string(scripts).unwrap_or_default()],
+            )
+            .map_err(db_err)?;
+        Ok(())
     }
 
     pub fn get_version(&self, id: &str) -> SResult<VersionRec> {
@@ -1982,6 +2008,312 @@ impl Store {
     }
 
     // ---------- profiles & settings ----------
+
+    // ---------- custom groups / shares / library (§3.17, §7.7) ----------
+
+    /// Is `dept_id` the department `ancestor_id` itself or one of its
+    /// descendants? (Department shares reach sub-departments and people
+    /// who join them later.)
+    pub fn dept_within(&self, dept_id: &str, ancestor_id: &str) -> SResult<bool> {
+        let mut cur = Some(dept_id.to_string());
+        for _ in 0..64 {
+            match cur {
+                None => return Ok(false),
+                Some(ref d) if d == ancestor_id => return Ok(true),
+                Some(d) => {
+                    cur = self
+                        .conn
+                        .query_row(
+                            "SELECT parent_id FROM departments WHERE id=?1",
+                            params![d],
+                            |r| r.get::<_, Option<String>>(0),
+                        )
+                        .optional()
+                        .map_err(db_err)?
+                        .flatten();
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    pub fn create_custom_group(&self, owner_id: &str, name: &str) -> SResult<String> {
+        let id = new_id("cgrp");
+        self.conn
+            .execute(
+                "INSERT INTO custom_groups(id, name, owner_id, created_ms) VALUES(?1,?2,?3,?4)",
+                params![id, name, owner_id, now_ms()],
+            )
+            .map_err(db_err)?;
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO custom_group_members(group_id, user_id) VALUES(?1,?2)",
+                params![id, owner_id],
+            )
+            .map_err(db_err)?;
+        Ok(id)
+    }
+
+    pub fn custom_group(&self, id: &str) -> SResult<Option<(String, String)>> {
+        // (name, owner_id)
+        let row = self
+            .conn
+            .query_row(
+                "SELECT name, owner_id FROM custom_groups WHERE id=?1",
+                params![id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(db_err)?;
+        Ok(row)
+    }
+
+    pub fn custom_group_members(&self, group_id: &str) -> SResult<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT user_id FROM custom_group_members WHERE group_id=?1")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![group_id], |r| r.get::<_, String>(0))
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(rows)
+    }
+
+    pub fn add_custom_group_member(&self, group_id: &str, user_id: &str) -> SResult<()> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO custom_group_members(group_id, user_id) VALUES(?1,?2)",
+                params![group_id, user_id],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn remove_custom_group_member(&self, group_id: &str, user_id: &str) -> SResult<()> {
+        self.conn
+            .execute(
+                "DELETE FROM custom_group_members WHERE group_id=?1 AND user_id=?2",
+                params![group_id, user_id],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Custom groups the user owns or belongs to, as JSON with members.
+    pub fn list_custom_groups_for(&self, user_id: &str) -> SResult<Vec<serde_json::Value>> {
+        let users = self.list_users()?;
+        let name_of = |uid: &str| {
+            users
+                .iter()
+                .find(|u| u.id == uid)
+                .map(|u| u.display_name.clone())
+                .unwrap_or_else(|| uid.to_string())
+        };
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, name, owner_id, created_ms FROM custom_groups ORDER BY created_ms")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        let mut out = Vec::new();
+        for (id, name, owner_id, created_ms) in rows {
+            let members = self.custom_group_members(&id)?;
+            if owner_id != user_id && !members.iter().any(|m| m == user_id) {
+                continue;
+            }
+            out.push(serde_json::json!({
+                "id": id, "name": name, "owner_id": owner_id,
+                "owner_name": name_of(&owner_id), "created_ms": created_ms,
+                "members": members.iter().map(|m| serde_json::json!({
+                    "user_id": m, "name": name_of(m),
+                })).collect::<Vec<_>>(),
+            }));
+        }
+        Ok(out)
+    }
+
+    pub fn create_share(
+        &self,
+        item_kind: &str,
+        item_id: &str,
+        title: &str,
+        from_user: &str,
+        target_kind: &str,
+        target_id: &str,
+    ) -> SResult<String> {
+        let id = new_id("shr2");
+        self.conn
+            .execute(
+                "INSERT INTO shares(id, item_kind, item_id, title, from_user, target_kind, target_id, created_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![id, item_kind, item_id, title, from_user, target_kind, target_id, now_ms()],
+            )
+            .map_err(db_err)?;
+        Ok(id)
+    }
+
+    pub fn list_shares(&self) -> SResult<Vec<serde_json::Value>> {
+        let users = self.list_users()?;
+        let name_of = |uid: &str| {
+            users
+                .iter()
+                .find(|u| u.id == uid)
+                .map(|u| u.display_name.clone())
+                .unwrap_or_else(|| uid.to_string())
+        };
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, item_kind, item_id, title, from_user, target_kind, target_id, created_ms FROM shares ORDER BY created_ms DESC")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, String>(0)?,
+                    "item_kind": r.get::<_, String>(1)?,
+                    "item_id": r.get::<_, String>(2)?,
+                    "title": r.get::<_, String>(3)?,
+                    "from_user": r.get::<_, String>(4)?,
+                    "from_name": name_of(&r.get::<_, String>(4)?),
+                    "target_kind": r.get::<_, String>(5)?,
+                    "target_id": r.get::<_, String>(6)?,
+                    "created_ms": r.get::<_, i64>(7)?,
+                }))
+            })
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(rows)
+    }
+
+    pub fn get_showroom(&self, id: &str) -> SResult<Option<ShowroomRec>> {
+        Ok(self.list_showroom(None)?.into_iter().find(|r| r.id == id))
+    }
+
+    pub fn add_library_entry(
+        &self,
+        user_id: &str,
+        item_kind: &str,
+        item_id: &str,
+        title: &str,
+        folder: &str,
+    ) -> SResult<String> {
+        if let Some(existing) = self
+            .list_library(user_id)?
+            .iter()
+            .find(|e| e["item_id"] == item_id && e["item_kind"] == item_kind)
+        {
+            return Ok(existing["id"].as_str().unwrap_or_default().to_string());
+        }
+        let id = new_id("lib");
+        self.conn
+            .execute(
+                "INSERT INTO library_entries(id, user_id, item_kind, item_id, title, folder, added_ms) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![id, user_id, item_kind, item_id, title, folder, now_ms()],
+            )
+            .map_err(db_err)?;
+        Ok(id)
+    }
+
+    pub fn list_library(&self, user_id: &str) -> SResult<Vec<serde_json::Value>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, item_kind, item_id, title, folder, added_ms FROM library_entries WHERE user_id=?1 ORDER BY added_ms DESC")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![user_id], |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, String>(0)?,
+                    "item_kind": r.get::<_, String>(1)?,
+                    "item_id": r.get::<_, String>(2)?,
+                    "title": r.get::<_, String>(3)?,
+                    "folder": r.get::<_, String>(4)?,
+                    "added_ms": r.get::<_, i64>(5)?,
+                }))
+            })
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(rows)
+    }
+
+    pub fn remove_library_entry(&self, id: &str, user_id: &str) -> SResult<()> {
+        self.conn
+            .execute(
+                "DELETE FROM library_entries WHERE id=?1 AND user_id=?2",
+                params![id, user_id],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Can this user access a showroom item at item level: it is live and
+    /// (its source group is visible, or it was shared to them / their
+    /// department / one of their custom groups, or it sits in their
+    /// library, or they submitted it)?
+    pub fn showroom_item_access(&self, user: &UserRec, item: &ShowroomRec) -> SResult<bool> {
+        if item.submitted_by == user.id
+            || item.submitted_by == user.display_name
+            || user.role == "super"
+        {
+            return Ok(true);
+        }
+        if item.state != "live" {
+            return Ok(false);
+        }
+        if let Some(idx_id) = &item.source_index_id {
+            if let Ok(idx) = self.get_index(idx_id) {
+                if self.can_see_group(user, &idx.group_id)? {
+                    return Ok(true);
+                }
+            }
+        }
+        if self
+            .list_library(&user.id)?
+            .iter()
+            .any(|e| e["item_id"] == item.id)
+        {
+            return Ok(true);
+        }
+        let my_depts = self.user_dept_ids(&user.id)?;
+        let my_groups: Vec<String> = self
+            .list_custom_groups_for(&user.id)?
+            .iter()
+            .filter_map(|g| g["id"].as_str().map(|s| s.to_string()))
+            .collect();
+        for s in self.list_shares()? {
+            if s["item_kind"] != "showroom" || s["item_id"] != item.id {
+                continue;
+            }
+            match s["target_kind"].as_str() {
+                Some("user") if s["target_id"] == user.id => return Ok(true),
+                Some("group") if my_groups.iter().any(|g| Some(g.as_str()) == s["target_id"].as_str()) => {
+                    return Ok(true)
+                }
+                Some("dept") => {
+                    if let Some(t) = s["target_id"].as_str() {
+                        for d in &my_depts {
+                            if self.dept_within(d, t)? {
+                                return Ok(true);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(false)
+    }
 
     pub fn set_profile_field(&self, user_id: &str, field: &str, value: &str) -> SResult<()> {
         self.conn

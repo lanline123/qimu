@@ -341,6 +341,257 @@ async fn put_languages(
     Ok(Json(json!({ "ok": true })))
 }
 
+// ---------------- AI translation (§3.13) ----------------
+
+use qimu_core::translate::{GlossaryPair, Translator};
+
+fn load_glossary(store: &qimu_core::store::Store) -> Vec<GlossaryPair> {
+    store
+        .get_setting("glossary")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+async fn get_glossary(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
+    let _ = auth(&st, &headers)?;
+    let store = st.store.lock().unwrap();
+    Ok(Json(json!({ "pairs": load_glossary(&store) })))
+}
+
+#[derive(Deserialize)]
+struct GlossaryReq {
+    pairs: Vec<GlossaryPair>,
+}
+
+async fn put_glossary(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Json(req): Json<GlossaryReq>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    if user.role != "super" {
+        return Err(forbidden());
+    }
+    let store = st.store.lock().unwrap();
+    store
+        .set_setting("glossary", &serde_json::to_string(&req.pairs).unwrap_or_default())
+        .map_err(bad)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn get_ai_settings(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    if user.role != "super" {
+        return Err(forbidden());
+    }
+    let store = st.store.lock().unwrap();
+    let get = |k: &str| store.get_setting(k).ok().flatten().unwrap_or_default();
+    let p = get("ai_provider");
+    Ok(Json(json!({
+        "provider": if p.is_empty() { "stub".to_string() } else { p },
+        "endpoint": get("ai_endpoint"),
+        "model": get("ai_model"),
+        "has_key": !get("ai_api_key").is_empty(),
+    })))
+}
+
+#[derive(Deserialize)]
+struct AiSettingsReq {
+    provider: String,
+    endpoint: Option<String>,
+    model: Option<String>,
+    api_key: Option<String>,
+}
+
+async fn put_ai_settings(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Json(req): Json<AiSettingsReq>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    if user.role != "super" {
+        return Err(forbidden());
+    }
+    let store = st.store.lock().unwrap();
+    store.set_setting("ai_provider", &req.provider).map_err(bad)?;
+    if let Some(e) = &req.endpoint {
+        store.set_setting("ai_endpoint", e).map_err(bad)?;
+    }
+    if let Some(m) = &req.model {
+        store.set_setting("ai_model", m).map_err(bad)?;
+    }
+    if let Some(k) = &req.api_key {
+        store.set_setting("ai_api_key", k).map_err(bad)?;
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// OpenAI-compatible chat-completions provider.
+struct OpenAiCompat {
+    endpoint: String, // base URL, e.g. https://api.openai.com
+    api_key: String,
+    model: String,
+}
+
+impl Translator for OpenAiCompat {
+    fn translate(
+        &self,
+        texts: &[String],
+        target_lang: &str,
+        glossary: &[GlossaryPair],
+    ) -> Result<Vec<String>, String> {
+        let gloss = glossary
+            .iter()
+            .map(|g| format!("{} -> {}", g.src, g.dst))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let system = format!(
+            "You translate presentation slide text into {target_lang}. \
+             Return ONLY a JSON array of strings with exactly the same length and order as the input array. \
+             Preserve {{{{placeholders}}}}, numbers, units and line breaks. \
+             Never translate these terms differently: {gloss}. \
+             If a string is empty or whitespace, return it unchanged."
+        );
+        let body = json!({
+            "model": self.model,
+            "messages": [
+                { "role": "system", "content": system },
+                { "role": "user", "content": serde_json::to_string(texts).unwrap_or_default() },
+            ],
+            "temperature": 0.2,
+        });
+        let url = format!("{}/v1/chat/completions", self.endpoint.trim_end_matches('/'));
+        let resp = ureq::post(&url)
+            .set("Authorization", &format!("Bearer {}", self.api_key))
+            .send_json(body)
+            .map_err(|e| format!("翻译服务请求失败：{e}"))?;
+        let v: Value = resp.into_json().map_err(|e| e.to_string())?;
+        let content = v["choices"][0]["message"]["content"]
+            .as_str()
+            .ok_or("翻译服务返回格式异常")?;
+        let content = content.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+        let out: Vec<String> = serde_json::from_str(content)
+            .map_err(|e| format!("翻译服务未返回 JSON 数组：{e}"))?;
+        Ok(out)
+    }
+}
+
+#[derive(Deserialize)]
+struct TranslateReq {
+    version_id: String,
+    target_lang: String,
+}
+
+/// Translate one version into a target language: creates (or reuses) the
+/// target rendition and publishes a DRAFT 1.0.0 whose provenance is
+/// recorded in the note and in `ai` page bindings (§3.13/§3.15).
+async fn translate_unit(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<TranslateReq>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let unit = {
+        let store = st.store.lock().unwrap();
+        store.get_unit(&id).map_err(|_| not_found())?
+    };
+    need_cap(&st, &user, &unit.group_id, "publish")?;
+    let (src_version, src_rendition, frag_bytes, glossary, provider_cfg) = {
+        let store = st.store.lock().unwrap();
+        let v = store.get_version(&req.version_id).map_err(|_| not_found())?;
+        let r = store.get_rendition(&v.rendition_id).map_err(bad)?;
+        if r.unit_id != id {
+            return Err(bad("版本不属于该内容块"));
+        }
+        let bytes = store.file_get(&v.fragment_hash).map_err(bad)?;
+        let get = |k: &str| store.get_setting(k).ok().flatten().unwrap_or_default();
+        (
+            v,
+            r,
+            bytes,
+            load_glossary(&store),
+            (get("ai_provider"), get("ai_endpoint"), get("ai_model"), get("ai_api_key")),
+        )
+    };
+    let (provider_name, endpoint, model, api_key) = provider_cfg;
+    let translator: Box<dyn Translator> = match provider_name.as_str() {
+        "openai-compat" => {
+            if endpoint.is_empty() || api_key.is_empty() || model.is_empty() {
+                return Err(bad("AI 翻译未配置完整（endpoint / model / api_key），请先在设置中配置，或使用 stub 提供方"));
+            }
+            Box::new(OpenAiCompat { endpoint, api_key, model })
+        }
+        _ => Box::new(qimu_core::translate::StubTranslator),
+    };
+    let pkg = Package::load(&frag_bytes).map_err(bad)?;
+    let (mut new_pkg, run_count) = qimu_core::translate::translate_package(
+        &pkg,
+        translator.as_ref(),
+        &req.target_lang,
+        &glossary,
+    )
+    .map_err(bad)?;
+    // translate the speaker scripts too, and write them into the notes
+    let src_scripts: Vec<String> = src_version.scripts.clone();
+    let non_empty: Vec<String> = src_scripts.iter().filter(|s| !s.trim().is_empty()).cloned().collect();
+    let mut translated_scripts = src_scripts.clone();
+    if !non_empty.is_empty() {
+        let out = translator
+            .translate(&non_empty, &req.target_lang, &glossary)
+            .map_err(bad)?;
+        let mut it = out.into_iter();
+        for s in translated_scripts.iter_mut() {
+            if !s.trim().is_empty() {
+                *s = it.next().unwrap_or_default();
+            }
+        }
+        for (i, s) in translated_scripts.iter().enumerate() {
+            if !s.is_empty() {
+                qimu_core::pptx::set_notes_text(&mut new_pkg, i, s);
+            }
+        }
+    }
+    let new_bytes = new_pkg.to_bytes().map_err(bad)?;
+    let store = st.store.lock().unwrap();
+    let rend = store
+        .get_or_create_rendition(&id, &src_rendition.form, &req.target_lang)
+        .map_err(bad)?;
+    let version = store
+        .insert_version(
+            &rend.id,
+            SemVer::new(1, 0, 0),
+            src_version.basis_revision,
+            &user.display_name,
+            &format!(
+                "AI 翻译草稿（待校对）· 源 {} v{} · {} 个文本run",
+                src_rendition.lang, src_version.semver, run_count
+            ),
+            &new_bytes,
+            "draft",
+        )
+        .map_err(bad)?;
+    for i in 0..src_version.page_count {
+        let _ = store.add_page_binding(
+            &id,
+            &src_version.id,
+            i,
+            &version.id,
+            i,
+            "ai",
+            &user.display_name,
+        );
+    }
+    Ok(Json(json!({
+        "version": version,
+        "rendition_id": rend.id,
+        "provider": if provider_name.is_empty() { "stub".to_string() } else { provider_name },
+        "translated_runs": run_count,
+    })))
+}
+
 // ---------------- folders ----------------
 
 async fn folders(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
@@ -516,6 +767,26 @@ struct ImportReq {
     folder_id: Option<String>,
     group_id: String,
     blocks: Option<Vec<ImportBlock>>,
+}
+
+#[derive(Deserialize)]
+struct ProposeReq {
+    data_base64: String,
+}
+
+/// Propose content blocks for an import (§5.8 step 1). Nothing is
+/// stored; the importer confirms or adjusts the proposal.
+async fn import_propose(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Json(req): Json<ProposeReq>,
+) -> Api<Value> {
+    let _ = auth(&st, &headers)?;
+    let _ = &st;
+    let bytes = b64d(&req.data_base64)?;
+    let pkg = Package::load(&bytes).map_err(bad)?;
+    let report = qimu_core::propose::propose_blocks(&pkg).map_err(bad)?;
+    Ok(Json(serde_json::to_value(&report).unwrap_or_default()))
 }
 
 /// Import (§5.8 + §3.1): the deck is split, reassembled and verified
@@ -919,6 +1190,48 @@ async fn delete_page_binding(
     Ok(Json(json!({ "ok": true })))
 }
 
+async fn get_version(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let store = st.store.lock().unwrap();
+    let v = store.get_version(&id).map_err(|_| not_found())?;
+    let rend = store.get_rendition(&v.rendition_id).map_err(bad)?;
+    let unit = store.get_unit(&rend.unit_id).map_err(bad)?;
+    if !store.can_see_group(&user, &unit.group_id).map_err(bad)? {
+        return Err(not_found());
+    }
+    Ok(Json(json!({ "version": v })))
+}
+
+#[derive(Deserialize)]
+struct ScriptsReq {
+    scripts: Vec<String>,
+}
+
+/// Edit a version's per-page speaker scripts. Never bumps the version
+/// (§3.16); requires publish capability on the unit's group.
+async fn put_version_scripts(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<ScriptsReq>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let unit = {
+        let store = st.store.lock().unwrap();
+        let v = store.get_version(&id).map_err(|_| not_found())?;
+        let rend = store.get_rendition(&v.rendition_id).map_err(bad)?;
+        store.get_unit(&rend.unit_id).map_err(bad)?
+    };
+    need_cap(&st, &user, &unit.group_id, "publish")?;
+    let store = st.store.lock().unwrap();
+    store.set_version_scripts(&id, &req.scripts).map_err(bad)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
 async fn add_version_tag(
     State(st): State<St>,
     headers: HeaderMap,
@@ -1271,10 +1584,12 @@ fn build_export(
     entries: &[IndexEntry],
     source: Option<SourceRef>,
     kind: &str,
+    include_notes: bool,
 ) -> Result<(Vec<u8>, Manifest, i64), (StatusCode, Json<Value>)> {
     let store = st.store.lock().unwrap();
     let mut pkgs: Vec<Package> = Vec::new();
     let mut bindings: Vec<Binding> = Vec::new();
+    let mut binding_scripts: Vec<Vec<String>> = Vec::new();
     for e in entries {
         let version = store
             .resolve_entry_version(e)
@@ -1292,12 +1607,15 @@ fn build_export(
             None => (0..singles.len()).collect(),
         };
         let mut fps = Vec::new();
+        let mut scripts = Vec::new();
         for i in &chosen {
             if let Some(p) = version.pages.get(*i) {
                 fps.push(p.fp.clone());
             }
+            scripts.push(version.scripts.get(*i).cloned().unwrap_or_default());
             pkgs.push(singles[*i].clone());
         }
+        binding_scripts.push(scripts);
         bindings.push(Binding {
             unit_id: e.unit_id.0.clone(),
             rendition_id: e.rendition_id.0.clone(),
@@ -1311,6 +1629,19 @@ fn build_export(
     }
     let page_count = pkgs.len() as i64;
     let mut assembled = qimu_core::assemble::assemble(&pkgs).map_err(bad)?;
+    // Speaker scripts (§3.16): optionally write each version's per-page
+    // 讲稿 back into the deck's notes pages.
+    if include_notes {
+        let mut cursor = 0usize;
+        for scripts in &binding_scripts {
+            for script in scripts {
+                if !script.is_empty() {
+                    qimu_core::pptx::set_notes_text(&mut assembled, cursor, script);
+                }
+                cursor += 1;
+            }
+        }
+    }
     // Personal binding (§3.14): resolve {{placeholders}} per recipient.
     // 个人版 = exporter's own profile + company data; 公用版 = company
     // data only, personal placeholders scrubbed blank. A placeholder with
@@ -1367,6 +1698,7 @@ struct ExportReq {
     branch: Option<String>,
     tag: Option<String>,
     kind: Option<String>,
+    include_notes: Option<bool>,
 }
 
 async fn export_index(
@@ -1406,7 +1738,14 @@ async fn export_index(
         commit_id: commit.id.clone(),
         tag: req.tag.clone(),
     };
-    let (deck, manifest, page_count) = build_export(&st, &user, &commit.entries, Some(source), kind)?;
+    let (deck, manifest, page_count) = build_export(
+        &st,
+        &user,
+        &commit.entries,
+        Some(source),
+        kind,
+        req.include_notes.unwrap_or(false),
+    )?;
     let export_id = qimu_core::auth::new_id("exp");
     {
         let store = st.store.lock().unwrap();
@@ -1780,6 +2119,320 @@ async fn review_showroom(
     Ok(Json(json!({ "ok": true })))
 }
 
+// ---------------- custom groups / shares / library (§3.17, §7.7) ----------------
+
+#[derive(Deserialize)]
+struct CGroupReq {
+    name: String,
+}
+
+async fn create_custom_group(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Json(req): Json<CGroupReq>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let store = st.store.lock().unwrap();
+    let id = store.create_custom_group(&user.id, &req.name).map_err(bad)?;
+    Ok(Json(json!({ "id": id })))
+}
+
+async fn list_custom_groups(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let store = st.store.lock().unwrap();
+    let groups = store.list_custom_groups_for(&user.id).map_err(bad)?;
+    Ok(Json(json!({ "groups": groups })))
+}
+
+#[derive(Deserialize)]
+struct MemberReq {
+    user_id: String,
+}
+
+async fn add_custom_group_member(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<MemberReq>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let store = st.store.lock().unwrap();
+    let (_, owner) = store.custom_group(&id).map_err(bad)?.ok_or_else(|| not_found())?;
+    if owner != user.id && user.role != "super" {
+        return Err(forbidden());
+    }
+    store
+        .add_custom_group_member(&id, &req.user_id)
+        .map_err(bad)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn remove_custom_group_member(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<MemberReq>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let store = st.store.lock().unwrap();
+    let (_, owner) = store.custom_group(&id).map_err(bad)?.ok_or_else(|| not_found())?;
+    if owner != user.id && user.id != req.user_id && user.role != "super" {
+        return Err(forbidden());
+    }
+    store
+        .remove_custom_group_member(&id, &req.user_id)
+        .map_err(bad)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct ShareReq {
+    item_kind: String, // showroom | assembly
+    item_id: String,
+    target_kind: String, // user | dept | group
+    target_id: String,
+}
+
+async fn create_share(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Json(req): Json<ShareReq>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let store = st.store.lock().unwrap();
+    // the sharer must actually hold the item
+    let title = match req.item_kind.as_str() {
+        "showroom" => {
+            let item = store
+                .get_showroom(&req.item_id)
+                .map_err(bad)?
+                .ok_or_else(|| not_found())?;
+            if !store.showroom_item_access(&user, &item).map_err(bad)? {
+                return Err(forbidden());
+            }
+            item.title.clone()
+        }
+        "assembly" => {
+            let mine = store.list_assemblies(&user.id).map_err(bad)?;
+            let a = mine
+                .iter()
+                .find(|a| a["id"] == req.item_id)
+                .ok_or_else(|| not_found())?;
+            a["name"].as_str().unwrap_or("组装").to_string()
+        }
+        _ => return Err(bad("item_kind 只能是 showroom 或 assembly")),
+    };
+    // validate target
+    match req.target_kind.as_str() {
+        "user" => {
+            if !store.list_users().map_err(bad)?.iter().any(|u| u.id == req.target_id) {
+                return Err(bad("目标用户不存在"));
+            }
+        }
+        "dept" => {
+            if !store.list_departments().map_err(bad)?.iter().any(|d| d.id == req.target_id) {
+                return Err(bad("目标部门不存在"));
+            }
+        }
+        "group" => {
+            let members = store.custom_group_members(&req.target_id).map_err(bad)?;
+            if !members.iter().any(|m| m == &user.id) {
+                return Err(forbidden());
+            }
+        }
+        _ => return Err(bad("target_kind 只能是 user、dept 或 group")),
+    }
+    let id = store
+        .create_share(&req.item_kind, &req.item_id, &title, &user.id, &req.target_kind, &req.target_id)
+        .map_err(bad)?;
+    Ok(Json(json!({ "share_id": id })))
+}
+
+/// Shares landing in my inbox: targeted at me directly, or at a
+/// department I belong to (incl. sub-department reach). Group shares
+/// live in the group space instead.
+async fn list_inbox(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let store = st.store.lock().unwrap();
+    let my_depts = store.user_dept_ids(&user.id).map_err(bad)?;
+    let library = store.list_library(&user.id).map_err(bad)?;
+    let mut out = Vec::new();
+    for s in store.list_shares().map_err(bad)? {
+        if s["from_user"] == user.id {
+            continue;
+        }
+        let visible = match s["target_kind"].as_str() {
+            Some("user") => s["target_id"] == user.id,
+            Some("dept") => {
+                let t = s["target_id"].as_str().unwrap_or("");
+                let mut v = false;
+                for d in &my_depts {
+                    if store.dept_within(d, t).map_err(bad)? {
+                        v = true;
+                        break;
+                    }
+                }
+                v
+            }
+            _ => false,
+        };
+        if visible {
+            let mut s = s;
+            s["in_library"] = json!(library.iter().any(|e| e["item_id"] == s["item_id"]));
+            out.push(s);
+        }
+    }
+    Ok(Json(json!({ "shares": out })))
+}
+
+/// Group space: shares targeted at custom groups I belong to, grouped.
+async fn group_space(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let store = st.store.lock().unwrap();
+    let groups = store.list_custom_groups_for(&user.id).map_err(bad)?;
+    let shares = store.list_shares().map_err(bad)?;
+    let mut out = Vec::new();
+    for g in &groups {
+        let items: Vec<Value> = shares
+            .iter()
+            .filter(|s| {
+                s["target_kind"] == "group" && s["target_id"] == g["id"]
+            })
+            .cloned()
+            .collect();
+        out.push(json!({ "group": g, "items": items }));
+    }
+    Ok(Json(json!({ "spaces": out })))
+}
+
+#[derive(Deserialize)]
+struct AcceptReq {
+    folder: Option<String>,
+}
+
+async fn accept_share(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<AcceptReq>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let store = st.store.lock().unwrap();
+    let share = store
+        .list_shares()
+        .map_err(bad)?
+        .into_iter()
+        .find(|s| s["id"] == id)
+        .ok_or_else(|| not_found())?;
+    // must be a legitimate recipient (same rules as inbox / group space)
+    let my_depts = store.user_dept_ids(&user.id).map_err(bad)?;
+    let recipient = match share["target_kind"].as_str() {
+        Some("user") => share["target_id"] == user.id,
+        Some("dept") => {
+            let t = share["target_id"].as_str().unwrap_or("");
+            let mut v = false;
+            for d in &my_depts {
+                if store.dept_within(d, t).map_err(bad)? {
+                    v = true;
+                    break;
+                }
+            }
+            v
+        }
+        Some("group") => store
+            .custom_group_members(share["target_id"].as_str().unwrap_or(""))
+            .map_err(bad)?
+            .iter()
+            .any(|m| m == &user.id),
+        _ => false,
+    };
+    if !recipient {
+        return Err(forbidden());
+    }
+    let lib_id = store
+        .add_library_entry(
+            &user.id,
+            share["item_kind"].as_str().unwrap_or("showroom"),
+            share["item_id"].as_str().unwrap_or(""),
+            share["title"].as_str().unwrap_or(""),
+            req.folder.as_deref().unwrap_or(""),
+        )
+        .map_err(bad)?;
+    Ok(Json(json!({ "library_id": lib_id })))
+}
+
+async fn list_library(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let store = st.store.lock().unwrap();
+    let entries = store.list_library(&user.id).map_err(bad)?;
+    Ok(Json(json!({ "entries": entries })))
+}
+
+async fn remove_library_entry(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let store = st.store.lock().unwrap();
+    store.remove_library_entry(&id, &user.id).map_err(bad)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Export a showroom item's deck at item level: live item + (source
+/// group visible OR item shared to me / in my library / mine).
+async fn export_showroom(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<ExportReq>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let (item, entries, source) = {
+        let store = st.store.lock().unwrap();
+        let item = store
+            .get_showroom(&id)
+            .map_err(bad)?
+            .ok_or_else(|| not_found())?;
+        if !store.showroom_item_access(&user, &item).map_err(bad)? {
+            return Err(not_found());
+        }
+        let idx_id = item.source_index_id.clone().ok_or_else(|| bad("该条目没有来源索引"))?;
+        let commit = match &item.commit_id {
+            Some(cid) => store.get_commit(cid).map_err(bad)?,
+            None => {
+                let head = store
+                    .branch_head(&idx_id, "main")
+                    .map_err(bad)?
+                    .ok_or_else(|| bad("来源索引尚无提交"))?;
+                store.get_commit(&head).map_err(bad)?
+            }
+        };
+        let source = SourceRef {
+            index_id: idx_id,
+            branch: "main".to_string(),
+            commit_id: commit.id.clone(),
+            tag: None,
+        };
+        (item, commit.entries.clone(), source)
+    };
+    let _ = item;
+    let kind = req.kind.as_deref().unwrap_or("personal");
+    let (deck, manifest, page_count) = build_export(
+        &st,
+        &user,
+        &entries,
+        Some(source),
+        kind,
+        req.include_notes.unwrap_or(false),
+    )?;
+    Ok(Json(json!({
+        "page_count": page_count,
+        "manifest": manifest,
+        "data_base64": b64e(&deck),
+    })))
+}
+
 #[derive(Deserialize)]
 struct AssemblyReq {
     name: String,
@@ -1809,6 +2462,7 @@ async fn create_assembly(
 #[derive(Deserialize)]
 struct AssemblyExportReq {
     kind: Option<String>,
+    include_notes: Option<bool>,
 }
 
 async fn export_assembly(
@@ -1822,8 +2476,14 @@ async fn export_assembly(
         let store = st.store.lock().unwrap();
         store.assembly_entries(&id).map_err(|_| not_found())?
     };
-    let (deck, manifest, page_count) =
-        build_export(&st, &user, &entries, None, req.kind.as_deref().unwrap_or("personal"))?;
+    let (deck, manifest, page_count) = build_export(
+        &st,
+        &user,
+        &entries,
+        None,
+        req.kind.as_deref().unwrap_or("personal"),
+        req.include_notes.unwrap_or(false),
+    )?;
     Ok(Json(json!({
         "page_count": page_count,
         "manifest": manifest,
@@ -1859,6 +2519,9 @@ async fn main() {
         .route("/v1/grants", get(grants).post(add_grant))
         .route("/v1/company-profile", get(company_profile).put(put_company_profile))
         .route("/v1/settings/languages", get(languages).put(put_languages))
+        .route("/v1/settings/glossary", get(get_glossary).put(put_glossary))
+        .route("/v1/settings/ai", get(get_ai_settings).put(put_ai_settings))
+        .route("/v1/units/:id/translate", post(translate_unit))
         .route("/v1/folders", get(folders).post(create_folder))
         .route("/v1/folders/:id/rename", post(rename_folder))
         .route("/v1/units", get(list_units).post(create_unit))
@@ -1874,12 +2537,15 @@ async fn main() {
             Ok::<_, (StatusCode, Json<Value>)>(Json(json!({ "current_revision": r })))
         }))
         .route("/v1/import", post(import_deck))
+        .route("/v1/import/propose", post(import_propose))
         .route("/v1/units/:id/publish", post(publish))
         .route("/v1/versions/:id/recall", post(recall_version))
         .route("/v1/versions/:id/delete", post(delete_version))
         .route("/v1/versions/:id/fragment", get(version_fragment))
         .route("/v1/versions/:id/thumb/:page", get(version_thumb))
         .route("/v1/versions/:id/tags", get(list_version_tags).post(add_version_tag))
+        .route("/v1/versions/:id", get(get_version))
+        .route("/v1/versions/:id/scripts", axum::routing::put(put_version_scripts))
         .route(
             "/v1/units/:id/page-bindings",
             get(list_page_bindings).post(add_page_binding),
@@ -1903,6 +2569,16 @@ async fn main() {
         .route("/v1/attachments/:id/download", get(download_attachment))
         .route("/v1/showroom", get(list_showroom).post(submit_showroom))
         .route("/v1/showroom/:id/review", post(review_showroom))
+        .route("/v1/showroom/:id/export", post(export_showroom))
+        .route("/v1/custom-groups", get(list_custom_groups).post(create_custom_group))
+        .route("/v1/custom-groups/:id/members", post(add_custom_group_member))
+        .route("/v1/custom-groups/:id/members/remove", post(remove_custom_group_member))
+        .route("/v1/shares", post(create_share))
+        .route("/v1/shares/inbox", get(list_inbox))
+        .route("/v1/shares/:id/accept", post(accept_share))
+        .route("/v1/group-space", get(group_space))
+        .route("/v1/library", get(list_library))
+        .route("/v1/library/:id/delete", post(remove_library_entry))
         .route("/v1/assemblies", get(list_assemblies).post(create_assembly))
         .route("/v1/assemblies/:id/export", post(export_assembly))
         .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
