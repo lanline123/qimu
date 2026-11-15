@@ -2,6 +2,7 @@
 //! 演示厅 / 内容页 / 索引页 / 设置, talking to qimu-server over HTTP.
 //! All logic lives in qimu-core / the server; this crate is a frontend,
 //! exactly like the CLI (spec §4.4 parity).
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use base64::Engine;
 use eframe::egui;
@@ -9,7 +10,26 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 fn install_cjk_font(ctx: &egui::Context) {
-    // egui's bundled fonts have no CJK glyphs; load a system CJK font.
+    // Default UI font: Alibaba PuHuiTi 3.0, embedded at build time when
+    // the font file is present in assets/ (see build.rs). egui's bundled
+    // fonts have no CJK glyphs, so a system CJK font is the fallback.
+    let mut fonts = egui::FontDefinitions::default();
+    #[cfg(puhuiti)]
+    {
+        fonts.font_data.insert(
+            "puhuiti".to_owned(),
+            egui::FontData::from_static(include_bytes!(
+                "../assets/AlibabaPuHuiTi-3-55-Regular.ttf"
+            )),
+        );
+        for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts
+                .families
+                .entry(fam)
+                .or_default()
+                .insert(0, "puhuiti".to_owned());
+        }
+    }
     let candidates = [
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
@@ -20,7 +40,6 @@ fn install_cjk_font(ctx: &egui::Context) {
     ];
     for path in candidates {
         if let Ok(bytes) = std::fs::read(path) {
-            let mut fonts = egui::FontDefinitions::default();
             fonts.font_data.insert(
                 "cjk".to_owned(),
                 egui::FontData::from_owned(bytes),
@@ -30,12 +49,12 @@ fn install_cjk_font(ctx: &egui::Context) {
                     .families
                     .entry(fam)
                     .or_default()
-                    .insert(0, "cjk".to_owned());
+                    .push("cjk".to_owned());
             }
-            ctx.set_fonts(fonts);
-            return;
+            break;
         }
     }
+    ctx.set_fonts(fonts);
 }
 
 /// Design language of the Craft family apps in their dark theme (the
