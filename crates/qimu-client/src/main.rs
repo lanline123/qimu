@@ -45,7 +45,7 @@ fn install_cjk_font(ctx: &egui::Context) {
 pub const ACCENT: egui::Color32 = egui::Color32::from_rgb(0xD9, 0x5A, 0x1A);
 pub const ACCENT_DEEP: egui::Color32 = egui::Color32::from_rgb(0xC2, 0x4E, 0x14);
 pub const CHROME: egui::Color32 = egui::Color32::from_rgb(0xF5, 0xF5, 0xF5);
-pub const APP_BG: egui::Color32 = egui::Color32::from_rgb(0xF0, 0xF0, 0xF0);
+pub const APP_BG: egui::Color32 = egui::Color32::from_rgb(0xFB, 0xFB, 0xFB);
 pub const CARD_BORDER: egui::Color32 = egui::Color32::from_rgb(0xE3, 0xE3, 0xE3);
 pub const SEPARATOR: egui::Color32 = egui::Color32::from_rgb(0xE1, 0xE1, 0xE1);
 pub const TEXT_MAIN: egui::Color32 = egui::Color32::from_rgb(0x24, 0x24, 0x24);
@@ -62,8 +62,8 @@ fn apply_modern_style(ctx: &egui::Context) {
     // Craft's text_field gray, so fields read on white cards and canvas.
     v.extreme_bg_color = egui::Color32::from_rgb(0xEB, 0xEB, 0xEB);
     v.faint_bg_color = HOVER_BG;
-    v.selection.bg_fill = ACCENT.gamma_multiply(0.85);
-    v.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+    v.selection.bg_fill = egui::Color32::from_rgb(0xE6, 0xE6, 0xE6);
+    v.selection.stroke = egui::Stroke::new(1.0, TEXT_MAIN);
     v.hyperlink_color = ACCENT;
     v.override_text_color = Some(TEXT_MAIN);
     v.window_rounding = egui::Rounding::same(10.0);
@@ -140,10 +140,10 @@ fn card_frame() -> egui::Frame {
         .rounding(egui::Rounding::same(10.0))
         .inner_margin(egui::Margin::same(14.0))
         .shadow(egui::epaint::Shadow {
-            offset: egui::vec2(0.0, 2.0),
-            blur: 10.0,
+            offset: egui::vec2(0.0, 1.0),
+            blur: 6.0,
             spread: 0.0,
-            color: egui::Color32::from_black_alpha(18),
+            color: egui::Color32::from_black_alpha(8),
         })
 }
 
@@ -949,7 +949,7 @@ impl eframe::App for App {
         egui::TopBottomPanel::top("top")
             .frame(
                 egui::Frame::none()
-                    .fill(CHROME)
+                    .fill(egui::Color32::WHITE)
                     .inner_margin(egui::Margin {
                         left: 14.0,
                         right: 14.0,
@@ -1001,7 +1001,7 @@ impl eframe::App for App {
         egui::TopBottomPanel::bottom("status")
             .frame(
                 egui::Frame::none()
-                    .fill(CHROME)
+                    .fill(egui::Color32::WHITE)
                     .inner_margin(egui::Margin {
                         left: 14.0,
                         right: 14.0,
