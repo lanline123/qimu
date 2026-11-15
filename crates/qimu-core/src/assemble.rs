@@ -403,3 +403,35 @@ mod debug_tests {
         assert!(report.ok, "nested assembly failed verification");
     }
 }
+
+#[cfg(test)]
+mod debug_charts {
+    use super::*;
+    use crate::pptx::split;
+
+    #[test]
+    fn case2_charts_survive_split_and_assemble() {
+        let bytes = std::fs::read("/home/hatch/workspace/user/files/Case2_Charts_Animation.pptx")
+            .expect("case2 deck");
+        let pkg = Package::load(&bytes).unwrap();
+        let singles = split(&pkg).unwrap();
+        assert_eq!(singles.len(), 7);
+        for (i, s) in singles.iter().enumerate() {
+            let charts: Vec<&String> = s
+                .parts
+                .keys()
+                .filter(|k| k.contains("charts/") && k.ends_with(".xml"))
+                .collect();
+            println!("single {i}: {} parts, charts: {charts:?}", s.parts.len());
+        }
+        let merged = assemble(&singles).unwrap();
+        let charts: Vec<&String> = merged
+            .parts
+            .keys()
+            .filter(|k| k.contains("chart"))
+            .collect();
+        println!("merged charts: {charts:?}");
+        assert!(charts.iter().any(|c| c.contains("chart1")), "charts lost in assemble");
+    }
+}
+

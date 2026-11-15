@@ -263,6 +263,13 @@ pub struct ExportRec {
     pub deck_hash: String,
     pub page_count: i64,
     pub kind: String, // personal | public
+    /// The manifest's deck_id + full manifest JSON, kept server-side so a
+    /// deck whose embedded manifest was stripped by an editor can be
+    /// recovered from the surviving deck-id token.
+    #[serde(default)]
+    pub deck_id: String,
+    #[serde(default)]
+    pub manifest_json: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -328,7 +335,7 @@ CREATE TABLE IF NOT EXISTS indexes_tbl(id TEXT PRIMARY KEY, name TEXT NOT NULL, 
 CREATE TABLE IF NOT EXISTS index_branches(index_id TEXT NOT NULL, name TEXT NOT NULL, head_commit TEXT, PRIMARY KEY(index_id, name));
 CREATE TABLE IF NOT EXISTS index_commits(id TEXT PRIMARY KEY, index_id TEXT NOT NULL, branch TEXT NOT NULL, parent_id TEXT, author TEXT NOT NULL, message TEXT NOT NULL, created_ms INTEGER NOT NULL, entries_json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS index_tags(id TEXT PRIMARY KEY, index_id TEXT NOT NULL, branch TEXT NOT NULL, name TEXT NOT NULL, commit_id TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS exports(id TEXT PRIMARY KEY, index_id TEXT NOT NULL, branch TEXT NOT NULL, commit_id TEXT NOT NULL, tag TEXT, user_id TEXT NOT NULL, created_ms INTEGER NOT NULL, deck_hash TEXT NOT NULL, page_count INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'personal');
+CREATE TABLE IF NOT EXISTS exports(id TEXT PRIMARY KEY, index_id TEXT NOT NULL, branch TEXT NOT NULL, commit_id TEXT NOT NULL, tag TEXT, user_id TEXT NOT NULL, created_ms INTEGER NOT NULL, deck_hash TEXT NOT NULL, page_count INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'personal', deck_id TEXT NOT NULL DEFAULT '', manifest_json TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS attachments(id TEXT PRIMARY KEY, parent_type TEXT NOT NULL, parent_id TEXT NOT NULL, filename TEXT NOT NULL, hash TEXT NOT NULL, size INTEGER NOT NULL, uploader TEXT NOT NULL, created_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS version_tags(id TEXT PRIMARY KEY, version_id TEXT NOT NULL, dim TEXT NOT NULL, value TEXT NOT NULL, strength TEXT NOT NULL DEFAULT 'fits', author TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS showroom(id TEXT PRIMARY KEY, title TEXT NOT NULL, intro TEXT NOT NULL DEFAULT '', source_index_id TEXT, commit_id TEXT, submitted_by TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending', created_ms INTEGER NOT NULL);
@@ -349,6 +356,23 @@ impl Store {
         std::fs::create_dir_all(root.join("files")).map_err(|e| e.to_string())?;
         let conn = Connection::open(root.join("qimu.db")).map_err(db_err)?;
         conn.execute_batch(SCHEMA).map_err(db_err)?;
+        // migrations for databases created before these columns existed
+        for (col, decl) in [
+            ("deck_id", "TEXT NOT NULL DEFAULT ''"),
+            ("manifest_json", "TEXT NOT NULL DEFAULT ''"),
+        ] {
+            let has: bool = conn
+                .prepare("PRAGMA table_info(exports)")
+                .and_then(|mut s| {
+                    let rows = s.query_map([], |r| r.get::<_, String>(1))?;
+                    Ok(rows.collect::<Result<Vec<_>, _>>()?.iter().any(|n| n == col))
+                })
+                .unwrap_or(false);
+            if !has {
+                conn.execute_batch(&format!("ALTER TABLE exports ADD COLUMN {col} {decl}"))
+                    .map_err(db_err)?;
+            }
+        }
         Ok(Store {
             conn,
             root: root.to_path_buf(),
@@ -1682,7 +1706,7 @@ impl Store {
     pub fn insert_export(&self, rec: &ExportRec) -> SResult<()> {
         self.conn
             .execute(
-                "INSERT INTO exports(id, index_id, branch, commit_id, tag, user_id, created_ms, deck_hash, page_count, kind) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                "INSERT INTO exports(id, index_id, branch, commit_id, tag, user_id, created_ms, deck_hash, page_count, kind, deck_id, manifest_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
                 params![
                     rec.id,
                     rec.index_id,
@@ -1693,7 +1717,9 @@ impl Store {
                     rec.created_ms,
                     rec.deck_hash,
                     rec.page_count,
-                    rec.kind
+                    rec.kind,
+                    rec.deck_id,
+                    rec.manifest_json
                 ],
             )
             .map_err(db_err)?;
@@ -1701,7 +1727,7 @@ impl Store {
     }
 
     pub fn list_exports(&self, index_id: Option<&str>) -> SResult<Vec<ExportRec>> {
-        let sql = "SELECT id, index_id, branch, commit_id, tag, user_id, created_ms, deck_hash, page_count, kind FROM exports";
+        let sql = "SELECT id, index_id, branch, commit_id, tag, user_id, created_ms, deck_hash, page_count, kind, deck_id, manifest_json FROM exports";
         let mut stmt = self
             .conn
             .prepare(&format!("{sql} ORDER BY created_ms DESC LIMIT 500"))
@@ -1719,6 +1745,8 @@ impl Store {
                     deck_hash: r.get(7)?,
                     page_count: r.get(8)?,
                     kind: r.get(9)?,
+                    deck_id: r.get(10)?,
+                    manifest_json: r.get(11)?,
                 })
             })
             .map_err(db_err)?
@@ -1728,6 +1756,13 @@ impl Store {
             None => rows,
             Some(iid) => rows.into_iter().filter(|e| e.index_id == iid).collect(),
         })
+    }
+
+    /// The export record for a manifest deck_id (editor-stripped deck
+    /// recovery). Latest export wins.
+    pub fn export_by_deck_id(&self, deck_id: &str) -> SResult<Option<ExportRec>> {
+        let all = self.list_exports(None)?;
+        Ok(all.into_iter().find(|e| e.deck_id == deck_id && !e.manifest_json.is_empty()))
     }
 
     pub fn insert_attachment(

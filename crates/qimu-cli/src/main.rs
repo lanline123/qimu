@@ -6,7 +6,7 @@
 
 use base64::Engine;
 use clap::{Parser, Subcommand};
-use qimu_core::manifest::{read_manifest, Manifest};
+use qimu_core::manifest::{read_deck_id, read_manifest, Manifest};
 use qimu_core::pptx::{self, Package};
 use serde_json::{json, Value};
 use std::process::ExitCode;
@@ -499,9 +499,23 @@ fn read_deck(path: &str) -> Result<Vec<u8>, String> {
     std::fs::read(path).map_err(|e| format!("read {path}: {e}"))
 }
 
-fn deck_manifest(path: &str) -> Result<Manifest, String> {
+/// Local embedded manifest first; if an editor stripped it on save, fall
+/// back to the deck-id token (core keywords) + the server's export
+/// registry.
+fn deck_manifest(ctx: &Ctx, path: &str) -> Result<Manifest, String> {
     let bytes = read_deck(path)?;
-    read_manifest(&bytes).ok_or_else(|| "该文件没有内嵌清单（不是受管文件）".to_string())
+    if let Some(m) = read_manifest(&bytes) {
+        return Ok(m);
+    }
+    if let Some(deck_id) = read_deck_id(&bytes) {
+        let resp = ctx.call("GET", &format!("/v1/decks/{deck_id}/manifest"), None)?;
+        if let Some(mv) = resp.get("manifest") {
+            let m: Manifest = serde_json::from_value(mv.clone()).map_err(|e| e.to_string())?;
+            eprintln!("（内嵌清单已被编辑器剥离，已凭文件中的 deck 标识从服务器导出台账恢复清单）");
+            return Ok(m);
+        }
+    }
+    Err("该文件没有内嵌清单（不是受管文件，或清单已被编辑器剥离且服务器无此稿记录）".to_string())
 }
 
 // ---------------- deck apply (in-place update acceptance) ----------------
@@ -510,7 +524,8 @@ fn deck_manifest(path: &str) -> Result<Manifest, String> {
 /// 0 clean, 2 finished with conflicts / pending structural changes.
 fn deck_apply(ctx: &Ctx, path: &str) -> Result<i32, String> {
     let bytes = read_deck(path)?;
-    let manifest = read_manifest(&bytes).ok_or("该文件没有内嵌清单（不是受管文件）")?;
+    let manifest = deck_manifest(ctx, path)?;
+    let _ = bytes;
     let resp = ctx.call(
         "POST",
         "/v1/deck/update-package",
@@ -730,6 +745,7 @@ fn run() -> Result<i32, String> {
                     "package_fingerprint": pptx::package_fingerprint(&pkg),
                     "slides": slides,
                     "managed": read_manifest(&bytes).is_some(),
+                    "deck_id": read_deck_id(&bytes),
                 }));
                 Ok(0)
             }
@@ -745,12 +761,12 @@ fn run() -> Result<i32, String> {
                 }
             }
             DeckCommand::Manifest { path } => {
-                let m = deck_manifest(&path)?;
+                let m = deck_manifest(&ctx, &path)?;
                 print(&serde_json::to_value(&m).unwrap());
                 Ok(0)
             }
             DeckCommand::Check { path } => {
-                let m = deck_manifest(&path)?;
+                let m = deck_manifest(&ctx, &path)?;
                 let r = ctx.call("POST", "/v1/check-updates", Some(json!({ "manifest": m })))?;
                 print(&r);
                 Ok(0)

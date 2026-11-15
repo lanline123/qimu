@@ -5,7 +5,13 @@
 //!
 //! Storage: a `qimu_manifest` custom document property (JSON inside
 //! docProps/custom.xml — a standard part editors preserve), mirrored into
-//! a plain part `qimu/manifest.json` as a fallback read path.
+//! a plain part `qimu/manifest.json` as a fallback read path. A third,
+//! minimal carrier — a `qimu:<deck_id>` token inside the standard
+//! docProps/core.xml keywords — survives editors that strip custom
+//! properties and unknown parts (verified: LibreOffice drops the first
+//! two carriers on open→save but preserves core properties); with just
+//! the deck ID, the full manifest is recovered from the server's export
+//! registry (GET /v1/decks/:deck_id/manifest).
 
 use crate::pptx::Package;
 use serde::{Deserialize, Serialize};
@@ -41,6 +47,7 @@ pub struct Manifest {
 
 const CUSTOM_PART: &str = "docProps/custom.xml";
 const MIRROR_PART: &str = "qimu/manifest.json";
+const CORE_PART: &str = "docProps/core.xml";
 const FMTID: &str = "{D5CDD505-2E9C-101B-9397-08002B2CF9AE}";
 
 fn xml_escape(s: &str) -> String {
@@ -81,6 +88,10 @@ pub fn embed_manifest(deck: &[u8], manifest: &Manifest) -> Result<Vec<u8>, Strin
     pkg.parts
         .insert(MIRROR_PART.to_string(), json.clone().into_bytes());
 
+    // 2b) deck-id token in the standard core keywords (survives editors
+    // that strip custom properties and unknown parts)
+    upsert_keywords_token(&mut pkg, &format!("qimu:{}", manifest.deck_id));
+
     // 3) content types overrides for both parts
     let ct_name = "[Content_Types].xml";
     let mut ct = pkg.get_text(ct_name)?;
@@ -118,6 +129,73 @@ pub fn embed_manifest(deck: &[u8], manifest: &Manifest) -> Result<Vec<u8>, Strin
     }
 
     pkg.to_bytes()
+}
+
+/// Add/replace the `qimu:<deck_id>` token inside docProps/core.xml's
+/// standard <cp:keywords>, preserving any user keywords.
+fn upsert_keywords_token(pkg: &mut Package, token: &str) {
+    let core = pkg.get_text(CORE_PART).unwrap_or_default();
+    if !core.contains("<cp:coreProperties") {
+        let xml = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:dcterms=\"http://purl.org/dc/terms/\" xmlns:dcmitype=\"http://purl.org/dc/dcmitype/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"><cp:keywords>{token}</cp:keywords></cp:coreProperties>"
+        );
+        pkg.parts.insert(CORE_PART.to_string(), xml.into_bytes());
+        return;
+    }
+    let mut tokens: Vec<String> = Vec::new();
+    if let Some(s) = core.find("<cp:keywords>") {
+        let vs = s + "<cp:keywords>".len();
+        if let Some(e) = core[vs..].find("</cp:keywords>") {
+            tokens = core[vs..vs + e]
+                .split_whitespace()
+                .map(|t| t.to_string())
+                .collect();
+        }
+    }
+    tokens.retain(|t| !t.starts_with("qimu:"));
+    tokens.push(token.to_string());
+    let joined = tokens.join(" ");
+    let new_core = if let Some(s) = core.find("<cp:keywords>") {
+        let vs = s + "<cp:keywords>".len();
+        let e = core[vs..].find("</cp:keywords>").map(|x| vs + x).unwrap_or(vs);
+        let mut out = core.clone();
+        out.replace_range(vs..e, &joined);
+        out
+    } else if core.contains("<cp:keywords/>") {
+        core.replacen("<cp:keywords/>", &format!("<cp:keywords>{joined}</cp:keywords>"), 1)
+    } else if let Some(pos) = core.rfind("</cp:coreProperties>") {
+        let mut out = core.clone();
+        out.insert_str(pos, &format!("<cp:keywords>{joined}</cp:keywords>"));
+        out
+    } else {
+        core
+    };
+    pkg.parts.insert(CORE_PART.to_string(), new_core.into_bytes());
+}
+
+/// The deck ID from any surviving carrier: full manifest first, then the
+/// core-keywords token.
+pub fn read_deck_id(deck: &[u8]) -> Option<String> {
+    if let Some(m) = read_manifest(deck) {
+        return Some(m.deck_id);
+    }
+    let pkg = Package::load(deck).ok()?;
+    let core = pkg.get_text(CORE_PART).ok()?;
+    // Editors may normalize the token (LibreOffice turns "qimu:deck_x"
+    // into "qimu deck_x" — the colon becomes a keyword separator), so
+    // accept any light separator run before the deck_ id.
+    let pos = core.find("qimu")?;
+    let rest = &core[pos + "qimu".len()..];
+    let rest = rest.trim_start_matches(|c| c == ':' || c == ' ' || c == ';' || c == ',');
+    let id: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    if id.starts_with("deck_") {
+        Some(id)
+    } else {
+        None
+    }
 }
 
 fn remove_property(xml: &str, name: &str) -> String {
@@ -193,6 +271,13 @@ mod tests {
         let embedded = embed_manifest(&bytes, &m).unwrap();
         let back = read_manifest(&embedded).expect("manifest readable after embed");
         assert_eq!(back.deck_id, "deck_test");
+        // the keywords carrier holds the deck id on its own
+        assert_eq!(read_deck_id(&embedded).as_deref(), Some("deck_test"));
+        let core = Package::load(&embedded)
+            .unwrap()
+            .get_text("docProps/core.xml")
+            .unwrap();
+        assert!(core.contains("qimu:deck_test"), "keywords token missing: {core}");
         assert_eq!(back.bindings.len(), 1);
         assert_eq!(back.bindings[0].version_semver, "1.0.0");
         // re-embed replaces rather than duplicates

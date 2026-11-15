@@ -1423,6 +1423,8 @@ async fn export_index(
                 deck_hash,
                 page_count,
                 kind: kind.to_string(),
+                deck_id: manifest.deck_id.clone(),
+                manifest_json: serde_json::to_string(&manifest).unwrap_or_default(),
             })
             .map_err(bad)?;
     }
@@ -1433,6 +1435,34 @@ async fn export_index(
         "manifest": manifest,
         "data_base64": b64e(&deck),
     })))
+}
+
+/// Recover a deck's manifest from the export registry when an editor
+/// stripped the embedded copies; the caller presents only the deck_id
+/// that survived in the file's core keywords. Access: the exporter, or
+/// anyone who can see the source index's group.
+async fn deck_manifest_by_id(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(deck_id): Path<String>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let store = st.store.lock().unwrap();
+    let rec = store
+        .export_by_deck_id(&deck_id)
+        .map_err(bad)?
+        .ok_or_else(|| not_found())?;
+    let allowed = rec.user_id == user.id
+        || store
+            .get_index(&rec.index_id)
+            .map(|idx| store.can_see_group(&user, &idx.group_id).unwrap_or(false))
+            .unwrap_or(false);
+    if !allowed {
+        return Err(not_found());
+    }
+    let manifest: Value =
+        serde_json::from_str(&rec.manifest_json).map_err(|e| bad(e.to_string()))?;
+    Ok(Json(json!({ "manifest": manifest })))
 }
 
 async fn list_exports(
@@ -1865,6 +1895,7 @@ async fn main() {
         .route("/v1/indexes/:id/tags", post(create_tag))
         .route("/v1/indexes/:id/lifecycle", post(set_lifecycle))
         .route("/v1/indexes/:id/export", post(export_index))
+        .route("/v1/decks/:deck_id/manifest", get(deck_manifest_by_id))
         .route("/v1/exports", get(list_exports))
         .route("/v1/check-updates", post(check_updates))
         .route("/v1/deck/update-package", post(update_package))
