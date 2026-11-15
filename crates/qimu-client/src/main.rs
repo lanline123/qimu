@@ -149,6 +149,11 @@ fn card_frame() -> egui::Frame {
         })
 }
 
+/// Square-corner variant used by the index entry (PPT) cards.
+fn card_frame_square() -> egui::Frame {
+    card_frame().rounding(egui::Rounding::ZERO)
+}
+
 /// Flush variant (no inner margin) for cover-first cards: the cover
 /// image runs edge to edge, the body adds its own padding.
 fn card_frame_flush() -> egui::Frame {
@@ -2760,7 +2765,7 @@ impl App {
                     .get("policy")
                     .map(|p| p.get("locked").is_some())
                     .unwrap_or(false);
-                card_frame().show(ui, |ui| {
+                card_frame_square().show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
                             ui.label(format!("#{}", pos + 1));
@@ -2802,11 +2807,85 @@ impl App {
                         });
                         ui.separator();
                         ui.vertical(|ui| {
-                            ui.label(
-                                egui::RichText::new(re.get("unit_name").and_then(|x| x.as_str()).unwrap_or(""))
-                                    .strong()
-                                    .size(15.0),
-                            );
+                            // top row: name left; policy chip, lock toggle and
+                            // excerpt at the top right; delete is a red ✕ in
+                            // the card's top-right corner
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(re.get("unit_name").and_then(|x| x.as_str()).unwrap_or(""))
+                                        .strong()
+                                        .size(15.0),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .button(
+                                                egui::RichText::new("×")
+                                                    .color(egui::Color32::from_rgb(0xE5, 0x53, 0x4B))
+                                                    .size(17.0)
+                                                    .strong(),
+                                            )
+                                            .clicked()
+                                        {
+                                            let mut es = entries.clone();
+                                            es.remove(pos);
+                                            self.commit_entries(es, "删除条目");
+                                            return;
+                                        }
+                                        if ui.button("选页").clicked() {
+                                            let total = i(&ver, "page_count") as usize;
+                                            let mut sel = vec![true; total];
+                                            if let Some(slots) = entry
+                                                .get("excerpt_slots")
+                                                .and_then(|x| x.as_array())
+                                            {
+                                                sel = vec![false; total];
+                                                for sl in slots {
+                                                    if let Some(n) = sl
+                                                        .as_str()
+                                                        .and_then(|x| x.parse::<usize>().ok())
+                                                    {
+                                                        if n < total {
+                                                            sel[n] = true;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            self.index.excerpt_sel = sel;
+                                            self.index.excerpt_for = Some(pos);
+                                        }
+                                        if locked {
+                                            if ui
+                                                .button(
+                                                    egui::RichText::new("解除锁定")
+                                                        .color(CHIP_GREEN_FG),
+                                                )
+                                                .clicked()
+                                            {
+                                                let mut es = entries.clone();
+                                                es[pos]["policy"] = json!("follow_latest");
+                                                es[pos]["locked_semver"] = Value::Null;
+                                                self.commit_entries(es, "解除锁定");
+                                                return;
+                                            }
+                                            chip(ui, "版本锁定", CHIP_ORANGE_FG, CHIP_ORANGE_BG);
+                                        } else {
+                                            if ui.button("锁定当前版本").clicked() {
+                                                if ver.is_object() {
+                                                    let mut es = entries.clone();
+                                                    es[pos]["policy"] = json!({ "locked": { "version_id": s(&ver, "id") } });
+                                                    es[pos]["locked_semver"] =
+                                                        json!(s(&ver, "semver"));
+                                                    self.commit_entries(es, "锁定版本");
+                                                    return;
+                                                }
+                                            }
+                                            chip(ui, "跟随最新", CHIP_GREEN_FG, CHIP_GREEN_BG);
+                                        }
+                                    },
+                                );
+                            });
                             ui.label(format!(
                                 "{} · {} · {}",
                                 re.get("form").and_then(|x| x.as_str()).unwrap_or(""),
@@ -2831,77 +2910,25 @@ impl App {
                                 if re.get("substituted").and_then(|x| x.as_bool()) == Some(true) {
                                     chip(ui, "原版已删 · 已替代", CHIP_ORANGE_FG, CHIP_ORANGE_BG);
                                 }
-                            });
-                        });
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("选页").clicked() {
-                                let total = i(&ver, "page_count") as usize;
-                                let mut sel = vec![true; total];
-                                if let Some(slots) =
-                                    entry.get("excerpt_slots").and_then(|x| x.as_array())
-                                {
-                                    sel = vec![false; total];
-                                    for sl in slots {
-                                        if let Some(n) =
-                                            sl.as_str().and_then(|x| x.parse::<usize>().ok())
-                                        {
-                                            if n < total {
-                                                sel[n] = true;
-                                            }
-                                        }
-                                    }
-                                }
-                                self.index.excerpt_sel = sel;
-                                self.index.excerpt_for = Some(pos);
-                            }
-                            if ui.button("删除").clicked() {
-                                let mut es = entries.clone();
-                                es.remove(pos);
-                                self.commit_entries(es, "删除条目");
-                                return;
-                            }
-                            if ui.button("↓").clicked() && pos + 1 < entries.len() {
-                                let mut es = entries.clone();
-                                es.swap(pos, pos + 1);
-                                self.commit_entries(es, "调整顺序");
-                                return;
-                            }
-                            if ui.button("↑").clicked() && pos > 0 {
-                                let mut es = entries.clone();
-                                es.swap(pos, pos - 1);
-                                self.commit_entries(es, "调整顺序");
-                                return;
-                            }
-                            if locked {
-                                if ui
-                                    .button(egui::RichText::new("解除锁定").color(CHIP_GREEN_FG))
-                                    .clicked()
-                                {
+                                if ui.button("↑").clicked() && pos > 0 {
                                     let mut es = entries.clone();
-                                    es[pos]["policy"] = json!("follow_latest");
-                                    es[pos]["locked_semver"] = Value::Null;
-                                    self.commit_entries(es, "解除锁定");
+                                    es.swap(pos, pos - 1);
+                                    self.commit_entries(es, "调整顺序");
                                     return;
                                 }
-                                chip(ui, "版本锁定", CHIP_ORANGE_FG, CHIP_ORANGE_BG);
-                            } else {
-                                if ui.button("锁定当前版本").clicked() {
-                                    if ver.is_object() {
-                                        let mut es = entries.clone();
-                                        es[pos]["policy"] = json!({ "locked": { "version_id": s(&ver, "id") } });
-                                        es[pos]["locked_semver"] = json!(s(&ver, "semver"));
-                                        self.commit_entries(es, "锁定版本");
-                                        return;
-                                    }
+                                if ui.button("↓").clicked() && pos + 1 < entries.len() {
+                                    let mut es = entries.clone();
+                                    es.swap(pos, pos + 1);
+                                    self.commit_entries(es, "调整顺序");
+                                    return;
                                 }
-                                chip(ui, "跟随最新", CHIP_GREEN_FG, CHIP_GREEN_BG);
-                            }
+                            });
                         });
                     });
                 });
                 if self.index.excerpt_for == Some(pos) {
                     let ver2 = re.get("resolved").cloned().unwrap_or(Value::Null);
-                    card_frame().show(ui, |ui| {
+                    card_frame_square().show(ui, |ui| {
                         ui.label(egui::RichText::new("摘录选页（只导出勾选的页）").strong());
                         if ver2.is_object() {
                             let vid = s(&ver2, "id");
@@ -2963,7 +2990,7 @@ impl App {
                         });
                     });
                 }
-                ui.add_space(4.0);
+                ui.add_space(12.0);
             }
             ui.separator();
             ui.label(egui::RichText::new("分支合并").strong());
