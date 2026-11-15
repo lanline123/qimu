@@ -1058,7 +1058,18 @@ fn render_thumbs(root: &std::path::Path, version_id: &str, frag: &[u8]) -> Resul
     };
     let pptx = work.join("frag.pptx");
     std::fs::write(&pptx, frag).map_err(|e| e.to_string())?;
-    let profile = format!("file://{}", work.join("lo-profile").display());
+    // The profile must be a real file:// URI: with a relative data root
+    // (the packaged default "qimu-data") the naive concatenation yields
+    // file://qimu-data/... — "qimu-data" parses as a host name and
+    // LibreOffice hangs forever. Absolutize, and normalize for Windows
+    // (strip the \\?\ prefix, use forward slashes).
+    let work_abs = std::fs::canonicalize(&work).unwrap_or_else(|_| work.clone());
+    let profile_str = work_abs.join("lo-profile").display().to_string();
+    let profile_str = profile_str
+        .strip_prefix(r"\\?\")
+        .unwrap_or(&profile_str)
+        .replace('\\', "/");
+    let profile = format!("file://{profile_str}");
     let lo = std::process::Command::new("soffice")
         .arg(format!("-env:UserInstallation={profile}"))
         .args(["--headless", "--convert-to", "pdf", "--outdir"])

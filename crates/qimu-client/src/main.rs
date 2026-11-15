@@ -451,6 +451,14 @@ struct IndexState {
 
 #[derive(Default)]
 struct SettingsState {
+    section: usize,
+    ai_provider: String,
+    ai_endpoint: String,
+    ai_model: String,
+    ai_key: String,
+    ai_has_key: bool,
+    ai_loaded: bool,
+    glossary_text: String,
     profile: BTreeMap<String, String>,
     company: BTreeMap<String, String>,
     languages_text: String,
@@ -3462,246 +3470,559 @@ impl App {
     }
 
     fn page_settings(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.heading("个人资料");
-            for (key, label) in [
-                ("title", "职务"),
-                ("english_name", "英文名"),
-                ("phone", "手机号"),
-                ("email", "邮箱"),
-                ("wechat", "微信"),
-            ] {
-                ui.horizontal(|ui| {
-                    ui.label(label);
-                    let v = self.settings.profile.entry(key.to_string()).or_default();
-                    ui.text_edit_singleline(v);
-                });
-            }
-            if ui.button("保存个人资料").clicked() {
-                let fields: Value = json!(self.settings.profile);
-                match self.call("PUT", "/v1/me/profile", Some(json!({ "fields": fields }))) {
-                    Ok(_) => self.msg = "已保存".into(),
-                    Err(e) => self.msg = e,
+        // Board layout: left section nav, one section at a time on the
+        // right; sections a role may not see are not rendered at all.
+        let role = self.role();
+        let mut sections: Vec<&str> = vec!["个人资料"];
+        if role != "member" {
+            sections.push("组织管理");
+        }
+        if role == "super" {
+            sections.extend([
+                "内容组与授权",
+                "公司公共资料",
+                "内容语言",
+                "AI 翻译",
+                "离线缓存策略",
+            ]);
+        }
+        if self.settings.section >= sections.len() {
+            self.settings.section = 0;
+        }
+        let current = sections[self.settings.section];
+        egui::SidePanel::left("settings_nav")
+            .resizable(false)
+            .default_width(190.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(CHROME)
+                    .inner_margin(egui::Margin::same(10.0)),
+            )
+            .show_inside(ui, |ui| {
+                for (i, name) in sections.iter().enumerate() {
+                    if ui
+                        .selectable_label(self.settings.section == i, *name)
+                        .clicked()
+                    {
+                        self.settings.section = i;
+                    }
+                    ui.add_space(4.0);
                 }
-            }
-            if self.role() == "super" {
-                ui.separator();
-                ui.heading("离线缓存策略");
-                let mut allowed = self
-                    .cache_policy
-                    .get("allowed")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
-                let mut max_mb = self
-                    .cache_policy
-                    .get("max_mb")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(500);
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut allowed, "允许离线缓存");
-                    ui.label("容量上限（MB）");
-                    ui.add(egui::DragValue::new(&mut max_mb).range(10..=100000));
-                    if ui.button("保存策略").clicked() {
-                        match self.call(
-                            "PUT",
-                            "/v1/settings/cache-policy",
-                            Some(json!({ "allowed": allowed, "max_mb": max_mb })),
-                        ) {
-                            Ok(_) => {
-                                self.cache_policy =
-                                    json!({ "allowed": allowed, "max_mb": max_mb });
-                                self.msg = "缓存策略已保存".into();
+            });
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::none()
+                    .fill(APP_BG)
+                    .inner_margin(egui::Margin::same(20.0)),
+            )
+            .show_inside(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.heading(current);
+                    ui.add_space(10.0);
+                    match current {
+                        "个人资料" => {
+                            egui::Grid::new("profile_grid")
+                                .num_columns(2)
+                                .spacing([14.0, 10.0])
+                                .show(ui, |ui| {
+                                    for (key, label) in [
+                                        ("title", "职务"),
+                                        ("english_name", "英文名"),
+                                        ("phone", "手机号"),
+                                        ("email", "邮箱"),
+                                        ("wechat", "微信"),
+                                    ] {
+                                        ui.label(label);
+                                        let v = self
+                                            .settings
+                                            .profile
+                                            .entry(key.to_string())
+                                            .or_default();
+                                        ui.add_sized(
+                                            [300.0, 26.0],
+                                            egui::TextEdit::singleline(v),
+                                        );
+                                        ui.end_row();
+                                    }
+                                });
+                            ui.add_space(12.0);
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("保存资料")
+                                            .color(egui::Color32::WHITE),
+                                    )
+                                    .fill(ACCENT)
+                                    .rounding(15.0),
+                                )
+                                .clicked()
+                            {
+                                let fields: Value = json!(self.settings.profile);
+                                match self.call(
+                                    "PUT",
+                                    "/v1/me/profile",
+                                    Some(json!({ "fields": fields })),
+                                ) {
+                                    Ok(_) => self.msg = "已保存".into(),
+                                    Err(e) => self.msg = e,
+                                }
                             }
-                            Err(e) => self.msg = e,
                         }
+                        "组织管理" => {
+                            let depts = self
+                                .org
+                                .get("departments")
+                                .and_then(|d| d.as_array())
+                                .cloned()
+                                .unwrap_or_default();
+                            for d in &depts {
+                                ui.label(format!("· {}", s(d, "name")));
+                            }
+                            ui.horizontal(|ui| {
+                                ui.label("新部门");
+                                ui.add_sized(
+                                    [240.0, 26.0],
+                                    egui::TextEdit::singleline(&mut self.settings.dept_name),
+                                );
+                                if ui.button("添加").clicked()
+                                    && !self.settings.dept_name.is_empty()
+                                {
+                                    match self.call(
+                                        "POST",
+                                        "/v1/org/departments",
+                                        Some(json!({ "name": self.settings.dept_name })),
+                                    ) {
+                                        Ok(_) => {
+                                            self.settings.dept_name.clear();
+                                            self.refresh_all();
+                                        }
+                                        Err(e) => self.msg = e,
+                                    }
+                                }
+                            });
+                            ui.add_space(10.0);
+                            let users = self
+                                .org
+                                .get("users")
+                                .and_then(|d| d.as_array())
+                                .cloned()
+                                .unwrap_or_default();
+                            for u in &users {
+                                ui.label(format!(
+                                    "{} · {} · {}",
+                                    s(u, "username"),
+                                    s(u, "display_name"),
+                                    s(u, "role")
+                                ));
+                            }
+                            ui.horizontal(|ui| {
+                                ui.label("新账号");
+                                ui.add_sized(
+                                    [150.0, 26.0],
+                                    egui::TextEdit::singleline(&mut self.settings.user_name),
+                                );
+                                ui.label("姓名");
+                                ui.add_sized(
+                                    [150.0, 26.0],
+                                    egui::TextEdit::singleline(
+                                        &mut self.settings.user_display,
+                                    ),
+                                );
+                                ui.label("密码");
+                                ui.add_sized(
+                                    [150.0, 26.0],
+                                    egui::TextEdit::singleline(
+                                        &mut self.settings.user_password,
+                                    )
+                                    .password(true),
+                                );
+                                if ui.button("创建账号").clicked() {
+                                    match self.call(
+                                        "POST",
+                                        "/v1/org/users",
+                                        Some(json!({
+                                            "username": self.settings.user_name,
+                                            "display_name": self.settings.user_display,
+                                            "password": self.settings.user_password,
+                                            "role": "member",
+                                        })),
+                                    ) {
+                                        Ok(_) => {
+                                            self.settings.user_name.clear();
+                                            self.refresh_all();
+                                        }
+                                        Err(e) => self.msg = e,
+                                    }
+                                }
+                            });
+                        }
+                        "内容组与授权" => {
+                            for g in self.groups.clone() {
+                                ui.label(format!("· {}", s(&g, "name")));
+                            }
+                            ui.horizontal(|ui| {
+                                ui.label("新内容组");
+                                ui.add_sized(
+                                    [240.0, 26.0],
+                                    egui::TextEdit::singleline(&mut self.settings.group_name),
+                                );
+                                if ui.button("添加").clicked()
+                                    && !self.settings.group_name.is_empty()
+                                {
+                                    match self.call(
+                                        "POST",
+                                        "/v1/groups",
+                                        Some(json!({ "name": self.settings.group_name })),
+                                    ) {
+                                        Ok(_) => {
+                                            self.settings.group_name.clear();
+                                            self.refresh_all();
+                                        }
+                                        Err(e) => self.msg = e,
+                                    }
+                                }
+                            });
+                            ui.add_space(10.0);
+                            if ui.button("载入授权列表").clicked() {
+                                match self.call("GET", "/v1/grants", None) {
+                                    Ok(v) => {
+                                        self.grants = v
+                                            .get("grants")
+                                            .and_then(|g| g.as_array())
+                                            .cloned()
+                                            .unwrap_or_default()
+                                    }
+                                    Err(e) => self.msg = e,
+                                }
+                            }
+                            for g in self.grants.clone() {
+                                ui.label(format!(
+                                    "{} → {}:{} {}",
+                                    self.group_name(&s(&g, "group_id")),
+                                    s(&g, "subject_type"),
+                                    s(&g, "subject_id"),
+                                    s(&g, "capability")
+                                ));
+                            }
+                            ui.horizontal(|ui| {
+                                egui::ComboBox::from_id_salt("grant_group")
+                                    .selected_text(
+                                        self.group_name(&self.settings.grant_group.clone()),
+                                    )
+                                    .show_ui(ui, |ui| {
+                                        for g in self.groups.clone() {
+                                            ui.selectable_value(
+                                                &mut self.settings.grant_group,
+                                                s(&g, "id"),
+                                                s(&g, "name"),
+                                            );
+                                        }
+                                    });
+                                egui::ComboBox::from_id_salt("grant_st")
+                                    .selected_text(self.settings.grant_subject_type.clone())
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut self.settings.grant_subject_type,
+                                            "dept".into(),
+                                            "部门",
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.settings.grant_subject_type,
+                                            "user".into(),
+                                            "个人",
+                                        );
+                                    });
+                                ui.text_edit_singleline(&mut self.settings.grant_subject_id);
+                                egui::ComboBox::from_id_salt("grant_cap")
+                                    .selected_text(self.settings.grant_capability.clone())
+                                    .show_ui(ui, |ui| {
+                                        for (v, l) in [
+                                            ("view", "查看"),
+                                            ("use", "使用"),
+                                            ("publish", "发布"),
+                                            ("manage", "管理"),
+                                        ] {
+                                            ui.selectable_value(
+                                                &mut self.settings.grant_capability,
+                                                v.into(),
+                                                l,
+                                            );
+                                        }
+                                    });
+                                if ui.button("添加授权").clicked() {
+                                    match self.call(
+                                        "POST",
+                                        "/v1/grants",
+                                        Some(json!({
+                                            "group_id": self.settings.grant_group,
+                                            "subject_type": self.settings.grant_subject_type,
+                                            "subject_id": self.settings.grant_subject_id,
+                                            "capability": self.settings.grant_capability,
+                                        })),
+                                    ) {
+                                        Ok(_) => self.msg = "已添加授权".into(),
+                                        Err(e) => self.msg = e,
+                                    }
+                                }
+                            });
+                        }
+                        "公司公共资料" => {
+                            egui::Grid::new("company_grid")
+                                .num_columns(2)
+                                .spacing([14.0, 10.0])
+                                .show(ui, |ui| {
+                                    for (key, label) in [
+                                        ("phone", "公司电话"),
+                                        ("website", "官网"),
+                                        ("address", "地址"),
+                                        ("gongzhonghao", "公众号"),
+                                    ] {
+                                        ui.label(label);
+                                        let v = self
+                                            .settings
+                                            .company
+                                            .entry(key.to_string())
+                                            .or_default();
+                                        ui.add_sized(
+                                            [300.0, 26.0],
+                                            egui::TextEdit::singleline(v),
+                                        );
+                                        ui.end_row();
+                                    }
+                                });
+                            ui.add_space(12.0);
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("保存公司资料")
+                                            .color(egui::Color32::WHITE),
+                                    )
+                                    .fill(ACCENT)
+                                    .rounding(15.0),
+                                )
+                                .clicked()
+                            {
+                                let fields: Value = json!(self.settings.company);
+                                match self.call(
+                                    "PUT",
+                                    "/v1/company-profile",
+                                    Some(json!({ "fields": fields })),
+                                ) {
+                                    Ok(_) => self.msg = "已保存".into(),
+                                    Err(e) => self.msg = e,
+                                }
+                            }
+                        }
+                        "内容语言" => {
+                            ui.horizontal(|ui| {
+                                ui.label("内容语言清单");
+                                ui.add_sized(
+                                    [300.0, 26.0],
+                                    egui::TextEdit::singleline(
+                                        &mut self.settings.languages_text,
+                                    ),
+                                );
+                                if ui.button("保存").clicked() {
+                                    let langs: Vec<String> = self
+                                        .settings
+                                        .languages_text
+                                        .split(',')
+                                        .map(|x| x.trim().to_string())
+                                        .filter(|x| !x.is_empty())
+                                        .collect();
+                                    match self.call(
+                                        "PUT",
+                                        "/v1/settings/languages",
+                                        Some(json!({ "languages": langs })),
+                                    ) {
+                                        Ok(_) => self.msg = "已保存".into(),
+                                        Err(e) => self.msg = e,
+                                    }
+                                }
+                            });
+                        }
+                        "AI 翻译" => {
+                            if !self.settings.ai_loaded {
+                                self.settings.ai_loaded = true;
+                                if let Ok(v) = self.call("GET", "/v1/settings/ai", None) {
+                                    self.settings.ai_provider = s(&v, "provider");
+                                    self.settings.ai_endpoint = s(&v, "endpoint");
+                                    self.settings.ai_model = s(&v, "model");
+                                    self.settings.ai_has_key = v
+                                        .get("has_key")
+                                        .and_then(|x| x.as_bool())
+                                        .unwrap_or(false);
+                                }
+                                if let Ok(v) = self.call("GET", "/v1/settings/glossary", None) {
+                                    if let Some(pairs) =
+                                        v.get("pairs").and_then(|x| x.as_array())
+                                    {
+                                        self.settings.glossary_text = pairs
+                                            .iter()
+                                            .map(|pr| {
+                                                format!(
+                                                    "{}={}",
+                                                    s(pr, "source"),
+                                                    s(pr, "target")
+                                                )
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join("\n");
+                                    }
+                                }
+                            }
+                            egui::Grid::new("ai_grid")
+                                .num_columns(2)
+                                .spacing([14.0, 10.0])
+                                .show(ui, |ui| {
+                                    ui.label("提供方");
+                                    egui::ComboBox::from_id_salt("ai_provider")
+                                        .selected_text(self.settings.ai_provider.clone())
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(
+                                                &mut self.settings.ai_provider,
+                                                "stub".into(),
+                                                "stub（本地占位）",
+                                            );
+                                            ui.selectable_value(
+                                                &mut self.settings.ai_provider,
+                                                "openai-compat".into(),
+                                                "OpenAI 兼容接口",
+                                            );
+                                        });
+                                    ui.end_row();
+                                    ui.label("接口地址");
+                                    ui.add_sized(
+                                        [300.0, 26.0],
+                                        egui::TextEdit::singleline(
+                                            &mut self.settings.ai_endpoint,
+                                        ),
+                                    );
+                                    ui.end_row();
+                                    ui.label("模型");
+                                    ui.add_sized(
+                                        [300.0, 26.0],
+                                        egui::TextEdit::singleline(
+                                            &mut self.settings.ai_model,
+                                        ),
+                                    );
+                                    ui.end_row();
+                                    ui.label("API 密钥");
+                                    ui.add_sized(
+                                        [300.0, 26.0],
+                                        egui::TextEdit::singleline(&mut self.settings.ai_key)
+                                            .password(true),
+                                    );
+                                    ui.end_row();
+                                });
+                            ui.label(
+                                egui::RichText::new(if self.settings.ai_has_key {
+                                    "密钥：已设置（留空保存则不更换）"
+                                } else {
+                                    "密钥：未设置"
+                                })
+                                .small()
+                                .color(TEXT_WEAK),
+                            );
+                            ui.add_space(8.0);
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("保存 AI 设置")
+                                            .color(egui::Color32::WHITE),
+                                    )
+                                    .fill(ACCENT)
+                                    .rounding(15.0),
+                                )
+                                .clicked()
+                            {
+                                let mut body = json!({
+                                    "provider": self.settings.ai_provider,
+                                    "endpoint": self.settings.ai_endpoint,
+                                    "model": self.settings.ai_model,
+                                });
+                                if !self.settings.ai_key.is_empty() {
+                                    body["api_key"] = json!(self.settings.ai_key);
+                                }
+                                match self.call("PUT", "/v1/settings/ai", Some(body)) {
+                                    Ok(_) => {
+                                        if !self.settings.ai_key.is_empty() {
+                                            self.settings.ai_has_key = true;
+                                            self.settings.ai_key.clear();
+                                        }
+                                        self.msg = "AI 设置已保存".into();
+                                    }
+                                    Err(e) => self.msg = e,
+                                }
+                            }
+                            ui.add_space(16.0);
+                            ui.label(egui::RichText::new("术语表（每行一条：源词=译词）").strong());
+                            ui.add_sized(
+                                [440.0, 120.0],
+                                egui::TextEdit::multiline(&mut self.settings.glossary_text),
+                            );
+                            ui.add_space(8.0);
+                            if ui.button("保存术语表").clicked() {
+                                let pairs: Vec<Value> = self
+                                    .settings
+                                    .glossary_text
+                                    .lines()
+                                    .filter_map(|l| {
+                                        let (a, b) = l.split_once('=')?;
+                                        Some(json!({
+                                            "source": a.trim(),
+                                            "target": b.trim(),
+                                        }))
+                                    })
+                                    .collect();
+                                match self.call(
+                                    "PUT",
+                                    "/v1/settings/glossary",
+                                    Some(json!({ "pairs": pairs })),
+                                ) {
+                                    Ok(_) => self.msg = "术语表已保存".into(),
+                                    Err(e) => self.msg = e,
+                                }
+                            }
+                        }
+                        "离线缓存策略" => {
+                            let mut allowed = self
+                                .cache_policy
+                                .get("allowed")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(true);
+                            let mut max_mb = self
+                                .cache_policy
+                                .get("max_mb")
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(500);
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut allowed, "允许离线缓存");
+                                ui.label("容量上限（MB）");
+                                ui.add(egui::DragValue::new(&mut max_mb).range(10..=100000));
+                                if ui.button("保存策略").clicked() {
+                                    match self.call(
+                                        "PUT",
+                                        "/v1/settings/cache-policy",
+                                        Some(json!({
+                                            "allowed": allowed,
+                                            "max_mb": max_mb
+                                        })),
+                                    ) {
+                                        Ok(_) => {
+                                            self.cache_policy =
+                                                json!({ "allowed": allowed, "max_mb": max_mb });
+                                            self.msg = "缓存策略已保存".into();
+                                        }
+                                        Err(e) => self.msg = e,
+                                    }
+                                }
+                            });
+                        }
+                        _ => {}
                     }
                 });
-            }
-            if self.role() == "member" {
-                return;
-            }
-            ui.separator();
-            ui.heading("组织管理");
-            let depts = self
-                .org
-                .get("departments")
-                .and_then(|d| d.as_array())
-                .cloned()
-                .unwrap_or_default();
-            for d in &depts {
-                ui.label(format!("· {}", s(d, "name")));
-            }
-            ui.horizontal(|ui| {
-                ui.label("新部门");
-                ui.text_edit_singleline(&mut self.settings.dept_name);
-                if ui.button("添加").clicked() && !self.settings.dept_name.is_empty() {
-                    match self.call(
-                        "POST",
-                        "/v1/org/departments",
-                        Some(json!({ "name": self.settings.dept_name })),
-                    ) {
-                        Ok(_) => {
-                            self.settings.dept_name.clear();
-                            self.refresh_all();
-                        }
-                        Err(e) => self.msg = e,
-                    }
-                }
             });
-            let users = self
-                .org
-                .get("users")
-                .and_then(|d| d.as_array())
-                .cloned()
-                .unwrap_or_default();
-            for u in &users {
-                ui.label(format!(
-                    "{} · {} · {}",
-                    s(u, "username"),
-                    s(u, "display_name"),
-                    s(u, "role")
-                ));
-            }
-            ui.horizontal(|ui| {
-                ui.label("新账号");
-                ui.text_edit_singleline(&mut self.settings.user_name);
-                ui.label("姓名");
-                ui.text_edit_singleline(&mut self.settings.user_display);
-                ui.label("密码");
-                ui.add(egui::TextEdit::singleline(&mut self.settings.user_password).password(true));
-                if ui.button("创建账号").clicked() {
-                    match self.call(
-                        "POST",
-                        "/v1/org/users",
-                        Some(json!({
-                            "username": self.settings.user_name,
-                            "display_name": self.settings.user_display,
-                            "password": self.settings.user_password,
-                            "role": "member",
-                        })),
-                    ) {
-                        Ok(_) => {
-                            self.settings.user_name.clear();
-                            self.refresh_all();
-                        }
-                        Err(e) => self.msg = e,
-                    }
-                }
-            });
-            if self.role() != "super" {
-                return;
-            }
-            ui.separator();
-            ui.heading("内容组与授权");
-            for g in self.groups.clone() {
-                ui.label(format!("· {}", s(&g, "name")));
-            }
-            ui.horizontal(|ui| {
-                ui.label("新内容组");
-                ui.text_edit_singleline(&mut self.settings.group_name);
-                if ui.button("添加").clicked() && !self.settings.group_name.is_empty() {
-                    // group creation endpoint is POST /v1/groups (super only)
-                    match self.call("POST", "/v1/groups", Some(json!({ "name": self.settings.group_name }))) {
-                        Ok(_) => {
-                            self.settings.group_name.clear();
-                            self.refresh_all();
-                        }
-                        Err(e) => self.msg = e,
-                    }
-                }
-            });
-            if ui.button("载入授权列表").clicked() {
-                match self.call("GET", "/v1/grants", None) {
-                    Ok(v) => self.grants = v.get("grants").and_then(|g| g.as_array()).cloned().unwrap_or_default(),
-                    Err(e) => self.msg = e,
-                }
-            }
-            for g in self.grants.clone() {
-                ui.label(format!(
-                    "{} → {}:{} {}",
-                    self.group_name(&s(&g, "group_id")),
-                    s(&g, "subject_type"),
-                    s(&g, "subject_id"),
-                    s(&g, "capability")
-                ));
-            }
-            ui.horizontal(|ui| {
-                egui::ComboBox::from_id_salt("grant_group")
-                    .selected_text(self.group_name(&self.settings.grant_group.clone()))
-                    .show_ui(ui, |ui| {
-                        for g in self.groups.clone() {
-                            ui.selectable_value(&mut self.settings.grant_group, s(&g, "id"), s(&g, "name"));
-                        }
-                    });
-                egui::ComboBox::from_id_salt("grant_st")
-                    .selected_text(self.settings.grant_subject_type.clone())
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.settings.grant_subject_type, "dept".into(), "部门");
-                        ui.selectable_value(&mut self.settings.grant_subject_type, "user".into(), "个人");
-                    });
-                ui.text_edit_singleline(&mut self.settings.grant_subject_id);
-                egui::ComboBox::from_id_salt("grant_cap")
-                    .selected_text(self.settings.grant_capability.clone())
-                    .show_ui(ui, |ui| {
-                        for (v, l) in [("view", "查看"), ("use", "使用"), ("publish", "发布"), ("manage", "管理")] {
-                            ui.selectable_value(&mut self.settings.grant_capability, v.into(), l);
-                        }
-                    });
-                if ui.button("添加授权").clicked() {
-                    match self.call(
-                        "POST",
-                        "/v1/grants",
-                        Some(json!({
-                            "group_id": self.settings.grant_group,
-                            "subject_type": self.settings.grant_subject_type,
-                            "subject_id": self.settings.grant_subject_id,
-                            "capability": self.settings.grant_capability,
-                        })),
-                    ) {
-                        Ok(_) => self.msg = "已添加授权".into(),
-                        Err(e) => self.msg = e,
-                    }
-                }
-            });
-            ui.separator();
-            ui.heading("公司公共资料");
-            for (key, label) in [
-                ("phone", "公司电话"),
-                ("website", "官网"),
-                ("address", "地址"),
-                ("gongzhonghao", "公众号"),
-            ] {
-                ui.horizontal(|ui| {
-                    ui.label(label);
-                    let v = self.settings.company.entry(key.to_string()).or_default();
-                    ui.text_edit_singleline(v);
-                });
-            }
-            if ui.button("保存公司资料").clicked() {
-                let fields: Value = json!(self.settings.company);
-                match self.call("PUT", "/v1/company-profile", Some(json!({ "fields": fields }))) {
-                    Ok(_) => self.msg = "已保存".into(),
-                    Err(e) => self.msg = e,
-                }
-            }
-            ui.horizontal(|ui| {
-                ui.label("内容语言清单");
-                ui.text_edit_singleline(&mut self.settings.languages_text);
-                if ui.button("保存").clicked() {
-                    let langs: Vec<String> = self
-                        .settings
-                        .languages_text
-                        .split(',')
-                        .map(|x| x.trim().to_string())
-                        .filter(|x| !x.is_empty())
-                        .collect();
-                    match self.call("PUT", "/v1/settings/languages", Some(json!({ "languages": langs }))) {
-                        Ok(_) => self.msg = "已保存".into(),
-                        Err(e) => self.msg = e,
-                    }
-                }
-            });
-        });
     }
 }
 
