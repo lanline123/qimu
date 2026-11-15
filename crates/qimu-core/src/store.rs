@@ -116,6 +116,120 @@ pub struct IndexRec {
     pub created_ms: i64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct MergeConflict {
+    /// Entry key: "{unit_id}:{rendition_id}#{occurrence}".
+    pub key: String,
+    pub unit_id: String,
+    pub rendition_id: String,
+    pub base: Option<IndexEntry>,
+    pub ours: Option<IndexEntry>,
+    pub theirs: Option<IndexEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MergePreview {
+    pub base_commit: Option<String>,
+    pub from_head: String,
+    pub into_head: String,
+    pub clean: bool,
+    /// Auto-merged entries (conflicts excluded until adjudicated).
+    pub merged: Vec<IndexEntry>,
+    pub conflicts: Vec<MergeConflict>,
+}
+
+/// Occurrence-suffixed keys so the same block used twice in one index
+/// merges instance by instance.
+fn entry_keys(entries: &[IndexEntry]) -> Vec<String> {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    entries
+        .iter()
+        .map(|e| {
+            let base = format!("{}:{}", e.unit_id.0, e.rendition_id.0);
+            let n = counts.entry(base.clone()).or_default();
+            let key = format!("{base}#{n}");
+            *n += 1;
+            key
+        })
+        .collect()
+}
+
+/// The three-way merge itself. `resolutions` maps a conflict key to
+/// "ours" or "theirs"; without a resolution the entry stays a conflict.
+fn compute_merge(
+    base: &[IndexEntry],
+    ours: &[IndexEntry],
+    theirs: &[IndexEntry],
+    resolutions: Option<&std::collections::HashMap<String, String>>,
+) -> (Vec<IndexEntry>, Vec<MergeConflict>) {
+    use std::collections::HashMap;
+    let (bk, ok, tk) = (entry_keys(base), entry_keys(ours), entry_keys(theirs));
+    let bmap: HashMap<&str, &IndexEntry> =
+        bk.iter().map(|k| k.as_str()).zip(base.iter()).collect();
+    let omap: HashMap<&str, &IndexEntry> =
+        ok.iter().map(|k| k.as_str()).zip(ours.iter()).collect();
+    let tmap: HashMap<&str, &IndexEntry> =
+        tk.iter().map(|k| k.as_str()).zip(theirs.iter()).collect();
+
+    let mut decided: HashMap<String, Option<IndexEntry>> = HashMap::new();
+    let mut conflicts: Vec<MergeConflict> = Vec::new();
+    let mut all_keys: Vec<String> = ok.clone();
+    for k in tk.iter().chain(bk.iter()) {
+        if !all_keys.contains(k) {
+            all_keys.push(k.clone());
+        }
+    }
+    for key in &all_keys {
+        let (b, o, t) = (
+            bmap.get(key.as_str()).copied(),
+            omap.get(key.as_str()).copied(),
+            tmap.get(key.as_str()).copied(),
+        );
+        let decision = if o == t {
+            o.cloned()
+        } else if b == o {
+            t.cloned()
+        } else if b == t {
+            o.cloned()
+        } else {
+            match resolutions.and_then(|r| r.get(key.as_str())).map(|s| s.as_str()) {
+                Some("ours") => o.cloned(),
+                Some("theirs") => t.cloned(),
+                _ => {
+                    let (unit_id, rendition_id) = key
+                        .split_once(':')
+                        .map(|(u, rest)| {
+                            (u.to_string(), rest.split('#').next().unwrap_or("").to_string())
+                        })
+                        .unwrap_or_default();
+                    conflicts.push(MergeConflict {
+                        key: key.clone(),
+                        unit_id,
+                        rendition_id,
+                        base: b.cloned(),
+                        ours: o.cloned(),
+                        theirs: t.cloned(),
+                    });
+                    continue;
+                }
+            }
+        };
+        decided.insert(key.clone(), decision);
+    }
+    // Result order: the target branch's order first, then entries that
+    // only exist on the source branch, in source order.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut ordered = Vec::new();
+    for k in ok.iter().chain(tk.iter()) {
+        if seen.insert(k.to_string()) {
+            if let Some(Some(e)) = decided.get(k.as_str()) {
+                ordered.push(e.clone());
+            }
+        }
+    }
+    (ordered, conflicts)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitRec {
     pub id: String,
@@ -174,6 +288,20 @@ pub struct VerTagRec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PageBindingRec {
+    pub id: String,
+    pub unit_id: String,
+    pub from_version_id: String,
+    pub from_slot: i64,
+    pub to_version_id: String,
+    pub to_slot: i64,
+    /// manual | import_auto | ai
+    pub kind: String,
+    pub author: String,
+    pub created_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShowroomRec {
     pub id: String,
     pub title: String,
@@ -205,6 +333,7 @@ CREATE TABLE IF NOT EXISTS attachments(id TEXT PRIMARY KEY, parent_type TEXT NOT
 CREATE TABLE IF NOT EXISTS version_tags(id TEXT PRIMARY KEY, version_id TEXT NOT NULL, dim TEXT NOT NULL, value TEXT NOT NULL, strength TEXT NOT NULL DEFAULT 'fits', author TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS showroom(id TEXT PRIMARY KEY, title TEXT NOT NULL, intro TEXT NOT NULL DEFAULT '', source_index_id TEXT, commit_id TEXT, submitted_by TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending', created_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS assemblies(id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, entries_json TEXT NOT NULL, created_ms INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS page_bindings(id TEXT PRIMARY KEY, unit_id TEXT NOT NULL, from_version_id TEXT NOT NULL, from_slot INTEGER NOT NULL, to_version_id TEXT NOT NULL, to_slot INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'manual', author TEXT NOT NULL, created_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS profile_fields(user_id TEXT NOT NULL, field TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(user_id, field));
 CREATE TABLE IF NOT EXISTS company_profile(field TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -1015,6 +1144,109 @@ impl Store {
         Ok(rows)
     }
 
+    // ---------- page bindings (§3.12 language binding) ----------
+
+    /// Bind one page (slot) of one version of a unit to a page of another
+    /// version of the SAME unit — the per-page language correspondence.
+    /// 1-to-many is allowed in both directions. Idempotent per tuple.
+    pub fn add_page_binding(
+        &self,
+        unit_id: &str,
+        from_version_id: &str,
+        from_slot: i64,
+        to_version_id: &str,
+        to_slot: i64,
+        kind: &str,
+        author: &str,
+    ) -> SResult<PageBindingRec> {
+        // both versions must belong to renditions of this unit
+        for vid in [from_version_id, to_version_id] {
+            let v = self.get_version(vid)?;
+            let r = self.get_rendition(&v.rendition_id)?;
+            if r.unit_id != unit_id {
+                return Err("版本不属于该内容块".into());
+            }
+            if from_slot < 0 || to_slot < 0 {
+                return Err("页位不能为负".into());
+            }
+        }
+        let existing = self
+            .list_page_bindings(unit_id)?
+            .into_iter()
+            .find(|b| {
+                b.from_version_id == from_version_id
+                    && b.from_slot == from_slot
+                    && b.to_version_id == to_version_id
+                    && b.to_slot == to_slot
+            });
+        if let Some(b) = existing {
+            return Ok(b);
+        }
+        let rec = PageBindingRec {
+            id: new_id("bnd"),
+            unit_id: unit_id.into(),
+            from_version_id: from_version_id.into(),
+            from_slot,
+            to_version_id: to_version_id.into(),
+            to_slot,
+            kind: kind.into(),
+            author: author.into(),
+            created_ms: now_ms(),
+        };
+        self.conn
+            .execute(
+                "INSERT INTO page_bindings(id, unit_id, from_version_id, from_slot, to_version_id, to_slot, kind, author, created_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![
+                    rec.id,
+                    rec.unit_id,
+                    rec.from_version_id,
+                    rec.from_slot,
+                    rec.to_version_id,
+                    rec.to_slot,
+                    rec.kind,
+                    rec.author,
+                    rec.created_ms
+                ],
+            )
+            .map_err(db_err)?;
+        Ok(rec)
+    }
+
+    pub fn list_page_bindings(&self, unit_id: &str) -> SResult<Vec<PageBindingRec>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, unit_id, from_version_id, from_slot, to_version_id, to_slot, kind, author, created_ms FROM page_bindings WHERE unit_id=?1 ORDER BY created_ms")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![unit_id], |r| {
+                Ok(PageBindingRec {
+                    id: r.get(0)?,
+                    unit_id: r.get(1)?,
+                    from_version_id: r.get(2)?,
+                    from_slot: r.get(3)?,
+                    to_version_id: r.get(4)?,
+                    to_slot: r.get(5)?,
+                    kind: r.get(6)?,
+                    author: r.get(7)?,
+                    created_ms: r.get(8)?,
+                })
+            })
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(rows)
+    }
+
+    pub fn delete_page_binding(&self, unit_id: &str, binding_id: &str) -> SResult<()> {
+        self.conn
+            .execute(
+                "DELETE FROM page_bindings WHERE id=?1 AND unit_id=?2",
+                params![binding_id, unit_id],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     // ---------- search ----------
 
     /// Full-text-ish search over extracted slide text and titles; only units
@@ -1239,6 +1471,109 @@ impl Store {
                 },
             )
             .map_err(db_err)
+    }
+
+    /// Ancestor commit IDs of `commit_id`, starting with itself and
+    /// walking the (single-parent) chain to the root.
+    pub fn ancestors(&self, commit_id: &str) -> SResult<Vec<String>> {
+        let mut out = Vec::new();
+        let mut cur = Some(commit_id.to_string());
+        while let Some(cid) = cur {
+            let c = self.get_commit(&cid)?;
+            out.push(cid);
+            cur = c.parent_id.clone();
+            if out.len() > 1000 {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Nearest common ancestor of two commits (the fork point), if any.
+    pub fn merge_base(&self, a: &str, b: &str) -> SResult<Option<String>> {
+        let b_set: std::collections::HashSet<String> =
+            self.ancestors(b)?.into_iter().collect();
+        for cand in self.ancestors(a)? {
+            if b_set.contains(&cand) {
+                return Ok(Some(cand));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Entry-level three-way merge preview (§3.10): `ours` = the target
+    /// branch head, `theirs` = the source branch head, base = fork point.
+    /// Entries are keyed by (unit, rendition, occurrence) so a block used
+    /// twice merges instance by instance. One-sided changes merge
+    /// automatically; two-sided changes to the same entry are conflicts
+    /// for a human to adjudicate — slide content is never merged.
+    pub fn preview_merge(
+        &self,
+        index_id: &str,
+        from_branch: &str,
+        into_branch: &str,
+    ) -> SResult<MergePreview> {
+        let from_head = self
+            .branch_head(index_id, from_branch)?
+            .ok_or_else(|| format!("分支 {from_branch} 尚无提交"))?;
+        let into_head = self
+            .branch_head(index_id, into_branch)?
+            .ok_or_else(|| format!("分支 {into_branch} 尚无提交"))?;
+        let base_id = self.merge_base(&from_head, &into_head)?;
+        let base_entries = match &base_id {
+            Some(b) => self.get_commit(b)?.entries,
+            None => Vec::new(),
+        };
+        let ours = self.get_commit(&into_head)?.entries;
+        let theirs = self.get_commit(&from_head)?.entries;
+        let (merged, conflicts) = compute_merge(&base_entries, &ours, &theirs, None);
+        Ok(MergePreview {
+            base_commit: base_id,
+            from_head,
+            into_head,
+            clean: conflicts.is_empty(),
+            merged,
+            conflicts,
+        })
+    }
+
+    /// Execute a merge: applies the three-way merge, filling conflicts
+    /// from `resolutions` (key -> "ours" | "theirs"). Fails listing any
+    /// conflict left unresolved. Creates the merge commit on the target
+    /// branch; the source head is recorded in the commit message.
+    pub fn execute_merge(
+        &self,
+        index_id: &str,
+        from_branch: &str,
+        into_branch: &str,
+        author: &str,
+        resolutions: &std::collections::HashMap<String, String>,
+    ) -> SResult<CommitRec> {
+        let preview = self.preview_merge(index_id, from_branch, into_branch)?;
+        if preview.from_head == preview.into_head {
+            return Err("两个分支指向同一提交，无需合并".into());
+        }
+        let base_entries = match &preview.base_commit {
+            Some(b) => self.get_commit(b)?.entries,
+            None => Vec::new(),
+        };
+        let ours = self.get_commit(&preview.into_head)?.entries;
+        let theirs = self.get_commit(&preview.from_head)?.entries;
+        let (merged, conflicts) = compute_merge(&base_entries, &ours, &theirs, Some(resolutions));
+        if !conflicts.is_empty() {
+            let keys: Vec<&str> = conflicts.iter().map(|c| c.key.as_str()).collect();
+            return Err(format!("仍有未裁决的冲突条目：{}", keys.join("、")));
+        }
+        self.create_commit(
+            index_id,
+            into_branch,
+            author,
+            &format!(
+                "合并分支 {from_branch}（源提交 {}）",
+                &preview.from_head[..preview.from_head.len().min(12)]
+            ),
+            merged,
+        )
     }
 
     /// Commit history of a branch, newest first (walks the parent chain).
@@ -1573,6 +1908,30 @@ impl Store {
             )
             .map_err(db_err)?;
         Ok(id)
+    }
+
+    pub fn list_assemblies(&self, user_id: &str) -> SResult<Vec<serde_json::Value>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, name, entries_json, created_ms FROM assemblies WHERE user_id=?1 ORDER BY created_ms DESC")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![user_id], |r| {
+                let entries_json: String = r.get(2)?;
+                let count = serde_json::from_str::<Vec<IndexEntry>>(&entries_json)
+                    .map(|v| v.len())
+                    .unwrap_or(0);
+                Ok(serde_json::json!({
+                    "id": r.get::<_, String>(0)?,
+                    "name": r.get::<_, String>(1)?,
+                    "entry_count": count,
+                    "created_ms": r.get::<_, i64>(3)?,
+                }))
+            })
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(rows)
     }
 
     pub fn assembly_entries(&self, id: &str) -> SResult<Vec<IndexEntry>> {

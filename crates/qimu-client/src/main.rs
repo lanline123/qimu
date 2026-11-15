@@ -38,6 +38,50 @@ fn install_cjk_font(ctx: &egui::Context) {
     }
 }
 
+/// Offline cache (§3.17): adopted snapshots live under ~/.qimu/cache with
+/// a small JSON index, per account machine — usable with no server at all.
+fn cache_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    std::path::Path::new(&home).join(".qimu").join("cache")
+}
+
+fn load_cache_index() -> Vec<Value> {
+    std::fs::read_to_string(cache_dir().join("index.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default()
+}
+
+fn save_cache_index(entries: &[Value]) {
+    let dir = cache_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(
+        dir.join("index.json"),
+        serde_json::to_string_pretty(&json!(entries)).unwrap_or_default(),
+    );
+}
+
+/// Short human label for one index entry's version policy (merge view).
+fn entry_label(e: &Value) -> String {
+    if e.is_null() {
+        return "（无此条目）".into();
+    }
+    let pol = e.get("policy").cloned().unwrap_or(Value::Null);
+    let mut base = if pol.get("locked").is_some() {
+        format!(
+            "锁定 v{}",
+            e.get("locked_semver").and_then(|x| x.as_str()).unwrap_or("?")
+        )
+    } else {
+        "跟随最新".to_string()
+    };
+    if let Some(slots) = e.get("excerpt_slots").and_then(|x| x.as_array()) {
+        base += &format!(" · 摘录 {} 页", slots.len());
+    }
+    base
+}
+
 fn fmt_time(ms: i64) -> String {
     // unix ms -> "YYYY-MM-DD HH:MM" (UTC+8 display for the LAN product)
     let secs = ms / 1000 + 8 * 3600;
@@ -93,6 +137,10 @@ struct ContentState {
     publish_lang: String,
     publish_note: String,
     publish_file: Option<std::path::PathBuf>,
+    bindings: Vec<Value>,
+    bind_from: String,
+    bind_to: String,
+    bind_from_slot: Option<i64>,
 }
 
 #[derive(Default)]
@@ -108,6 +156,9 @@ struct IndexState {
     pick: Vec<(String, String, bool)>, // unit_id, rendition_id, checked
     commits: Option<Value>,
     exports: Option<Value>,
+    merge_from: String,
+    merge_preview: Option<Value>,
+    merge_resolutions: std::collections::HashMap<String, String>,
 }
 
 #[derive(Default)]
@@ -144,17 +195,30 @@ struct App {
     showroom_pending: Vec<Value>,
     sr_title: String,
     sr_index: String,
+    sr_zone: String, // plaza | library
+    my_assemblies: Vec<Value>,
+    cache_entries: Vec<Value>,
     content: ContentState,
     index: IndexState,
     settings: SettingsState,
     frames: u64,
     screenshot_path: Option<String>,
     screenshot_done: bool,
+    thumbs: std::collections::HashMap<String, ThumbState>,
+    thumb_tx: std::sync::mpsc::Sender<(String, Option<Vec<u8>>)>,
+    thumb_rx: std::sync::mpsc::Receiver<(String, Option<Vec<u8>>)>,
+}
+
+enum ThumbState {
+    Loading,
+    Ready(egui::TextureHandle),
+    Failed,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_cjk_font(&cc.egui_ctx);
+        let (thumb_tx, thumb_rx) = std::sync::mpsc::channel();
         let mut app = App {
             server: std::env::var("QIMU_SERVER").unwrap_or_else(|_| "http://127.0.0.1:8730".into()),
             username: std::env::var("QIMU_USERNAME").unwrap_or_else(|_| "admin".into()),
@@ -178,6 +242,9 @@ impl App {
             showroom_pending: vec![],
             sr_title: String::new(),
             sr_index: String::new(),
+            sr_zone: std::env::var("QIMU_ZONE").unwrap_or_else(|_| "plaza".into()),
+            my_assemblies: vec![],
+            cache_entries: load_cache_index(),
             content: ContentState {
                 publish_bump: 1, // default preselect: minor （小版本）
                 ..Default::default()
@@ -191,6 +258,9 @@ impl App {
             frames: 0,
             screenshot_path: std::env::var("QIMU_SCREENSHOT").ok(),
             screenshot_done: false,
+            thumbs: std::collections::HashMap::new(),
+            thumb_tx,
+            thumb_rx,
         };
         if std::env::var("QIMU_AUTOLOGIN").is_ok() && !app.password.is_empty() {
             app.do_login();
@@ -283,6 +353,14 @@ impl App {
         if let Ok(v) = self.call("GET", "/v1/showroom?state=pending", None) {
             self.showroom_pending = v.get("items").and_then(|f| f.as_array()).cloned().unwrap_or_default();
         }
+        if let Ok(v) = self.call("GET", "/v1/assemblies", None) {
+            self.my_assemblies = v
+                .get("assemblies")
+                .and_then(|f| f.as_array())
+                .cloned()
+                .unwrap_or_default();
+        }
+        self.cache_entries = load_cache_index();
         if let Ok(v) = self.call("GET", "/v1/me", None) {
             if let Some(p) = v.get("profile").and_then(|p| p.as_object()) {
                 self.settings.profile = p
@@ -358,6 +436,16 @@ impl App {
                     self.content.publish_lang = s(first, "lang");
                 }
                 self.content.detail = Some(v);
+                self.content.bind_from.clear();
+                self.content.bind_to.clear();
+                self.content.bind_from_slot = None;
+                self.content.bindings = self
+                    .call("GET", &format!("/v1/units/{unit_id}/page-bindings"), None)
+                    .ok()
+                    .and_then(|b| {
+                        b.get("bindings").and_then(|x| x.as_array()).cloned()
+                    })
+                    .unwrap_or_default();
             }
             Err(e) => self.msg = format!("打开失败：{e}"),
         }
@@ -440,9 +528,26 @@ fn i(v: &Value, key: &str) -> i64 {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.frames += 1;
+        // Collect finished thumbnail fetches and upload them as textures.
+        while let Ok((key, bytes)) = self.thumb_rx.try_recv() {
+            let state = bytes
+                .and_then(|b| image::load_from_memory(&b).ok())
+                .map(|img| {
+                    let rgba = img.to_rgba8();
+                    let (w, h) = rgba.dimensions();
+                    let ci = egui::ColorImage::from_rgba_unmultiplied(
+                        [w as usize, h as usize],
+                        rgba.as_raw(),
+                    );
+                    ThumbState::Ready(ctx.load_texture(&key, ci, egui::TextureOptions::LINEAR))
+                })
+                .unwrap_or(ThumbState::Failed);
+            self.thumbs.insert(key, state);
+            ctx.request_repaint();
+        }
         // Self-screenshot mode for headless verification (QIMU_SCREENSHOT).
         if let Some(path) = self.screenshot_path.clone() {
-            if !self.screenshot_done && self.frames == 45 {
+            if !self.screenshot_done && self.frames == 240 {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
             }
             if !self.screenshot_done {
@@ -543,15 +648,254 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// Real slide thumbnail, fetched on a background thread (the server
+    /// renders it once via LibreOffice and caches it on disk).
+    fn thumb(&mut self, version_id: &str, page: usize) -> Option<egui::TextureHandle> {
+        if version_id.is_empty() {
+            return None;
+        }
+        let key = format!("{version_id}:{page}");
+        match self.thumbs.get(&key) {
+            Some(ThumbState::Ready(t)) => Some(t.clone()),
+            Some(_) => None,
+            None => {
+                self.thumbs.insert(key.clone(), ThumbState::Loading);
+                let (server, token, tx) = (
+                    self.server.clone(),
+                    self.token.clone(),
+                    self.thumb_tx.clone(),
+                );
+                let url = format!("{server}/v1/versions/{version_id}/thumb/{page}");
+                std::thread::spawn(move || {
+                    let mut req = ureq::get(&url);
+                    if let Some(t) = &token {
+                        req = req.set("Authorization", &format!("Bearer {t}"));
+                    }
+                    let out = req
+                        .call()
+                        .ok()
+                        .and_then(|r| r.into_json::<Value>().ok())
+                        .and_then(|v| {
+                            v.get("image_base64")
+                                .and_then(|x| x.as_str())
+                                .map(str::to_string)
+                        })
+                        .and_then(|s| b64d(&s).ok());
+                    let _ = tx.send((key, out));
+                });
+                None
+            }
+        }
+    }
+
+    fn thumb_ui(&mut self, ui: &mut egui::Ui, version_id: &str, page: usize, width: f32) {
+        let h = width * 9.0 / 16.0;
+        if let Some(tex) = self.thumb(version_id, page) {
+            ui.image((tex.id(), egui::vec2(width, h)));
+        } else {
+            ui.allocate_ui(egui::vec2(width, h), |ui| {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.set_min_size(egui::vec2(width - 8.0, h - 8.0));
+                    ui.centered_and_justified(|ui| {
+                        ui.label(egui::RichText::new(format!("第 {} 页", page + 1)).weak());
+                    });
+                });
+            });
+        }
+    }
+
+    /// Export the open index to a user-chosen file. kind: personal|company
+    /// (§3.14 — the server resolves or blocks on personal placeholders).
+    fn export_index_file(&mut self, index: &Value, kind: &str) {
+        let Some(id) = self.index.selected.clone() else {
+            return;
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name(format!("{}.pptx", s(index, "name")))
+            .save_file()
+        else {
+            return;
+        };
+        let r = self.call(
+            "POST",
+            &format!("/v1/indexes/{id}/export"),
+            Some(json!({ "branch": self.index.branch, "kind": kind })),
+        );
+        match r {
+            Ok(v) => {
+                if let Some(data) = v.get("data_base64").and_then(|x| x.as_str()) {
+                    if let Ok(bytes) = b64d(data) {
+                        let _ = std::fs::write(&path, bytes);
+                        self.msg = format!(
+                            "已导出 {} 页（{}）",
+                            v.get("page_count").and_then(|x| x.as_i64()).unwrap_or(0),
+                            if kind == "company" { "公用版" } else { "个人版" }
+                        );
+                        self.load_index_detail();
+                    }
+                }
+            }
+            Err(e) => self.msg = format!("导出失败：{e}"),
+        }
+    }
+
+    /// Write an adopted snapshot into the local offline cache (§3.17).
+    fn cache_deck(&mut self, key: &str, title: &str, bytes: &[u8], page_count: i64) {
+        let dir = cache_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let safe: String = key
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let file = format!("{safe}.pptx");
+        match std::fs::write(dir.join(&file), bytes) {
+            Ok(_) => {
+                self.cache_entries.retain(|e| s(e, "key") != key);
+                self.cache_entries.push(json!({
+                    "key": key,
+                    "title": title,
+                    "page_count": page_count,
+                    "file": file,
+                    "cached_ms": qimu_core::auth::now_ms(),
+                }));
+                save_cache_index(&self.cache_entries);
+                self.msg = format!("已缓存到本地：{title}");
+            }
+            Err(e) => self.msg = format!("缓存失败：{e}"),
+        }
+    }
+
+    fn remove_cache(&mut self, key: &str) {
+        if let Some(e) = self
+            .cache_entries
+            .iter()
+            .find(|e| s(e, "key") == key)
+            .cloned()
+        {
+            let _ = std::fs::remove_file(cache_dir().join(s(&e, "file")));
+        }
+        self.cache_entries.retain(|e| s(e, "key") != key);
+        save_cache_index(&self.cache_entries);
+        self.msg = "已移除缓存".into();
+    }
+
+    fn open_cache(&mut self, key: &str) {
+        let Some(e) = self
+            .cache_entries
+            .iter()
+            .find(|e| s(e, "key") == key)
+            .cloned()
+        else {
+            return;
+        };
+        let path = cache_dir().join(s(&e, "file"));
+        let r = if cfg!(target_os = "windows") {
+            std::process::Command::new("cmd")
+                .args(["/C", "start", ""])
+                .arg(&path)
+                .spawn()
+        } else if cfg!(target_os = "macos") {
+            std::process::Command::new("open").arg(&path).spawn()
+        } else {
+            std::process::Command::new("xdg-open").arg(&path).spawn()
+        };
+        self.msg = match r {
+            Ok(_) => format!("已打开本地副本：{}", path.display()),
+            Err(e) => format!("打开失败：{e}（文件在 {}）", path.display()),
+        };
+    }
+
+    fn library_view(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("本地缓存（离线可用）").strong());
+        if self.cache_entries.is_empty() {
+            ui.label(egui::RichText::new("暂无缓存。在广场或我的组装里点「缓存到本地」。").weak());
+        }
+        for e in self.cache_entries.clone() {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(s(&e, "title")).strong());
+                ui.label(format!(
+                    "{} 页 · {}",
+                    i(&e, "page_count"),
+                    fmt_time(i(&e, "cached_ms"))
+                ));
+                let key = s(&e, "key");
+                if ui.button("打开").clicked() {
+                    self.open_cache(&key);
+                }
+                if ui.button("移除缓存").clicked() {
+                    self.remove_cache(&key);
+                }
+            });
+        }
+        ui.separator();
+        ui.label(egui::RichText::new("我的组装").strong());
+        if self.my_assemblies.is_empty() {
+            ui.label(egui::RichText::new("暂无组装").weak());
+        }
+        for a in self.my_assemblies.clone() {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(s(&a, "name")).strong());
+                ui.label(format!(
+                    "{} 个条目 · {}",
+                    i(&a, "entry_count"),
+                    fmt_time(i(&a, "created_ms"))
+                ));
+                if ui.button("缓存到本地").clicked() {
+                    let aid = s(&a, "id");
+                    let name = s(&a, "name");
+                    match self.call(
+                        "POST",
+                        &format!("/v1/assemblies/{aid}/export"),
+                        Some(json!({ "kind": "personal" })),
+                    ) {
+                        Ok(v) => {
+                            if let Some(data) = v.get("data_base64").and_then(|x| x.as_str()) {
+                                if let Ok(bytes) = b64d(data) {
+                                    let pages = i(&v, "page_count");
+                                    self.cache_deck(&aid, &name, &bytes, pages);
+                                }
+                            }
+                        }
+                        Err(e) => self.msg = format!("缓存失败：{e}"),
+                    }
+                }
+            });
+        }
+    }
+
     fn page_showroom(&mut self, ui: &mut egui::Ui) {
-        ui.heading("演示厅 · 广场");
+        ui.horizontal(|ui| {
+            ui.heading("演示厅");
+            if ui
+                .selectable_label(self.sr_zone == "plaza", "广场")
+                .clicked()
+            {
+                self.sr_zone = "plaza".into();
+            }
+            if ui
+                .selectable_label(self.sr_zone == "library", "我的库")
+                .clicked()
+            {
+                self.sr_zone = "library".into();
+            }
+        });
+        if self.sr_zone == "library" {
+            self.library_view(ui);
+            return;
+        }
         ui.add_space(6.0);
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 for item in self.showroom_live.clone() {
-                    ui.allocate_ui(egui::vec2(300.0, 128.0), |ui| {
+                    ui.allocate_ui(egui::vec2(300.0, 156.0), |ui| {
                         egui::Frame::group(ui.style()).show(ui, |ui| {
-                            ui.set_min_size(egui::vec2(284.0, 112.0));
+                            ui.set_min_size(egui::vec2(284.0, 140.0));
                             ui.label(egui::RichText::new(s(&item, "title")).strong());
                             ui.label(s(&item, "intro"));
                             ui.label(
@@ -563,6 +907,30 @@ impl App {
                                 .small()
                                 .weak(),
                             );
+                            let src = s(&item, "source_index_id");
+                            if !src.is_empty() {
+                                if ui.small_button("缓存到本地").clicked() {
+                                    let title = s(&item, "title");
+                                    let key = format!("sr_{}", s(&item, "id"));
+                                    match self.call(
+                                        "POST",
+                                        &format!("/v1/indexes/{src}/export"),
+                                        Some(json!({ "branch": "main", "kind": "personal" })),
+                                    ) {
+                                        Ok(v) => {
+                                            if let Some(data) =
+                                                v.get("data_base64").and_then(|x| x.as_str())
+                                            {
+                                                if let Ok(bytes) = b64d(data) {
+                                                    let pages = i(&v, "page_count");
+                                                    self.cache_deck(&key, &title, &bytes, pages);
+                                                }
+                                            }
+                                        }
+                                        Err(e) => self.msg = format!("缓存失败：{e}"),
+                                    }
+                                }
+                            }
                         });
                     });
                 }
@@ -775,9 +1143,13 @@ impl App {
                         .and_then(|r| r.get("latest"))
                         .cloned()
                         .unwrap_or(Value::Null);
-                    ui.allocate_ui(egui::vec2(300.0, 128.0), |ui| {
+                    ui.allocate_ui(egui::vec2(300.0, 232.0), |ui| {
                         let resp = egui::Frame::group(ui.style()).show(ui, |ui| {
-                            ui.set_min_size(egui::vec2(284.0, 112.0));
+                            ui.set_min_size(egui::vec2(284.0, 216.0));
+                            if latest.is_object() {
+                                let vid = s(&latest, "id");
+                                self.thumb_ui(ui, &vid, 0, 268.0);
+                            }
                             ui.label(egui::RichText::new(s(&unit, "name")).strong().size(16.0));
                             if latest.is_object() {
                                 ui.label(format!(
@@ -842,6 +1214,8 @@ impl App {
                     if let Some(versions) = r.get("versions").and_then(|v| v.as_array()) {
                         for v in versions {
                             ui.horizontal(|ui| {
+                                let vid = s(v, "id");
+                                self.thumb_ui(ui, &vid, 0, 96.0);
                                 ui.label(format!(
                                     "v{} · {} 页 · {} · {}",
                                     s(v, "semver"),
@@ -944,6 +1318,157 @@ impl App {
                 } else {
                     self.msg = "先选择片段文件".into();
                 }
+            }
+            ui.separator();
+            ui.label(egui::RichText::new("语言绑定（逐页）").strong());
+            let mut all_versions: Vec<(String, String, i64)> = Vec::new();
+            if let Some(rends) = detail.get("renditions").and_then(|r| r.as_array()) {
+                for r in rends {
+                    let rend = r.get("rendition").cloned().unwrap_or(json!({}));
+                    if let Some(vs) = r.get("versions").and_then(|v| v.as_array()) {
+                        for v in vs {
+                            all_versions.push((
+                                s(v, "id"),
+                                format!(
+                                    "{} · {} · v{}",
+                                    s(&rend, "form"),
+                                    s(&rend, "lang"),
+                                    s(v, "semver")
+                                ),
+                                i(v, "page_count"),
+                            ));
+                        }
+                    }
+                }
+            }
+            if all_versions.len() >= 2 {
+                if self.content.bind_from.is_empty() {
+                    self.content.bind_from = all_versions[0].0.clone();
+                }
+                if self.content.bind_to.is_empty() {
+                    self.content.bind_to = all_versions[1].0.clone();
+                }
+                ui.horizontal(|ui| {
+                    ui.label("基准");
+                    let cur = all_versions
+                        .iter()
+                        .find(|v| v.0 == self.content.bind_from)
+                        .map(|v| v.1.clone())
+                        .unwrap_or_default();
+                    egui::ComboBox::from_id_salt("bind_from")
+                        .selected_text(cur)
+                        .show_ui(ui, |ui| {
+                            for v in &all_versions {
+                                ui.selectable_value(
+                                    &mut self.content.bind_from,
+                                    v.0.clone(),
+                                    &v.1,
+                                );
+                            }
+                        });
+                    ui.label("对应");
+                    let cur = all_versions
+                        .iter()
+                        .find(|v| v.0 == self.content.bind_to)
+                        .map(|v| v.1.clone())
+                        .unwrap_or_default();
+                    egui::ComboBox::from_id_salt("bind_to")
+                        .selected_text(cur)
+                        .show_ui(ui, |ui| {
+                            for v in &all_versions {
+                                ui.selectable_value(&mut self.content.bind_to, v.0.clone(), &v.1);
+                            }
+                        });
+                });
+                let from_pages = all_versions
+                    .iter()
+                    .find(|v| v.0 == self.content.bind_from)
+                    .map(|v| v.2)
+                    .unwrap_or(0);
+                let to_pages = all_versions
+                    .iter()
+                    .find(|v| v.0 == self.content.bind_to)
+                    .map(|v| v.2)
+                    .unwrap_or(0);
+                ui.label("基准页（点选）：");
+                ui.horizontal(|ui| {
+                    for p in 0..from_pages {
+                        ui.vertical(|ui| {
+                            let vid = self.content.bind_from.clone();
+                            self.thumb_ui(ui, &vid, p as usize, 84.0);
+                            let selected = self.content.bind_from_slot == Some(p);
+                            if ui
+                                .selectable_label(selected, format!("第{}页", p + 1))
+                                .clicked()
+                            {
+                                self.content.bind_from_slot = Some(p);
+                            }
+                        });
+                    }
+                });
+                ui.label("对应页（点「绑定/已绑定」切换）：");
+                ui.horizontal(|ui| {
+                    for p in 0..to_pages {
+                        ui.vertical(|ui| {
+                            let vid = self.content.bind_to.clone();
+                            self.thumb_ui(ui, &vid, p as usize, 84.0);
+                            let existing = self.content.bindings.iter().find(|b| {
+                                s(b, "from_version_id") == self.content.bind_from
+                                    && self.content.bind_from_slot == Some(i(b, "from_slot"))
+                                    && s(b, "to_version_id") == self.content.bind_to
+                                    && i(b, "to_slot") == p
+                            }).map(|b| s(b, "id"));
+                            match (self.content.bind_from_slot, existing) {
+                                (Some(_), Some(bid)) => {
+                                    if ui.button("已绑定 ✓").clicked() {
+                                        if let Some(uid) = self.content.selected_unit.clone() {
+                                            let _ = self.call(
+                                                "POST",
+                                                &format!("/v1/units/{uid}/page-bindings/{bid}/delete"),
+                                                None,
+                                            );
+                                            self.open_unit_detail(&uid);
+                                        }
+                                    }
+                                }
+                                (Some(fs), None) => {
+                                    if ui.button("绑定").clicked() {
+                                        if let Some(uid) = self.content.selected_unit.clone() {
+                                            let r = self.call(
+                                                "POST",
+                                                &format!("/v1/units/{uid}/page-bindings"),
+                                                Some(json!({
+                                                    "from_version_id": self.content.bind_from,
+                                                    "from_slot": fs,
+                                                    "to_version_id": self.content.bind_to,
+                                                    "to_slot": p,
+                                                })),
+                                            );
+                                            match r {
+                                                Ok(_) => self.open_unit_detail(&uid),
+                                                Err(e) => {
+                                                    self.msg = format!("绑定失败：{e}")
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    ui.label("先选基准页");
+                                }
+                            }
+                        });
+                    }
+                });
+                if !self.content.bindings.is_empty() {
+                    ui.label(
+                        egui::RichText::new(format!("已有绑定 {} 条", self.content.bindings.len()))
+                            .small()
+                            .weak(),
+                    );
+                }
+            } else {
+                ui.label(egui::RichText::new("至少两个版本后可做逐页绑定").weak());
             }
         });
     }
@@ -1135,34 +1660,11 @@ impl App {
             }
         });
         ui.horizontal(|ui| {
-            if ui.button("导出 PPT").clicked() {
-                if let Some(id) = self.index.selected.clone() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .set_file_name(format!("{}.pptx", s(&index, "name")))
-                        .save_file()
-                    {
-                        let r = self.call(
-                            "POST",
-                            &format!("/v1/indexes/{id}/export"),
-                            Some(json!({ "branch": self.index.branch, "kind": "personal" })),
-                        );
-                        match r {
-                            Ok(v) => {
-                                if let Some(data) = v.get("data_base64").and_then(|x| x.as_str()) {
-                                    if let Ok(bytes) = b64d(data) {
-                                        let _ = std::fs::write(&path, bytes);
-                                        self.msg = format!(
-                                            "已导出 {} 页",
-                                            v.get("page_count").and_then(|x| x.as_i64()).unwrap_or(0)
-                                        );
-                                        self.load_index_detail();
-                                    }
-                                }
-                            }
-                            Err(e) => self.msg = format!("导出失败：{e}"),
-                        }
-                    }
-                }
+            if ui.button("导出（个人版）").clicked() {
+                self.export_index_file(&index, "personal");
+            }
+            if ui.button("导出（公用版）").clicked() {
+                self.export_index_file(&index, "company");
             }
             ui.text_edit_singleline(&mut self.index.new_branch);
             if ui.button("拉分支").clicked() && !self.index.new_branch.is_empty() {
@@ -1218,15 +1720,25 @@ impl App {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "{} 页",
-                                    if ver.is_object() { i(&ver, "page_count") } else { 0 }
-                                ))
-                                .size(20.0)
-                                .strong(),
-                            );
                             ui.label(format!("#{}", pos + 1));
+                            if ver.is_object() {
+                                let vid = s(&ver, "id");
+                                let pages = i(&ver, "page_count").min(3);
+                                ui.horizontal(|ui| {
+                                    for p in 0..pages {
+                                        self.thumb_ui(ui, &vid, p as usize, 148.0);
+                                    }
+                                });
+                                if i(&ver, "page_count") > 3 {
+                                    ui.label(
+                                        egui::RichText::new(format!("共 {} 页", i(&ver, "page_count")))
+                                            .small()
+                                            .weak(),
+                                    );
+                                }
+                            } else {
+                                ui.label("无版本");
+                            }
                         });
                         ui.separator();
                         ui.vertical(|ui| {
@@ -1307,6 +1819,130 @@ impl App {
                     });
                 });
                 ui.add_space(4.0);
+            }
+            ui.separator();
+            ui.label(egui::RichText::new("分支合并").strong());
+            ui.horizontal(|ui| {
+                ui.label("来源分支");
+                ui.text_edit_singleline(&mut self.index.merge_from);
+                if ui.button("预览合并").clicked() && !self.index.merge_from.is_empty() {
+                    if let Some(id) = self.index.selected.clone() {
+                        let into = self.index.branch.clone();
+                        let from = self.index.merge_from.clone();
+                        match self.call(
+                            "POST",
+                            &format!("/v1/indexes/{id}/merge/preview"),
+                            Some(json!({ "from": from, "into": into })),
+                        ) {
+                            Ok(v) => {
+                                self.index.merge_preview = Some(v);
+                                self.index.merge_resolutions.clear();
+                            }
+                            Err(e) => self.msg = format!("合并预览失败：{e}"),
+                        }
+                    }
+                }
+            });
+            if let Some(preview) = self.index.merge_preview.clone() {
+                let conflicts = preview
+                    .get("conflicts")
+                    .and_then(|c| c.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let mut names: std::collections::HashMap<String, String> =
+                    std::collections::HashMap::new();
+                for re in &resolved {
+                    if let Some(en) = re.get("entry") {
+                        names.insert(
+                            s(en, "unit_id"),
+                            re.get("unit_name")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                        );
+                    }
+                }
+                if conflicts.is_empty() {
+                    ui.label(
+                        egui::RichText::new("无冲突，可自动合并")
+                            .color(egui::Color32::from_rgb(30, 150, 60)),
+                    );
+                } else {
+                    ui.label(format!("{} 个条目冲突，逐条裁决：", conflicts.len()));
+                    for c in &conflicts {
+                        let key = s(c, "key");
+                        let uname = names
+                            .get(&s(c, "unit_id"))
+                            .cloned()
+                            .unwrap_or_else(|| "条目".to_string());
+                        let ours = c.get("ours").cloned().unwrap_or(Value::Null);
+                        let theirs = c.get("theirs").cloned().unwrap_or(Value::Null);
+                        ui.horizontal(|ui| {
+                            ui.label(format!(
+                                "{}：本分支「{}」 / 对方「{}」",
+                                uname,
+                                entry_label(&ours),
+                                entry_label(&theirs)
+                            ));
+                            let cur = self.index.merge_resolutions.get(&key).cloned();
+                            if ui
+                                .selectable_label(cur.as_deref() == Some("ours"), "用本分支")
+                                .clicked()
+                            {
+                                self.index
+                                    .merge_resolutions
+                                    .insert(key.clone(), "ours".to_string());
+                            }
+                            if ui
+                                .selectable_label(cur.as_deref() == Some("theirs"), "用对方")
+                                .clicked()
+                            {
+                                self.index
+                                    .merge_resolutions
+                                    .insert(key.clone(), "theirs".to_string());
+                            }
+                        });
+                    }
+                }
+                let unresolved = conflicts
+                    .iter()
+                    .filter(|c| !self.index.merge_resolutions.contains_key(&s(c, "key")))
+                    .count();
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(unresolved == 0, egui::Button::new("执行合并"))
+                        .clicked()
+                    {
+                        if let Some(id) = self.index.selected.clone() {
+                            let resolutions: serde_json::Map<String, Value> = self
+                                .index
+                                .merge_resolutions
+                                .iter()
+                                .map(|(k, v)| (k.clone(), json!(v)))
+                                .collect();
+                            let r = self.call(
+                                "POST",
+                                &format!("/v1/indexes/{id}/merge"),
+                                Some(json!({
+                                    "from": self.index.merge_from,
+                                    "into": self.index.branch,
+                                    "resolutions": resolutions,
+                                })),
+                            );
+                            match r {
+                                Ok(_) => {
+                                    self.msg = "合并完成".into();
+                                    self.index.merge_preview = None;
+                                    self.load_index_detail();
+                                }
+                                Err(e) => self.msg = format!("合并失败：{e}"),
+                            }
+                        }
+                    }
+                    if unresolved > 0 {
+                        ui.label(format!("还剩 {unresolved} 条未裁决"));
+                    }
+                });
             }
             ui.separator();
             ui.label(egui::RichText::new("提交历史").strong());

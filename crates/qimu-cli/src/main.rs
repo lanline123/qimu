@@ -97,6 +97,10 @@ enum Command {
         #[command(subcommand)]
         cmd: ShowroomCommand,
     },
+    Assemblies {
+        #[command(subcommand)]
+        cmd: AssembliesCommand,
+    },
     /// Set personal profile fields (key=value, repeatable).
     Profile {
         #[arg(long = "set")]
@@ -147,6 +151,25 @@ enum UnitsCommand {
         folder: Option<String>,
         #[arg(long)]
         lang: Option<String>,
+    },
+    /// List a unit's per-page language bindings.
+    Bindings { id: String },
+    /// Bind one page of one version to a page of another version (same unit).
+    Bind {
+        id: String,
+        #[arg(long)]
+        from_version: String,
+        #[arg(long)]
+        from_slot: i64,
+        #[arg(long)]
+        to_version: String,
+        #[arg(long)]
+        to_slot: i64,
+    },
+    Unbind {
+        id: String,
+        #[arg(long)]
+        binding: String,
     },
 }
 
@@ -234,6 +257,24 @@ enum IndexCommand {
         id: String,
         #[arg(long)]
         state: String,
+    },
+    /// Preview an entry-level three-way merge of --from into --into.
+    MergePreview {
+        id: String,
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        into: Option<String>,
+    },
+    /// Execute the merge; unresolved conflicts fail. --resolve key=ours|theirs (repeatable).
+    Merge {
+        id: String,
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        into: Option<String>,
+        #[arg(long = "resolve")]
+        resolve: Vec<String>,
     },
     Export {
         id: String,
@@ -347,6 +388,25 @@ enum ShowroomCommand {
         id: String,
         #[arg(long)]
         state: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum AssembliesCommand {
+    List,
+    /// Create a personal assembly from entry JSON (array of index entries).
+    Create {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        entries_json: String,
+    },
+    Export {
+        id: String,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(short, long)]
+        out: String,
     },
 }
 
@@ -740,6 +800,28 @@ fn run() -> Result<i32, String> {
                         "name": name, "group_id": group, "folder_id": folder, "lead_lang": lang
                     })),
                 )?),
+                UnitsCommand::Bindings { id } => print(
+                    &ctx.call("GET", &format!("/v1/units/{id}/page-bindings"), None)?,
+                ),
+                UnitsCommand::Bind {
+                    id,
+                    from_version,
+                    from_slot,
+                    to_version,
+                    to_slot,
+                } => print(&ctx.call(
+                    "POST",
+                    &format!("/v1/units/{id}/page-bindings"),
+                    Some(json!({
+                        "from_version_id": from_version, "from_slot": from_slot,
+                        "to_version_id": to_version, "to_slot": to_slot
+                    })),
+                )?),
+                UnitsCommand::Unbind { id, binding } => print(&ctx.call(
+                    "POST",
+                    &format!("/v1/units/{id}/page-bindings/{binding}/delete"),
+                    None,
+                )?),
             }
             Ok(0)
         }
@@ -876,6 +958,31 @@ fn run() -> Result<i32, String> {
                     &format!("/v1/indexes/{id}/lifecycle"),
                     Some(json!({ "lifecycle": state })),
                 )?),
+                IndexCommand::MergePreview { id, from, into } => print(&ctx.call(
+                    "POST",
+                    &format!("/v1/indexes/{id}/merge/preview"),
+                    Some(json!({ "from": from, "into": into })),
+                )?),
+                IndexCommand::Merge {
+                    id,
+                    from,
+                    into,
+                    resolve,
+                } => {
+                    let mut resolutions = serde_json::Map::new();
+                    for kv in &resolve {
+                        let mut it = kv.splitn(2, '=');
+                        resolutions.insert(
+                            it.next().unwrap_or("").to_string(),
+                            json!(it.next().unwrap_or("")),
+                        );
+                    }
+                    print(&ctx.call(
+                        "POST",
+                        &format!("/v1/indexes/{id}/merge"),
+                        Some(json!({ "from": from, "into": into, "resolutions": resolutions })),
+                    )?)
+                }
                 IndexCommand::Export {
                     id,
                     branch,
@@ -1027,6 +1134,38 @@ fn run() -> Result<i32, String> {
                     &format!("/v1/showroom/{id}/review"),
                     Some(json!({ "state": state })),
                 )?),
+            }
+            Ok(0)
+        }
+        Command::Assemblies { cmd } => {
+            match cmd {
+                AssembliesCommand::List => print(&ctx.call("GET", "/v1/assemblies", None)?),
+                AssembliesCommand::Create { name, entries_json } => {
+                    let entries: Value =
+                        serde_json::from_str(&entries_json).map_err(|e| e.to_string())?;
+                    print(&ctx.call(
+                        "POST",
+                        "/v1/assemblies",
+                        Some(json!({ "name": name, "entries": entries })),
+                    )?)
+                }
+                AssembliesCommand::Export { id, kind, out } => {
+                    let r = ctx.call(
+                        "POST",
+                        &format!("/v1/assemblies/{id}/export"),
+                        Some(json!({ "kind": kind })),
+                    )?;
+                    let data = r
+                        .get("data_base64")
+                        .and_then(|v| v.as_str())
+                        .ok_or("响应缺少文件数据")?;
+                    std::fs::write(&out, b64d(data)?).map_err(|e| e.to_string())?;
+                    print(&json!({
+                        "ok": true,
+                        "out": out,
+                        "page_count": r.get("page_count"),
+                    }));
+                }
             }
             Ok(0)
         }

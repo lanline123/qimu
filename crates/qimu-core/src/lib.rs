@@ -9,6 +9,7 @@ pub mod assemble;
 pub mod auth;
 pub mod manifest;
 pub mod model;
+pub mod personalize;
 pub mod pptx;
 pub mod semver;
 pub mod store;

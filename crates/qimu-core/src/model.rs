@@ -112,7 +112,7 @@ pub enum EntryPolicy {
     Locked { version_id: Id },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexEntry {
     pub unit_id: Id,
     pub rendition_id: Id,

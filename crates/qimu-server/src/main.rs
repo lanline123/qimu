@@ -740,11 +740,183 @@ async fn version_fragment(
     Ok(Json(json!({ "version": ver, "data_base64": b64e(&bytes) })))
 }
 
+/// Render a fragment PPTX to per-slide PNGs with LibreOffice headless
+/// (PPTX -> PDF -> pdftoppm). Runs in a private temp dir with its own LO
+/// profile so concurrent renders don't fight over the default profile.
+fn render_thumbs(root: &std::path::Path, version_id: &str, frag: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    let work = root.join("thumbs").join(format!(".work-{version_id}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+    let cleanup = |work: &std::path::Path| {
+        let _ = std::fs::remove_dir_all(work);
+    };
+    let pptx = work.join("frag.pptx");
+    std::fs::write(&pptx, frag).map_err(|e| e.to_string())?;
+    let profile = format!("file://{}", work.join("lo-profile").display());
+    let lo = std::process::Command::new("soffice")
+        .arg(format!("-env:UserInstallation={profile}"))
+        .args(["--headless", "--convert-to", "pdf", "--outdir"])
+        .arg(&work)
+        .arg(&pptx)
+        .output()
+        .map_err(|e| format!("启动 LibreOffice 失败: {e}"))?;
+    let pdf = work.join("frag.pdf");
+    if !lo.status.success() || !pdf.exists() {
+        cleanup(&work);
+        return Err(format!(
+            "LibreOffice 渲染失败: {}",
+            String::from_utf8_lossy(&lo.stderr)
+        ));
+    }
+    let ppm = std::process::Command::new("pdftoppm")
+        .args(["-png", "-r", "55"])
+        .arg(&pdf)
+        .arg(work.join("page"))
+        .output()
+        .map_err(|e| format!("启动 pdftoppm 失败: {e}"))?;
+    if !ppm.status.success() {
+        cleanup(&work);
+        return Err(format!(
+            "pdftoppm 失败: {}",
+            String::from_utf8_lossy(&ppm.stderr)
+        ));
+    }
+    let mut pages: Vec<(u32, Vec<u8>)> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&work) {
+        for ent in rd.flatten() {
+            let name = ent.file_name().to_string_lossy().to_string();
+            if let Some(num) = name
+                .strip_prefix("page-")
+                .and_then(|n| n.strip_suffix(".png"))
+                .and_then(|n| n.parse::<u32>().ok())
+            {
+                if let Ok(bytes) = std::fs::read(ent.path()) {
+                    pages.push((num, bytes));
+                }
+            }
+        }
+    }
+    pages.sort_by_key(|(n, _)| *n);
+    cleanup(&work);
+    if pages.is_empty() {
+        return Err("渲染未产出任何页面".into());
+    }
+    Ok(pages.into_iter().map(|(_, b)| b).collect())
+}
+
+/// GET /v1/versions/:id/thumb/:page — real slide thumbnail (PNG, base64
+/// JSON like the fragment endpoint). Rendered once per version, then
+/// cached on disk under <data>/thumbs/<version_id>/<page>.png.
+async fn version_thumb(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path((id, page)): Path<(String, usize)>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let (root, frag) = {
+        let store = st.store.lock().unwrap();
+        let ver = store.get_version(&id).map_err(|_| not_found())?;
+        let rend = store.get_rendition(&ver.rendition_id).map_err(bad)?;
+        let unit = store.get_unit(&rend.unit_id).map_err(bad)?;
+        if !store.can_see_group(&user, &unit.group_id).map_err(bad)? {
+            return Err(not_found());
+        }
+        let frag = store.file_get(&ver.fragment_hash).map_err(bad)?;
+        (store.root().to_path_buf(), frag)
+    };
+    let cache_dir = root.join("thumbs").join(&id);
+    let cache_file = cache_dir.join(format!("{page}.png"));
+    if !cache_file.exists() {
+        let root2 = root.clone();
+        let id2 = id.clone();
+        let rendered = tokio::task::spawn_blocking(move || render_thumbs(&root2, &id2, &frag))
+            .await
+            .map_err(|e| bad(e.to_string()))?
+            .map_err(bad)?;
+        std::fs::create_dir_all(&cache_dir).map_err(|e| bad(e.to_string()))?;
+        for (n, bytes) in rendered.iter().enumerate() {
+            let f = cache_dir.join(format!("{n}.png"));
+            if !f.exists() {
+                std::fs::write(&f, bytes).map_err(|e| bad(e.to_string()))?;
+            }
+        }
+    }
+    let bytes = std::fs::read(&cache_file).map_err(|_| not_found())?;
+    Ok(Json(json!({ "page": page, "image_base64": b64e(&bytes) })))
+}
+
 #[derive(Deserialize)]
 struct VerTagReq {
     dim: String,
     value: String,
     strength: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PageBindingReq {
+    from_version_id: String,
+    from_slot: i64,
+    to_version_id: String,
+    to_slot: i64,
+    kind: Option<String>,
+}
+
+async fn list_page_bindings(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let store = st.store.lock().unwrap();
+    let unit = store.get_unit(&id).map_err(|_| not_found())?;
+    if !store.can_see_group(&user, &unit.group_id).map_err(bad)? {
+        return Err(not_found());
+    }
+    let bindings = store.list_page_bindings(&id).map_err(bad)?;
+    Ok(Json(json!({ "bindings": bindings })))
+}
+
+async fn add_page_binding(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<PageBindingReq>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let unit = {
+        let store = st.store.lock().unwrap();
+        store.get_unit(&id).map_err(|_| not_found())?
+    };
+    need_cap(&st, &user, &unit.group_id, "publish")?;
+    let store = st.store.lock().unwrap();
+    let b = store
+        .add_page_binding(
+            &id,
+            &req.from_version_id,
+            req.from_slot,
+            &req.to_version_id,
+            req.to_slot,
+            req.kind.as_deref().unwrap_or("manual"),
+            &user.display_name,
+        )
+        .map_err(bad)?;
+    Ok(Json(json!(b)))
+}
+
+async fn delete_page_binding(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path((id, bid)): Path<(String, String)>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let unit = {
+        let store = st.store.lock().unwrap();
+        store.get_unit(&id).map_err(|_| not_found())?
+    };
+    need_cap(&st, &user, &unit.group_id, "publish")?;
+    let store = st.store.lock().unwrap();
+    store.delete_page_binding(&id, &bid).map_err(bad)?;
+    Ok(Json(json!({ "ok": true })))
 }
 
 async fn add_version_tag(
@@ -991,6 +1163,58 @@ async fn create_branch(
 }
 
 #[derive(Deserialize)]
+struct MergeReq {
+    from: String,
+    into: Option<String>,
+    resolutions: Option<std::collections::HashMap<String, String>>,
+}
+
+async fn merge_preview(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<MergeReq>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let index = {
+        let store = st.store.lock().unwrap();
+        store.get_index(&id).map_err(|_| not_found())?
+    };
+    need_cap(&st, &user, &index.group_id, "publish")?;
+    let store = st.store.lock().unwrap();
+    let p = store
+        .preview_merge(&id, &req.from, req.into.as_deref().unwrap_or("main"))
+        .map_err(bad)?;
+    Ok(Json(json!(p)))
+}
+
+async fn merge_execute(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<MergeReq>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let index = {
+        let store = st.store.lock().unwrap();
+        store.get_index(&id).map_err(|_| not_found())?
+    };
+    need_cap(&st, &user, &index.group_id, "publish")?;
+    let store = st.store.lock().unwrap();
+    let resolutions = req.resolutions.unwrap_or_default();
+    let c = store
+        .execute_merge(
+            &id,
+            &req.from,
+            req.into.as_deref().unwrap_or("main"),
+            &user.display_name,
+            &resolutions,
+        )
+        .map_err(bad)?;
+    Ok(Json(json!({ "commit": c })))
+}
+
+#[derive(Deserialize)]
 struct TagReq {
     branch: Option<String>,
     name: String,
@@ -1043,6 +1267,7 @@ async fn set_lifecycle(
 /// manifest. Returns (deck bytes, manifest, page count).
 fn build_export(
     st: &St,
+    user: &UserRec,
     entries: &[IndexEntry],
     source: Option<SourceRef>,
     kind: &str,
@@ -1085,7 +1310,46 @@ fn build_export(
         return Err(bad("没有可导出的页面"));
     }
     let page_count = pkgs.len() as i64;
-    let assembled = qimu_core::assemble::assemble(&pkgs).map_err(bad)?;
+    let mut assembled = qimu_core::assemble::assemble(&pkgs).map_err(bad)?;
+    // Personal binding (§3.14): resolve {{placeholders}} per recipient.
+    // 个人版 = exporter's own profile + company data; 公用版 = company
+    // data only, personal placeholders scrubbed blank. A placeholder with
+    // no value blocks the export — never fill with someone else's data.
+    {
+        use qimu_core::personalize;
+        use std::collections::BTreeMap;
+        let mut values: BTreeMap<String, String> = BTreeMap::new();
+        for (k, v) in store.company_profile().map_err(bad)? {
+            let token = match k.as_str() {
+                "phone" => "company_phone",
+                "website" => "company_website",
+                "address" => "company_address",
+                "gongzhonghao" => "company_gongzhonghao",
+                _ => continue,
+            };
+            if !v.is_empty() {
+                values.insert(token.to_string(), v);
+            }
+        }
+        let scrub: &[&str] = if kind == "company" {
+            personalize::PERSONAL_FIELDS
+        } else {
+            values.insert("name".to_string(), user.display_name.clone());
+            for (k, v) in store.profile(&user.id).map_err(bad)? {
+                if !v.is_empty() {
+                    values.insert(k, v);
+                }
+            }
+            &[]
+        };
+        let missing = personalize::substitute(&mut assembled, &values, scrub);
+        if !missing.is_empty() {
+            return Err(bad(format!(
+                "导出已拦截：以下占位字段没有值（请先在设置里补全资料）：{}",
+                missing.join("、")
+            )));
+        }
+    }
     let deck = assembled.to_bytes().map_err(bad)?;
     let manifest = Manifest {
         deck_id: qimu_core::auth::new_id("deck"),
@@ -1142,7 +1406,7 @@ async fn export_index(
         commit_id: commit.id.clone(),
         tag: req.tag.clone(),
     };
-    let (deck, manifest, page_count) = build_export(&st, &commit.entries, Some(source), kind)?;
+    let (deck, manifest, page_count) = build_export(&st, &user, &commit.entries, Some(source), kind)?;
     let export_id = qimu_core::auth::new_id("exp");
     {
         let store = st.store.lock().unwrap();
@@ -1492,6 +1756,13 @@ struct AssemblyReq {
     entries: Vec<IndexEntry>,
 }
 
+async fn list_assemblies(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let store = st.store.lock().unwrap();
+    let list = store.list_assemblies(&user.id).map_err(bad)?;
+    Ok(Json(json!({ "assemblies": list })))
+}
+
 async fn create_assembly(
     State(st): State<St>,
     headers: HeaderMap,
@@ -1516,13 +1787,13 @@ async fn export_assembly(
     Path(id): Path<String>,
     Json(req): Json<AssemblyExportReq>,
 ) -> Api<Value> {
-    let _ = auth(&st, &headers)?;
+    let user = auth(&st, &headers)?;
     let entries = {
         let store = st.store.lock().unwrap();
         store.assembly_entries(&id).map_err(|_| not_found())?
     };
     let (deck, manifest, page_count) =
-        build_export(&st, &entries, None, req.kind.as_deref().unwrap_or("personal"))?;
+        build_export(&st, &user, &entries, None, req.kind.as_deref().unwrap_or("personal"))?;
     Ok(Json(json!({
         "page_count": page_count,
         "manifest": manifest,
@@ -1577,12 +1848,20 @@ async fn main() {
         .route("/v1/versions/:id/recall", post(recall_version))
         .route("/v1/versions/:id/delete", post(delete_version))
         .route("/v1/versions/:id/fragment", get(version_fragment))
+        .route("/v1/versions/:id/thumb/:page", get(version_thumb))
         .route("/v1/versions/:id/tags", get(list_version_tags).post(add_version_tag))
+        .route(
+            "/v1/units/:id/page-bindings",
+            get(list_page_bindings).post(add_page_binding),
+        )
+        .route("/v1/units/:id/page-bindings/:bid/delete", post(delete_page_binding))
         .route("/v1/search", get(search))
         .route("/v1/indexes", get(list_indexes).post(create_index))
         .route("/v1/indexes/:id", get(get_index))
         .route("/v1/indexes/:id/commits", get(list_commits).post(post_commit))
         .route("/v1/indexes/:id/branches", post(create_branch))
+        .route("/v1/indexes/:id/merge/preview", post(merge_preview))
+        .route("/v1/indexes/:id/merge", post(merge_execute))
         .route("/v1/indexes/:id/tags", post(create_tag))
         .route("/v1/indexes/:id/lifecycle", post(set_lifecycle))
         .route("/v1/indexes/:id/export", post(export_index))
@@ -1593,7 +1872,7 @@ async fn main() {
         .route("/v1/attachments/:id/download", get(download_attachment))
         .route("/v1/showroom", get(list_showroom).post(submit_showroom))
         .route("/v1/showroom/:id/review", post(review_showroom))
-        .route("/v1/assemblies", post(create_assembly))
+        .route("/v1/assemblies", get(list_assemblies).post(create_assembly))
         .route("/v1/assemblies/:id/export", post(export_assembly))
         .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
         .with_state(state);
