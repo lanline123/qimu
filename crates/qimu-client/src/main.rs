@@ -38,55 +38,80 @@ fn install_cjk_font(ctx: &egui::Context) {
     }
 }
 
-/// Modern light theme: soft gray app background, white cards, one accent
-/// color, rounded corners, compact controls (spec §4.2: graphics first,
-/// controls step back).
-pub const ACCENT: egui::Color32 = egui::Color32::from_rgb(43, 108, 232);
-pub const APP_BG: egui::Color32 = egui::Color32::from_rgb(243, 245, 248);
-pub const CARD_BORDER: egui::Color32 = egui::Color32::from_rgb(225, 229, 235);
-pub const TEXT_WEAK: egui::Color32 = egui::Color32::from_rgb(110, 119, 133);
+/// Design language adopted 1:1 from the Craft family apps (DeckCraft /
+/// EffectCraft), whose look the product owner picked as the reference:
+/// flat light chrome, white cards, hairline separators, ghost controls,
+/// one orange accent used for tab underlines, selection and primaries.
+pub const ACCENT: egui::Color32 = egui::Color32::from_rgb(0xD9, 0x5A, 0x1A);
+pub const ACCENT_DEEP: egui::Color32 = egui::Color32::from_rgb(0xC2, 0x4E, 0x14);
+pub const CHROME: egui::Color32 = egui::Color32::from_rgb(0xF5, 0xF5, 0xF5);
+pub const APP_BG: egui::Color32 = egui::Color32::from_rgb(0xF0, 0xF0, 0xF0);
+pub const CARD_BORDER: egui::Color32 = egui::Color32::from_rgb(0xE3, 0xE3, 0xE3);
+pub const SEPARATOR: egui::Color32 = egui::Color32::from_rgb(0xE1, 0xE1, 0xE1);
+pub const TEXT_MAIN: egui::Color32 = egui::Color32::from_rgb(0x24, 0x24, 0x24);
+pub const TEXT_WEAK: egui::Color32 = egui::Color32::from_rgb(0x5C, 0x5C, 0x5C);
+pub const TEXT_FAINT: egui::Color32 = egui::Color32::from_rgb(0x99, 0x99, 0x99);
+pub const HOVER_BG: egui::Color32 = egui::Color32::from_rgb(0xEB, 0xEB, 0xEB);
 
 fn apply_modern_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
     let mut v = egui::Visuals::light();
-    v.panel_fill = APP_BG;
+    v.panel_fill = CHROME;
     v.window_fill = egui::Color32::WHITE;
-    v.extreme_bg_color = egui::Color32::WHITE;
-    v.faint_bg_color = egui::Color32::from_rgb(248, 249, 251);
-    v.selection.bg_fill = ACCENT;
+    // egui 0.29 has no separate text-field fill; extreme_bg serves it —
+    // Craft's text_field gray, so fields read on white cards and canvas.
+    v.extreme_bg_color = egui::Color32::from_rgb(0xEB, 0xEB, 0xEB);
+    v.faint_bg_color = HOVER_BG;
+    v.selection.bg_fill = ACCENT.gamma_multiply(0.85);
     v.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
     v.hyperlink_color = ACCENT;
-    v.window_rounding = egui::Rounding::same(12.0);
-    v.menu_rounding = egui::Rounding::same(10.0);
-    let r = egui::Rounding::same(8.0);
-    v.widgets.noninteractive.rounding = r;
-    v.widgets.noninteractive.bg_stroke =
-        egui::Stroke::new(1.0, CARD_BORDER);
-    v.widgets.inactive.rounding = r;
-    v.widgets.inactive.bg_fill = egui::Color32::WHITE;
-    v.widgets.inactive.weak_bg_fill = egui::Color32::WHITE;
-    v.widgets.inactive.bg_stroke =
-        egui::Stroke::new(1.0, egui::Color32::from_rgb(210, 215, 223));
-    v.widgets.hovered.rounding = r;
-    v.widgets.hovered.bg_fill = egui::Color32::from_rgb(240, 244, 252);
-    v.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(240, 244, 252);
-    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, ACCENT);
-    v.widgets.active.rounding = r;
-    v.widgets.active.bg_fill = egui::Color32::from_rgb(226, 235, 253);
-    v.widgets.active.weak_bg_fill = egui::Color32::from_rgb(226, 235, 253);
-    v.widgets.active.bg_stroke = egui::Stroke::new(1.0, ACCENT);
-    v.widgets.open.rounding = r;
-    v.widgets.open.bg_fill = egui::Color32::from_rgb(240, 244, 252);
-    v.widgets.open.weak_bg_fill = egui::Color32::from_rgb(240, 244, 252);
+    v.override_text_color = Some(TEXT_MAIN);
+    v.window_rounding = egui::Rounding::same(10.0);
+    v.menu_rounding = egui::Rounding::same(8.0);
+    v.window_shadow = egui::epaint::Shadow {
+        offset: egui::vec2(0.0, 4.0),
+        blur: 18.0,
+        spread: 0.0,
+        color: egui::Color32::from_black_alpha(28),
+    };
+    v.popup_shadow = egui::epaint::Shadow {
+        offset: egui::vec2(0.0, 3.0),
+        blur: 12.0,
+        spread: 0.0,
+        color: egui::Color32::from_black_alpha(28),
+    };
+    let r = egui::Rounding::same(5.0);
+    for w in [
+        &mut v.widgets.noninteractive,
+        &mut v.widgets.inactive,
+        &mut v.widgets.hovered,
+        &mut v.widgets.active,
+        &mut v.widgets.open,
+    ] {
+        w.rounding = r;
+    }
+    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, SEPARATOR);
+    // ghost controls: no outlines; fills only where a control must stand out
+    v.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
+    v.widgets.inactive.bg_fill = egui::Color32::from_rgb(0xD6, 0xD6, 0xD6);
+    v.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+    v.widgets.hovered.weak_bg_fill = HOVER_BG;
+    v.widgets.hovered.bg_fill = egui::Color32::from_rgb(0xC8, 0xC8, 0xC8);
+    v.widgets.hovered.bg_stroke = egui::Stroke::NONE;
+    v.widgets.active.weak_bg_fill = egui::Color32::from_rgb(0xDE, 0xDE, 0xDE);
+    v.widgets.active.bg_fill = egui::Color32::from_rgb(0xBC, 0xBC, 0xBC);
+    v.widgets.active.bg_stroke = egui::Stroke::NONE;
+    v.widgets.open.weak_bg_fill = egui::Color32::from_rgb(0xDE, 0xDE, 0xDE);
+    v.widgets.open.bg_stroke = egui::Stroke::NONE;
     style.visuals = v;
     use egui::{FontFamily, FontId, TextStyle};
     style.text_styles.insert(
         TextStyle::Heading,
-        FontId::new(19.0, FontFamily::Proportional),
+        FontId::new(18.0, FontFamily::Proportional),
     );
     style
         .text_styles
-        .insert(TextStyle::Body, FontId::new(13.5, FontFamily::Proportional));
+        .insert(TextStyle::Body, FontId::new(13.0, FontFamily::Proportional));
     style.text_styles.insert(
         TextStyle::Button,
         FontId::new(13.0, FontFamily::Proportional),
@@ -98,46 +123,87 @@ fn apply_modern_style(ctx: &egui::Context) {
     style
         .text_styles
         .insert(TextStyle::Monospace, FontId::new(12.0, FontFamily::Monospace));
-    style.spacing.item_spacing = egui::vec2(8.0, 7.0);
-    style.spacing.button_padding = egui::vec2(11.0, 5.0);
+    style.spacing.item_spacing = egui::vec2(6.0, 4.0);
+    style.spacing.button_padding = egui::vec2(8.0, 3.0);
+    style.spacing.interact_size.y = 22.0;
     style.spacing.indent = 14.0;
     style.spacing.window_margin = egui::Margin::same(10.0);
     ctx.set_style(style);
 }
 
-/// The one standard card (§4.2): white surface, hairline border, soft
-/// shadow, rounded corners — replaces the dated group-box look.
+/// The one standard card (§4.2), Craft-style: white surface, hairline
+/// #E3E3E3 border, 10px radius, soft shadow — cover-first layout.
 fn card_frame() -> egui::Frame {
     egui::Frame::none()
         .fill(egui::Color32::WHITE)
         .stroke(egui::Stroke::new(1.0, CARD_BORDER))
         .rounding(egui::Rounding::same(10.0))
-        .inner_margin(egui::Margin::same(12.0))
+        .inner_margin(egui::Margin::same(14.0))
         .shadow(egui::epaint::Shadow {
-            offset: egui::vec2(0.0, 1.0),
-            blur: 5.0,
+            offset: egui::vec2(0.0, 2.0),
+            blur: 10.0,
             spread: 0.0,
-            color: egui::Color32::from_black_alpha(16),
+            color: egui::Color32::from_black_alpha(18),
         })
 }
 
-/// Pill tab used in the top bar and zone switchers.
+/// Flush variant (no inner margin) for cover-first cards: the cover
+/// image runs edge to edge, the body adds its own padding.
+fn card_frame_flush() -> egui::Frame {
+    card_frame().inner_margin(egui::Margin::same(0.0))
+}
+
+/// Small tinted pill for statuses (version policy, excerpt, version no).
+/// Painted manually with an exact-size allocation: a Frame here inherits
+/// whatever layout surrounds it and stretches/wraps unpredictably.
+fn chip(ui: &mut egui::Ui, text: &str, fg: egui::Color32, bg: egui::Color32) {
+    let font = egui::FontId::new(11.0, egui::FontFamily::Proportional);
+    let galley = ui.fonts(|f| f.layout_no_wrap(text.to_string(), font, fg));
+    let size = egui::vec2(galley.size().x + 16.0, 18.0);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 9.0, bg);
+    painter.galley(
+        egui::pos2(rect.min.x + 8.0, rect.center().y - galley.size().y / 2.0),
+        galley,
+        fg,
+    );
+}
+
+pub const CHIP_GREEN_FG: egui::Color32 = egui::Color32::from_rgb(24, 150, 84);
+pub const CHIP_GREEN_BG: egui::Color32 = egui::Color32::from_rgb(227, 245, 234);
+pub const CHIP_ORANGE_FG: egui::Color32 = egui::Color32::from_rgb(205, 110, 4);
+pub const CHIP_ORANGE_BG: egui::Color32 = egui::Color32::from_rgb(252, 238, 219);
+pub const CHIP_BLUE_BG: egui::Color32 = egui::Color32::from_rgb(0xFD, 0xEE, 0xE6);
+pub const CHIP_GRAY_FG: egui::Color32 = egui::Color32::from_rgb(96, 106, 120);
+pub const CHIP_GRAY_BG: egui::Color32 = egui::Color32::from_rgb(238, 241, 245);
+
+/// Craft-style tab (top bar + zone switchers): ghost text tab, the
+/// selected one carries an accent underline.
 fn pill(ui: &mut egui::Ui, selected: bool, label: &str) -> egui::Response {
     let text = egui::RichText::new(label).color(if selected {
-        egui::Color32::WHITE
+        TEXT_MAIN
     } else {
-        egui::Color32::from_rgb(70, 78, 92)
+        TEXT_WEAK
     });
-    let mut btn = egui::Button::new(text)
-        .rounding(egui::Rounding::same(15.0))
-        .min_size(egui::vec2(0.0, 29.0));
-    btn = if selected {
-        btn.fill(ACCENT).stroke(egui::Stroke::NONE)
-    } else {
-        btn.fill(egui::Color32::TRANSPARENT)
-            .stroke(egui::Stroke::NONE)
-    };
-    ui.add(btn)
+    let btn = egui::Button::new(text)
+        .fill(egui::Color32::TRANSPARENT)
+        .stroke(egui::Stroke::NONE)
+        .rounding(egui::Rounding::same(5.0))
+        .min_size(egui::vec2(0.0, 26.0));
+    let resp = ui.add(btn);
+    if selected {
+        let r = resp.rect;
+        ui.painter().rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(r.min.x + 7.0, r.max.y - 2.0),
+                egui::pos2(r.max.x - 7.0, r.max.y),
+            ),
+            1.0,
+            ACCENT,
+        );
+    }
+    resp
 }
 
 /// Offline cache (§3.17): adopted snapshots live under ~/.qimu/cache with
@@ -392,6 +458,7 @@ struct App {
     team_member_pick: String,
     cache_entries: Vec<Value>,
     cache_policy: Value,
+    index_covers: std::collections::HashMap<String, String>,
     content: ContentState,
     index: IndexState,
     settings: SettingsState,
@@ -451,6 +518,7 @@ impl App {
             team_member_pick: String::new(),
             cache_entries: load_cache_index(),
             cache_policy: json!({ "allowed": true, "max_mb": 500 }),
+            index_covers: std::collections::HashMap::new(),
             content: ContentState {
                 publish_bump: 1, // default preselect: minor （小版本）
                 ..Default::default()
@@ -555,6 +623,26 @@ impl App {
         }
         if let Ok(v) = self.call("GET", "/v1/showroom?state=live", None) {
             self.showroom_live = v.get("items").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+            // plaza card covers: first resolved version of the source index
+            for item in self.showroom_live.clone() {
+                let src = s(&item, "source_index_id");
+                if src.is_empty() || self.index_covers.contains_key(&src) {
+                    continue;
+                }
+                self.index_covers.insert(src.clone(), String::new());
+                if let Ok(d) = self.call("GET", &format!("/v1/indexes/{src}"), None) {
+                    if let Some(vid) = d
+                        .get("resolved_entries")
+                        .and_then(|r| r.as_array())
+                        .and_then(|a| a.first())
+                        .and_then(|e| e.get("resolved"))
+                        .and_then(|r| r.get("id"))
+                        .and_then(|x| x.as_str())
+                    {
+                        self.index_covers.insert(src, vid.to_string());
+                    }
+                }
+            }
         }
         if let Ok(v) = self.call("GET", "/v1/showroom?state=pending", None) {
             self.showroom_pending = v.get("items").and_then(|f| f.as_array()).cloned().unwrap_or_default();
@@ -861,14 +949,14 @@ impl eframe::App for App {
         egui::TopBottomPanel::top("top")
             .frame(
                 egui::Frame::none()
-                    .fill(egui::Color32::WHITE)
+                    .fill(CHROME)
                     .inner_margin(egui::Margin {
                         left: 14.0,
                         right: 14.0,
                         top: 8.0,
                         bottom: 8.0,
                     })
-                    .stroke(egui::Stroke::new(1.0, CARD_BORDER)),
+                    .stroke(egui::Stroke::new(1.0, SEPARATOR)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -876,7 +964,7 @@ impl eframe::App for App {
                         egui::RichText::new("启幕")
                             .strong()
                             .size(18.0)
-                            .color(ACCENT),
+                            .color(TEXT_MAIN),
                     );
                     ui.add_space(10.0);
                     for (page, label) in [
@@ -913,14 +1001,14 @@ impl eframe::App for App {
         egui::TopBottomPanel::bottom("status")
             .frame(
                 egui::Frame::none()
-                    .fill(egui::Color32::WHITE)
+                    .fill(CHROME)
                     .inner_margin(egui::Margin {
                         left: 14.0,
                         right: 14.0,
                         top: 5.0,
                         bottom: 5.0,
                     })
-                    .stroke(egui::Stroke::new(1.0, CARD_BORDER)),
+                    .stroke(egui::Stroke::new(1.0, SEPARATOR)),
             )
             .show(ctx, |ui| {
                 ui.label(egui::RichText::new(&self.msg).small().color(TEXT_WEAK));
@@ -988,12 +1076,17 @@ impl App {
             ui.image((tex.id(), egui::vec2(width, h)));
         } else {
             ui.allocate_ui(egui::vec2(width, h), |ui| {
-                card_frame().show(ui, |ui| {
-                    ui.set_min_size(egui::vec2(width - 8.0, h - 8.0));
-                    ui.centered_and_justified(|ui| {
-                        ui.label(egui::RichText::new(format!("第 {} 页", page + 1)).weak());
+                egui::Frame::none()
+                    .fill(HOVER_BG)
+                    .show(ui, |ui| {
+                        ui.set_min_size(egui::vec2(width, h));
+                        ui.centered_and_justified(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!("第 {} 页", page + 1))
+                                    .color(TEXT_FAINT),
+                            );
+                        });
                     });
-                });
             });
         }
     }
@@ -1600,14 +1693,31 @@ impl App {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 for item in self.showroom_live.clone() {
-                    ui.allocate_ui(egui::vec2(300.0, 128.0), |ui| {
+                    ui.allocate_ui(egui::vec2(300.0, 284.0), |ui| {
                         // allocate_ui inherits the wrapped horizontal layout;
                         // card content must flow top-down
                         ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
-                        card_frame().show(ui, |ui| {
-                            ui.set_min_size(egui::vec2(284.0, 112.0));
+                        card_frame_flush().show(ui, |ui| {
+                            ui.set_min_size(egui::vec2(300.0, 284.0));
+                            let src0 = s(&item, "source_index_id");
+                            let cover = self
+                                .index_covers
+                                .get(&src0)
+                                .cloned()
+                                .unwrap_or_default();
+                            if !cover.is_empty() {
+                                self.thumb_ui(ui, &cover, 0, 300.0);
+                            }
+                            egui::Frame::none()
+                                .inner_margin(egui::Margin {
+                                    left: 14.0,
+                                    right: 14.0,
+                                    top: 10.0,
+                                    bottom: 12.0,
+                                })
+                                .show(ui, |ui| {
                             ui.label(
-                                egui::RichText::new(s(&item, "title")).strong().size(15.0),
+                                egui::RichText::new(s(&item, "title")).strong().size(15.5),
                             );
                             let intro = s(&item, "intro");
                             if !intro.is_empty() {
@@ -1622,7 +1732,7 @@ impl App {
                                     fmt_time(i(&item, "created_ms"))
                                 ))
                                 .small()
-                                .weak(),
+                                .color(TEXT_WEAK),
                             );
                             ui.horizontal(|ui| {
                                 if ui.small_button("开始演示").clicked() {
@@ -1657,6 +1767,7 @@ impl App {
                                     }
                                 }
                             }
+                            });
                         });
                         });
                     });
@@ -1921,35 +2032,77 @@ impl App {
                         .and_then(|r| r.get("latest"))
                         .cloned()
                         .unwrap_or(Value::Null);
-                    ui.allocate_ui(egui::vec2(300.0, 232.0), |ui| {
-                        let resp = card_frame().show(ui, |ui| {
-                            ui.set_min_size(egui::vec2(284.0, 216.0));
+                    ui.allocate_ui(egui::vec2(300.0, 258.0), |ui| {
+                        let resp = ui
+                            .with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                                card_frame_flush().show(ui, |ui| {
+                            ui.set_min_size(egui::vec2(300.0, 258.0));
                             if latest.is_object() {
                                 let vid = s(&latest, "id");
-                                self.thumb_ui(ui, &vid, 0, 268.0);
-                            }
-                            ui.label(egui::RichText::new(s(&unit, "name")).strong().size(16.0));
-                            if latest.is_object() {
-                                ui.label(format!(
-                                    "v{} · {} 页",
-                                    s(&latest, "semver"),
-                                    i(&latest, "page_count")
-                                ));
+                                self.thumb_ui(ui, &vid, 0, 300.0);
                             } else {
-                                ui.label("暂无版本");
+                                ui.allocate_space(egui::vec2(300.0, 169.0));
                             }
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "{} · {}",
-                                    self.folder_name(
-                                        unit.get("folder_id").and_then(|x| x.as_str()).unwrap_or("")
-                                    ),
-                                    s(&unit, "maintainer")
-                                ))
-                                .small()
-                                .weak(),
-                            );
-                        });
+                            egui::Frame::none()
+                                .inner_margin(egui::Margin {
+                                    left: 14.0,
+                                    right: 14.0,
+                                    top: 10.0,
+                                    bottom: 12.0,
+                                })
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        egui::RichText::new(s(&unit, "name"))
+                                            .strong()
+                                            .size(15.5),
+                                    );
+                                    ui.add_space(5.0);
+                                    ui.horizontal(|ui| {
+                                        if latest.is_object() {
+                                            chip(
+                                                ui,
+                                                &format!("v{}", s(&latest, "semver")),
+                                                ACCENT_DEEP,
+                                                CHIP_BLUE_BG,
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "{} 页",
+                                                    i(&latest, "page_count")
+                                                ))
+                                                .small()
+                                                .color(TEXT_WEAK),
+                                            );
+                                        } else {
+                                            ui.label(
+                                                egui::RichText::new("暂无版本")
+                                                    .small()
+                                                    .color(TEXT_WEAK),
+                                            );
+                                        }
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "{} · {}",
+                                                        self.folder_name(
+                                                            unit.get("folder_id")
+                                                                .and_then(|x| x.as_str())
+                                                                .unwrap_or("")
+                                                        ),
+                                                        s(&unit, "maintainer")
+                                                    ))
+                                                    .small()
+                                                    .color(TEXT_WEAK),
+                                                );
+                                            },
+                                        );
+                                    });
+                                });
+                                })
+                            })
+                            .inner;
                         if resp.response.double_clicked() {
                             self.open_unit_detail(&uid);
                         }
@@ -2645,19 +2798,21 @@ impl App {
                                     "无版本".into()
                                 }
                             ));
-                            if let Some(slots) = entry.get("excerpt_slots").and_then(|x| x.as_array()) {
-                                ui.label(
-                                    egui::RichText::new(format!("摘录 {} 页", slots.len()))
-                                        .small()
-                                        .color(egui::Color32::from_rgb(30, 120, 200)),
-                                );
-                            }
-                            if re.get("substituted").and_then(|x| x.as_bool()) == Some(true) {
-                                ui.label(
-                                    egui::RichText::new("原版已删 · 已替代")
-                                        .color(egui::Color32::from_rgb(200, 120, 0)),
-                                );
-                            }
+                            ui.horizontal(|ui| {
+                                if let Some(slots) =
+                                    entry.get("excerpt_slots").and_then(|x| x.as_array())
+                                {
+                                    chip(
+                                        ui,
+                                        &format!("摘录 {} 页", slots.len()),
+                                        ACCENT_DEEP,
+                                        CHIP_BLUE_BG,
+                                    );
+                                }
+                                if re.get("substituted").and_then(|x| x.as_bool()) == Some(true) {
+                                    chip(ui, "原版已删 · 已替代", CHIP_ORANGE_FG, CHIP_ORANGE_BG);
+                                }
+                            });
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("选页").clicked() {
@@ -2709,11 +2864,7 @@ impl App {
                                     self.commit_entries(es, "解除锁定");
                                     return;
                                 }
-                                ui.label(
-                                    egui::RichText::new("版本锁定")
-                                        .color(egui::Color32::from_rgb(220, 120, 0))
-                                        .strong(),
-                                );
+                                chip(ui, "版本锁定", CHIP_ORANGE_FG, CHIP_ORANGE_BG);
                             } else {
                                 if ui.button("锁定当前版本").clicked() {
                                     if ver.is_object() {
@@ -2724,11 +2875,7 @@ impl App {
                                         return;
                                     }
                                 }
-                                ui.label(
-                                    egui::RichText::new("跟随最新")
-                                        .color(egui::Color32::from_rgb(30, 150, 60))
-                                        .strong(),
-                                );
+                                chip(ui, "跟随最新", CHIP_GREEN_FG, CHIP_GREEN_BG);
                             }
                         });
                     });
