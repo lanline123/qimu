@@ -64,9 +64,9 @@ fn install_cjk_font(ctx: &egui::Context) {
 /// selection is gray, never an accent flood. Spec: design/设计规范-EffectCraft风格.md.
 pub const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x2D, 0x8C, 0xEB);
 pub const ACCENT_DEEP: egui::Color32 = egui::Color32::from_rgb(0x6C, 0xB2, 0xF5);
-pub const CHROME: egui::Color32 = egui::Color32::from_rgb(0x1C, 0x1C, 0x1C);
+pub const CHROME: egui::Color32 = egui::Color32::from_rgb(0x23, 0x23, 0x23);
 pub const APP_BG: egui::Color32 = egui::Color32::from_rgb(0x12, 0x12, 0x12);
-pub const CARD_BG: egui::Color32 = egui::Color32::from_rgb(0x23, 0x23, 0x23);
+pub const CARD_BG: egui::Color32 = egui::Color32::from_rgb(0x28, 0x28, 0x28);
 pub const CARD_BORDER: egui::Color32 = egui::Color32::from_rgb(0x38, 0x38, 0x38);
 pub const SEPARATOR: egui::Color32 = egui::Color32::from_rgb(0x2A, 0x2A, 0x2A);
 pub const TEXT_MAIN: egui::Color32 = egui::Color32::from_rgb(0xF2, 0xF2, 0xF2);
@@ -426,6 +426,8 @@ struct ContentState {
 
 #[derive(Default)]
 struct IndexState {
+    overview_folder: Option<String>,
+    overview_selected: Option<String>,
     selected: Option<String>,
     detail: Option<Value>,
     branch: String,
@@ -492,6 +494,7 @@ struct App {
     sr_title: String,
     sr_index: String,
     sr_zone: String, // plaza | library | inbox | groups
+    sr_folder: Option<String>,
     my_assemblies: Vec<Value>,
     inbox: Vec<Value>,
     group_spaces: Vec<Value>,
@@ -506,6 +509,7 @@ struct App {
     cache_entries: Vec<Value>,
     cache_policy: Value,
     index_covers: std::collections::HashMap<String, String>,
+    index_tags: std::collections::HashMap<String, String>,
     content: ContentState,
     index: IndexState,
     settings: SettingsState,
@@ -552,6 +556,7 @@ impl App {
             sr_title: String::new(),
             sr_index: String::new(),
             sr_zone: std::env::var("QIMU_ZONE").unwrap_or_else(|_| "plaza".into()),
+            sr_folder: None,
             my_assemblies: vec![],
             inbox: vec![],
             group_spaces: vec![],
@@ -566,6 +571,7 @@ impl App {
             cache_entries: load_cache_index(),
             cache_policy: json!({ "allowed": true, "max_mb": 500 }),
             index_covers: std::collections::HashMap::new(),
+            index_tags: std::collections::HashMap::new(),
             content: ContentState {
                 publish_bump: 1, // default preselect: minor （小版本）
                 ..Default::default()
@@ -687,6 +693,47 @@ impl App {
                         .and_then(|x| x.as_str())
                     {
                         self.index_covers.insert(src, vid.to_string());
+                    }
+                }
+            }
+        }
+        for x in self.indexes.clone() {
+            let xid = s(&x, "id");
+            if xid.is_empty() || self.index_tags.contains_key(&xid) {
+                continue;
+            }
+            if let Ok(d) = self.call("GET", &format!("/v1/indexes/{xid}"), None) {
+                if self
+                    .index_covers
+                    .get(&xid)
+                    .map(|c| c.is_empty())
+                    .unwrap_or(true)
+                {
+                    if let Some(vid) = d
+                        .get("resolved_entries")
+                        .and_then(|r| r.as_array())
+                        .and_then(|a| a.first())
+                        .and_then(|e| e.get("resolved"))
+                        .and_then(|r| r.get("id"))
+                        .and_then(|v| v.as_str())
+                    {
+                        self.index_covers.insert(xid.clone(), vid.to_string());
+                    }
+                }
+                if let Some(tags) = d.get("tags").and_then(|x| x.as_array()) {
+                    let mut best: Option<((u64, u64, u64), String)> = None;
+                    for tg in tags {
+                        if s(tg, "branch") != "main" {
+                            continue;
+                        }
+                        let nm = s(tg, "name");
+                        let key = semver_key(&nm);
+                        if best.as_ref().map(|(k, _)| key > *k).unwrap_or(true) {
+                            best = Some((key, nm));
+                        }
+                    }
+                    if let Some((_, nm)) = best {
+                        self.index_tags.insert(xid.clone(), nm);
                     }
                 }
             }
@@ -1797,6 +1844,23 @@ impl App {
     }
 
     fn page_showroom(&mut self, ui: &mut egui::Ui) {
+        egui::SidePanel::left("showroom_folders")
+            .resizable(false)
+            .default_width(200.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(CHROME)
+                    .inner_margin(egui::Margin::same(10.0)),
+            )
+            .show_inside(ui, |ui| {
+                let mut sel = self.sr_folder.clone();
+                self.folder_tree(ui, &mut sel);
+                self.sr_folder = sel;
+            });
+        self.showroom_body(ui);
+    }
+
+    fn showroom_body(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading("演示厅");
             ui.add_space(6.0);
@@ -1829,8 +1893,15 @@ impl App {
         }
         ui.add_space(6.0);
         egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(16.0, 16.0);
             ui.horizontal_wrapped(|ui| {
                 for item in self.showroom_live.clone() {
+                    if !self.folder_filter_ok(
+                        &self.sr_folder.clone(),
+                        &self.index_folder_of(&s(&item, "source_index_id")),
+                    ) {
+                        continue;
+                    }
                     ui.allocate_ui(egui::vec2(300.0, 284.0), |ui| {
                         // allocate_ui inherits the wrapped horizontal layout;
                         // card content must flow top-down
@@ -1911,7 +1982,14 @@ impl App {
                     });
                 }
                 if self.showroom_live.is_empty() {
-                    ui.label("暂无内容。从索引页把成稿推送到演示厅，或在下方提交。");
+                    ui.add_space(90.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(egui::RichText::new("暂无内容").size(16.0));
+                        ui.label(
+                            egui::RichText::new("从索引页把成稿推送到演示厅")
+                                .color(TEXT_WEAK),
+                        );
+                    });
                 }
             });
         });
@@ -2155,6 +2233,7 @@ impl App {
             ui.separator();
         }
         egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(16.0, 16.0);
             ui.horizontal_wrapped(|ui| {
                 for item in self.units.clone() {
                     let unit = item.get("unit").cloned().unwrap_or(json!({}));
@@ -2653,16 +2732,110 @@ impl App {
 }
 
 impl App {
+    /// Folder tree used by the index page and the showroom: the left
+    /// column holds folders; the right side shows what lives in the
+    /// selected folder. `selected` None = 全部.
+    fn folder_tree(&mut self, ui: &mut egui::Ui, selected: &mut Option<String>) {
+        if ui
+            .selectable_label(
+                selected.is_none(),
+                egui::RichText::new("全部").size(14.5),
+            )
+            .clicked()
+        {
+            *selected = None;
+        }
+        ui.add_space(3.0);
+        let mut folders = self.folders.clone();
+        folders.sort_by_key(|f| i(f, "sort"));
+        // depth-first order by parent chain
+        fn depth_of(folders: &[Value], f: &Value) -> usize {
+            let mut d = 0;
+            let mut cur = s(f, "parent_id");
+            while !cur.is_empty() && d < 8 {
+                d += 1;
+                match folders.iter().find(|x| s(x, "id") == cur) {
+                    Some(p) => cur = s(p, "parent_id"),
+                    None => break,
+                }
+            }
+            d
+        }
+        let mut ordered: Vec<Value> = Vec::new();
+        fn walk(folders: &[Value], parent: &str, out: &mut Vec<Value>) {
+            for f in folders {
+                if s(f, "parent_id") == parent {
+                    out.push(f.clone());
+                    let id = s(f, "id");
+                    walk(folders, &id, out);
+                }
+            }
+        }
+        walk(&folders, "", &mut ordered);
+        for f in &folders {
+            if !ordered.iter().any(|x| s(x, "id") == s(f, "id")) {
+                ordered.push(f.clone());
+            }
+        }
+        for f in ordered {
+            let d = depth_of(&folders, &f);
+            ui.horizontal(|ui| {
+                ui.add_space(d as f32 * 14.0);
+                if ui
+                    .selectable_label(
+                        selected.as_deref() == Some(s(&f, "id").as_str()),
+                        egui::RichText::new(s(&f, "name")).size(14.5),
+                    )
+                    .clicked()
+                {
+                    *selected = Some(s(&f, "id"));
+                }
+            });
+            ui.add_space(3.0);
+        }
+    }
+
+    fn index_folder_of(&self, index_id: &str) -> String {
+        self.indexes
+            .iter()
+            .find(|x| s(x, "id") == index_id)
+            .map(|x| s(x, "folder_id"))
+            .unwrap_or_default()
+    }
+
+    /// Does an item whose home is `folder_id` pass the folder filter?
+    fn folder_filter_ok(&self, filter: &Option<String>, folder_id: &str) -> bool {
+        match filter {
+            None => true,
+            Some(f) => f == folder_id,
+        }
+    }
+
     fn page_index(&mut self, ui: &mut egui::Ui) {
         if self.index.creating {
             self.index_create(ui);
             return;
         }
-        egui::SidePanel::left("index_list")
+        egui::SidePanel::left("index_folders")
             .resizable(false)
-            .default_width(220.0)
+            .default_width(200.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(CHROME)
+                    .inner_margin(egui::Margin::same(10.0)),
+            )
             .show_inside(ui, |ui| {
-                if ui.button("＋ 新建索引").clicked() {
+                if ui
+                    .add_sized(
+                        [ui.available_width(), 34.0],
+                        egui::Button::new(
+                            egui::RichText::new("＋ 新建索引").color(egui::Color32::WHITE),
+                        )
+                        .fill(ACCENT)
+                        .rounding(17.0),
+                    )
+                    .clicked()
+                {
                     self.index.creating = true;
                     self.index.pick.clear();
                     for item in &self.units {
@@ -2680,31 +2853,151 @@ impl App {
                         }
                     }
                 }
-                ui.separator();
-                for x in self.indexes.clone() {
-                    let lifecycle = s(&x, "lifecycle");
-                    let badge = match lifecycle.as_str() {
-                        "history" => " · 历史",
-                        "void" => " · 已作废",
-                        _ => "",
-                    };
-                    if ui
-                        .selectable_label(
-                            self.index.selected.as_deref() == Some(s(&x, "id").as_str()),
-                            format!("{}{}", s(&x, "name"), badge),
-                        )
-                        .clicked()
-                    {
-                        self.index.branch = "main".into();
-                        self.open_index_detail(&s(&x, "id"));
-                    }
+                ui.add_space(12.0);
+                let mut sel = self.index.overview_folder.clone();
+                self.folder_tree(ui, &mut sel);
+                if sel != self.index.overview_folder {
+                    self.index.overview_folder = sel;
+                    self.index.detail = None;
+                    self.index.selected = None;
                 }
             });
         if self.index.detail.is_none() {
-            ui.label("从左侧选择一个索引，或新建索引。");
+            self.index_overview(ui);
             return;
         }
+        ui.horizontal(|ui| {
+            if ui.button("‹ 返回总览").clicked() {
+                self.index.detail = None;
+                self.index.selected = None;
+            }
+        });
         self.index_detail(ui);
+    }
+
+    /// Index overview: standard cards for the indexes living in the
+    /// selected folder. Single click selects, double click opens.
+    fn index_overview(&mut self, ui: &mut egui::Ui) {
+        let filter = self.index.overview_folder.clone();
+        let title = match &filter {
+            None => "全部索引".to_string(),
+            Some(fid) => self
+                .folders
+                .iter()
+                .find(|f| s(f, "id") == *fid)
+                .map(|f| s(f, "name"))
+                .unwrap_or_else(|| "索引".into()),
+        };
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new(title).size(22.0).strong());
+        ui.add_space(12.0);
+        let items: Vec<Value> = self
+            .indexes
+            .clone()
+            .into_iter()
+            .filter(|x| self.folder_filter_ok(&filter, &s(x, "folder_id")))
+            .collect();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(16.0, 16.0);
+            ui.horizontal_wrapped(|ui| {
+                for x in items {
+                    let xid = s(&x, "id");
+                    let selected = self.index.overview_selected.as_deref() == Some(xid.as_str());
+                    let scope_color = match s(&x, "scope").as_str() {
+                        "company" => ACCENT,
+                        "dept_sub" => egui::Color32::from_rgb(0x35, 0xB2, 0x6B),
+                        "dept" => egui::Color32::from_rgb(0xE8, 0xA1, 0x3A),
+                        _ => egui::Color32::from_rgb(0x6E, 0x6E, 0x6E),
+                    };
+                    let resp = ui.allocate_ui(egui::vec2(300.0, 284.0), |ui| {
+                        ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                            egui::Frame::none()
+                                .fill(CARD_BG)
+                                .rounding(10.0)
+                                .stroke(egui::Stroke::new(1.0, scope_color))
+                                .show(ui, |ui| {
+                                    ui.set_min_size(egui::vec2(300.0, 284.0));
+                                    let cover = self
+                                        .index_covers
+                                        .get(&xid)
+                                        .cloned()
+                                        .unwrap_or_default();
+                                    if !cover.is_empty() {
+                                        self.thumb_ui(ui, &cover, 0, 300.0);
+                                    } else {
+                                        ui.allocate_space(egui::vec2(300.0, 169.0));
+                                    }
+                                    egui::Frame::none()
+                                        .inner_margin(egui::Margin {
+                                            left: 14.0,
+                                            right: 14.0,
+                                            top: 10.0,
+                                            bottom: 12.0,
+                                        })
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                egui::RichText::new(s(&x, "name"))
+                                                    .strong()
+                                                    .size(15.5),
+                                            );
+                                            ui.horizontal(|ui| {
+                                                if let Some(tag) =
+                                                    self.index_tags.get(&xid)
+                                                {
+                                                    chip(
+                                                        ui,
+                                                        &format!("V{tag}"),
+                                                        ACCENT_DEEP,
+                                                        CHIP_BLUE_BG,
+                                                    );
+                                                }
+                                                match s(&x, "lifecycle").as_str() {
+                                                    "history" => chip(
+                                                        ui,
+                                                        "历史",
+                                                        TEXT_WEAK,
+                                                        CHIP_GRAY_BG,
+                                                    ),
+                                                    "void" => chip(
+                                                        ui,
+                                                        "已作废",
+                                                        egui::Color32::from_rgb(0xE5, 0x53, 0x4B),
+                                                        egui::Color32::from_rgb(0x3D, 0x1F, 0x1E),
+                                                    ),
+                                                    _ => {}
+                                                }
+                                            });
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "{} · {}",
+                                                    s(&x, "maintainer"),
+                                                    fmt_time(i(&x, "created_ms"))
+                                                ))
+                                                .small()
+                                                .color(TEXT_WEAK),
+                                            );
+                                        });
+                                });
+                        });
+                    });
+                    let rect = resp.response.rect;
+                    if selected {
+                        ui.painter().rect_stroke(
+                            rect,
+                            10.0,
+                            egui::Stroke::new(2.0, ACCENT),
+                        );
+                    }
+                    let click = ui.interact(rect, egui::Id::new(("idx_card", &xid)), egui::Sense::click());
+                    if click.double_clicked() {
+                        self.index.branch = "main".into();
+                        self.open_index_detail(&xid);
+                    } else if click.clicked() {
+                        self.index.overview_selected = Some(xid.clone());
+                    }
+                }
+            });
+        });
     }
 
     fn index_create(&mut self, ui: &mut egui::Ui) {

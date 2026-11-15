@@ -46,6 +46,7 @@ for item in units:
         entries.append({"unit_id": u["id"], "rendition_id": r["rendition"]["id"]})
 idx = call("POST", "/v1/indexes", tok, {
     "name": "Redwood 来访介绍", "group_id": gid, "scope": "company", "entries": entries,
+    "folder_id": fid,
 })
 print("index:", idx["id"])
 call("POST", f"/v1/indexes/{idx['id']}/tags", tok, {"branch": "main", "name": "1.0.0"})
