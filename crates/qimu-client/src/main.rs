@@ -73,6 +73,20 @@ pub const TEXT_MAIN: egui::Color32 = egui::Color32::from_rgb(0xF2, 0xF2, 0xF2);
 pub const TEXT_WEAK: egui::Color32 = egui::Color32::from_rgb(0x9E, 0x9E, 0x9E);
 pub const TEXT_FAINT: egui::Color32 = egui::Color32::from_rgb(0x6E, 0x6E, 0x6E);
 pub const HOVER_BG: egui::Color32 = egui::Color32::from_rgb(0x2C, 0x2C, 0x2C);
+/// Top bar fill — one step darker than the side panels (board sample).
+pub const TOPBAR: egui::Color32 = egui::Color32::from_rgb(0x1F, 0x1F, 0x1F);
+/// Text-field fill (board sample #2A2A2A, no stroke).
+pub const FIELD_BG: egui::Color32 = egui::Color32::from_rgb(0x2A, 0x2A, 0x2A);
+/// Secondary button fill (board sample #303030).
+pub const BTN_BG: egui::Color32 = egui::Color32::from_rgb(0x30, 0x30, 0x30);
+/// Selected row fill — gray, never the accent (board sample #3A3A3A).
+pub const SEL_BG: egui::Color32 = egui::Color32::from_rgb(0x3A, 0x3A, 0x3A);
+/// Layout tokens from the design boards (1440×900): folder panels are
+/// 220 wide, the settings nav 208, page content starts 24 right of the
+/// panel, cards round at 10.
+pub const PANEL_W: f32 = 220.0;
+pub const NAV_W: f32 = 208.0;
+pub const PAGE_PAD_L: f32 = 24.0;
 
 fn apply_modern_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
@@ -101,7 +115,7 @@ fn apply_modern_style(ctx: &egui::Context) {
         spread: 0.0,
         color: egui::Color32::from_black_alpha(90),
     };
-    let r = egui::Rounding::same(5.0);
+    let r = egui::Rounding::same(8.0);
     for w in [
         &mut v.widgets.noninteractive,
         &mut v.widgets.inactive,
@@ -128,7 +142,7 @@ fn apply_modern_style(ctx: &egui::Context) {
     use egui::{FontFamily, FontId, TextStyle};
     style.text_styles.insert(
         TextStyle::Heading,
-        FontId::new(18.0, FontFamily::Proportional),
+        FontId::new(19.0, FontFamily::Proportional),
     );
     style
         .text_styles
@@ -144,16 +158,29 @@ fn apply_modern_style(ctx: &egui::Context) {
     style
         .text_styles
         .insert(TextStyle::Monospace, FontId::new(12.0, FontFamily::Monospace));
-    style.spacing.item_spacing = egui::vec2(6.0, 4.0);
-    style.spacing.button_padding = egui::vec2(8.0, 3.0);
-    style.spacing.interact_size.y = 22.0;
+    style.spacing.item_spacing = egui::vec2(8.0, 5.0);
+    style.spacing.button_padding = egui::vec2(10.0, 4.0);
+    style.spacing.interact_size.y = 24.0;
+    // Scroll bars float thin and quiet instead of egui's solid gray rail;
+    // the boards show no visible bar at rest.
+    style.spacing.scroll = egui::style::ScrollStyle {
+        floating: true,
+        bar_width: 10.0,
+        floating_width: 5.0,
+        foreground_color: false,
+        dormant_background_opacity: 0.0,
+        dormant_handle_opacity: 0.5,
+        active_handle_opacity: 0.8,
+        ..Default::default()
+    };
     style.spacing.indent = 14.0;
     style.spacing.window_margin = egui::Margin::same(10.0);
     ctx.set_style(style);
 }
 
-/// The one standard card (§4.2), Craft-style: white surface, hairline
-/// #E3E3E3 border, 10px radius, soft shadow — cover-first layout.
+/// The one standard card (§4.2), Craft-style: raised #282828 surface,
+/// hairline #383838 border, 10px radius, NO shadow (spec: layering comes
+/// from the fill/border contrast alone) — cover-first layout.
 fn card_frame() -> egui::Frame {
     egui::Frame::none()
         .fill(CARD_BG)
@@ -161,10 +188,10 @@ fn card_frame() -> egui::Frame {
         .rounding(egui::Rounding::same(10.0))
         .inner_margin(egui::Margin::same(14.0))
         .shadow(egui::epaint::Shadow {
-            offset: egui::vec2(0.0, 1.0),
-            blur: 6.0,
+            offset: egui::vec2(0.0, 0.0),
+            blur: 0.0,
             spread: 0.0,
-            color: egui::Color32::from_black_alpha(8),
+            color: egui::Color32::TRANSPARENT,
         })
 }
 
@@ -207,16 +234,14 @@ pub const CHIP_GRAY_BG: egui::Color32 = egui::Color32::from_rgb(0x30, 0x30, 0x30
 /// Craft-style tab (top bar + zone switchers): ghost text tab, the
 /// selected one carries an accent underline.
 fn pill(ui: &mut egui::Ui, selected: bool, label: &str) -> egui::Response {
-    let text = egui::RichText::new(label).color(if selected {
-        TEXT_MAIN
-    } else {
-        TEXT_WEAK
-    });
+    let text = egui::RichText::new(label)
+        .size(14.0)
+        .color(if selected { TEXT_MAIN } else { TEXT_WEAK });
     let btn = egui::Button::new(text)
         .fill(egui::Color32::TRANSPARENT)
         .stroke(egui::Stroke::NONE)
-        .rounding(egui::Rounding::same(5.0))
-        .min_size(egui::vec2(0.0, 26.0));
+        .rounding(egui::Rounding::same(8.0))
+        .min_size(egui::vec2(0.0, 34.0));
     let resp = ui.add(btn);
     if selected {
         let r = resp.rect;
@@ -230,6 +255,69 @@ fn pill(ui: &mut egui::Ui, selected: bool, label: &str) -> egui::Response {
         );
     }
     resp
+}
+
+/// Ghost text action — the boards draw secondary actions as plain text
+/// (no box): 开始演示 in accent, the rest in main/weak text color.
+fn text_action(ui: &mut egui::Ui, label: &str, color: egui::Color32, size: f32) -> bool {
+    ui.add(
+        egui::Button::new(egui::RichText::new(label).size(size).color(color))
+            .fill(egui::Color32::TRANSPARENT)
+            .stroke(egui::Stroke::NONE)
+            .rounding(egui::Rounding::same(6.0)),
+    )
+    .clicked()
+}
+
+/// Full-width side-panel row (folder tree / settings nav): 32 high,
+/// selected = #3A3A3A rounded-8 fill across the whole panel width —
+/// egui's selectable_label only backlights the text itself, which is
+/// the main reason the built pages looked off-board. Returns clicked.
+fn tree_row(ui: &mut egui::Ui, selected: bool, indent: f32, label: &str, size: f32) -> bool {
+    let width = ui.available_width();
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(width, 32.0), egui::Sense::click());
+    let painter = ui.painter();
+    if selected {
+        painter.rect_filled(rect, 8.0, SEL_BG);
+    } else if resp.hovered() {
+        painter.rect_filled(rect, 8.0, HOVER_BG);
+    }
+    let font = egui::FontId::new(size, egui::FontFamily::Proportional);
+    let color = if selected { TEXT_MAIN } else { TEXT_WEAK };
+    let galley = painter.layout_no_wrap(label.to_string(), font, color);
+    let ty = rect.center().y - galley.size().y / 2.0;
+    painter.galley(egui::pos2(rect.min.x + 12.0 + indent, ty), galley, color);
+    resp.clicked()
+}
+
+/// The blue brand tile with the white 启 glyph (top bar 24px, login 64px).
+fn logo_tile(ui: &mut egui::Ui, size: f32, glyph: f32, radius: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, radius, ACCENT);
+    let font = egui::FontId::new(glyph, egui::FontFamily::Proportional);
+    let galley = painter.layout_no_wrap(
+        "启".to_string(),
+        font,
+        egui::Color32::WHITE,
+    );
+    let pos = egui::pos2(
+        rect.center().x - galley.size().x / 2.0,
+        rect.center().y - galley.size().y / 2.0,
+    );
+    painter.galley(pos, galley, egui::Color32::WHITE);
+}
+
+/// Page body padding next to a resident side panel: content starts
+/// 24px right of the panel (board x=244), 12 below the top bar.
+fn body_frame() -> egui::Frame {
+    egui::Frame::none().inner_margin(egui::Margin {
+        left: PAGE_PAD_L,
+        right: 20.0,
+        top: 10.0,
+        bottom: 12.0,
+    })
 }
 
 /// Offline cache (§3.17): adopted snapshots live under ~/.qimu/cache with
@@ -1018,61 +1106,83 @@ impl eframe::App for App {
             egui::CentralPanel::default()
                 .frame(egui::Frame::none().fill(APP_BG))
                 .show(ctx, |ui| {
+                    // Board: a 500×400 card (r16) centered on the canvas —
+                    // blue logo tile, white title, gray labels, 330×34
+                    // fields on a 52 pitch, blue pill aligned with the
+                    // field column.
+                    ui.add_space(((ui.available_height() - 400.0).max(0.0)) / 2.0 - 25.0);
                     ui.vertical_centered(|ui| {
-                        ui.add_space(110.0);
-                        card_frame().show(ui, |ui| {
-                            ui.set_width(320.0);
-                            ui.vertical_centered(|ui| {
-                                ui.label(
-                                    egui::RichText::new("启幕")
-                                        .strong()
-                                        .size(26.0)
-                                        .color(ACCENT),
-                                );
-                                ui.label(
-                                    egui::RichText::new("PPT 内容管理与更新系统")
-                                        .color(TEXT_WEAK),
-                                );
-                            });
-                            ui.add_space(14.0);
-                            egui::Grid::new("login_grid")
-                                .num_columns(2)
-                                .spacing([10.0, 10.0])
-                                .show(ui, |ui| {
-                                    ui.label("服务器");
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut self.server)
-                                            .desired_width(220.0),
+                        egui::Frame::none()
+                            .fill(CARD_BG)
+                            .stroke(egui::Stroke::new(1.0, CARD_BORDER))
+                            .rounding(egui::Rounding::same(16.0))
+                            .inner_margin(egui::Margin {
+                                left: 40.0,
+                                right: 40.0,
+                                top: 36.0,
+                                bottom: 28.0,
+                            })
+                            .show(ui, |ui| {
+                                ui.set_width(420.0);
+                                ui.vertical_centered(|ui| {
+                                    logo_tile(ui, 64.0, 30.0, 14.0);
+                                    ui.add_space(12.0);
+                                    ui.label(
+                                        egui::RichText::new("启幕")
+                                            .strong()
+                                            .size(26.0)
+                                            .color(TEXT_MAIN),
                                     );
-                                    ui.end_row();
-                                    ui.label("账号");
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut self.username)
-                                            .desired_width(220.0),
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        egui::RichText::new("PPT 内容管理与更新系统")
+                                            .size(13.0)
+                                            .color(TEXT_WEAK),
                                     );
-                                    ui.end_row();
-                                    ui.label("密码");
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut self.password)
-                                            .password(true)
-                                            .desired_width(220.0),
-                                    );
-                                    ui.end_row();
                                 });
-                            ui.add_space(12.0);
-                            ui.vertical_centered(|ui| {
-                                let login_btn = egui::Button::new(
-                                    egui::RichText::new("登录").color(egui::Color32::WHITE),
-                                )
-                                .fill(ACCENT)
-                                .min_size(egui::vec2(180.0, 32.0));
-                                if ui.add(login_btn).clicked() {
-                                    self.do_login();
-                                }
+                                ui.add_space(22.0);
+                                egui::Grid::new("login_grid")
+                                    .num_columns(2)
+                                    .spacing([10.0, 18.0])
+                                    .show(ui, |ui| {
+                                        for (label, val, pw) in [
+                                            ("服务器", &mut self.server, false),
+                                            ("账号", &mut self.username, false),
+                                            ("密码", &mut self.password, true),
+                                        ] {
+                                            ui.label(
+                                                egui::RichText::new(label)
+                                                    .size(13.0)
+                                                    .color(TEXT_WEAK),
+                                            );
+                                            ui.add_sized(
+                                                [330.0, 34.0],
+                                                egui::TextEdit::singleline(val)
+                                                    .password(pw)
+                                                    .margin(egui::vec2(10.0, 8.0)),
+                                            );
+                                            ui.end_row();
+                                        }
+                                    });
+                                ui.add_space(18.0);
+                                ui.horizontal(|ui| {
+                                    // align with the field column
+                                    ui.add_space(52.0);
+                                    let login_btn = egui::Button::new(
+                                        egui::RichText::new("登录")
+                                            .size(14.0)
+                                            .color(egui::Color32::WHITE),
+                                    )
+                                    .fill(ACCENT)
+                                    .rounding(20.0)
+                                    .min_size(egui::vec2(330.0, 40.0));
+                                    if ui.add(login_btn).clicked() {
+                                        self.do_login();
+                                    }
+                                });
                             });
-                        });
                         if !self.msg.is_empty() {
-                            ui.add_space(10.0);
+                            ui.add_space(12.0);
                             ui.label(egui::RichText::new(&self.msg).color(TEXT_WEAK));
                         }
                     });
@@ -1081,26 +1191,29 @@ impl eframe::App for App {
         }
 
         egui::TopBottomPanel::top("top")
+            .exact_height(52.0)
             .frame(
                 egui::Frame::none()
-                    .fill(CHROME)
+                    .fill(TOPBAR)
                     .inner_margin(egui::Margin {
-                        left: 14.0,
-                        right: 14.0,
-                        top: 8.0,
-                        bottom: 8.0,
-                    })
-                    .stroke(egui::Stroke::new(1.0, SEPARATOR)),
+                        left: 16.0,
+                        right: 16.0,
+                        top: 0.0,
+                        bottom: 0.0,
+                    }),
             )
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_centered(|ui| {
+                    logo_tile(ui, 24.0, 13.0, 6.0);
+                    ui.add_space(8.0);
                     ui.label(
                         egui::RichText::new("启幕")
                             .strong()
-                            .size(18.0)
+                            .size(19.0)
                             .color(TEXT_MAIN),
                     );
-                    ui.add_space(10.0);
+                    // first tab's text lands at board x≈128
+                    ui.add_space(22.0);
                     for (page, label) in [
                         (Page::Showroom, "演示厅"),
                         (Page::Content, "内容页"),
@@ -1110,16 +1223,30 @@ impl eframe::App for App {
                         if pill(ui, self.page == page, label).clicked() {
                             self.page = page;
                         }
+                        ui.add_space(6.0);
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("退出").clicked() {
+                        let boxed = |ui: &mut egui::Ui, label: &str| {
+                            ui.add_sized(
+                                [56.0, 28.0],
+                                egui::Button::new(
+                                    egui::RichText::new(label).size(12.0).color(TEXT_MAIN),
+                                )
+                                .fill(BTN_BG)
+                                .rounding(8.0),
+                            )
+                            .clicked()
+                        };
+                        if boxed(ui, "退出") {
                             let _ = self.call("POST", "/v1/auth/logout", None);
                             self.token = None;
                             self.user = None;
                         }
-                        if ui.button("刷新").clicked() {
+                        ui.add_space(4.0);
+                        if boxed(ui, "刷新") {
                             self.refresh_all();
                         }
+                        ui.add_space(6.0);
                         let name = self
                             .user
                             .as_ref()
@@ -1127,33 +1254,44 @@ impl eframe::App for App {
                             .unwrap_or_default();
                         ui.label(
                             egui::RichText::new(format!("{name} · {}", self.role()))
+                                .size(12.0)
                                 .color(TEXT_WEAK),
                         );
                     });
                 });
+                // hairline under the bar (board: 1px #2A2A2A at y=52)
+                let r = ui.max_rect();
+                ui.painter().hline(
+                    r.x_range(),
+                    r.max.y - 0.5,
+                    egui::Stroke::new(1.0, SEPARATOR),
+                );
             });
+        // Operation feedback lives here (it is the client's only message
+        // channel, so the bar stays) — but the boards have no status bar,
+        // so it is painted as part of the canvas: same fill, no stroke,
+        // 11px faint text.
         egui::TopBottomPanel::bottom("status")
             .frame(
                 egui::Frame::none()
-                    .fill(CHROME)
+                    .fill(APP_BG)
                     .inner_margin(egui::Margin {
-                        left: 14.0,
-                        right: 14.0,
-                        top: 5.0,
-                        bottom: 5.0,
-                    })
-                    .stroke(egui::Stroke::new(1.0, SEPARATOR)),
+                        left: 16.0,
+                        right: 16.0,
+                        top: 2.0,
+                        bottom: 2.0,
+                    }),
             )
             .show(ctx, |ui| {
-                ui.label(egui::RichText::new(&self.msg).small().color(TEXT_WEAK));
+                ui.label(
+                    egui::RichText::new(&self.msg)
+                        .size(11.0)
+                        .color(TEXT_FAINT),
+                );
             });
 
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::none()
-                    .fill(APP_BG)
-                    .inner_margin(egui::Margin::same(12.0)),
-            )
+            .frame(egui::Frame::none().fill(APP_BG))
             .show(ctx, |ui| match self.page {
                 Page::Showroom => self.page_showroom(ui),
                 Page::Content => self.page_content(ui),
@@ -1846,24 +1984,32 @@ impl App {
     fn page_showroom(&mut self, ui: &mut egui::Ui) {
         egui::SidePanel::left("showroom_folders")
             .resizable(false)
-            .default_width(200.0)
+            .exact_width(PANEL_W)
             .frame(
-                egui::Frame::none()
-                    .fill(CHROME)
-                    .inner_margin(egui::Margin::same(10.0)),
+                egui::Frame::none().fill(CHROME).inner_margin(egui::Margin {
+                    left: 10.0,
+                    right: 10.0,
+                    top: 12.0,
+                    bottom: 10.0,
+                }),
             )
             .show_inside(ui, |ui| {
                 let mut sel = self.sr_folder.clone();
                 self.folder_tree(ui, &mut sel);
                 self.sr_folder = sel;
             });
-        self.showroom_body(ui);
+        body_frame().show(ui, |ui| self.showroom_body(ui));
     }
 
     fn showroom_body(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.heading("演示厅");
-            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new("演示厅")
+                    .strong()
+                    .size(19.0)
+                    .color(TEXT_MAIN),
+            );
+            ui.add_space(18.0);
             for (zone, label) in [
                 ("plaza", "广场"),
                 ("library", "我的库"),
@@ -1873,9 +2019,10 @@ impl App {
                 if pill(ui, self.sr_zone == zone, label).clicked() {
                     self.sr_zone = zone.into();
                 }
+                ui.add_space(4.0);
             }
         });
-        ui.add_space(4.0);
+        ui.add_space(6.0);
         if self.sr_zone == "library" {
             self.library_view(ui);
             return;
@@ -1902,12 +2049,12 @@ impl App {
                     ) {
                         continue;
                     }
-                    ui.allocate_ui(egui::vec2(300.0, 284.0), |ui| {
+                    ui.allocate_ui(egui::vec2(340.0, 300.0), |ui| {
                         // allocate_ui inherits the wrapped horizontal layout;
                         // card content must flow top-down
                         ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
                         card_frame_flush().show(ui, |ui| {
-                            ui.set_min_size(egui::vec2(300.0, 284.0));
+                            ui.set_min_size(egui::vec2(340.0, 300.0));
                             let src0 = s(&item, "source_index_id");
                             let cover = self
                                 .index_covers
@@ -1915,24 +2062,30 @@ impl App {
                                 .cloned()
                                 .unwrap_or_default();
                             if !cover.is_empty() {
-                                self.thumb_ui(ui, &cover, 0, 300.0);
+                                self.thumb_ui(ui, &cover, 0, 340.0);
+                            } else {
+                                ui.allocate_space(egui::vec2(340.0, 191.0));
                             }
                             egui::Frame::none()
                                 .inner_margin(egui::Margin {
-                                    left: 14.0,
-                                    right: 14.0,
-                                    top: 10.0,
+                                    left: 16.0,
+                                    right: 16.0,
+                                    top: 12.0,
                                     bottom: 12.0,
                                 })
                                 .show(ui, |ui| {
+                            // the grid's 16px spacing must not leak in here
+                            ui.spacing_mut().item_spacing = egui::vec2(8.0, 5.0);
                             ui.label(
-                                egui::RichText::new(s(&item, "title")).strong().size(15.5),
+                                egui::RichText::new(s(&item, "title")).strong().size(15.0),
                             );
+                            ui.add_space(3.0);
                             let intro = s(&item, "intro");
                             if !intro.is_empty() {
                                 ui.label(
-                                    egui::RichText::new(intro).color(TEXT_WEAK),
+                                    egui::RichText::new(intro).size(12.5).color(TEXT_WEAK),
                                 );
+                                ui.add_space(3.0);
                             }
                             ui.label(
                                 egui::RichText::new(format!(
@@ -1940,21 +2093,21 @@ impl App {
                                     s(&item, "submitted_by"),
                                     fmt_time(i(&item, "created_ms"))
                                 ))
-                                .small()
-                                .color(TEXT_WEAK),
+                                .size(11.0)
+                                .color(TEXT_FAINT),
                             );
+                            ui.add_space(6.0);
                             ui.horizontal(|ui| {
-                                if ui.small_button("开始演示").clicked() {
+                                if text_action(ui, "开始演示", ACCENT, 12.5) {
                                     self.present_showroom(&s(&item, "id"), &s(&item, "title"));
                                 }
-                                if ui.small_button("分享").clicked() {
+                                if text_action(ui, "分享", TEXT_MAIN, 12.5) {
                                     self.share_for = Some(s(&item, "id"));
                                     self.share_target.clear();
                                 }
-                            });
                             let src = s(&item, "source_index_id");
                             if !src.is_empty() {
-                                if ui.small_button("缓存到本地").clicked() {
+                                if text_action(ui, "缓存到本地", TEXT_MAIN, 12.5) {
                                     let title = s(&item, "title");
                                     let key = format!("sr_{}", s(&item, "id"));
                                     match self.call(
@@ -1977,6 +2130,7 @@ impl App {
                                 }
                             }
                             });
+                            });
                         });
                         });
                     });
@@ -1993,11 +2147,20 @@ impl App {
                 }
             });
         });
-        ui.separator();
+        ui.add_space(16.0);
         ui.horizontal(|ui| {
-            ui.label("提交到演示厅");
-            ui.text_edit_singleline(&mut self.sr_title);
+            ui.label(
+                egui::RichText::new("提交到演示厅")
+                    .size(13.0)
+                    .color(TEXT_WEAK),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut self.sr_title)
+                    .desired_width(260.0)
+                    .margin(egui::vec2(10.0, 6.0)),
+            );
             egui::ComboBox::from_id_salt("sr_index")
+                .width(200.0)
                 .selected_text(
                     self.indexes
                         .iter()
@@ -2030,8 +2193,8 @@ impl App {
             }
         });
         if self.role() == "super" && !self.showroom_pending.is_empty() {
-            ui.separator();
-            ui.heading("待审队列");
+            ui.add_space(14.0);
+            ui.label(egui::RichText::new("待审队列").strong().size(15.0));
             for item in self.showroom_pending.clone() {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(s(&item, "title")).strong());
@@ -2059,43 +2222,40 @@ impl App {
 
     fn page_content(&mut self, ui: &mut egui::Ui) {
         if self.content.detail.is_some() {
-            self.unit_detail(ui);
+            body_frame().show(ui, |ui| self.unit_detail(ui));
             return;
         }
         egui::SidePanel::left("folders")
             .resizable(false)
-            .default_width(160.0)
+            .exact_width(PANEL_W)
+            .frame(
+                egui::Frame::none().fill(CHROME).inner_margin(egui::Margin {
+                    left: 10.0,
+                    right: 10.0,
+                    top: 12.0,
+                    bottom: 10.0,
+                }),
+            )
             .show_inside(ui, |ui| {
-                if ui
-                    .selectable_label(self.content.folder_filter.is_none(), "全部")
-                    .clicked()
-                {
-                    self.content.folder_filter = None;
-                }
-                for f in self.folders.clone() {
-                    let fid = s(&f, "id");
-                    let indent = if f.get("parent_id").is_some() { "　" } else { "" };
-                    if ui
-                        .selectable_label(
-                            self.content.folder_filter.as_deref() == Some(fid.as_str()),
-                            format!("{indent}{}", s(&f, "name")),
-                        )
-                        .clicked()
-                    {
-                        self.content.folder_filter = Some(fid);
-                    }
-                }
+                let mut sel = self.content.folder_filter.clone();
+                self.folder_tree(ui, &mut sel);
+                self.content.folder_filter = sel;
             });
+        body_frame().show(ui, |ui| {
         ui.horizontal(|ui| {
-            ui.label("搜索");
-            let resp = ui.text_edit_singleline(&mut self.content.search_text);
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.content.search_text)
+                    .hint_text("搜索")
+                    .desired_width(300.0)
+                    .margin(egui::vec2(14.0, 7.0)),
+            );
             if resp.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
                 match self.call("GET", &format!("/v1/search?q={}", self.content.search_text), None) {
                     Ok(v) => self.content.search_hits = Some(v),
                     Err(e) => self.msg = e,
                 }
             }
-            if ui.button("智能分块导入").clicked() {
+            if text_action(ui, "智能分块导入", TEXT_MAIN, 13.0) {
                 if let Some(path) = rfd::FileDialog::new()
                     .add_filter("PowerPoint", &["pptx"])
                     .pick_file()
@@ -2146,7 +2306,7 @@ impl App {
                     }
                 }
             }
-            if ui.button("导入 PPT").clicked() {
+            if text_action(ui, "导入 PPT", TEXT_MAIN, 13.0) {
                 if let Some(path) = rfd::FileDialog::new()
                     .add_filter("PowerPoint", &["pptx"])
                     .pick_file()
@@ -2179,9 +2339,14 @@ impl App {
                     }
                 }
             }
-            ui.label("导入到组");
+            ui.label(
+                egui::RichText::new("导入到组")
+                    .size(13.0)
+                    .color(TEXT_WEAK),
+            );
             let cur_group = self.group_name(&self.content.import_group.clone());
             egui::ComboBox::from_id_salt("import_group")
+                .width(150.0)
                 .selected_text(cur_group)
                 .show_ui(ui, |ui| {
                     for g in self.groups.clone() {
@@ -2193,10 +2358,24 @@ impl App {
                     }
                 });
         });
+        ui.add_space(2.0);
         ui.horizontal(|ui| {
-            ui.label("新建内容块");
-            ui.text_edit_singleline(&mut self.content.new_unit_name);
-            if ui.button("创建").clicked() && !self.content.new_unit_name.is_empty() {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.content.new_unit_name)
+                    .hint_text("新建内容块")
+                    .desired_width(300.0)
+                    .margin(egui::vec2(12.0, 7.0)),
+            );
+            if ui
+                .add_sized(
+                    [64.0, 32.0],
+                    egui::Button::new(egui::RichText::new("创建").size(12.5).color(TEXT_MAIN))
+                        .fill(BTN_BG)
+                        .rounding(8.0),
+                )
+                .clicked()
+                && !self.content.new_unit_name.is_empty()
+            {
                 let r = self.call(
                     "POST",
                     "/v1/units",
@@ -2215,7 +2394,7 @@ impl App {
                 }
             }
         });
-        ui.separator();
+        ui.add_space(12.0);
         if let Some(hits) = self.content.search_hits.clone() {
             ui.label(egui::RichText::new("搜索结果").strong());
             if let Some(arr) = hits.get("hits").and_then(|h| h.as_array()) {
@@ -2230,7 +2409,7 @@ impl App {
                     }
                 }
             }
-            ui.separator();
+            ui.add_space(8.0);
         }
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.spacing_mut().item_spacing = egui::vec2(16.0, 16.0);
@@ -2268,10 +2447,11 @@ impl App {
                                     bottom: 12.0,
                                 })
                                 .show(ui, |ui| {
+                                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 5.0);
                                     ui.label(
                                         egui::RichText::new(s(&unit, "name"))
                                             .strong()
-                                            .size(15.5),
+                                            .size(15.0),
                                     );
                                     ui.add_space(5.0);
                                     ui.horizontal(|ui| {
@@ -2326,6 +2506,7 @@ impl App {
                     });
                 }
             });
+        });
         });
     }
 
@@ -2736,16 +2917,10 @@ impl App {
     /// column holds folders; the right side shows what lives in the
     /// selected folder. `selected` None = 全部.
     fn folder_tree(&mut self, ui: &mut egui::Ui, selected: &mut Option<String>) {
-        if ui
-            .selectable_label(
-                selected.is_none(),
-                egui::RichText::new("全部").size(14.5),
-            )
-            .clicked()
-        {
+        if tree_row(ui, selected.is_none(), 0.0, "全部", 14.0) {
             *selected = None;
         }
-        ui.add_space(3.0);
+        ui.add_space(6.0);
         let mut folders = self.folders.clone();
         folders.sort_by_key(|f| i(f, "sort"));
         // depth-first order by parent chain
@@ -2779,19 +2954,16 @@ impl App {
         }
         for f in ordered {
             let d = depth_of(&folders, &f);
-            ui.horizontal(|ui| {
-                ui.add_space(d as f32 * 14.0);
-                if ui
-                    .selectable_label(
-                        selected.as_deref() == Some(s(&f, "id").as_str()),
-                        egui::RichText::new(s(&f, "name")).size(14.5),
-                    )
-                    .clicked()
-                {
-                    *selected = Some(s(&f, "id"));
-                }
-            });
-            ui.add_space(3.0);
+            if tree_row(
+                ui,
+                selected.as_deref() == Some(s(&f, "id").as_str()),
+                d as f32 * 14.0,
+                &s(&f, "name"),
+                14.0,
+            ) {
+                *selected = Some(s(&f, "id"));
+            }
+            ui.add_space(6.0);
         }
     }
 
@@ -2813,16 +2985,19 @@ impl App {
 
     fn page_index(&mut self, ui: &mut egui::Ui) {
         if self.index.creating {
-            self.index_create(ui);
+            body_frame().show(ui, |ui| self.index_create(ui));
             return;
         }
         egui::SidePanel::left("index_folders")
             .resizable(false)
-            .default_width(200.0)
+            .exact_width(PANEL_W)
             .frame(
-                egui::Frame::none()
-                    .fill(CHROME)
-                    .inner_margin(egui::Margin::same(10.0)),
+                egui::Frame::none().fill(CHROME).inner_margin(egui::Margin {
+                    left: 10.0,
+                    right: 10.0,
+                    top: 12.0,
+                    bottom: 10.0,
+                }),
             )
             .show_inside(ui, |ui| {
                 if ui
@@ -2862,17 +3037,22 @@ impl App {
                     self.index.selected = None;
                 }
             });
-        if self.index.detail.is_none() {
-            self.index_overview(ui);
-            return;
-        }
-        ui.horizontal(|ui| {
-            if ui.button("‹ 返回总览").clicked() {
+        body_frame().show(ui, |ui| {
+            if self.index.detail.is_none() {
+                self.index_overview(ui);
+                return;
+            }
+            // tight ghost row, like the board's plain text back-link
+            let back = ui.scope(|ui| {
+                ui.style_mut().spacing.button_padding = egui::vec2(6.0, 0.0);
+                text_action(ui, "‹ 返回总览", TEXT_WEAK, 12.5)
+            });
+            if back.inner {
                 self.index.detail = None;
                 self.index.selected = None;
             }
+            self.index_detail(ui);
         });
-        self.index_detail(ui);
     }
 
     /// Index overview: standard cards for the indexes living in the
@@ -2888,9 +3068,9 @@ impl App {
                 .map(|f| s(f, "name"))
                 .unwrap_or_else(|| "索引".into()),
         };
-        ui.add_space(6.0);
+        ui.add_space(2.0);
         ui.label(egui::RichText::new(title).size(22.0).strong());
-        ui.add_space(12.0);
+        ui.add_space(14.0);
         let items: Vec<Value> = self
             .indexes
             .clone()
@@ -2931,15 +3111,18 @@ impl App {
                                         .inner_margin(egui::Margin {
                                             left: 14.0,
                                             right: 14.0,
-                                            top: 10.0,
+                                            top: 13.0,
                                             bottom: 12.0,
                                         })
                                         .show(ui, |ui| {
+                                            ui.spacing_mut().item_spacing =
+                                                egui::vec2(8.0, 5.0);
                                             ui.label(
                                                 egui::RichText::new(s(&x, "name"))
                                                     .strong()
-                                                    .size(15.5),
+                                                    .size(15.0),
                                             );
+                                            ui.add_space(7.0);
                                             ui.horizontal(|ui| {
                                                 if let Some(tag) =
                                                     self.index_tags.get(&xid)
@@ -2967,14 +3150,15 @@ impl App {
                                                     _ => {}
                                                 }
                                             });
+                                            ui.add_space(7.0);
                                             ui.label(
                                                 egui::RichText::new(format!(
                                                     "{} · {}",
                                                     s(&x, "maintainer"),
                                                     fmt_time(i(&x, "created_ms"))
                                                 ))
-                                                .small()
-                                                .color(TEXT_WEAK),
+                                                .size(11.0)
+                                                .color(TEXT_FAINT),
                                             );
                                         });
                                 });
@@ -3079,22 +3263,25 @@ impl App {
         let tags = detail.get("tags").and_then(|t| t.as_array()).cloned().unwrap_or_default();
         ui.horizontal(|ui| {
             ui.heading(s(&index, "name"));
-            ui.label(format!(
-                "{} · {}",
-                self.folder_name(
-                    index.get("folder_id").and_then(|x| x.as_str()).unwrap_or("")
-                ),
-                s(&index, "maintainer")
-            ));
+            ui.label(
+                egui::RichText::new(format!(
+                    "· {}",
+                    s(&index, "maintainer")
+                ))
+                .size(12.0)
+                .color(TEXT_WEAK),
+            );
         });
+        ui.add_space(2.0);
         ui.horizontal(|ui| {
-            ui.label("分支");
+            ui.label(egui::RichText::new("分支").size(12.5).color(TEXT_WEAK));
             let mut branch = if self.index.branch.is_empty() {
                 "main".to_string()
             } else {
                 self.index.branch.clone()
             };
             egui::ComboBox::from_id_salt("branch")
+                .width(96.0)
                 .selected_text(branch.clone())
                 .show_ui(ui, |ui| {
                     for b in &branches {
@@ -3108,12 +3295,33 @@ impl App {
                 self.load_index_detail();
                 return;
             }
-            ui.label("版本");
+            ui.label(egui::RichText::new("版本").size(12.5).color(TEXT_WEAK));
             for t in &tags {
-                ui.label(format!("V{}", s(t, "name")));
+                ui.label(
+                    egui::RichText::new(format!("V{}", s(t, "name")))
+                        .size(12.5)
+                        .color(TEXT_MAIN),
+                );
             }
-            ui.text_edit_singleline(&mut self.index.tag_name);
-            if ui.button("发布版本").clicked() && !self.index.tag_name.is_empty() {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.index.tag_name)
+                    .desired_width(176.0)
+                    .margin(egui::vec2(10.0, 5.0)),
+            );
+            if ui
+                .add(
+                    egui::Button::new(
+                        egui::RichText::new("发布版本")
+                            .size(12.5)
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(ACCENT)
+                    .rounding(15.0)
+                    .min_size(egui::vec2(88.0, 30.0)),
+                )
+                .clicked()
+                && !self.index.tag_name.is_empty()
+            {
                 if let Some(id) = self.index.selected.clone() {
                     let r = self.call(
                         "POST",
@@ -3130,16 +3338,23 @@ impl App {
                 }
             }
         });
+        ui.add_space(2.0);
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.index.include_notes, "添加备注");
-            if ui.button("导出（个人版）").clicked() {
+            if text_action(ui, "导出（个人版）", TEXT_MAIN, 12.5) {
                 self.export_index_file(&index, "personal");
             }
-            if ui.button("导出（公用版）").clicked() {
+            if text_action(ui, "导出（公用版）", TEXT_MAIN, 12.5) {
                 self.export_index_file(&index, "company");
             }
-            ui.text_edit_singleline(&mut self.index.new_branch);
-            if ui.button("拉分支").clicked() && !self.index.new_branch.is_empty() {
+            ui.add_space(24.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.index.new_branch)
+                    .hint_text("新分支名")
+                    .desired_width(110.0)
+                    .margin(egui::vec2(8.0, 2.0)),
+            );
+            if text_action(ui, "拉分支", TEXT_MAIN, 12.5) && !self.index.new_branch.is_empty() {
                 if let Some(id) = self.index.selected.clone() {
                     let r = self.call(
                         "POST",
@@ -3155,7 +3370,7 @@ impl App {
                     }
                 }
             }
-            if ui.button("推送到演示厅").clicked() {
+            if text_action(ui, "推送到演示厅", TEXT_MAIN, 12.5) {
                 if let Some(id) = self.index.selected.clone() {
                     let r = self.call(
                         "POST",
@@ -3173,7 +3388,7 @@ impl App {
                 }
             }
         });
-        ui.separator();
+        ui.add_space(6.0);
         // entry tile wall: horizontal cards, one per row
         let entries = self.current_entries();
         let resolved = detail
@@ -3191,7 +3406,7 @@ impl App {
                     .unwrap_or(false);
                 if pos > 0 {
                     ui.vertical_centered(|ui| {
-                        if ui.small_button("+ 插入条目").clicked() {
+                        if text_action(ui, "＋ 插入条目", TEXT_WEAK, 12.0) {
                             self.index.insert_at = Some(pos);
                             if let Ok(v) = self.call("GET", "/v1/units", None) {
                                 self.index.insert_units = v
@@ -3202,14 +3417,22 @@ impl App {
                             }
                         }
                     });
-                    ui.add_space(2.0);
                 }
                 card_frame_square()
-                    .inner_margin(egui::Margin::same(20.0))
+                    .inner_margin(egui::Margin {
+                        left: 16.0,
+                        right: 16.0,
+                        top: 10.0,
+                        bottom: 12.0,
+                    })
                     .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
-                            ui.label(format!("#{}", pos + 1));
+                            ui.label(
+                                egui::RichText::new(format!("#{}", pos + 1))
+                                    .size(12.0)
+                                    .color(TEXT_WEAK),
+                            );
                             if ver.is_object() {
                                 let vid = s(&ver, "id");
                                 let total = i(&ver, "page_count");
@@ -3246,7 +3469,7 @@ impl App {
                                 ui.label("无版本");
                             }
                         });
-                        ui.separator();
+                        ui.add_space(6.0);
                         ui.vertical(|ui| {
                             // top row: name left; policy chip, lock toggle and
                             // excerpt at the top right; delete is a red ✕ in
@@ -3401,7 +3624,7 @@ impl App {
                                                         "v{}",
                                                         s(v, "semver")
                                                     ))
-                                                    .small()
+                                                    .size(10.5)
                                                     .color(if is_cur { ACCENT } else { TEXT_WEAK }),
                                                 );
                                             });
@@ -3479,10 +3702,10 @@ impl App {
                         });
                     });
                 }
-                ui.add_space(12.0);
+                ui.add_space(8.0);
             }
-            ui.separator();
-            ui.label(egui::RichText::new("分支合并").strong());
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("分支合并").strong().size(15.0));
             ui.horizontal(|ui| {
                 ui.label("来源分支");
                 ui.text_edit_singleline(&mut self.index.merge_from);
@@ -3785,71 +4008,163 @@ impl App {
         let current = sections[self.settings.section];
         egui::SidePanel::left("settings_nav")
             .resizable(false)
-            .default_width(190.0)
+            .exact_width(NAV_W)
             .frame(
-                egui::Frame::none()
-                    .fill(CHROME)
-                    .inner_margin(egui::Margin::same(10.0)),
+                egui::Frame::none().fill(CHROME).inner_margin(egui::Margin {
+                    left: 10.0,
+                    right: 10.0,
+                    top: 12.0,
+                    bottom: 10.0,
+                }),
             )
             .show_inside(ui, |ui| {
                 for (i, name) in sections.iter().enumerate() {
-                    if ui
-                        .selectable_label(self.settings.section == i, *name)
-                        .clicked()
-                    {
+                    if tree_row(ui, self.settings.section == i, 0.0, name, 13.5) {
                         self.settings.section = i;
                     }
-                    ui.add_space(4.0);
+                    ui.add_space(6.0);
                 }
             });
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::none()
                     .fill(APP_BG)
-                    .inner_margin(egui::Margin::same(20.0)),
+                    .inner_margin(egui::Margin {
+                        left: 24.0,
+                        right: 24.0,
+                        top: 14.0,
+                        bottom: 16.0,
+                    }),
             )
             .show_inside(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.heading(current);
-                    ui.add_space(10.0);
+                    ui.add_space(14.0);
                     match current {
                         "个人资料" => {
-                            egui::Grid::new("profile_grid")
-                                .num_columns(2)
-                                .spacing([14.0, 10.0])
-                                .show(ui, |ui| {
-                                    for (key, label) in [
-                                        ("title", "职务"),
-                                        ("english_name", "英文名"),
-                                        ("phone", "手机号"),
-                                        ("email", "邮箱"),
-                                        ("wechat", "微信"),
-                                    ] {
-                                        ui.label(label);
-                                        let v = self
-                                            .settings
-                                            .profile
-                                            .entry(key.to_string())
-                                            .or_default();
-                                        ui.add_sized(
-                                            [300.0, 26.0],
-                                            egui::TextEdit::singleline(v),
-                                        );
+                            // Board: label column + 380×34 fields on a 54
+                            // pitch, blue pill save under the field column,
+                            // personal-binding preview card on the right.
+                            let mut save_clicked = false;
+                            ui.horizontal_top(|ui| {
+                                egui::Grid::new("profile_grid")
+                                    .num_columns(2)
+                                    .spacing([16.0, 20.0])
+                                    .show(ui, |ui| {
+                                        for (key, label) in [
+                                            ("name", "姓名"),
+                                            ("title", "职务"),
+                                            ("english_name", "英文名"),
+                                            ("phone", "手机号"),
+                                            ("email", "邮箱"),
+                                            ("wechat", "微信二维码"),
+                                        ] {
+                                            ui.label(
+                                                egui::RichText::new(label)
+                                                    .size(13.0)
+                                                    .color(TEXT_WEAK),
+                                            );
+                                            let v = self
+                                                .settings
+                                                .profile
+                                                .entry(key.to_string())
+                                                .or_default();
+                                            ui.add_sized(
+                                                [380.0, 34.0],
+                                                egui::TextEdit::singleline(v)
+                                                    .margin(egui::vec2(10.0, 8.0)),
+                                            );
+                                            ui.end_row();
+                                        }
+                                        ui.label("");
+                                        if ui
+                                            .add(
+                                                egui::Button::new(
+                                                    egui::RichText::new("保存资料")
+                                                        .size(13.0)
+                                                        .color(egui::Color32::WHITE),
+                                                )
+                                                .fill(ACCENT)
+                                                .rounding(19.0)
+                                                .min_size(egui::vec2(120.0, 38.0)),
+                                            )
+                                            .clicked()
+                                        {
+                                            save_clicked = true;
+                                        }
                                         ui.end_row();
-                                    }
+                                    });
+                                ui.add_space(64.0);
+                                ui.vertical(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("个人绑定预览")
+                                            .strong()
+                                            .size(14.0),
+                                    );
+                                    ui.add_space(8.0);
+                                    let p = &self.settings.profile;
+                                    let get = |k: &str| {
+                                        p.get(k).cloned().unwrap_or_default()
+                                    };
+                                    let dname = self
+                                        .user
+                                        .as_ref()
+                                        .map(|u| s(u, "display_name"))
+                                        .unwrap_or_default();
+                                    let pname = if get("name").is_empty() {
+                                        dname
+                                    } else {
+                                        get("name")
+                                    };
+                                    egui::Frame::none()
+                                        .fill(egui::Color32::WHITE)
+                                        .rounding(egui::Rounding::same(8.0))
+                                        .inner_margin(egui::Margin::same(14.0))
+                                        .show(ui, |ui| {
+                                            ui.set_min_size(egui::vec2(312.0, 163.0));
+                                            let (bar, _) = ui.allocate_exact_size(
+                                                egui::vec2(150.0, 8.0),
+                                                egui::Sense::hover(),
+                                            );
+                                            ui.painter().rect_filled(
+                                                bar,
+                                                0.0,
+                                                egui::Color32::from_rgb(0x1F, 0x38, 0x64),
+                                            );
+                                            ui.add_space(10.0);
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "汇报人：{} · {}",
+                                                    pname,
+                                                    get("title")
+                                                ))
+                                                .size(11.0)
+                                                .color(egui::Color32::from_rgb(0x33, 0x33, 0x33)),
+                                            );
+                                            ui.add_space(4.0);
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "{} · {}",
+                                                    get("phone"),
+                                                    get("email")
+                                                ))
+                                                .size(11.0)
+                                                .color(egui::Color32::from_rgb(0x66, 0x66, 0x66)),
+                                            );
+                                            ui.add_space(12.0);
+                                            let (img, _) = ui.allocate_exact_size(
+                                                egui::vec2(90.0, 60.0),
+                                                egui::Sense::hover(),
+                                            );
+                                            ui.painter().rect_filled(
+                                                img,
+                                                0.0,
+                                                egui::Color32::from_rgb(0xB8, 0xC4, 0xD4),
+                                            );
+                                        });
                                 });
-                            ui.add_space(12.0);
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        egui::RichText::new("保存资料")
-                                            .color(egui::Color32::WHITE),
-                                    )
-                                    .fill(ACCENT)
-                                    .rounding(15.0),
-                                )
-                                .clicked()
-                            {
+                            });
+                            if save_clicked {
                                 let fields: Value = json!(self.settings.profile);
                                 match self.call(
                                     "PUT",
