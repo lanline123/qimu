@@ -38,31 +38,33 @@ fn install_cjk_font(ctx: &egui::Context) {
     }
 }
 
-/// Design language adopted 1:1 from the Craft family apps (DeckCraft /
-/// EffectCraft), whose look the product owner picked as the reference:
-/// flat light chrome, white cards, hairline separators, ghost controls,
-/// one orange accent used for tab underlines, selection and primaries.
-pub const ACCENT: egui::Color32 = egui::Color32::from_rgb(0xD9, 0x5A, 0x1A);
-pub const ACCENT_DEEP: egui::Color32 = egui::Color32::from_rgb(0xC2, 0x4E, 0x14);
-pub const CHROME: egui::Color32 = egui::Color32::from_rgb(0xF5, 0xF5, 0xF5);
-pub const APP_BG: egui::Color32 = egui::Color32::from_rgb(0xFB, 0xFB, 0xFB);
-pub const CARD_BORDER: egui::Color32 = egui::Color32::from_rgb(0xE3, 0xE3, 0xE3);
-pub const SEPARATOR: egui::Color32 = egui::Color32::from_rgb(0xE1, 0xE1, 0xE1);
-pub const TEXT_MAIN: egui::Color32 = egui::Color32::from_rgb(0x24, 0x24, 0x24);
-pub const TEXT_WEAK: egui::Color32 = egui::Color32::from_rgb(0x5C, 0x5C, 0x5C);
-pub const TEXT_FAINT: egui::Color32 = egui::Color32::from_rgb(0x99, 0x99, 0x99);
-pub const HOVER_BG: egui::Color32 = egui::Color32::from_rgb(0xEB, 0xEB, 0xEB);
+/// Design language of the Craft family apps in their dark theme (the
+/// EffectCraft look the product owner picked): near-black canvas #121212,
+/// chrome #1C1C1C, cards #232323 with #383838 hairlines, ghost controls,
+/// one blue accent #2D8CEB for tab underlines, primaries and key marks;
+/// selection is gray, never an accent flood. Spec: design/设计规范-EffectCraft风格.md.
+pub const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x2D, 0x8C, 0xEB);
+pub const ACCENT_DEEP: egui::Color32 = egui::Color32::from_rgb(0x6C, 0xB2, 0xF5);
+pub const CHROME: egui::Color32 = egui::Color32::from_rgb(0x1C, 0x1C, 0x1C);
+pub const APP_BG: egui::Color32 = egui::Color32::from_rgb(0x12, 0x12, 0x12);
+pub const CARD_BG: egui::Color32 = egui::Color32::from_rgb(0x23, 0x23, 0x23);
+pub const CARD_BORDER: egui::Color32 = egui::Color32::from_rgb(0x38, 0x38, 0x38);
+pub const SEPARATOR: egui::Color32 = egui::Color32::from_rgb(0x2A, 0x2A, 0x2A);
+pub const TEXT_MAIN: egui::Color32 = egui::Color32::from_rgb(0xF2, 0xF2, 0xF2);
+pub const TEXT_WEAK: egui::Color32 = egui::Color32::from_rgb(0x9E, 0x9E, 0x9E);
+pub const TEXT_FAINT: egui::Color32 = egui::Color32::from_rgb(0x6E, 0x6E, 0x6E);
+pub const HOVER_BG: egui::Color32 = egui::Color32::from_rgb(0x2C, 0x2C, 0x2C);
 
 fn apply_modern_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
-    let mut v = egui::Visuals::light();
+    let mut v = egui::Visuals::dark();
     v.panel_fill = CHROME;
-    v.window_fill = egui::Color32::WHITE;
+    v.window_fill = CARD_BG;
     // egui 0.29 has no separate text-field fill; extreme_bg serves it —
-    // Craft's text_field gray, so fields read on white cards and canvas.
-    v.extreme_bg_color = egui::Color32::from_rgb(0xEB, 0xEB, 0xEB);
-    v.faint_bg_color = HOVER_BG;
-    v.selection.bg_fill = egui::Color32::from_rgb(0xE6, 0xE6, 0xE6);
+    // Craft dark field gray, readable on cards and canvas alike.
+    v.extreme_bg_color = egui::Color32::from_rgb(0x2A, 0x2A, 0x2A);
+    v.faint_bg_color = CHROME;
+    v.selection.bg_fill = egui::Color32::from_rgb(0x3A, 0x3A, 0x3A);
     v.selection.stroke = egui::Stroke::new(1.0, TEXT_MAIN);
     v.hyperlink_color = ACCENT;
     v.override_text_color = Some(TEXT_MAIN);
@@ -72,13 +74,13 @@ fn apply_modern_style(ctx: &egui::Context) {
         offset: egui::vec2(0.0, 4.0),
         blur: 18.0,
         spread: 0.0,
-        color: egui::Color32::from_black_alpha(28),
+        color: egui::Color32::from_black_alpha(90),
     };
     v.popup_shadow = egui::epaint::Shadow {
         offset: egui::vec2(0.0, 3.0),
         blur: 12.0,
         spread: 0.0,
-        color: egui::Color32::from_black_alpha(28),
+        color: egui::Color32::from_black_alpha(90),
     };
     let r = egui::Rounding::same(5.0);
     for w in [
@@ -93,15 +95,15 @@ fn apply_modern_style(ctx: &egui::Context) {
     v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, SEPARATOR);
     // ghost controls: no outlines; fills only where a control must stand out
     v.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
-    v.widgets.inactive.bg_fill = egui::Color32::from_rgb(0xD6, 0xD6, 0xD6);
+    v.widgets.inactive.bg_fill = egui::Color32::from_rgb(0x30, 0x30, 0x30);
     v.widgets.inactive.bg_stroke = egui::Stroke::NONE;
     v.widgets.hovered.weak_bg_fill = HOVER_BG;
-    v.widgets.hovered.bg_fill = egui::Color32::from_rgb(0xC8, 0xC8, 0xC8);
+    v.widgets.hovered.bg_fill = egui::Color32::from_rgb(0x3A, 0x3A, 0x3A);
     v.widgets.hovered.bg_stroke = egui::Stroke::NONE;
-    v.widgets.active.weak_bg_fill = egui::Color32::from_rgb(0xDE, 0xDE, 0xDE);
-    v.widgets.active.bg_fill = egui::Color32::from_rgb(0xBC, 0xBC, 0xBC);
+    v.widgets.active.weak_bg_fill = egui::Color32::from_rgb(0x38, 0x38, 0x38);
+    v.widgets.active.bg_fill = egui::Color32::from_rgb(0x45, 0x45, 0x45);
     v.widgets.active.bg_stroke = egui::Stroke::NONE;
-    v.widgets.open.weak_bg_fill = egui::Color32::from_rgb(0xDE, 0xDE, 0xDE);
+    v.widgets.open.weak_bg_fill = HOVER_BG;
     v.widgets.open.bg_stroke = egui::Stroke::NONE;
     style.visuals = v;
     use egui::{FontFamily, FontId, TextStyle};
@@ -135,7 +137,7 @@ fn apply_modern_style(ctx: &egui::Context) {
 /// #E3E3E3 border, 10px radius, soft shadow — cover-first layout.
 fn card_frame() -> egui::Frame {
     egui::Frame::none()
-        .fill(egui::Color32::WHITE)
+        .fill(CARD_BG)
         .stroke(egui::Stroke::new(1.0, CARD_BORDER))
         .rounding(egui::Rounding::same(10.0))
         .inner_margin(egui::Margin::same(14.0))
@@ -170,13 +172,13 @@ fn chip(ui: &mut egui::Ui, text: &str, fg: egui::Color32, bg: egui::Color32) {
     );
 }
 
-pub const CHIP_GREEN_FG: egui::Color32 = egui::Color32::from_rgb(24, 150, 84);
-pub const CHIP_GREEN_BG: egui::Color32 = egui::Color32::from_rgb(227, 245, 234);
-pub const CHIP_ORANGE_FG: egui::Color32 = egui::Color32::from_rgb(205, 110, 4);
-pub const CHIP_ORANGE_BG: egui::Color32 = egui::Color32::from_rgb(252, 238, 219);
-pub const CHIP_BLUE_BG: egui::Color32 = egui::Color32::from_rgb(0xFD, 0xEE, 0xE6);
-pub const CHIP_GRAY_FG: egui::Color32 = egui::Color32::from_rgb(96, 106, 120);
-pub const CHIP_GRAY_BG: egui::Color32 = egui::Color32::from_rgb(238, 241, 245);
+pub const CHIP_GREEN_FG: egui::Color32 = egui::Color32::from_rgb(0x35, 0xB2, 0x6B);
+pub const CHIP_GREEN_BG: egui::Color32 = egui::Color32::from_rgb(0x1E, 0x3A, 0x2A);
+pub const CHIP_ORANGE_FG: egui::Color32 = egui::Color32::from_rgb(0xE8, 0xA1, 0x3A);
+pub const CHIP_ORANGE_BG: egui::Color32 = egui::Color32::from_rgb(0x3D, 0x2E, 0x1A);
+pub const CHIP_BLUE_BG: egui::Color32 = egui::Color32::from_rgb(0x1B, 0x2A, 0x3F);
+pub const CHIP_GRAY_FG: egui::Color32 = egui::Color32::from_rgb(0x9E, 0x9E, 0x9E);
+pub const CHIP_GRAY_BG: egui::Color32 = egui::Color32::from_rgb(0x30, 0x30, 0x30);
 
 /// Craft-style tab (top bar + zone switchers): ghost text tab, the
 /// selected one carries an accent underline.
@@ -949,7 +951,7 @@ impl eframe::App for App {
         egui::TopBottomPanel::top("top")
             .frame(
                 egui::Frame::none()
-                    .fill(egui::Color32::WHITE)
+                    .fill(CHROME)
                     .inner_margin(egui::Margin {
                         left: 14.0,
                         right: 14.0,
@@ -1001,7 +1003,7 @@ impl eframe::App for App {
         egui::TopBottomPanel::bottom("status")
             .frame(
                 egui::Frame::none()
-                    .fill(egui::Color32::WHITE)
+                    .fill(CHROME)
                     .inner_margin(egui::Margin {
                         left: 14.0,
                         right: 14.0,
@@ -2764,19 +2766,36 @@ impl App {
                             ui.label(format!("#{}", pos + 1));
                             if ver.is_object() {
                                 let vid = s(&ver, "id");
-                                let pages = i(&ver, "page_count").min(3);
+                                let total = i(&ver, "page_count");
+                                // first page large by default; extra pages
+                                // as small thumbs beside it (2 rows x 3)
                                 ui.horizontal(|ui| {
-                                    for p in 0..pages {
-                                        self.thumb_ui(ui, &vid, p as usize, 148.0);
+                                    self.thumb_ui(ui, &vid, 0, 232.0);
+                                    if total > 1 {
+                                        ui.vertical(|ui| {
+                                            for row in 0..2 {
+                                                ui.horizontal(|ui| {
+                                                    for col in 0..3 {
+                                                        let p = 1 + row * 3 + col;
+                                                        if (p as i64) < total {
+                                                            self.thumb_ui(
+                                                                ui,
+                                                                &vid,
+                                                                p,
+                                                                86.0,
+                                                            );
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                        });
                                     }
                                 });
-                                if i(&ver, "page_count") > 3 {
-                                    ui.label(
-                                        egui::RichText::new(format!("共 {} 页", i(&ver, "page_count")))
-                                            .small()
-                                            .weak(),
-                                    );
-                                }
+                                ui.label(
+                                    egui::RichText::new(format!("共 {} 页", total))
+                                        .small()
+                                        .color(TEXT_FAINT),
+                                );
                             } else {
                                 ui.label("无版本");
                             }
@@ -2855,7 +2874,7 @@ impl App {
                             }
                             if locked {
                                 if ui
-                                    .button(egui::RichText::new("解除锁定").color(egui::Color32::from_rgb(30, 150, 60)))
+                                    .button(egui::RichText::new("解除锁定").color(CHIP_GREEN_FG))
                                     .clicked()
                                 {
                                     let mut es = entries.clone();
@@ -2991,7 +3010,7 @@ impl App {
                 if conflicts.is_empty() {
                     ui.label(
                         egui::RichText::new("无冲突，可自动合并")
-                            .color(egui::Color32::from_rgb(30, 150, 60)),
+                            .color(CHIP_GREEN_FG),
                     );
                 } else {
                     ui.label(format!("{} 个条目冲突，逐条裁决：", conflicts.len()));
