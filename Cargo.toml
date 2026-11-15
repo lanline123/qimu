@@ -5,6 +5,7 @@ members = [
     "crates/qimu-server",
     "crates/qimu-cli",
     "crates/qimu-client",
+    "crates/qimu-bridge",
 ]
 
 [workspace.package]

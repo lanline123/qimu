@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 qimu-core = { path = "../qimu-core" }
+qimu-bridge = { path = "../qimu-bridge" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -107,6 +107,17 @@ enum Command {
         #[arg(long = "set")]
         set: Vec<String>,
     },
+    /// PowerPoint COM bridge (Windows; §4.3).
+    Bridge {
+        #[command(subcommand)]
+        cmd: BridgeCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum BridgeCommand {
+    /// Report whether PowerPoint is running and which deck is open.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -1043,6 +1054,13 @@ fn run() -> Result<i32, String> {
             print(&ctx.call("PUT", "/v1/company-profile", Some(json!({ "fields": fields })))?);
             Ok(0)
         }
+        Command::Bridge { cmd } => match cmd {
+            BridgeCommand::Status => {
+                let bridge = qimu_bridge::platform_bridge();
+                print(&serde_json::to_value(bridge.status()).map_err(|e| e.to_string())?);
+                Ok(0)
+            }
+        },
     }
 }
 
