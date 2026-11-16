@@ -57,65 +57,101 @@ fn install_cjk_font(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-/// Design language of the Craft family apps in their dark theme (the
-/// EffectCraft look the product owner picked): near-black canvas #121212,
-/// chrome #1C1C1C, cards #232323 with #383838 hairlines, ghost controls,
-/// one blue accent #2D8CEB for tab underlines, primaries and key marks;
-/// selection is gray, never an accent flood. Spec: design/设计规范-EffectCraft风格.md.
+/// Design language benchmarked on the EffectCraft main window (spec:
+/// design/设计规范-EffectCraft风格.md, 2026-11-15 six-dimension rewrite):
+/// chrome pressed to near-black — top bar #17181C, side panels #1A1B1F,
+/// canvas #121212; cards #1E1F24 layer by brightness over the canvas with
+/// only a #2C2D33 hairline to finish them; fields are inset #1A1A1A with
+/// no stroke; one blue accent #2D8CEB, spent only on interaction,
+/// selection marks, key values and focus; selection is gray, never an
+/// accent flood. State ladder, one step per state (§5): secondary button
+/// #26262B → hover #2C2C2C → pressed #36363C.
 pub const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x2D, 0x8C, 0xEB);
 pub const ACCENT_DEEP: egui::Color32 = egui::Color32::from_rgb(0x6C, 0xB2, 0xF5);
-pub const CHROME: egui::Color32 = egui::Color32::from_rgb(0x23, 0x23, 0x23);
+/// Side panel fill (#1A1B1F).
+pub const CHROME: egui::Color32 = egui::Color32::from_rgb(0x1A, 0x1B, 0x1F);
 pub const APP_BG: egui::Color32 = egui::Color32::from_rgb(0x12, 0x12, 0x12);
-pub const CARD_BG: egui::Color32 = egui::Color32::from_rgb(0x28, 0x28, 0x28);
-pub const CARD_BORDER: egui::Color32 = egui::Color32::from_rgb(0x38, 0x38, 0x38);
-pub const SEPARATOR: egui::Color32 = egui::Color32::from_rgb(0x2A, 0x2A, 0x2A);
+pub const CARD_BG: egui::Color32 = egui::Color32::from_rgb(0x1E, 0x1F, 0x24);
+pub const CARD_BORDER: egui::Color32 = egui::Color32::from_rgb(0x2C, 0x2D, 0x33);
+pub const SEPARATOR: egui::Color32 = egui::Color32::from_rgb(0x26, 0x26, 0x2B);
 pub const TEXT_MAIN: egui::Color32 = egui::Color32::from_rgb(0xF2, 0xF2, 0xF2);
 pub const TEXT_WEAK: egui::Color32 = egui::Color32::from_rgb(0x9E, 0x9E, 0x9E);
 pub const TEXT_FAINT: egui::Color32 = egui::Color32::from_rgb(0x6E, 0x6E, 0x6E);
+/// Hover fill — one step up from the secondary-button fill (§5).
 pub const HOVER_BG: egui::Color32 = egui::Color32::from_rgb(0x2C, 0x2C, 0x2C);
-/// Top bar fill — one step darker than the side panels (board sample).
-pub const TOPBAR: egui::Color32 = egui::Color32::from_rgb(0x1F, 0x1F, 0x1F);
-/// Text-field fill (board sample #2A2A2A, no stroke).
-pub const FIELD_BG: egui::Color32 = egui::Color32::from_rgb(0x2A, 0x2A, 0x2A);
-/// Secondary button fill (board sample #303030).
-pub const BTN_BG: egui::Color32 = egui::Color32::from_rgb(0x30, 0x30, 0x30);
-/// Selected row fill — gray, never the accent (board sample #3A3A3A).
-pub const SEL_BG: egui::Color32 = egui::Color32::from_rgb(0x3A, 0x3A, 0x3A);
-/// Layout tokens from the design boards (1440×900): folder panels are
-/// 220 wide, the settings nav 208, page content starts 24 right of the
-/// panel, cards round at 10.
-pub const PANEL_W: f32 = 220.0;
-pub const NAV_W: f32 = 208.0;
-pub const PAGE_PAD_L: f32 = 24.0;
+/// Pressed/active fill — one more step up the same ladder (§5).
+pub const PRESSED_BG: egui::Color32 = egui::Color32::from_rgb(0x36, 0x36, 0x3C);
+/// Menu/tool row fill — EffectCraft header_bg #1F1F1F (its theme
+/// tokens, crates/ui-egui theme.rs; the framework's two chrome rows).
+pub const HEADER_BG: egui::Color32 = egui::Color32::from_rgb(0x1F, 0x1F, 0x1F);
+/// Dock panel fill — EffectCraft panel_bg #232323: tab strips and
+/// panel bodies share it (design/EffectCraft主页布局拆解.md §3).
+pub const PANEL_BG: egui::Color32 = egui::Color32::from_rgb(0x23, 0x23, 0x23);
+/// Dock tab text: inactive #9A9A9A / active #E3E3E3 (color-only
+/// difference — no fill, no underline on panel tabs).
+pub const TAB_TEXT: egui::Color32 = egui::Color32::from_rgb(0x9A, 0x9A, 0x9A);
+pub const TAB_TEXT_ACTIVE: egui::Color32 = egui::Color32::from_rgb(0xE3, 0xE3, 0xE3);
+/// Workspace-tab active blue — EffectCraft hot_text #3D8FF5; used
+/// ONLY on the tool row's workspace tabs (text + 2px underline).
+pub const HOT: egui::Color32 = egui::Color32::from_rgb(0x3D, 0x8F, 0xF5);
+/// Field border #3A3A3A (toast outline, per the framework's toast).
+pub const FIELD_BORDER: egui::Color32 = egui::Color32::from_rgb(0x3A, 0x3A, 0x3A);
+/// Tool-row vertical separator — EffectCraft separator #343434.
+pub const LINE_34: egui::Color32 = egui::Color32::from_rgb(0x34, 0x34, 0x34);
+/// Icon tint at rest — EffectCraft icon #B4B4B4.
+pub const ICON_TINT: egui::Color32 = egui::Color32::from_rgb(0xB4, 0xB4, 0xB4);
+/// Icon-slot hover fill — EffectCraft hover #303030.
+pub const ICON_HOVER: egui::Color32 = egui::Color32::from_rgb(0x30, 0x30, 0x30);
+/// Text-field fill (#1A1A1A, inset darker than the panel, no stroke).
+pub const FIELD_BG: egui::Color32 = egui::Color32::from_rgb(0x1A, 0x1A, 0x1A);
+/// Secondary button fill (#26262B) — the darkest chrome control fill.
+pub const BTN_BG: egui::Color32 = egui::Color32::from_rgb(0x26, 0x26, 0x2B);
+/// Selected row fill (#2E2F36) — gray, never the accent.
+pub const SEL_BG: egui::Color32 = egui::Color32::from_rgb(0x2E, 0x2F, 0x36);
+/// Layout tokens: page content inset inside a dock frame (the dock
+/// frames carry the panel widths now — 300 left frames, 240 for the
+/// settings nav, per the framework's Default workspace).
+pub const PAGE_PAD_L: f32 = 16.0;
 
 fn apply_modern_style(ctx: &egui::Context) {
     let mut style = (*ctx.global_style()).clone();
     let mut v = egui::Visuals::dark();
     v.panel_fill = CHROME;
     v.window_fill = CARD_BG;
-    // egui 0.29 has no separate text-field fill; extreme_bg serves it —
-    // Craft dark field gray, readable on cards and canvas alike.
-    v.extreme_bg_color = egui::Color32::from_rgb(0x2A, 0x2A, 0x2A);
+    // egui's default window stroke is gray-60 (#3C3C3C) — brighter
+    // than anything the framework draws; windows, popups and menus
+    // all take it. Press it to the separator tier (#26262B).
+    v.window_stroke = egui::Stroke::new(1.0, SEPARATOR);
+    // extreme_bg serves as the text-field fill: inset #1A1A1A, darker
+    // than panels and cards alike, no stroke (spec §1).
+    v.extreme_bg_color = FIELD_BG;
     v.faint_bg_color = CHROME;
-    v.selection.bg_fill = egui::Color32::from_rgb(0x3A, 0x3A, 0x3A);
-    v.selection.stroke = egui::Stroke::new(1.0, TEXT_MAIN);
+    // Text selection: the family value (deckcraft theme) — translucent
+    // mid blue; the selection stroke doubles as the focused text field's
+    // outline, so it carries the accent (spec §5, figcraft model).
+    v.selection.bg_fill = egui::Color32::from_rgba_unmultiplied(0x5A, 0x8F, 0xE0, 90);
+    v.selection.stroke = egui::Stroke::new(1.0, ACCENT);
     v.hyperlink_color = ACCENT;
     v.override_text_color = Some(TEXT_MAIN);
     v.window_corner_radius = egui::CornerRadius::same(10);
     v.menu_corner_radius = egui::CornerRadius::same(8);
+    // Shadows live only on windows/popups (spec §2): chrome and cards
+    // layer by brightness alone.
     v.window_shadow = egui::epaint::Shadow {
-        offset: [0, 4],
-        blur: 18,
+        offset: [0, 8],
+        blur: 24,
         spread: 0,
         color: egui::Color32::from_black_alpha(90),
     };
     v.popup_shadow = egui::epaint::Shadow {
-        offset: [0, 3],
-        blur: 12,
+        offset: [0, 4],
+        blur: 16,
         spread: 0,
         color: egui::Color32::from_black_alpha(90),
     };
-    let r = egui::CornerRadius::same(8);
+    // Widget-level corner radius 5 across the board (spec §2; the Craft
+    // family themes use CornerRadius::same(5) for every control).
+    let r = egui::CornerRadius::same(5);
     for w in [
         &mut v.widgets.noninteractive,
         &mut v.widgets.inactive,
@@ -126,30 +162,36 @@ fn apply_modern_style(ctx: &egui::Context) {
         w.corner_radius = r;
     }
     v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, SEPARATOR);
-    // ghost controls: no outlines; fills only where a control must stand out
+    // State ladder (§5): one brightness step per state, applied
+    // instantly — no color tweening anywhere. Ghost controls keep a
+    // transparent weak fill; the strong fill is the button gray.
     v.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
-    v.widgets.inactive.bg_fill = egui::Color32::from_rgb(0x30, 0x30, 0x30);
+    v.widgets.inactive.bg_fill = BTN_BG;
     v.widgets.inactive.bg_stroke = egui::Stroke::NONE;
     v.widgets.hovered.weak_bg_fill = HOVER_BG;
-    v.widgets.hovered.bg_fill = egui::Color32::from_rgb(0x3A, 0x3A, 0x3A);
+    v.widgets.hovered.bg_fill = HOVER_BG;
     v.widgets.hovered.bg_stroke = egui::Stroke::NONE;
-    v.widgets.active.weak_bg_fill = egui::Color32::from_rgb(0x38, 0x38, 0x38);
-    v.widgets.active.bg_fill = egui::Color32::from_rgb(0x45, 0x45, 0x45);
+    v.widgets.active.weak_bg_fill = SEL_BG;
+    v.widgets.active.bg_fill = PRESSED_BG;
     v.widgets.active.bg_stroke = egui::Stroke::NONE;
     v.widgets.open.weak_bg_fill = HOVER_BG;
+    v.widgets.open.bg_fill = HOVER_BG;
     v.widgets.open.bg_stroke = egui::Stroke::NONE;
     style.visuals = v;
     use egui::{FontFamily, FontId, TextStyle};
+    // Type ladder (spec §6): page title 18 / section 16 / card title
+    // 13.5; the ambient styles take the framework's measured values
+    // (EffectCraft theme.rs: Body 12 / Button 12 / Small 11).
     style.text_styles.insert(
         TextStyle::Heading,
-        FontId::new(19.0, FontFamily::Proportional),
+        FontId::new(18.0, FontFamily::Proportional),
     );
     style
         .text_styles
-        .insert(TextStyle::Body, FontId::new(13.0, FontFamily::Proportional));
+        .insert(TextStyle::Body, FontId::new(12.0, FontFamily::Proportional));
     style.text_styles.insert(
         TextStyle::Button,
-        FontId::new(13.0, FontFamily::Proportional),
+        FontId::new(12.0, FontFamily::Proportional),
     );
     style.text_styles.insert(
         TextStyle::Small,
@@ -159,8 +201,15 @@ fn apply_modern_style(ctx: &egui::Context) {
         .text_styles
         .insert(TextStyle::Monospace, FontId::new(12.0, FontFamily::Monospace));
     style.spacing.item_spacing = egui::vec2(8.0, 5.0);
-    style.spacing.button_padding = egui::vec2(10.0, 4.0);
-    style.spacing.interact_size.y = 24.0;
+    style.spacing.button_padding = egui::vec2(8.0, 4.0);
+    // Product floor (§8): desktop hit targets stay ≈28–30 high.
+    style.spacing.interact_size.y = 28.0;
+    // Motion (spec §4): the family's whole character is 0.2s linear for
+    // structural animation and instant state-color changes; set the
+    // duration explicitly (the fork default is already 0.2/linear) and
+    // take figcraft's 0.4s tooltip delay.
+    style.animation_time = 0.2;
+    style.interaction.tooltip_delay = 0.4;
     // Scroll bars float thin and quiet instead of egui's solid gray rail;
     // the boards show no visible bar at rest.
     style.spacing.scroll = egui::style::ScrollStyle {
@@ -178,15 +227,16 @@ fn apply_modern_style(ctx: &egui::Context) {
     ctx.set_global_style(style);
 }
 
-/// The one standard card (§4.2), Craft-style: raised #282828 surface,
-/// hairline #383838 border, 10px radius, NO shadow (spec: layering comes
-/// from the fill/border contrast alone) — cover-first layout.
+/// The one standard card (§4.2), EffectCraft-benchmarked: #1E1F24
+/// surface layered by brightness over the canvas, #2C2D33 hairline as
+/// the only finish, 6px radius, 12px inner margin, NO shadow —
+/// cover-first layout.
 fn card_frame() -> egui::Frame {
     egui::Frame::NONE
         .fill(CARD_BG)
         .stroke(egui::Stroke::new(1.0, CARD_BORDER))
-        .corner_radius(egui::CornerRadius::same(10))
-        .inner_margin(egui::Margin::same(14))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::same(12))
         .shadow(egui::epaint::Shadow {
             offset: [0, 0],
             blur: 0,
@@ -229,33 +279,7 @@ pub const CHIP_ORANGE_FG: egui::Color32 = egui::Color32::from_rgb(0xE8, 0xA1, 0x
 pub const CHIP_ORANGE_BG: egui::Color32 = egui::Color32::from_rgb(0x3D, 0x2E, 0x1A);
 pub const CHIP_BLUE_BG: egui::Color32 = egui::Color32::from_rgb(0x1B, 0x2A, 0x3F);
 pub const CHIP_GRAY_FG: egui::Color32 = egui::Color32::from_rgb(0x9E, 0x9E, 0x9E);
-pub const CHIP_GRAY_BG: egui::Color32 = egui::Color32::from_rgb(0x30, 0x30, 0x30);
-
-/// Craft-style tab (top bar + zone switchers): ghost text tab, the
-/// selected one carries an accent underline.
-fn pill(ui: &mut egui::Ui, selected: bool, label: &str) -> egui::Response {
-    let text = egui::RichText::new(label)
-        .size(14.0)
-        .color(if selected { TEXT_MAIN } else { TEXT_WEAK });
-    let btn = egui::Button::new(text)
-        .fill(egui::Color32::TRANSPARENT)
-        .stroke(egui::Stroke::NONE)
-        .corner_radius(egui::CornerRadius::same(8))
-        .min_size(egui::vec2(0.0, 34.0));
-    let resp = ui.add(btn);
-    if selected {
-        let r = resp.rect;
-        ui.painter().rect_filled(
-            egui::Rect::from_min_max(
-                egui::pos2(r.min.x + 7.0, r.max.y - 2.0),
-                egui::pos2(r.max.x - 7.0, r.max.y),
-            ),
-            1.0,
-            ACCENT,
-        );
-    }
-    resp
-}
+pub const CHIP_GRAY_BG: egui::Color32 = egui::Color32::from_rgb(0x26, 0x26, 0x2B);
 
 /// Ghost text action — the boards draw secondary actions as plain text
 /// (no box): 开始演示 in accent, the rest in main/weak text color.
@@ -269,26 +293,62 @@ fn text_action(ui: &mut egui::Ui, label: &str, color: egui::Color32, size: f32) 
     .clicked()
 }
 
-/// Full-width side-panel row (folder tree / settings nav): 32 high,
-/// selected = #3A3A3A rounded-8 fill across the whole panel width —
-/// egui's selectable_label only backlights the text itself, which is
-/// the main reason the built pages looked off-board. Returns the row's
-/// response (click + right-click context menu both hang off it).
-fn tree_row(ui: &mut egui::Ui, selected: bool, indent: f32, label: &str, size: f32) -> egui::Response {
+/// Split a nav-panel body rect into (content, footer strip): the
+/// footer is the bottom 30px (EffectCraft's panel footer); content
+/// keeps the panel inner margins — 6px sides, 8px top, 4px above the
+/// footer.
+fn nav_split(rect: egui::Rect) -> (egui::Rect, egui::Rect) {
+    let footer = egui::Rect::from_min_max(egui::pos2(rect.min.x, rect.max.y - 30.0), rect.max);
+    let content = egui::Rect::from_min_max(
+        egui::pos2(rect.min.x + 6.0, rect.min.y + 8.0),
+        egui::pos2(rect.max.x - 6.0, rect.max.y - 34.0),
+    );
+    (content, footer)
+}
+
+/// Full-width panel row (folder tree / zone list / settings nav):
+/// 24 high — the framework's list density (EffectCraft's project
+/// panel rows are 19; Qimu's rows carry a 14px icon, so 24) —
+/// selected = #2E2F36 gray rounded-4 fill across the whole panel
+/// width (never blue, spec §5). An optional IconPark glyph (14px,
+/// icon tint #B4B4B4) leads the label. Returns the row's response
+/// (click + right-click context menu both hang off it).
+fn tree_row(
+    ui: &mut egui::Ui,
+    selected: bool,
+    indent: f32,
+    icon: Option<egui::TextureId>,
+    label: &str,
+    size: f32,
+) -> egui::Response {
     let width = ui.available_width();
     let (rect, resp) =
-        ui.allocate_exact_size(egui::vec2(width, 32.0), egui::Sense::click());
+        ui.allocate_exact_size(egui::vec2(width, 24.0), egui::Sense::click());
     let painter = ui.painter();
     if selected {
-        painter.rect_filled(rect, 8.0, SEL_BG);
+        painter.rect_filled(rect, 4.0, SEL_BG);
     } else if resp.hovered() {
-        painter.rect_filled(rect, 8.0, HOVER_BG);
+        painter.rect_filled(rect, 4.0, HOVER_BG);
+    }
+    let mut tx = rect.min.x + 10.0 + indent;
+    if let Some(tex) = icon {
+        let ir = egui::Rect::from_min_size(
+            egui::pos2(tx, rect.center().y - 7.0),
+            egui::vec2(14.0, 14.0),
+        );
+        painter.image(
+            tex,
+            ir,
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
+            ICON_TINT,
+        );
+        tx += 14.0 + 6.0;
     }
     let font = egui::FontId::new(size, egui::FontFamily::Proportional);
     let color = if selected { TEXT_MAIN } else { TEXT_WEAK };
     let galley = painter.layout_no_wrap(label.to_string(), font, color);
     let ty = rect.center().y - galley.size().y / 2.0;
-    painter.galley(egui::pos2(rect.min.x + 12.0 + indent, ty), galley, color);
+    painter.galley(egui::pos2(tx, ty), galley, color);
     resp
 }
 
@@ -310,13 +370,16 @@ fn logo_tile(ui: &mut egui::Ui, size: f32, glyph: f32, radius: f32) {
     painter.galley(pos, galley, egui::Color32::WHITE);
 }
 
-/// Page body padding next to a resident side panel: content starts
-/// 24px right of the panel (board x=244), 12 below the top bar.
+/// Page body padding inside a dock frame, tightened one step with
+/// the frame2 density pass: 16 left/right, 8 top. The fill is the
+/// app canvas: inside a dock frame the panel_bg would otherwise
+/// show through, and the page content is unchanged from the
+/// pre-framework shell, where it sat directly on the canvas.
 fn body_frame() -> egui::Frame {
-    egui::Frame::NONE.inner_margin(egui::Margin {
+    egui::Frame::NONE.fill(APP_BG).inner_margin(egui::Margin {
         left: PAGE_PAD_L as i8,
-        right: 20,
-        top: 10,
+        right: 16,
+        top: 8,
         bottom: 12,
     })
 }
@@ -621,6 +684,25 @@ enum Page {
     Settings,
 }
 
+/// Panels of the dock framework (craft-ui docking — the same
+/// component EffectCraft's main window is built on; layout authority:
+/// design/EffectCraft主页布局拆解.md). Each top-level page is one
+/// workspace: a fixed-width left frame beside the page's main frame;
+/// the showroom adds a bottom frame for the review queue, the slot
+/// the framework's Default workspace gives its Render Queue.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum QPanel {
+    SrNav,
+    SrMain,
+    SrReview,
+    CtNav,
+    CtMain,
+    IxNav,
+    IxMain,
+    StNav,
+    StMain,
+}
+
 #[derive(Default)]
 struct ContentState {
     folder_filter: Option<String>,
@@ -772,6 +854,22 @@ struct App {
     upd_note: Option<String>,
     upd_tx: std::sync::mpsc::Sender<(bool, Result<Option<String>, String>)>,
     upd_rx: std::sync::mpsc::Receiver<(bool, Result<Option<String>, String>)>,
+    /// Dock workspaces (craft-ui docking), one per top-level page,
+    /// built lazily on first show. Layout variants that replace the
+    /// split (content detail, index creation, the showroom review
+    /// frame appearing) rebuild the workspace; the split sizes are
+    /// fixed/ratio, so a rebuild restores the same geometry.
+    ws_sr: Option<craft_ui::docking::Workspace<QPanel>>,
+    ws_sr_review: bool,
+    ws_ct: Option<craft_ui::docking::Workspace<QPanel>>,
+    ws_ct_detail: bool,
+    ws_ix: Option<craft_ui::docking::Workspace<QPanel>>,
+    ws_ix_creating: bool,
+    ws_st: Option<craft_ui::docking::Workspace<QPanel>>,
+    /// Toast state (the framework has no status bar): the message
+    /// currently floating and when it appeared, in egui time.
+    toast_msg: String,
+    toast_since: f64,
 }
 
 enum ThumbState {
@@ -947,6 +1045,46 @@ static ICON_DOWNLOAD: std::sync::LazyLock<&'static [u8]> =
     std::sync::LazyLock::new(|| icon_png(include_str!("../assets/icons/download.png.b64")));
 static ICON_BACK: std::sync::LazyLock<&'static [u8]> =
     std::sync::LazyLock::new(|| icon_png(include_str!("../assets/icons/back.png.b64")));
+/// Shell icons, second batch (IconPark; inventory and sources in
+/// `assets/icons/README.md`): white glyphs colored by tint at draw
+/// time — toolbar slots, showroom zones, folder rows, panel footer.
+static ICON_HOME: std::sync::LazyLock<&'static [u8]> =
+    std::sync::LazyLock::new(|| icon_png(include_str!("../assets/icons/home.png.b64")));
+static ICON_REFRESH: std::sync::LazyLock<&'static [u8]> =
+    std::sync::LazyLock::new(|| icon_png(include_str!("../assets/icons/refresh.png.b64")));
+static ICON_POWER: std::sync::LazyLock<&'static [u8]> =
+    std::sync::LazyLock::new(|| icon_png(include_str!("../assets/icons/power.png.b64")));
+static ICON_GLOBE: std::sync::LazyLock<&'static [u8]> =
+    std::sync::LazyLock::new(|| icon_png(include_str!("../assets/icons/globe.png.b64")));
+static ICON_BOOKSHELF: std::sync::LazyLock<&'static [u8]> = std::sync::LazyLock::new(|| {
+    icon_png(include_str!("../assets/icons/bookshelf.png.b64"))
+});
+static ICON_INBOX: std::sync::LazyLock<&'static [u8]> =
+    std::sync::LazyLock::new(|| icon_png(include_str!("../assets/icons/inbox.png.b64")));
+static ICON_PEOPLES2: std::sync::LazyLock<&'static [u8]> = std::sync::LazyLock::new(|| {
+    icon_png(include_str!("../assets/icons/peoples-two.png.b64"))
+});
+static ICON_FOLDER: std::sync::LazyLock<&'static [u8]> = std::sync::LazyLock::new(|| {
+    icon_png(include_str!("../assets/icons/folder-close.png.b64"))
+});
+static ICON_FOLDER_OPEN: std::sync::LazyLock<&'static [u8]> = std::sync::LazyLock::new(|| {
+    icon_png(include_str!("../assets/icons/folder-open.png.b64"))
+});
+static ICON_ALL_APPS: std::sync::LazyLock<&'static [u8]> = std::sync::LazyLock::new(|| {
+    icon_png(include_str!("../assets/icons/all-application.png.b64"))
+});
+static ICON_FOLDER_PLUS: std::sync::LazyLock<&'static [u8]> = std::sync::LazyLock::new(|| {
+    icon_png(include_str!("../assets/icons/folder-plus.png.b64"))
+});
+static ICON_SPLIT: std::sync::LazyLock<&'static [u8]> =
+    std::sync::LazyLock::new(|| icon_png(include_str!("../assets/icons/split.png.b64")));
+static ICON_UPLOAD: std::sync::LazyLock<&'static [u8]> =
+    std::sync::LazyLock::new(|| icon_png(include_str!("../assets/icons/upload.png.b64")));
+static ICON_CLIPBOARD: std::sync::LazyLock<&'static [u8]> = std::sync::LazyLock::new(|| {
+    icon_png(include_str!("../assets/icons/clipboard.png.b64"))
+});
+static ICON_DOC_ADD: std::sync::LazyLock<&'static [u8]> =
+    std::sync::LazyLock::new(|| icon_png(include_str!("../assets/icons/doc-add.png.b64")));
 
 /// Temporary index-initiated modes hosted on the content page (§3.10):
 /// picking an entry's pages, or inserting a new entry, both start from
@@ -1298,6 +1436,15 @@ impl App {
             upd_note: None,
             upd_tx,
             upd_rx,
+            ws_sr: None,
+            ws_sr_review: false,
+            ws_ct: None,
+            ws_ct_detail: false,
+            ws_ix: None,
+            ws_ix_creating: false,
+            ws_st: None,
+            toast_msg: String::new(),
+            toast_since: 0.0,
         };
         if std::env::var("QIMU_AUTOLOGIN").is_ok() && !app.password.is_empty() {
             app.do_login();
@@ -1714,6 +1861,21 @@ impl App {
             }
         }
         conn_display_name(&self.server)
+    }
+
+    /// Log out of the active connection (the old top bar's 退出 action,
+    /// now on the tool row's exit slot and the 文件 menu).
+    fn logout(&mut self) {
+        let _ = self.call("POST", "/v1/auth/logout", None);
+        self.token = None;
+        self.user = None;
+        if let Some(i) = self.active {
+            if let Some(c) = self.conns.get_mut(i) {
+                c.token = None;
+                c.status = ConnStatus::LoggedOut;
+            }
+            self.persist_conns();
+        }
     }
 
     fn refresh_all(&mut self) {
@@ -2280,7 +2442,7 @@ impl App {
         let mut cancel = false;
         egui::Frame::NONE
             .fill(CHIP_BLUE_BG)
-            .corner_radius(8)
+            .corner_radius(6)
             .inner_margin(egui::Margin::symmetric(14, 8))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -2422,7 +2584,7 @@ impl App {
         );
         ui.painter().rect_stroke(
             rect,
-            10.0,
+            6.0,
             egui::Stroke::new(1.0, CARD_BORDER),
             egui::StrokeKind::Middle,
         );
@@ -2440,9 +2602,9 @@ impl App {
                     if ui
                         .add_sized(
                             [92.0, 28.0],
-                            egui::Button::new(egui::RichText::new("新建空白块").size(12.0))
+                            egui::Button::new(egui::RichText::new("新建空白块").size(11.5))
                                 .fill(BTN_BG)
-                                .corner_radius(8),
+                                .corner_radius(6),
                         )
                         .clicked()
                     {
@@ -2451,9 +2613,9 @@ impl App {
                     if ui
                         .add_sized(
                             [104.0, 28.0],
-                            egui::Button::new(egui::RichText::new("粘贴 PPT 页新建").size(12.0))
+                            egui::Button::new(egui::RichText::new("粘贴 PPT 页新建").size(11.5))
                                 .fill(BTN_BG)
-                                .corner_radius(8),
+                                .corner_radius(6),
                         )
                         .clicked()
                     {
@@ -2577,6 +2739,432 @@ fn i(v: &Value, key: &str) -> i64 {
     v.get(key).and_then(|x| x.as_i64()).unwrap_or(0)
 }
 
+/// The tool row's vertical separator: 20 high, #343434, with the
+/// framework's 6px breathing room on each side.
+fn tool_vsep(ui: &mut egui::Ui) {
+    ui.add_space(6.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(1.0, 20.0), egui::Sense::hover());
+    ui.painter().vline(rect.center().x, rect.y_range(), egui::Stroke::new(1.0, LINE_34));
+    ui.add_space(6.0);
+}
+
+/// EffectCraft workspace tab (tool row, right side): 12px text, 26
+/// high; active = hot blue #3D8FF5 text + a 2px underline in the same
+/// blue; inactive = dim text, no fill anywhere.
+fn workspace_tab(ui: &mut egui::Ui, active: bool, label: &str) -> egui::Response {
+    let color = if active { HOT } else { TAB_TEXT };
+    let btn = egui::Button::new(egui::RichText::new(label).size(12.0).color(color))
+        .fill(egui::Color32::TRANSPARENT)
+        .stroke(egui::Stroke::NONE)
+        .corner_radius(egui::CornerRadius::ZERO)
+        .min_size(egui::vec2(0.0, 26.0));
+    let resp = ui.add(btn);
+    if active {
+        let r = resp.rect;
+        ui.painter().rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(r.min.x + 8.0, r.max.y - 2.0),
+                egui::pos2(r.max.x - 8.0, r.max.y),
+            ),
+            0.0,
+            HOT,
+        );
+    }
+    resp
+}
+
+/// Panel permissions inside Qimu workspaces: LOCKED (James
+/// 2026-11-16 — the framework's homepage is a fixed layout, and so
+/// is Qimu's). craft-ui's `Permissions::locked()` clears movable /
+/// floatable / closable, which gates every drag, float and close
+/// path inside the component (tab drags become plain clicks, the
+/// group menu loses its float/move entries). Splits still resize:
+/// workspace apply keeps resizing working under lock — width
+/// adjustment is not panel movement.
+fn qpanel_permissions(_p: &QPanel) -> craft_ui::docking::Permissions {
+    craft_ui::docking::Permissions::default().locked()
+}
+
+/// Build a page workspace with its layout root and lock it: the
+/// workspace-level lock additionally rejects Move / Float / Close
+/// commands at apply time, and DockArea is told the same (dock_show
+/// passes ws.locked), so no gesture can start a move at all.
+fn q_workspace(root: craft_ui::docking::Node<QPanel>) -> craft_ui::docking::Workspace<QPanel> {
+    let mut ws = craft_ui::docking::Workspace::new(q_layout(root));
+    ws.locked = true;
+    ws
+}
+
+/// DockStyle from the framework tokens — the same assignments
+/// EffectCraft's dock_style() makes from its theme: strips and bodies
+/// panel_bg, text #E3E3E3 / inactive #9A9A9A, accent = the focus blue,
+/// floating frames panel_bg, 12px font, 30px tabs, 4px gaps.
+/// Border: from_ui takes egui's noninteractive bg_stroke (#26262B),
+/// which the component then draws around the dock area, every group
+/// and every column — a wireframe the framework's homepage does not
+/// have (its groups are separated only by the 4px app_bg gap), so
+/// the border is switched off entirely.
+fn qimu_dock_style(ui: &egui::Ui) -> craft_ui::docking::DockStyle {
+    let mut style = craft_ui::docking::DockStyle::from_ui(ui);
+    style.border = egui::Stroke::NONE;
+    style.tab_height = 30.0;
+    style.gap = 4.0;
+    style.background = PANEL_BG;
+    style.tab_background = PANEL_BG;
+    style.active_background = PANEL_BG;
+    style.text = TAB_TEXT_ACTIVE;
+    style.inactive_text = TAB_TEXT;
+    style.accent = ACCENT;
+    style.floating_background = PANEL_BG;
+    style.font = egui::FontId::proportional(12.0);
+    style.min_tab_width = 12.0 * 2.5 + 24.0;
+    style.float_label = "浮动".into();
+    style.close_label = "关闭".into();
+    style.panels_label = "面板".into();
+    style
+}
+
+fn q_tabs(panels: &[QPanel]) -> craft_ui::docking::Node<QPanel> {
+    craft_ui::docking::Node::Tabs {
+        panels: panels.to_vec(),
+        active: 0,
+    }
+}
+
+fn q_hsplit(
+    size: craft_ui::layout::SplitSize,
+    first: craft_ui::docking::Node<QPanel>,
+    second: craft_ui::docking::Node<QPanel>,
+) -> craft_ui::docking::Node<QPanel> {
+    craft_ui::docking::Node::Split {
+        axis: craft_ui::layout::SplitAxis::Horizontal,
+        size,
+        first: Box::new(first),
+        second: Box::new(second),
+    }
+}
+
+fn q_vsplit(
+    size: craft_ui::layout::SplitSize,
+    first: craft_ui::docking::Node<QPanel>,
+    second: craft_ui::docking::Node<QPanel>,
+) -> craft_ui::docking::Node<QPanel> {
+    craft_ui::docking::Node::Split {
+        axis: craft_ui::layout::SplitAxis::Vertical,
+        size,
+        first: Box::new(first),
+        second: Box::new(second),
+    }
+}
+
+fn q_layout(root: craft_ui::docking::Node<QPanel>) -> craft_ui::docking::Layout<QPanel> {
+    craft_ui::docking::Layout {
+        root: Some(root),
+        floating: Vec::new(),
+    }
+}
+
+/// Main frames sit on the app canvas (the pages' content was built
+/// for it): paint the whole body rect before the page's own frame,
+/// whose fill only covers the content's extent.
+fn paint_body_bg(ui: &mut egui::Ui) {
+    ui.painter().rect_filled(ui.max_rect(), 0.0, APP_BG);
+}
+
+/// The DockContent adapter: panel bodies are the pages' existing
+/// render code, unchanged; the group header is the framework's ≡
+/// mark (26 wide) — kept as framework furniture, but rendered as a
+/// static glyph, not a button: the layout is locked, so there is no
+/// menu to offer (and permissions would reject the commands anyway).
+struct QimuDock<'a> {
+    app: &'a mut App,
+    commands: Vec<craft_ui::docking::DockCommand<QPanel>>,
+}
+
+impl craft_ui::docking::DockContent<QPanel> for QimuDock<'_> {
+    fn body(&mut self, ui: &mut egui::Ui, panel: &QPanel) {
+        match panel {
+            QPanel::SrNav => self.app.sr_nav_body(ui),
+            QPanel::SrMain => {
+                paint_body_bg(ui);
+                self.app.sr_main_body(ui);
+            }
+            QPanel::SrReview => self.app.sr_review_body(ui),
+            QPanel::CtNav => self.app.ct_nav_body(ui),
+            QPanel::CtMain => {
+                paint_body_bg(ui);
+                self.app.ct_main_body(ui);
+            }
+            QPanel::IxNav => self.app.ix_nav_body(ui),
+            QPanel::IxMain => {
+                paint_body_bg(ui);
+                self.app.ix_main_body(ui);
+            }
+            QPanel::StNav => self.app.st_nav_body(ui),
+            QPanel::StMain => self.app.st_main_body(ui),
+        }
+    }
+
+    fn logical_label(&self, panel: &QPanel) -> String {
+        match panel {
+            QPanel::SrNav => "导航".into(),
+            QPanel::SrMain => "演示厅".into(),
+            QPanel::SrReview => "待审队列".into(),
+            QPanel::CtNav => "目录".into(),
+            QPanel::CtMain => "内容".into(),
+            QPanel::IxNav => "目录".into(),
+            QPanel::IxMain => "索引".into(),
+            QPanel::StNav => "设置".into(),
+            QPanel::StMain => self.app.settings_section_name(),
+        }
+    }
+
+    fn permissions(&self, panel: &QPanel) -> craft_ui::docking::Permissions {
+        qpanel_permissions(panel)
+    }
+
+    fn panel_menu(&mut self, _ui: &mut egui::Ui, _panel: &QPanel) {
+        // Intentionally empty (locked layout, see qpanel_permissions):
+        // no move/float commands are offered anywhere; the group
+        // header's ≡ is a static glyph and never opens this menu.
+    }
+
+    fn group_header_width(
+        &self,
+        _panels: &[QPanel],
+        _active: &QPanel,
+        _floating: bool,
+        _strip_width: f32,
+    ) -> f32 {
+        26.0
+    }
+
+    fn group_header(&mut self, ui: &mut egui::Ui, _panels: &[QPanel], _active: &QPanel, _floating: bool) {
+        // Locked layout: the ≡ is a static framework mark, painted
+        // directly with hover-only sense — not clickable, no menu
+        // hangs off it (the previous menu_button opened an empty
+        // popup, since panel_menu offers no commands).
+        let (rect, _resp) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
+        let font = egui::FontId::new(16.0, egui::FontFamily::Proportional);
+        let galley = ui.painter().layout_no_wrap("≡".to_string(), font, ICON_TINT);
+        let pos = egui::pos2(
+            rect.center().x - galley.size().x / 2.0,
+            rect.center().y - galley.size().y / 2.0,
+        );
+        ui.painter().galley(pos, galley, ICON_TINT);
+    }
+}
+
+
+impl App {
+    /// Settings sections visible to the current role — sections a
+    /// role may not see are not rendered at all (§7.9).
+    fn settings_sections(&self) -> Vec<&'static str> {
+        let role = self.role();
+        let mut sections: Vec<&str> = vec!["服务器", "个人资料"];
+        if role != "member" {
+            sections.push("组织管理");
+        }
+        if role == "super" {
+            sections.extend([
+                "内容组与授权",
+                "公司公共资料",
+                "内容语言",
+                "AI 翻译",
+                "离线缓存策略",
+            ]);
+        } else {
+            // The cache path is a local per-user setting; the admin
+            // policy section above stays super-only.
+            sections.push("离线缓存");
+        }
+        sections
+    }
+
+    fn settings_section_name(&self) -> String {
+        let sections = self.settings_sections();
+        sections
+            .get(self.settings.section)
+            .copied()
+            .unwrap_or("设置")
+            .to_string()
+    }
+
+    /// Render one page's dock workspace into the body ui — the same
+    /// glue EffectCraft's dock_area() uses: the workspace is taken
+    /// out, its layout cloned for the render, bodies draw through
+    /// the DockContent adapter, then the output actions and any
+    /// panel-menu commands are applied back to the workspace.
+    fn dock_show(&mut self, ui: &mut egui::Ui, page: Page) {
+        let mut ws = match page {
+            Page::Showroom => self.ws_sr.take(),
+            Page::Content => self.ws_ct.take(),
+            Page::Index => self.ws_ix.take(),
+            Page::Settings => self.ws_st.take(),
+        }
+        .expect("workspace built by the dock_<page> caller");
+        let area_id = match page {
+            Page::Showroom => "qimu-dock-showroom",
+            Page::Content => "qimu-dock-content",
+            Page::Index => "qimu-dock-index",
+            Page::Settings => "qimu-dock-settings",
+        };
+        let body = ui.max_rect();
+        let style = qimu_dock_style(ui);
+        let layout = ws.layout.clone();
+        let mut content = QimuDock {
+            app: self,
+            commands: Vec::new(),
+        };
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(body).id_salt(area_id));
+        child.set_clip_rect(body.intersect(ui.clip_rect()));
+        let out = craft_ui::docking::DockArea::new(egui::Id::new(area_id))
+            .float_bounds(body)
+            .locked(ws.locked)
+            .show_content(&mut child, &layout, &style, &mut content);
+        let commands = std::mem::take(&mut content.commands);
+        drop(content);
+        if let Some(err) = &out.error {
+            self.msg = err.to_string();
+        }
+        let _ = ws.apply_all(out.actions, qpanel_permissions);
+        if !commands.is_empty() {
+            let space = craft_ui::docking::FloatSpace::new(body);
+            for cmd in commands {
+                let _ = cmd.apply(&mut ws, false, &space, qpanel_permissions);
+            }
+        }
+        match page {
+            Page::Showroom => self.ws_sr = Some(ws),
+            Page::Content => self.ws_ct = Some(ws),
+            Page::Index => self.ws_ix = Some(ws),
+            Page::Settings => self.ws_st = Some(ws),
+        }
+    }
+
+    /// Showroom workspace: left frame 300 fixed (navigation), main
+    /// frame (the wall / deck view); for a super admin with a
+    /// non-empty review queue, a bottom frame at ratio 0.72 carries
+    /// the queue — the framework Default tree's bottom-frame slot.
+    fn dock_showroom(&mut self, ui: &mut egui::Ui) {
+        let review = self.role() == "super" && !self.showroom_pending.is_empty();
+        if self.ws_sr.is_none() || self.ws_sr_review != review {
+            let main = q_hsplit(
+                craft_ui::layout::SplitSize::FixedFirst(300.0),
+                q_tabs(&[QPanel::SrNav]),
+                q_tabs(&[QPanel::SrMain]),
+            );
+            let root = if review {
+                q_vsplit(
+                    craft_ui::layout::SplitSize::Ratio(0.72),
+                    main,
+                    q_tabs(&[QPanel::SrReview]),
+                )
+            } else {
+                main
+            };
+            self.ws_sr = Some(q_workspace(root));
+            self.ws_sr_review = review;
+        }
+        self.dock_show(ui, Page::Showroom);
+    }
+
+    /// Content workspace: folder frame 300 fixed + main frame; with
+    /// a block open for maintenance the split gives way to the single
+    /// main frame, exactly as the page behaved before the framework.
+    fn dock_content(&mut self, ui: &mut egui::Ui) {
+        let detail = self.content.detail.is_some();
+        if self.ws_ct.is_none() || self.ws_ct_detail != detail {
+            let root = if detail {
+                q_tabs(&[QPanel::CtMain])
+            } else {
+                q_hsplit(
+                    craft_ui::layout::SplitSize::FixedFirst(300.0),
+                    q_tabs(&[QPanel::CtNav]),
+                    q_tabs(&[QPanel::CtMain]),
+                )
+            };
+            self.ws_ct = Some(q_workspace(root));
+            self.ws_ct_detail = detail;
+        }
+        self.dock_show(ui, Page::Content);
+    }
+
+    /// Index workspace: folder frame 300 fixed + main frame; the
+    /// create flow takes the whole body, as before.
+    fn dock_index(&mut self, ui: &mut egui::Ui) {
+        let creating = self.index.creating;
+        if self.ws_ix.is_none() || self.ws_ix_creating != creating {
+            let root = if creating {
+                q_tabs(&[QPanel::IxMain])
+            } else {
+                q_hsplit(
+                    craft_ui::layout::SplitSize::FixedFirst(300.0),
+                    q_tabs(&[QPanel::IxNav]),
+                    q_tabs(&[QPanel::IxMain]),
+                )
+            };
+            self.ws_ix = Some(q_workspace(root));
+            self.ws_ix_creating = creating;
+        }
+        self.dock_show(ui, Page::Index);
+    }
+
+    /// Settings workspace: section nav frame 240 fixed + section frame.
+    fn dock_settings(&mut self, ui: &mut egui::Ui) {
+        if self.ws_st.is_none() {
+            let root = q_hsplit(
+                craft_ui::layout::SplitSize::FixedFirst(240.0),
+                q_tabs(&[QPanel::StNav]),
+                q_tabs(&[QPanel::StMain]),
+            );
+            self.ws_st = Some(q_workspace(root));
+        }
+        self.dock_show(ui, Page::Settings);
+    }
+
+    /// The framework's status surface: no status bar — a floating
+    /// toast at the screen's bottom-left (16 in, 44 up), panel_bg
+    /// with a field_border outline, radius 6, 12px text, gone after
+    /// 5 seconds. `msg` remains the client's only message channel;
+    /// the toast stamps it when it changes.
+    fn toast(&mut self, ui: &mut egui::Ui, screen: egui::Rect) {
+        let now = ui.ctx().input(|i| i.time);
+        if self.msg != self.toast_msg {
+            self.toast_msg = self.msg.clone();
+            self.toast_since = now;
+        }
+        if self.toast_msg.is_empty() || now - self.toast_since > 5.0 {
+            return;
+        }
+        egui::Area::new(egui::Id::new("qimu_toast"))
+            .fixed_pos(egui::pos2(screen.min.x + 16.0, screen.max.y - 44.0))
+            .order(egui::Order::Foreground)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::NONE
+                    .fill(PANEL_BG)
+                    .stroke(egui::Stroke::new(1.0, FIELD_BORDER))
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .inner_margin(egui::Margin {
+                        left: 12,
+                        right: 12,
+                        top: 7,
+                        bottom: 7,
+                    })
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(&self.toast_msg)
+                                .size(12.0)
+                                .color(TEXT_MAIN),
+                        );
+                    });
+            });
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(500));
+    }
+}
+
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
@@ -2685,16 +3273,16 @@ impl eframe::App for App {
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE.fill(APP_BG))
                 .show(ui, |ui| {
-                    // Board: a 500×400 card (r16) centered on the canvas —
-                    // blue logo tile, white title, gray labels, 330×34
-                    // fields on a 52 pitch, blue pill aligned with the
-                    // field column.
+                    // Board: a 500×400 card (r6, standard card radius)
+                    // centered on the canvas — blue logo tile, white
+                    // title, gray labels, 330×34 fields on a 52 pitch,
+                    // blue pill aligned with the field column.
                     ui.add_space(((ui.available_height() - 400.0).max(0.0)) / 2.0 - 25.0);
                     ui.vertical_centered(|ui| {
                         egui::Frame::NONE
                             .fill(CARD_BG)
                             .stroke(egui::Stroke::new(1.0, CARD_BORDER))
-                            .corner_radius(egui::CornerRadius::same(16))
+                            .corner_radius(egui::CornerRadius::same(6))
                             .inner_margin(egui::Margin {
                                 left: 40,
                                 right: 40,
@@ -2769,68 +3357,144 @@ impl eframe::App for App {
             return;
         }
 
-        egui::Panel::top("top")
-            .exact_size(52.0)
+        // ==== Main-window framework, replicated from the EffectCraft
+        // source (design/EffectCraft主页布局拆解.md): menu row 24 +
+        // tool row 40 over a craft-ui dock body; no status bar — the
+        // message channel floats as a toast. ====
+        let screen = ui.max_rect();
+        // Row 1 — menu row: pure text menus (File/Edit/... in the
+        // original; Qimu's own commands in the same slots).
+        egui::Panel::top("menu_row")
+            .exact_size(24.0)
+            .frame(egui::Frame::NONE.fill(HEADER_BG))
+            // No separator line: egui panels draw one by default from
+            // the noninteractive stroke — the framework's menu row
+            // sits directly on the tool row with no line between.
+            .show_separator_line(false)
+            .show(ui, |ui| {
+                egui::MenuBar::new().ui(ui, |ui| {
+                    ui.menu_button(egui::RichText::new(tr("文件")).size(12.0), |ui| {
+                        ui.set_min_width(160.0);
+                        if ui.button(tr("退出登录")).clicked() {
+                            self.logout();
+                            ui.close();
+                        }
+                        if ui.button(tr("退出")).clicked() {
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                            ui.close();
+                        }
+                    });
+                    ui.menu_button(egui::RichText::new(tr("视图")).size(12.0), |ui| {
+                        ui.set_min_width(160.0);
+                        for (page, label) in [
+                            (Page::Showroom, "演示厅"),
+                            (Page::Content, "内容页"),
+                            (Page::Index, "索引页"),
+                            (Page::Settings, "设置"),
+                        ] {
+                            if ui.button(tr(label)).clicked() {
+                                self.page = page;
+                                ui.close();
+                            }
+                        }
+                    });
+                    ui.menu_button(egui::RichText::new(tr("帮助")).size(12.0), |ui| {
+                        ui.set_min_width(160.0);
+                        if ui.button(tr("检查更新")).clicked() {
+                            self.check_lan_update(true);
+                            ui.close();
+                        }
+                        if ui.button(tr("关于启幕")).clicked() {
+                            self.msg = "启幕 · PPT 内容管理与更新系统".into();
+                            ui.close();
+                        }
+                    });
+                });
+            });
+        // Row 2 — tool row: logo, Home slot, separator, the current
+        // page's tool slots (IconPark glyphs); right side: workspace
+        // tabs (the four pages, in the framework's workspace-switch
+        // form), separator, then the server / user / exit cluster.
+        // A 1px app_bg line closes it (drawn by hand below — the
+        // panel's own separator line stays off).
+        egui::Panel::top("tool_row")
+            .exact_size(40.0)
+            .show_separator_line(false)
             .frame(
-                egui::Frame::NONE
-                    .fill(TOPBAR)
-                    .inner_margin(egui::Margin {
-                        left: 16,
-                        right: 16,
-                        top: 0,
-                        bottom: 0,
-                    }),
+                egui::Frame::NONE.fill(HEADER_BG).inner_margin(egui::Margin {
+                    left: 10,
+                    right: 10,
+                    top: 0,
+                    bottom: 0,
+                }),
             )
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
                     logo_tile(ui, 24.0, 13.0, 6.0);
                     ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new("启幕")
-                            .strong()
-                            .size(19.0)
-                            .color(TEXT_MAIN),
-                    );
-                    // first tab's text lands at board x≈128
-                    ui.add_space(22.0);
-                    for (page, label) in [
-                        (Page::Showroom, "演示厅"),
-                        (Page::Content, "内容页"),
-                        (Page::Index, "索引页"),
-                        (Page::Settings, "设置"),
-                    ] {
-                        if pill(ui, self.page == page, tr(label)).clicked() {
-                            self.page = page;
-                        }
-                        ui.add_space(6.0);
+                    if self.tool_slot(
+                        ui,
+                        self.page == Page::Showroom,
+                        tr("演示厅"),
+                        "home",
+                        *ICON_HOME,
+                    ) {
+                        self.page = Page::Showroom;
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let boxed = |ui: &mut egui::Ui, label: &str| {
-                            ui.add_sized(
-                                [56.0, 28.0],
-                                egui::Button::new(
-                                    egui::RichText::new(label).size(12.0).color(TEXT_MAIN),
-                                )
-                                .fill(BTN_BG)
-                                .corner_radius(8),
-                            )
-                            .clicked()
-                        };
-                        if boxed(ui, tr("退出")) {
-                            let _ = self.call("POST", "/v1/auth/logout", None);
-                            self.token = None;
-                            self.user = None;
-                            if let Some(i) = self.active {
-                                if let Some(c) = self.conns.get_mut(i) {
-                                    c.token = None;
-                                    c.status = ConnStatus::LoggedOut;
-                                }
-                                self.persist_conns();
+                    ui.add_space(2.0);
+                    tool_vsep(ui);
+                    // Page tool slots: only actions the page already
+                    // has (the pages keep their in-body buttons; these
+                    // call the same methods) — showroom refreshes,
+                    // content imports, index creates.
+                    match self.page {
+                        Page::Showroom => {
+                            if self.tool_slot(ui, false, tr("刷新"), "refresh", *ICON_REFRESH) {
+                                self.refresh_all();
                             }
                         }
-                        ui.add_space(4.0);
-                        if boxed(ui, tr("刷新")) {
-                            self.refresh_all();
+                        Page::Content => {
+                            if self.tool_slot(
+                                ui,
+                                false,
+                                tr("智能分块导入"),
+                                "split",
+                                *ICON_SPLIT,
+                            ) {
+                                self.act_import_split();
+                            }
+                            ui.add_space(2.0);
+                            if self.tool_slot(ui, false, tr("导入 PPT"), "upload", *ICON_UPLOAD)
+                            {
+                                self.act_import_ppt();
+                            }
+                            ui.add_space(2.0);
+                            if self.tool_slot(
+                                ui,
+                                false,
+                                tr("粘贴新建"),
+                                "clipboard",
+                                *ICON_CLIPBOARD,
+                            ) {
+                                self.create_unit_from_paste();
+                            }
+                        }
+                        Page::Index => {
+                            if self.tool_slot(
+                                ui,
+                                false,
+                                tr("新建索引"),
+                                "doc-add",
+                                *ICON_DOC_ADD,
+                            ) {
+                                self.act_new_index();
+                            }
+                        }
+                        Page::Settings => {}
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if self.tool_slot(ui, false, tr("退出"), "power", *ICON_POWER) {
+                            self.logout();
                         }
                         ui.add_space(6.0);
                         let name = self
@@ -2840,7 +3504,7 @@ impl eframe::App for App {
                             .unwrap_or_default();
                         ui.label(
                             egui::RichText::new(format!("{name} · {}", self.role()))
-                                .size(12.0)
+                                .size(11.5)
                                 .color(TEXT_WEAK),
                         );
                         ui.add_space(6.0);
@@ -2853,10 +3517,10 @@ impl eframe::App for App {
                         if ui
                             .add(
                                 egui::Button::new(
-                                    egui::RichText::new(srv_label).size(12.0).color(TEXT_WEAK),
+                                    egui::RichText::new(srv_label).size(11.5).color(TEXT_WEAK),
                                 )
                                 .fill(BTN_BG)
-                                .corner_radius(8),
+                                .corner_radius(6),
                             )
                             .clicked()
                         {
@@ -2873,47 +3537,50 @@ impl eframe::App for App {
                                 self.settings.section = 0;
                             }
                         }
+                        ui.add_space(10.0);
+                        tool_vsep(ui);
+                        ui.add_space(10.0);
+                        // Workspace tabs, rightmost first (rtl layout):
+                        // they read 演示厅 → 内容页 → 索引页 → 设置.
+                        for (page, label) in [
+                            (Page::Settings, "设置"),
+                            (Page::Index, "索引页"),
+                            (Page::Content, "内容页"),
+                            (Page::Showroom, "演示厅"),
+                        ] {
+                            if workspace_tab(ui, self.page == page, tr(label)).clicked() {
+                                self.page = page;
+                            }
+                        }
                     });
                 });
-                // hairline under the bar (board: 1px #2A2A2A at y=52)
+                // 1px app_bg line under the tool row (frame.rs paints
+                // the row's bottom edge with app_bg, not a hairline).
                 let r = ui.max_rect();
                 ui.painter().hline(
                     r.x_range(),
                     r.max.y - 0.5,
-                    egui::Stroke::new(1.0, SEPARATOR),
+                    egui::Stroke::new(1.0, APP_BG),
                 );
             });
-        // Operation feedback lives here (it is the client's only message
-        // channel, so the bar stays) — but the boards have no status bar,
-        // so it is painted as part of the canvas: same fill, no stroke,
-        // 11px faint text.
-        egui::Panel::bottom("status")
-            .frame(
-                egui::Frame::NONE
-                    .fill(APP_BG)
-                    .inner_margin(egui::Margin {
-                        left: 16,
-                        right: 16,
-                        top: 2,
-                        bottom: 2,
-                    }),
-            )
-            .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new(&self.msg)
-                        .size(11.0)
-                        .color(TEXT_FAINT),
-                );
-            });
-
+        // Body: the dock area, inset 4 left/right, +2 top, −4 bottom
+        // from the window edges (frame.rs), on the app canvas.
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(APP_BG))
+            .frame(
+                egui::Frame::NONE.fill(APP_BG).inner_margin(egui::Margin {
+                    left: 4,
+                    right: 4,
+                    top: 2,
+                    bottom: 4,
+                }),
+            )
             .show(ui, |ui| match self.page {
-                Page::Showroom => self.page_showroom(ui),
-                Page::Content => self.page_content(ui),
-                Page::Index => self.page_index(ui),
-                Page::Settings => self.page_settings(ui),
+                Page::Showroom => self.dock_showroom(ui),
+                Page::Content => self.dock_content(ui),
+                Page::Index => self.dock_index(ui),
+                Page::Settings => self.dock_settings(ui),
             });
+        self.toast(ui, screen);
     }
 }
 
@@ -3006,8 +3673,11 @@ impl App {
             ui.painter()
                 .rect_stroke(rect, 0.0, egui::Stroke::new(1.5, ACCENT), egui::StrokeKind::Middle);
         } else if resp.hovered() {
+            // hover outline sits in the selected-fill tier (#2E2F36),
+            // not the text gray — a #9E9E9E stroke reads as a bright
+            // white line against the dark panels.
             ui.painter()
-                .rect_stroke(rect, 0.0, egui::Stroke::new(1.0, TEXT_WEAK), egui::StrokeKind::Middle);
+                .rect_stroke(rect, 0.0, egui::Stroke::new(1.0, SEL_BG), egui::StrokeKind::Middle);
         }
         resp.clicked()
     }
@@ -3283,17 +3953,15 @@ impl App {
         self.icon_button_tinted(ui, name, bytes, label, egui::Color32::WHITE)
     }
 
-    /// Same as `icon_button`, with a texture tint — used to weaken the
-    /// glyph when it reports a state (e.g. already cached) rather than
-    /// a fresh action.
-    fn icon_button_tinted(
+    /// Load an embedded IconPark PNG into the texture cache (once)
+    /// and return its texture id — shared by every icon consumer:
+    /// buttons, toolbar slots and nav rows.
+    fn tex_icon(
         &mut self,
-        ui: &mut egui::Ui,
+        ui: &egui::Ui,
         name: &'static str,
         bytes: &'static [u8],
-        label: &str,
-        tint: egui::Color32,
-    ) -> bool {
+    ) -> egui::TextureId {
         if !self.icon_tex.contains_key(name) {
             let img = image::load_from_memory(bytes).expect("embedded icon png");
             let rgba = img.to_rgba8();
@@ -3305,7 +3973,21 @@ impl App {
             let tex = ui.ctx().load_texture(name, ci, egui::TextureOptions::LINEAR);
             self.icon_tex.insert(name, tex);
         }
-        let tex_id = self.icon_tex.get(name).expect("icon texture").id();
+        self.icon_tex.get(name).expect("icon texture").id()
+    }
+
+    /// Same as `icon_button`, with a texture tint — used to weaken the
+    /// glyph when it reports a state (e.g. already cached) rather than
+    /// a fresh action.
+    fn icon_button_tinted(
+        &mut self,
+        ui: &mut egui::Ui,
+        name: &'static str,
+        bytes: &'static [u8],
+        label: &str,
+        tint: egui::Color32,
+    ) -> bool {
+        let tex_id = self.tex_icon(ui, name, bytes);
         // craft-ui's IconButton (storytold/craft-libs) with its native
         // interaction model — hover/pressed/focus painting and the
         // accessibility response come from the component; qimu supplies
@@ -3339,6 +4021,116 @@ impl App {
         resp.on_hover_text(label).clicked()
     }
 
+    /// Toolbar slot (framework geometry, decomposition §2): a 26×26
+    /// craft-ui IconButton carrying an IconPark glyph at ≈15px —
+    /// icon tint #B4B4B4 at rest, and the framework's one accent-filled
+    /// state (white glyph on accent) when the slot is the active one.
+    /// The label doubles as tooltip and accessibility name.
+    fn tool_slot(
+        &mut self,
+        ui: &mut egui::Ui,
+        active: bool,
+        label: &str,
+        name: &'static str,
+        bytes: &'static [u8],
+    ) -> bool {
+        let tex_id = self.tex_icon(ui, name, bytes);
+        let visuals = |fill: egui::Color32, icon: egui::Color32| {
+            craft_ui::buttons::ButtonVisuals {
+                fill,
+                stroke: egui::Stroke::NONE,
+                icon,
+            }
+        };
+        let style = craft_ui::buttons::IconButtonStyle {
+            normal: visuals(egui::Color32::TRANSPARENT, ICON_TINT),
+            hovered: visuals(ICON_HOVER, ICON_TINT),
+            pressed: None,
+            selected: visuals(ACCENT, egui::Color32::WHITE),
+            corner_radius: egui::CornerRadius::same(4),
+            focus_stroke: egui::Stroke::new(1.0, ACCENT),
+        };
+        let resp = craft_ui::buttons::IconButton::new(label, egui::vec2(26.0, 26.0), &style)
+            .selected(active)
+            .show(ui, |ui, rect, icon_tint| {
+                let icon_rect =
+                    egui::Rect::from_center_size(rect.center(), egui::vec2(15.0, 15.0));
+                ui.painter().image(
+                    tex_id,
+                    icon_rect,
+                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
+                    icon_tint,
+                );
+            });
+        resp.on_hover_text(label).clicked()
+    }
+
+    /// Panel-footer icon button: 22×22 craft-ui IconButton with a
+    /// 14px glyph — the footer scale of EffectCraft's project panel
+    /// (28px strip, 22px buttons).
+    fn small_icon_button(
+        &mut self,
+        ui: &mut egui::Ui,
+        name: &'static str,
+        bytes: &'static [u8],
+        label: &str,
+    ) -> bool {
+        let tex_id = self.tex_icon(ui, name, bytes);
+        let visuals = |fill: egui::Color32| craft_ui::buttons::ButtonVisuals {
+            fill,
+            stroke: egui::Stroke::NONE,
+            icon: ICON_TINT,
+        };
+        let style = craft_ui::buttons::IconButtonStyle {
+            normal: visuals(egui::Color32::TRANSPARENT),
+            hovered: visuals(HOVER_BG),
+            pressed: None,
+            selected: visuals(HOVER_BG),
+            corner_radius: egui::CornerRadius::same(4),
+            focus_stroke: egui::Stroke::new(1.0, ACCENT),
+        };
+        let resp = craft_ui::buttons::IconButton::new(label, egui::vec2(22.0, 22.0), &style)
+            .show(ui, |ui, rect, icon_tint| {
+                let icon_rect =
+                    egui::Rect::from_center_size(rect.center(), egui::vec2(14.0, 14.0));
+                ui.painter().image(
+                    tex_id,
+                    icon_rect,
+                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
+                    icon_tint,
+                );
+            });
+        resp.on_hover_text(label).clicked()
+    }
+
+    /// Bottom tool strip of a folder panel (the framework's panel
+    /// footer): a #26262B hairline over a 30px strip holding the one
+    /// action every folder panel shares — new folder at the root,
+    /// through the same FolderEdit state as the tree's context menu.
+    fn nav_footer(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        ui.painter().hline(
+            rect.x_range(),
+            rect.min.y + 0.5,
+            egui::Stroke::new(1.0, SEPARATOR),
+        );
+        let inner = egui::Rect::from_min_max(
+            egui::pos2(rect.min.x + 6.0, rect.min.y + 4.0),
+            egui::pos2(rect.max.x - 6.0, rect.max.y - 2.0),
+        );
+        let mut fui = ui.new_child(egui::UiBuilder::new().max_rect(inner));
+        fui.set_clip_rect(inner.intersect(ui.clip_rect()));
+        fui.horizontal_centered(|ui| {
+            if self.small_icon_button(ui, "folder-plus", *ICON_FOLDER_PLUS, tr("新建文件夹")) {
+                self.folder_edit = Some(FolderEdit {
+                    target: None,
+                    parent: None,
+                    text: "新文件夹".into(),
+                });
+                self.folder_edit_focus = true;
+            }
+        });
+    }
+
     /// Whole-deck page view inside the showroom: every page of the deck
     /// in entry order; clicking a page opens the large preview.
     fn showroom_deck(&mut self, ui: &mut egui::Ui) {
@@ -3361,7 +4153,7 @@ impl App {
             ui.label(
                 egui::RichText::new(s(&item, "title"))
                     .strong()
-                    .size(19.0)
+                    .size(18.0)
                     .color(TEXT_MAIN),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3420,7 +4212,7 @@ impl App {
                 },
                 s(&item, "submitted_by")
             ))
-            .size(12.0)
+            .size(11.5)
             .color(TEXT_FAINT),
         );
         ui.add_space(8.0);
@@ -3508,9 +4300,9 @@ impl App {
                         pages.push((vid.clone(), p as usize, pages.len() + 1));
                     }
                 }
-                let per_row = ((ui.available_width() + 16.0) / 232.0).floor().max(1.0) as usize;
+                let per_row = ((ui.available_width() + 12.0) / 228.0).floor().max(1.0) as usize;
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(16.0, 14.0);
+                    ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
                     for row in pages.chunks(per_row) {
                         ui.horizontal(|ui| {
                             for (vid, p, n) in row {
@@ -3535,7 +4327,7 @@ impl App {
                 ui.vertical_centered(|ui| {
                     ui.label(
                         egui::RichText::new("该条目暂不支持逐页查看")
-                            .size(14.0)
+                            .size(13.0)
                             .color(TEXT_WEAK),
                     );
                 });
@@ -3946,43 +4738,88 @@ impl App {
         });
     }
 
-    fn page_showroom(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::left("showroom_folders")
-            .resizable(false)
-            .exact_size(PANEL_W)
-            .frame(
-                egui::Frame::NONE.fill(CHROME).inner_margin(egui::Margin {
-                    left: 10,
-                    right: 10,
-                    top: 12,
-                    bottom: 10,
-                }),
-            )
-            .show_inside(ui, |ui| {
-                // the four zones live at the top of the left column
-                // (James 2026-11-15); the folder tree sits below them
-                for (zone, label) in [
-                    ("plaza", "广场"),
-                    ("library", "我的库"),
-                    ("inbox", "收到的分享"),
-                    ("groups", "群组空间"),
-                ] {
-                    if tree_row(ui, self.sr_zone == zone, 0.0, label, 14.0).clicked() {
-                        self.sr_zone = zone.to_string();
-                        self.sr_detail = None;
-                        self.sr_deck = None;
-                        self.sr_preview = None;
-                    }
-                    ui.add_space(6.0);
+    /// Showroom navigation frame body: the four zones over the
+    /// folder tree — the page's existing left column, unchanged,
+    /// drawn on its chrome fill inside the dock frame.
+    fn sr_nav_body(&mut self, ui: &mut egui::Ui) {
+        let rect = ui.max_rect();
+        ui.painter().rect_filled(rect, 0.0, CHROME);
+        let (content_rect, footer_rect) = nav_split(rect);
+        let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(content_rect));
+        cui.set_clip_rect(content_rect.intersect(ui.clip_rect()));
+        {
+            let ui = &mut cui;
+            // the four zones live at the top of the left column
+            // (James 2026-11-15), each with its IconPark glyph; the
+            // folder tree sits below them
+            for (zone, label, icon) in [
+                ("plaza", "广场", self.tex_icon(ui, "globe", *ICON_GLOBE)),
+                ("library", "我的库", self.tex_icon(ui, "bookshelf", *ICON_BOOKSHELF)),
+                ("inbox", "收到的分享", self.tex_icon(ui, "inbox", *ICON_INBOX)),
+                ("groups", "群组空间", self.tex_icon(ui, "peoples-two", *ICON_PEOPLES2)),
+            ] {
+                if tree_row(ui, self.sr_zone == zone, 0.0, Some(icon), label, 12.0).clicked() {
+                    self.sr_zone = zone.to_string();
+                    self.sr_detail = None;
+                    self.sr_deck = None;
+                    self.sr_preview = None;
                 }
-                ui.add_space(2.0);
-                ui.separator();
-                ui.add_space(8.0);
-                let mut sel = self.sr_folder.clone();
-                self.folder_tree(ui, &mut sel);
-                self.sr_folder = sel;
-            });
+            }
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(6.0);
+            let mut sel = self.sr_folder.clone();
+            self.folder_tree(ui, &mut sel);
+            self.sr_folder = sel;
+        }
+        self.nav_footer(ui, footer_rect);
+    }
+
+    /// Showroom main frame body: the wall / deck view, unchanged.
+    fn sr_main_body(&mut self, ui: &mut egui::Ui) {
         body_frame().show(ui, |ui| self.showroom_body(ui));
+    }
+
+    /// Review queue frame body (super admins): the queue that used
+    /// to sit under the showroom wall, now in the framework's bottom
+    /// frame — its tab strip carries the title, so the in-body
+    /// heading is gone; rows and actions are the same.
+    fn sr_review_body(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::NONE
+            .fill(APP_BG)
+            .inner_margin(egui::Margin {
+                left: 16,
+                right: 16,
+                top: 8,
+                bottom: 12,
+            })
+            .show(ui, |ui| {
+                ui.set_min_size(ui.available_size());
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for item in self.showroom_pending.clone() {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(s(&item, "title")).strong());
+                            ui.label(format!("提交人 {}", s(&item, "submitted_by")));
+                            if ui.button("通过").clicked() {
+                                let _ = self.call(
+                                    "POST",
+                                    &format!("/v1/showroom/{}/review", s(&item, "id")),
+                                    Some(json!({ "state": "live" })),
+                                );
+                                self.refresh_all();
+                            }
+                            if ui.button("驳回").clicked() {
+                                let _ = self.call(
+                                    "POST",
+                                    &format!("/v1/showroom/{}/review", s(&item, "id")),
+                                    Some(json!({ "state": "rejected" })),
+                                );
+                                self.refresh_all();
+                            }
+                        });
+                    }
+                });
+            });
     }
 
     fn showroom_body(&mut self, ui: &mut egui::Ui) {
@@ -3995,7 +4832,7 @@ impl App {
         ui.label(
             egui::RichText::new(tr("演示厅"))
                 .strong()
-                .size(19.0)
+                .size(18.0)
                 .color(TEXT_MAIN),
         );
         ui.add_space(6.0);
@@ -4016,7 +4853,7 @@ impl App {
         }
         ui.add_space(6.0);
         egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(16.0, 16.0);
+            ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
             ui.horizontal_wrapped(|ui| {
                 for item in self.showroom_live.clone() {
                     if !self.folder_filter_ok(
@@ -4053,13 +4890,13 @@ impl App {
                             // the grid's 16px spacing must not leak in here
                             ui.spacing_mut().item_spacing = egui::vec2(8.0, 5.0);
                             ui.label(
-                                egui::RichText::new(s(&item, "title")).strong().size(15.0).color(TEXT_MAIN),
+                                egui::RichText::new(s(&item, "title")).strong().size(13.5).color(TEXT_MAIN),
                             );
                             ui.add_space(3.0);
                             let intro = s(&item, "intro");
                             if !intro.is_empty() {
                                 ui.label(
-                                    egui::RichText::new(intro).size(12.5).color(TEXT_WEAK),
+                                    egui::RichText::new(intro).size(11.5).color(TEXT_WEAK),
                                 );
                                 ui.add_space(3.0);
                             }
@@ -4074,16 +4911,16 @@ impl App {
                             );
                             ui.add_space(6.0);
                             ui.horizontal(|ui| {
-                                if text_action(ui, "开始演示", ACCENT, 12.5) {
+                                if text_action(ui, "开始演示", ACCENT, 13.0) {
                                     self.present_showroom(&s(&item, "id"), &s(&item, "title"));
                                 }
-                                if text_action(ui, "分享", TEXT_MAIN, 12.5) {
+                                if text_action(ui, "分享", TEXT_MAIN, 13.0) {
                                     self.share_for = Some(s(&item, "id"));
                                     self.share_target.clear();
                                 }
                             let src = s(&item, "source_index_id");
                             if !src.is_empty() {
-                                if text_action(ui, "缓存到本地", TEXT_MAIN, 12.5) {
+                                if text_action(ui, "缓存到本地", TEXT_MAIN, 13.0) {
                                     let title = s(&item, "title");
                                     let key = format!("sr_{}", s(&item, "id"));
                                     match self.call(
@@ -4141,36 +4978,116 @@ impl App {
         // NOTE: there is deliberately no "submit to showroom" form here
         // any more (James 2026-11-15): pushing to the showroom happens
         // from the index detail （推送到演示厅）, which feeds the same
-        // review queue below.
-        if self.role() == "super" && !self.showroom_pending.is_empty() {
-            ui.add_space(14.0);
-            ui.label(egui::RichText::new("待审队列").strong().size(15.0));
-            for item in self.showroom_pending.clone() {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(s(&item, "title")).strong());
-                    ui.label(format!("提交人 {}", s(&item, "submitted_by")));
-                    if ui.button("通过").clicked() {
-                        let _ = self.call(
+        // review queue — rendered in its own dock frame (sr_review_body).
+    }
+
+    /// Content folder frame body: the folder tree over the panel
+    /// footer strip.
+    fn ct_nav_body(&mut self, ui: &mut egui::Ui) {
+        let rect = ui.max_rect();
+        ui.painter().rect_filled(rect, 0.0, CHROME);
+        let (content_rect, footer_rect) = nav_split(rect);
+        let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(content_rect));
+        cui.set_clip_rect(content_rect.intersect(ui.clip_rect()));
+        let mut sel = self.content.folder_filter.clone();
+        self.folder_tree(&mut cui, &mut sel);
+        self.content.folder_filter = sel;
+        self.nav_footer(ui, footer_rect);
+    }
+
+    /// Content main frame body: the maintenance grid, or — with a
+    /// block open — the drill-down (the dock layout swaps to this
+    /// single frame then, as the page behaved before the framework).
+    /// 智能分块导入 (content page action, also the content page's
+    /// toolbar slot): pick a deck, let the server propose blocks,
+    /// then import with the proposal confirmed as-is.
+    fn act_import_split(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("PowerPoint", &["pptx"])
+            .pick_file()
+        {
+            if let Ok(bytes) = std::fs::read(&path) {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                match self.call(
+                    "POST",
+                    "/v1/import/propose",
+                    Some(json!({ "data_base64": b64e(&bytes) })),
+                ) {
+                    Ok(p) => {
+                        let blocks = p.get("blocks").cloned().unwrap_or(json!([]));
+                        let names: Vec<String> = blocks
+                            .as_array()
+                            .map(|arr| arr.iter().map(|b| s(b, "name")).collect())
+                            .unwrap_or_default();
+                        let r = self.call(
                             "POST",
-                            &format!("/v1/showroom/{}/review", s(&item, "id")),
-                            Some(json!({ "state": "live" })),
+                            "/v1/import",
+                            Some(json!({
+                                "filename": name,
+                                "data_base64": b64e(&bytes),
+                                "folder_id": self.content.folder_filter,
+                                "group_id": self.content.import_group,
+                                "blocks": blocks,
+                            })),
                         );
-                        self.refresh_all();
+                        match r {
+                            Ok(_) => {
+                                self.msg = format!(
+                                    "智能分块导入完成：{} 块（{}）",
+                                    names.len(),
+                                    names.join("、")
+                                );
+                                self.refresh_all();
+                            }
+                            Err(e) => self.msg = format!("导入失败：{e}"),
+                        }
                     }
-                    if ui.button("驳回").clicked() {
-                        let _ = self.call(
-                            "POST",
-                            &format!("/v1/showroom/{}/review", s(&item, "id")),
-                            Some(json!({ "state": "rejected" })),
-                        );
-                        self.refresh_all();
-                    }
-                });
+                    Err(e) => self.msg = format!("提块失败：{e}"),
+                }
             }
         }
     }
 
-    fn page_content(&mut self, ui: &mut egui::Ui) {
+    /// 导入 PPT (content page action, also its toolbar slot): import
+    /// a whole deck into the current folder/group.
+    fn act_import_ppt(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("PowerPoint", &["pptx"])
+            .pick_file()
+        {
+            if let Ok(bytes) = std::fs::read(&path) {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let r = self.call(
+                    "POST",
+                    "/v1/import",
+                    Some(json!({
+                        "filename": name,
+                        "data_base64": b64e(&bytes),
+                        "folder_id": self.content.folder_filter,
+                        "group_id": self.content.import_group,
+                    })),
+                );
+                match r {
+                    Ok(v) => {
+                        self.msg = format!(
+                            "导入完成：{} 页，校验通过",
+                            v.get("slide_count").and_then(|x| x.as_i64()).unwrap_or(0)
+                        );
+                        self.refresh_all();
+                    }
+                    Err(e) => self.msg = format!("导入失败：{e}"),
+                }
+            }
+        }
+    }
+
+    fn ct_main_body(&mut self, ui: &mut egui::Ui) {
         if self.content.detail.is_some() {
             body_frame().show(ui, |ui| {
                 if self.pick.is_some() {
@@ -4180,22 +5097,6 @@ impl App {
             });
             return;
         }
-        egui::Panel::left("folders")
-            .resizable(false)
-            .exact_size(PANEL_W)
-            .frame(
-                egui::Frame::NONE.fill(CHROME).inner_margin(egui::Margin {
-                    left: 10,
-                    right: 10,
-                    top: 12,
-                    bottom: 10,
-                }),
-            )
-            .show_inside(ui, |ui| {
-                let mut sel = self.content.folder_filter.clone();
-                self.folder_tree(ui, &mut sel);
-                self.content.folder_filter = sel;
-            });
         body_frame().show(ui, |ui| {
         if self.pick.is_some() {
             self.pick_bar(ui);
@@ -4215,88 +5116,10 @@ impl App {
                 }
             }
             if text_action(ui, "智能分块导入", TEXT_MAIN, 13.0) {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("PowerPoint", &["pptx"])
-                    .pick_file()
-                {
-                    if let Ok(bytes) = std::fs::read(&path) {
-                        let name = path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_default();
-                        match self.call(
-                            "POST",
-                            "/v1/import/propose",
-                            Some(json!({ "data_base64": b64e(&bytes) })),
-                        ) {
-                            Ok(p) => {
-                                let blocks = p.get("blocks").cloned().unwrap_or(json!([]));
-                                let names: Vec<String> = blocks
-                                    .as_array()
-                                    .map(|arr| {
-                                        arr.iter().map(|b| s(b, "name")).collect()
-                                    })
-                                    .unwrap_or_default();
-                                let r = self.call(
-                                    "POST",
-                                    "/v1/import",
-                                    Some(json!({
-                                        "filename": name,
-                                        "data_base64": b64e(&bytes),
-                                        "folder_id": self.content.folder_filter,
-                                        "group_id": self.content.import_group,
-                                        "blocks": blocks,
-                                    })),
-                                );
-                                match r {
-                                    Ok(_) => {
-                                        self.msg = format!(
-                                            "智能分块导入完成：{} 块（{}）",
-                                            names.len(),
-                                            names.join("、")
-                                        );
-                                        self.refresh_all();
-                                    }
-                                    Err(e) => self.msg = format!("导入失败：{e}"),
-                                }
-                            }
-                            Err(e) => self.msg = format!("提块失败：{e}"),
-                        }
-                    }
-                }
+                self.act_import_split();
             }
             if text_action(ui, "导入 PPT", TEXT_MAIN, 13.0) {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("PowerPoint", &["pptx"])
-                    .pick_file()
-                {
-                    if let Ok(bytes) = std::fs::read(&path) {
-                        let name = path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_default();
-                        let r = self.call(
-                            "POST",
-                            "/v1/import",
-                            Some(json!({
-                                "filename": name,
-                                "data_base64": b64e(&bytes),
-                                "folder_id": self.content.folder_filter,
-                                "group_id": self.content.import_group,
-                            })),
-                        );
-                        match r {
-                            Ok(v) => {
-                                self.msg = format!(
-                                    "导入完成：{} 页，校验通过",
-                                    v.get("slide_count").and_then(|x| x.as_i64()).unwrap_or(0)
-                                );
-                                self.refresh_all();
-                            }
-                            Err(e) => self.msg = format!("导入失败：{e}"),
-                        }
-                    }
-                }
+                self.act_import_ppt();
             }
             ui.label(
                 egui::RichText::new("导入到组")
@@ -4336,7 +5159,7 @@ impl App {
             ui.add_space(8.0);
         }
         egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(16.0, 16.0);
+            ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
             ui.horizontal_wrapped(|ui| {
                 for item in self.units.clone() {
                     let unit = item.get("unit").cloned().unwrap_or(json!({}));
@@ -4375,7 +5198,7 @@ impl App {
                                     ui.label(
                                         egui::RichText::new(s(&unit, "name"))
                                             .strong()
-                                            .size(15.0)
+                                            .size(13.5)
                                             .color(TEXT_MAIN),
                                     );
                                     ui.add_space(5.0);
@@ -4428,7 +5251,7 @@ impl App {
                                                 [72.0, 28.0],
                                                 egui::Button::new(
                                                     egui::RichText::new("插入")
-                                                        .size(12.5)
+                                                        .size(13.0)
                                                         .color(egui::Color32::WHITE),
                                                 )
                                                 .fill(ACCENT)
@@ -4458,7 +5281,7 @@ impl App {
                     if self.content.selected_unit.as_deref() == Some(uid.as_str()) {
                         ui.painter().rect_stroke(
                             outer.response.rect,
-                            10.0,
+                            6.0,
                             egui::Stroke::new(1.5, ACCENT),
                             egui::StrokeKind::Middle,
                         );
@@ -4530,7 +5353,7 @@ impl App {
                 ui.label(
                     egui::RichText::new("当前解析版本 · 逐页勾选")
                         .strong()
-                        .size(14.0),
+                        .size(16.0),
                 );
                 ui.add_space(6.0);
                 ui.horizontal_wrapped(|ui| {
@@ -4965,14 +5788,14 @@ impl App {
             Delete(String, String),
         }
         let mut action: Option<Act> = None;
-        if tree_row(ui, selected.is_none(), 0.0, "全部", 14.0).clicked() {
+        let all_icon = self.tex_icon(ui, "all-application", *ICON_ALL_APPS);
+        if tree_row(ui, selected.is_none(), 0.0, Some(all_icon), "全部", 12.0).clicked() {
             *selected = None;
         }
-        ui.add_space(6.0);
         // an inline editor for a NEW root folder sits right under 全部
         if matches!(&self.folder_edit, Some(e) if e.target.is_none() && e.parent.is_none()) {
             self.folder_edit_row(ui, 0.0);
-            ui.add_space(6.0);
+            ui.add_space(2.0);
         }
         let mut folders = self.folders.clone();
         folders.sort_by_key(|f| i(f, "sort"));
@@ -5015,12 +5838,19 @@ impl App {
             if editing_this {
                 self.folder_edit_row(ui, d as f32 * 14.0);
             } else {
+                let is_sel = selected.as_deref() == Some(fid.as_str());
+                let ficon = if is_sel {
+                    self.tex_icon(ui, "folder-open", *ICON_FOLDER_OPEN)
+                } else {
+                    self.tex_icon(ui, "folder-close", *ICON_FOLDER)
+                };
                 let resp = tree_row(
                     ui,
-                    selected.as_deref() == Some(fid.as_str()),
+                    is_sel,
                     d as f32 * 14.0,
+                    Some(ficon),
                     &fname,
-                    14.0,
+                    12.0,
                 );
                 if resp.clicked() {
                     *selected = Some(fid.clone());
@@ -5050,11 +5880,10 @@ impl App {
                     }
                 });
             }
-            ui.add_space(6.0);
             // an inline editor for a NEW child of this folder
             if matches!(&self.folder_edit, Some(e) if e.target.is_none() && e.parent.as_deref() == Some(fid.as_str())) {
                 self.folder_edit_row(ui, (d + 1) as f32 * 14.0);
-                ui.add_space(6.0);
+                ui.add_space(2.0);
             }
         }
         // blank area: right-click creates a root folder
@@ -5260,84 +6089,96 @@ impl App {
         }
     }
 
-    fn page_index(&mut self, ui: &mut egui::Ui) {
+    /// 新建索引 (the index page's pill button, also its toolbar
+    /// slot): enter the create flow with the pick list primed from
+    /// every unit's renditions.
+    fn act_new_index(&mut self) {
+        self.index.creating = true;
+        self.index.pick.clear();
+        for item in &self.units {
+            let unit = item.get("unit").cloned().unwrap_or(json!({}));
+            if let Some(rends) = item.get("renditions").and_then(|r| r.as_array()) {
+                for r in rends {
+                    let rend = r.get("rendition").cloned().unwrap_or(json!({}));
+                    self.index.pick.push((s(&unit, "id"), s(&rend, "id"), false));
+                }
+            }
+        }
+        if self.index.new_group.is_empty() {
+            if let Some(g) = self.groups.first() {
+                self.index.new_group = s(g, "id");
+            }
+        }
+    }
+
+    /// Index folder frame body: the folder tree with ＋ 新建索引
+    /// pinned above the panel footer (the framework's panel
+    /// furniture: content / action / footer strip).
+    fn ix_nav_body(&mut self, ui: &mut egui::Ui) {
+        let rect = ui.max_rect();
+        ui.painter().rect_filled(rect, 0.0, CHROME);
+        let (content_rect, footer_rect) = nav_split(rect);
+        let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(content_rect));
+        cui.set_clip_rect(content_rect.intersect(ui.clip_rect()));
+        {
+            let ui = &mut cui;
+            // folder tree scrolls in the space above; ＋ 新建索引 is
+            // pinned to the bottom of the panel (James 2026-11-15)
+            let panel_h = ui.available_height();
+            egui::ScrollArea::vertical()
+                .max_height((panel_h - 48.0).max(60.0))
+                .show(ui, |ui| {
+                    let detail_folder = if self.index.detail.is_some() {
+                        self.index
+                            .detail
+                            .as_ref()
+                            .map(|d| self.index_folder_of(&s(d, "id")))
+                            .filter(|x| !x.is_empty())
+                    } else {
+                        None
+                    };
+                    let mut sel = if self.index.detail.is_some() {
+                        detail_folder.clone()
+                    } else {
+                        self.index.overview_folder.clone()
+                    };
+                    self.folder_tree(ui, &mut sel);
+                    if self.index.detail.is_some() {
+                        if sel != detail_folder {
+                            self.index.detail = None;
+                            self.index.selected = None;
+                            self.index.overview_folder = sel;
+                        }
+                    } else {
+                        self.index.overview_folder = sel;
+                    }
+                });
+            ui.add_space(8.0);
+            if ui
+                .add_sized(
+                    [ui.available_width(), 34.0],
+                    egui::Button::new(
+                        egui::RichText::new("＋ 新建索引").color(egui::Color32::WHITE),
+                    )
+                    .fill(ACCENT)
+                    .corner_radius(17),
+                )
+                .clicked()
+            {
+                self.act_new_index();
+            }
+        }
+        self.nav_footer(ui, footer_rect);
+    }
+
+    /// Index main frame body: overview cards, the detail tile wall,
+    /// or — while creating — the create flow (which takes the whole
+    /// body, as before).
+    fn ix_main_body(&mut self, ui: &mut egui::Ui) {
         if self.index.creating {
             body_frame().show(ui, |ui| self.index_create(ui));
             return;
         }
-        egui::Panel::left("index_folders")
-            .resizable(false)
-            .exact_size(PANEL_W)
-            .frame(
-                egui::Frame::NONE.fill(CHROME).inner_margin(egui::Margin {
-                    left: 10,
-                    right: 10,
-                    top: 12,
-                    bottom: 10,
-                }),
-            )
-            .show_inside(ui, |ui| {
-                // folder tree scrolls in the space above; ＋ 新建索引 is
-                // pinned to the bottom of the panel (James 2026-11-15)
-                let panel_h = ui.available_height();
-                egui::ScrollArea::vertical()
-                    .max_height((panel_h - 48.0).max(60.0))
-                    .show(ui, |ui| {
-                        let detail_folder = if self.index.detail.is_some() {
-                            self.index
-                                .detail
-                                .as_ref()
-                                .map(|d| self.index_folder_of(&s(d, "id")))
-                                .filter(|x| !x.is_empty())
-                        } else {
-                            None
-                        };
-                        let mut sel = if self.index.detail.is_some() {
-                            detail_folder.clone()
-                        } else {
-                            self.index.overview_folder.clone()
-                        };
-                        self.folder_tree(ui, &mut sel);
-                        if self.index.detail.is_some() {
-                            if sel != detail_folder {
-                                self.index.detail = None;
-                                self.index.selected = None;
-                                self.index.overview_folder = sel;
-                            }
-                        } else {
-                            self.index.overview_folder = sel;
-                        }
-                    });
-                ui.add_space(8.0);
-                if ui
-                    .add_sized(
-                        [ui.available_width(), 34.0],
-                        egui::Button::new(
-                            egui::RichText::new("＋ 新建索引").color(egui::Color32::WHITE),
-                        )
-                        .fill(ACCENT)
-                        .corner_radius(17),
-                    )
-                    .clicked()
-                {
-                    self.index.creating = true;
-                    self.index.pick.clear();
-                    for item in &self.units {
-                        let unit = item.get("unit").cloned().unwrap_or(json!({}));
-                        if let Some(rends) = item.get("renditions").and_then(|r| r.as_array()) {
-                            for r in rends {
-                                let rend = r.get("rendition").cloned().unwrap_or(json!({}));
-                                self.index.pick.push((s(&unit, "id"), s(&rend, "id"), false));
-                            }
-                        }
-                    }
-                    if self.index.new_group.is_empty() {
-                        if let Some(g) = self.groups.first() {
-                            self.index.new_group = s(g, "id");
-                        }
-                    }
-                }
-            });
         body_frame().show(ui, |ui| {
             if self.index.detail.is_none() {
                 self.index_overview(ui);
@@ -5346,7 +6187,7 @@ impl App {
             // tight ghost row, like the board's plain text back-link
             let back = ui.scope(|ui| {
                 ui.style_mut().spacing.button_padding = egui::vec2(6.0, 0.0);
-                text_action(ui, "‹ 返回总览", TEXT_WEAK, 12.5)
+                text_action(ui, "‹ 返回总览", TEXT_WEAK, 13.0)
             });
             if back.inner {
                 self.index.detail = None;
@@ -5370,7 +6211,7 @@ impl App {
                 .unwrap_or_else(|| "索引".into()),
         };
         ui.add_space(2.0);
-        ui.label(egui::RichText::new(title).size(22.0).strong());
+        ui.label(egui::RichText::new(title).size(18.0).strong());
         ui.add_space(14.0);
         let items: Vec<Value> = self
             .indexes
@@ -5379,7 +6220,7 @@ impl App {
             .filter(|x| self.folder_filter_ok(&filter, &s(x, "folder_id")))
             .collect();
         egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(16.0, 16.0);
+            ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
             ui.horizontal_wrapped(|ui| {
                 for x in items {
                     let xid = s(&x, "id");
@@ -5394,7 +6235,7 @@ impl App {
                         ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
                             egui::Frame::NONE
                                 .fill(CARD_BG)
-                                .corner_radius(10)
+                                .corner_radius(6)
                                 .stroke(egui::Stroke::new(1.0, scope_color))
                                 .show(ui, |ui| {
                                     ui.set_min_size(egui::vec2(300.0, 284.0));
@@ -5421,7 +6262,7 @@ impl App {
                                             ui.label(
                                                 egui::RichText::new(s(&x, "name"))
                                                     .strong()
-                                                    .size(15.0),
+                                                    .size(13.5),
                                             );
                                             ui.add_space(7.0);
                                             ui.horizontal(|ui| {
@@ -5486,7 +6327,7 @@ impl App {
                     if selected {
                         ui.painter().rect_stroke(
                             rect,
-                            10.0,
+                            6.0,
                             egui::Stroke::new(2.0, ACCENT),
                             egui::StrokeKind::Middle,
                         );
@@ -5587,13 +6428,13 @@ impl App {
                     "· {}",
                     s(&index, "maintainer")
                 ))
-                .size(12.0)
+                .size(11.5)
                 .color(TEXT_WEAK),
             );
         });
         ui.add_space(2.0);
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("分支").size(12.5).color(TEXT_WEAK));
+            ui.label(egui::RichText::new("分支").size(11.5).color(TEXT_WEAK));
             let mut branch = if self.index.branch.is_empty() {
                 "main".to_string()
             } else {
@@ -5614,11 +6455,11 @@ impl App {
                 self.load_index_detail();
                 return;
             }
-            ui.label(egui::RichText::new("版本").size(12.5).color(TEXT_WEAK));
+            ui.label(egui::RichText::new("版本").size(11.5).color(TEXT_WEAK));
             for t in &tags {
                 ui.label(
                     egui::RichText::new(format!("V{}", s(t, "name")))
-                        .size(12.5)
+                        .size(11.5)
                         .color(TEXT_MAIN),
                 );
             }
@@ -5631,7 +6472,7 @@ impl App {
                 .add(
                     egui::Button::new(
                         egui::RichText::new("发布版本")
-                            .size(12.5)
+                            .size(13.0)
                             .color(egui::Color32::WHITE),
                     )
                     .fill(ACCENT)
@@ -5660,10 +6501,10 @@ impl App {
         ui.add_space(2.0);
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.index.include_notes, "添加备注");
-            if text_action(ui, "导出（个人版）", TEXT_MAIN, 12.5) {
+            if text_action(ui, "导出（个人版）", TEXT_MAIN, 13.0) {
                 self.export_index_file(&index, "personal");
             }
-            if text_action(ui, "导出（公用版）", TEXT_MAIN, 12.5) {
+            if text_action(ui, "导出（公用版）", TEXT_MAIN, 13.0) {
                 self.export_index_file(&index, "company");
             }
             ui.add_space(24.0);
@@ -5673,7 +6514,7 @@ impl App {
                     .desired_width(110.0)
                     .margin(egui::vec2(8.0, 2.0)),
             );
-            if text_action(ui, "拉分支", TEXT_MAIN, 12.5) && !self.index.new_branch.is_empty() {
+            if text_action(ui, "拉分支", TEXT_MAIN, 13.0) && !self.index.new_branch.is_empty() {
                 if let Some(id) = self.index.selected.clone() {
                     let r = self.call(
                         "POST",
@@ -5689,7 +6530,7 @@ impl App {
                     }
                 }
             }
-            if text_action(ui, "推送到演示厅", TEXT_MAIN, 12.5) {
+            if text_action(ui, "推送到演示厅", TEXT_MAIN, 13.0) {
                 if let Some(id) = self.index.selected.clone() {
                     let r = self.call(
                         "POST",
@@ -5725,7 +6566,7 @@ impl App {
                     .unwrap_or(false);
                 if pos > 0 {
                     ui.vertical_centered(|ui| {
-                        if text_action(ui, "＋ 插入条目", TEXT_WEAK, 12.0) {
+                        if text_action(ui, "＋ 插入条目", TEXT_WEAK, 13.0) {
                             // insert happens on the content page (pick
                             // mode), not in a popup (James 2026-11-15)
                             self.pick = Some(PickState::Insert {
@@ -5750,7 +6591,7 @@ impl App {
                         ui.vertical(|ui| {
                             ui.label(
                                 egui::RichText::new(format!("#{}", pos + 1))
-                                    .size(12.0)
+                                    .size(11.5)
                                     .color(TEXT_WEAK),
                             );
                             if ver.is_object() {
@@ -5793,7 +6634,7 @@ impl App {
                                 ui.label(
                                     egui::RichText::new(re.get("unit_name").and_then(|x| x.as_str()).unwrap_or(""))
                                         .strong()
-                                        .size(15.0)
+                                        .size(13.5)
                                         .color(TEXT_MAIN),
                                 );
                                 ui.label(
@@ -5807,7 +6648,7 @@ impl App {
                                             "无版本".into()
                                         }
                                     ))
-                                    .size(12.5)
+                                    .size(11.5)
                                     .color(TEXT_WEAK),
                                 );
                                 ui.with_layout(
@@ -5959,7 +6800,7 @@ impl App {
                 ui.add_space(8.0);
             }
             ui.add_space(6.0);
-            ui.label(egui::RichText::new("分支合并").strong().size(15.0));
+            ui.label(egui::RichText::new("分支合并").strong().size(16.0));
             ui.horizontal(|ui| {
                 ui.label("来源分支");
                 ui.text_edit_singleline(&mut self.index.merge_from);
@@ -6195,14 +7036,14 @@ impl App {
         ui.label(
             egui::RichText::new("已保存的服务器")
                 .strong()
-                .size(14.0)
+                .size(16.0)
                 .color(TEXT_MAIN),
         );
         ui.add_space(6.0);
         if self.conns.is_empty() {
             ui.label(
                 egui::RichText::new("暂无保存的服务器。在下方手动添加，或搜索局域网服务器。")
-                    .size(12.0)
+                    .size(11.5)
                     .color(TEXT_WEAK),
             );
         }
@@ -6213,14 +7054,14 @@ impl App {
             egui::Frame::NONE
                 .fill(CARD_BG)
                 .stroke(egui::Stroke::new(1.0, CARD_BORDER))
-                .corner_radius(egui::CornerRadius::same(10))
+                .corner_radius(egui::CornerRadius::same(6))
                 .inner_margin(egui::Margin::same(12))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(
                             egui::RichText::new(&c.name)
                                 .strong()
-                                .size(14.0)
+                                .size(13.5)
                                 .color(TEXT_MAIN),
                         );
                         if is_active {
@@ -6251,10 +7092,10 @@ impl App {
                     ui.horizontal(|ui| {
                         ui.label(
                             egui::RichText::new(format!("{} · {}", c.url, c.username))
-                                .size(12.0)
+                                .size(11.5)
                                 .color(TEXT_WEAK),
                         );
-                        ui.label(egui::RichText::new(status).size(12.0).color(color));
+                        ui.label(egui::RichText::new(status).size(11.5).color(color));
                     });
                 });
             ui.add_space(8.0);
@@ -6304,7 +7145,7 @@ impl App {
         ui.label(
             egui::RichText::new("添加服务器")
                 .strong()
-                .size(14.0)
+                .size(16.0)
                 .color(TEXT_MAIN),
         );
         ui.add_space(6.0);
@@ -6348,11 +7189,11 @@ impl App {
             ui.label(
                 egui::RichText::new("局域网发现")
                     .strong()
-                    .size(14.0)
+                    .size(16.0)
                     .color(TEXT_MAIN),
             );
             if self.disc_scanning {
-                ui.label(egui::RichText::new("搜索中…").size(12.0).color(TEXT_WEAK));
+                ui.label(egui::RichText::new("搜索中…").size(11.5).color(TEXT_WEAK));
             } else if ui.button("搜索局域网服务器").clicked() {
                 self.start_discovery();
             }
@@ -6361,7 +7202,7 @@ impl App {
         if self.discovered.is_empty() {
             ui.label(
                 egui::RichText::new("点「搜索局域网服务器」自动发现同一局域网内的启幕服务器。")
-                    .size(12.0)
+                    .size(11.5)
                     .color(TEXT_WEAK),
             );
         }
@@ -6373,7 +7214,7 @@ impl App {
             egui::Frame::NONE
                 .fill(CARD_BG)
                 .stroke(egui::Stroke::new(1.0, CARD_BORDER))
-                .corner_radius(egui::CornerRadius::same(10))
+                .corner_radius(egui::CornerRadius::same(6))
                 .inner_margin(egui::Margin::same(12))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -6384,7 +7225,7 @@ impl App {
                         );
                         ui.label(
                             egui::RichText::new(format!("{url} · v{ver}"))
-                                .size(12.0)
+                                .size(11.5)
                                 .color(TEXT_WEAK),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -6404,14 +7245,14 @@ impl App {
         ui.label(
             egui::RichText::new("软件更新（局域网镜像）")
                 .strong()
-                .size(14.0)
+                .size(16.0)
                 .color(TEXT_MAIN),
         );
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new(format!("当前版本 v{}", env!("CARGO_PKG_VERSION")))
-                    .size(12.0)
+                    .size(11.5)
                     .color(TEXT_WEAK),
             );
             if ui.button("检查更新").clicked() {
@@ -6420,7 +7261,7 @@ impl App {
         });
         if let Some(note) = &self.upd_note {
             ui.add_space(4.0);
-            ui.label(egui::RichText::new(note.clone()).size(12.0).color(ACCENT_DEEP));
+            ui.label(egui::RichText::new(note.clone()).size(11.5).color(ACCENT_DEEP));
         }
     }
 
@@ -6430,7 +7271,7 @@ impl App {
         ui.label(
             egui::RichText::new("缓存路径（本机设置）")
                 .strong()
-                .size(14.0)
+                .size(16.0)
                 .color(TEXT_MAIN),
         );
         ui.add_space(4.0);
@@ -6438,7 +7279,7 @@ impl App {
             egui::RichText::new(
                 "离线缓存的加密快照保存在这个目录，装在本机的所有账号共用；与管理员下发的缓存策略无关。",
             )
-            .size(12.0)
+            .size(11.5)
             .color(TEXT_WEAK),
         );
         ui.add_space(8.0);
@@ -6451,7 +7292,7 @@ impl App {
                 self.cache_entries.len(),
                 total_bytes as f64 / 1_000_000.0
             ))
-            .size(12.0)
+            .size(11.5)
             .color(TEXT_WEAK),
         );
         ui.add_space(8.0);
@@ -6486,62 +7327,53 @@ impl App {
         });
     }
 
-    fn page_settings(&mut self, ui: &mut egui::Ui) {
+    /// Settings nav frame body: the section list, unchanged.
+    fn st_nav_body(&mut self, ui: &mut egui::Ui) {
+        let sections = self.settings_sections();
+        if self.settings.section >= sections.len() {
+            self.settings.section = 0;
+        }
+        egui::Frame::NONE
+            .fill(CHROME)
+            .inner_margin(egui::Margin {
+                left: 6,
+                right: 6,
+                top: 8,
+                bottom: 6,
+            })
+            .show(ui, |ui| {
+                ui.set_min_size(ui.available_size());
+                for (i, name) in sections.iter().enumerate() {
+                    if tree_row(ui, self.settings.section == i, 0.0, None, tr(name), 12.0)
+                        .clicked()
+                    {
+                        self.settings.section = i;
+                    }
+                }
+            });
+    }
+
+    /// Settings main frame body: one section at a time, unchanged —
+    /// the section computation and content are the page's own; only
+    /// the wrapping panel became a dock frame.
+    fn st_main_body(&mut self, ui: &mut egui::Ui) {
         // Board layout: left section nav, one section at a time on the
         // right; sections a role may not see are not rendered at all.
-        let role = self.role();
-        let mut sections: Vec<&str> = vec!["服务器", "个人资料"];
-        if role != "member" {
-            sections.push("组织管理");
-        }
-        if role == "super" {
-            sections.extend([
-                "内容组与授权",
-                "公司公共资料",
-                "内容语言",
-                "AI 翻译",
-                "离线缓存策略",
-            ]);
-        } else {
-            // The cache path is a local per-user setting; the admin
-            // policy section above stays super-only.
-            sections.push("离线缓存");
-        }
+        let sections = self.settings_sections();
         if self.settings.section >= sections.len() {
             self.settings.section = 0;
         }
         let current = sections[self.settings.section];
-        egui::Panel::left("settings_nav")
-            .resizable(false)
-            .exact_size(NAV_W)
-            .frame(
-                egui::Frame::NONE.fill(CHROME).inner_margin(egui::Margin {
-                    left: 10,
-                    right: 10,
-                    top: 12,
-                    bottom: 10,
-                }),
-            )
-            .show_inside(ui, |ui| {
-                for (i, name) in sections.iter().enumerate() {
-                    if tree_row(ui, self.settings.section == i, 0.0, tr(name), 13.5).clicked() {
-                        self.settings.section = i;
-                    }
-                    ui.add_space(6.0);
-                }
-            });
-        egui::CentralPanel::default()
-            .frame(
-                egui::Frame::NONE
-                    .fill(APP_BG)
-                    .inner_margin(egui::Margin {
-                        left: 24,
-                        right: 24,
-                        top: 14,
-                        bottom: 16,
-                    }),
-            )
-            .show_inside(ui, |ui| {
+        egui::Frame::NONE
+            .fill(APP_BG)
+            .inner_margin(egui::Margin {
+                left: 16,
+                right: 16,
+                top: 12,
+                bottom: 16,
+            })
+            .show(ui, |ui| {
+                ui.set_min_size(ui.available_size());
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.heading(tr(current));
                     ui.add_space(14.0);
@@ -6610,7 +7442,7 @@ impl App {
                                     ui.label(
                                         egui::RichText::new("个人绑定预览")
                                             .strong()
-                                            .size(14.0),
+                                            .size(16.0),
                                     );
                                     ui.add_space(8.0);
                                     let p = &self.settings.profile;
@@ -7112,7 +7944,7 @@ impl App {
                             ui.label(
                                 egui::RichText::new("管理员策略（服务器下发）")
                                     .strong()
-                                    .size(14.0)
+                                    .size(16.0)
                                     .color(TEXT_MAIN),
                             );
                             ui.add_space(8.0);
@@ -7160,6 +7992,7 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 900.0])
+            .with_min_inner_size([960.0, 600.0])
             .with_title("启幕 · PPT 管理器"),
         ..Default::default()
     };

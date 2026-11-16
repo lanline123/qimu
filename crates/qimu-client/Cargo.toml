@@ -27,8 +27,10 @@ rfd = "0.15"
 craft-i18n = { git = "https://github.com/storytold/craft-libs", rev = "0c144b7d983899d4b5b281046dd03a8b1ab35fbb" }
 # craft-ui (storytold/craft-libs@0c144b7, MIT OR Apache-2.0): the Craft
 # component library on the egui fork; adopted component by component
-# with its native interaction model (step 6b: buttons::IconButton).
-craft-ui = { git = "https://github.com/storytold/craft-libs", rev = "0c144b7d983899d4b5b281046dd03a8b1ab35fbb" }
+# with its native interaction model (step 6b: buttons::IconButton;
+# framework round: docking — the feature set matches EffectCraft's
+# own workspace pin: "serde" unlocks docking::DockCommand).
+craft-ui = { git = "https://github.com/storytold/craft-libs", rev = "0c144b7d983899d4b5b281046dd03a8b1ab35fbb", features = ["serde"] }
 aes-gcm = "0.10"
 image = "0.25"
 # storytold/craft-libs (MIT OR Apache-2.0), pinned git rev — see design/组件接入台账.md
