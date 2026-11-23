@@ -2615,6 +2615,10 @@ async fn list_showroom(
 #[derive(Deserialize)]
 struct ReviewReq {
     state: String, // live | rejected
+    /// Rejection reason (required when rejecting — the prototype
+    /// sends it back to the submitter verbatim). Approvals may
+    /// carry an optional note too.
+    note: Option<String>,
 }
 
 async fn review_showroom(
@@ -2627,9 +2631,361 @@ async fn review_showroom(
     if user.role != "super" {
         return Err(forbidden());
     }
+    let note = req.note.as_deref().unwrap_or("");
+    if req.state == "rejected" && note.trim().is_empty() {
+        return Err(bad("驳回必须填写理由（会原样回到提交人）"));
+    }
     let store = st.store.lock().unwrap();
-    store.set_showroom_state(&id, &req.state).map_err(bad)?;
+    store
+        .review_showroom(&id, &req.state, note, &user.display_name)
+        .map_err(bad)?;
     Ok(Json(json!({ "ok": true })))
+}
+
+
+// ---------------- trash (soft delete, prototype #trashView) ----------------
+// Deleting moves an object behind the store's trash overlay: it
+// disappears from the normal lists but keeps every version and
+// binding, so restore is lossless. Purge is the only destructive
+// step. Indexes and units are gated on `manage` for their content
+// group (the lifecycle endpoint's bar); showroom items belong to
+// their submitter, with super acting for anyone.
+
+#[derive(Deserialize)]
+struct TrashAddReq {
+    kind: String, // index | unit | showroom
+    object_id: String,
+}
+
+fn trash_origin(store: &Store, folder_id: Option<&str>, fallback: &str) -> String {
+    match folder_id {
+        Some(fid) => store
+            .list_folders()
+            .ok()
+            .and_then(|fs| fs.into_iter().find(|f| f.id == fid))
+            .map(|f| f.name)
+            .unwrap_or_else(|| fallback.to_string()),
+        None => fallback.to_string(),
+    }
+}
+
+/// Resolve (title, origin) for a move-to-trash, enforcing the
+/// caller's right to delete the object.
+fn trash_check_cap(
+    st: &St,
+    user: &UserRec,
+    kind: &str,
+    object_id: &str,
+) -> Result<(String, String), (StatusCode, Json<Value>)> {
+    let (title, origin, gid) = {
+        let store = st.store.lock().unwrap();
+        match kind {
+            "index" => {
+                let idx = store.get_index(object_id).map_err(|_| not_found())?;
+                (
+                    idx.name.clone(),
+                    trash_origin(&store, idx.folder_id.as_deref(), "索引页"),
+                    Some(idx.group_id.clone()),
+                )
+            }
+            "unit" => {
+                let unit = store.get_unit(object_id).map_err(|_| not_found())?;
+                (
+                    unit.name.clone(),
+                    trash_origin(&store, unit.folder_id.as_deref(), "内容页"),
+                    Some(unit.group_id.clone()),
+                )
+            }
+            "showroom" => {
+                let item = store
+                    .get_showroom(object_id)
+                    .map_err(bad)?
+                    .ok_or_else(not_found)?;
+                if user.role != "super" && item.submitted_by != user.display_name {
+                    return Err(forbidden());
+                }
+                (item.title.clone(), "演示厅".to_string(), None)
+            }
+            _ => return Err(bad("unknown trash kind")),
+        }
+    };
+    if let Some(gid) = gid {
+        need_cap(st, user, &gid, "manage")?;
+    }
+    Ok((title, origin))
+}
+
+/// Restore / purge gate on an existing trash row: super, the person
+/// who deleted it, or a `manage` holder on the object's group.
+fn trash_row_cap(
+    st: &St,
+    user: &UserRec,
+    row: &TrashRec,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if user.role == "super" || row.deleted_by == user.display_name {
+        return Ok(());
+    }
+    let gid = {
+        let store = st.store.lock().unwrap();
+        match row.kind.as_str() {
+            "unit" => store
+                .get_unit(&row.object_id)
+                .map(|u| u.group_id)
+                .map_err(|_| not_found())?,
+            "index" => store
+                .get_index(&row.object_id)
+                .map(|x| x.group_id)
+                .map_err(|_| not_found())?,
+            _ => return Err(forbidden()),
+        }
+    };
+    need_cap(st, user, &gid, "manage")
+}
+
+/// Cover for a trash row: the version whose first page represents
+/// the object (unit → latest version of its first rendition; index
+/// → first resolved entry of the main branch head), plus its page
+/// count for the preview frame.
+fn trash_cover(store: &Store, row: &TrashRec) -> (Option<String>, i64) {
+    let ver = match row.kind.as_str() {
+        "unit" => store
+            .list_renditions(&row.object_id)
+            .ok()
+            .and_then(|rs| rs.into_iter().next())
+            .and_then(|r| store.latest_version(&r.id).ok().flatten()),
+        "index" => store
+            .branch_head(&row.object_id, "main")
+            .ok()
+            .flatten()
+            .and_then(|cid| store.get_commit(&cid).ok())
+            .and_then(|c| c.entries.into_iter().next())
+            .and_then(|e| store.resolve_entry_version(&e).ok().flatten()),
+        _ => None,
+    };
+    match ver {
+        Some(v) => (Some(v.id), v.page_count),
+        None => (None, 0),
+    }
+}
+
+async fn list_trash(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let visible = visible_set(&st, &user)?;
+    let store = st.store.lock().unwrap();
+    let rows = store.trash_list().map_err(bad)?;
+    let mut items = Vec::new();
+    for row in rows {
+        let see = if user.role == "super" || row.deleted_by == user.display_name {
+            true
+        } else {
+            let in_groups = |gid: &str| {
+                visible
+                    .as_ref()
+                    .map(|set| set.contains(gid))
+                    .unwrap_or(true)
+            };
+            match row.kind.as_str() {
+                "unit" => store
+                    .get_unit(&row.object_id)
+                    .map(|u| in_groups(&u.group_id))
+                    .unwrap_or(false),
+                "index" => store
+                    .get_index(&row.object_id)
+                    .map(|x| in_groups(&x.group_id))
+                    .unwrap_or(false),
+                _ => false,
+            }
+        };
+        if !see {
+            continue;
+        }
+        let (cover, pages) = trash_cover(&store, &row);
+        let mut v = json!(row);
+        v["cover_version_id"] = json!(cover);
+        v["page_count"] = json!(pages);
+        items.push(v);
+    }
+    Ok(Json(json!({ "items": items })))
+}
+
+async fn add_trash(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Json(req): Json<TrashAddReq>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let (title, origin) = trash_check_cap(&st, &user, &req.kind, &req.object_id)?;
+    let store = st.store.lock().unwrap();
+    let rec = store
+        .trash_add(&req.kind, &req.object_id, &title, &origin, &user.display_name)
+        .map_err(bad)?;
+    Ok(Json(json!(rec)))
+}
+
+async fn restore_trash(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let row = {
+        let store = st.store.lock().unwrap();
+        store.trash_get(&id).map_err(|_| not_found())?
+    };
+    trash_row_cap(&st, &user, &row)?;
+    let store = st.store.lock().unwrap();
+    let rec = store.trash_restore(&id).map_err(bad)?;
+    Ok(Json(json!(rec)))
+}
+
+async fn purge_trash(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let row = {
+        let store = st.store.lock().unwrap();
+        store.trash_get(&id).map_err(|_| not_found())?
+    };
+    trash_row_cap(&st, &user, &row)?;
+    let store = st.store.lock().unwrap();
+    let rec = store.trash_purge(&id).map_err(bad)?;
+    Ok(Json(json!(rec)))
+}
+
+async fn purge_all_trash(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let rows = {
+        let store = st.store.lock().unwrap();
+        store.trash_list().map_err(bad)?
+    };
+    let mut purged = 0usize;
+    for row in rows {
+        if trash_row_cap(&st, &user, &row).is_ok() {
+            let store = st.store.lock().unwrap();
+            if store.trash_purge(&row.id).is_ok() {
+                purged += 1;
+            }
+        }
+    }
+    Ok(Json(json!({ "purged": purged })))
+}
+
+// ---------------- page-level visual editing ----------------
+
+/// The editable text runs of one page of a version (visual editor
+/// read side). Same visibility bar as `get_version`.
+async fn version_page_text(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let (ver, bytes) = {
+        let store = st.store.lock().unwrap();
+        let ver = store.get_version(&id).map_err(|_| not_found())?;
+        let rend = store.get_rendition(&ver.rendition_id).map_err(bad)?;
+        let unit = store.get_unit(&rend.unit_id).map_err(bad)?;
+        if !store.can_see_group(&user, &unit.group_id).map_err(bad)? {
+            return Err(not_found());
+        }
+        let bytes = store.file_get(&ver.fragment_hash).map_err(bad)?;
+        (ver, bytes)
+    };
+    let _ = ver;
+    let page: usize = q
+        .get("page")
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(0);
+    let pkg = Package::load(&bytes).map_err(bad)?;
+    let runs = pptx::slide_text_runs(&pkg, page).map_err(bad)?;
+    Ok(Json(json!({ "page": page, "runs": runs })))
+}
+
+#[derive(Deserialize)]
+struct PageRunEdit {
+    page: usize,
+    run: usize,
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct EditPagesReq {
+    edits: Vec<PageRunEdit>,
+    bump: Option<String>, // major | minor | patch (default minor)
+    note: Option<String>,
+    new_revision: Option<bool>,
+}
+
+/// Save page-level text edits as a NEW version of the same rendition
+/// (the §8 rule: saving an edit follows the existing bump dialog —
+/// the client sends the chosen bump level). The fragment base is the
+/// opened version; the new version becomes the rendition's latest.
+async fn edit_version_pages(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<EditPagesReq>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let (ver, rend, unit, bytes) = {
+        let store = st.store.lock().unwrap();
+        let ver = store.get_version(&id).map_err(|_| not_found())?;
+        let rend = store.get_rendition(&ver.rendition_id).map_err(bad)?;
+        let unit = store.get_unit(&rend.unit_id).map_err(bad)?;
+        let bytes = store.file_get(&ver.fragment_hash).map_err(bad)?;
+        (ver, rend, unit, bytes)
+    };
+    need_cap(&st, &user, &unit.group_id, "publish")?;
+    let mut pkg = Package::load(&bytes).map_err(bad)?;
+    // Group the flat edit list by page and apply run replacements.
+    let mut by_page: std::collections::BTreeMap<usize, Vec<(usize, String)>> =
+        std::collections::BTreeMap::new();
+    for e in &req.edits {
+        by_page
+            .entry(e.page)
+            .or_default()
+            .push((e.run, e.text.clone()));
+    }
+    let mut applied = 0usize;
+    for (page, edits) in &by_page {
+        applied += pptx::replace_slide_text_runs(&mut pkg, *page, edits).map_err(bad)?;
+    }
+    if applied == 0 {
+        return Err(bad("没有可应用的文字修改"));
+    }
+    let frag = pkg.to_bytes().map_err(bad)?;
+    let store = st.store.lock().unwrap();
+    let basis = if req.new_revision.unwrap_or(false) {
+        store.bump_unit_revision(&unit.id).map_err(bad)?
+    } else {
+        unit.current_revision
+    };
+    let latest = store.latest_version(&rend.id).map_err(bad)?;
+    let inc = match req.bump.as_deref() {
+        Some("major") => Increment::Major,
+        Some("patch") => Increment::Patch,
+        _ => Increment::Minor,
+    };
+    let next = match latest {
+        Some(v) => SemVer::parse(&v.semver).map_err(bad)?.bumped(inc),
+        None => SemVer::new(1, 0, 0),
+    };
+    let _ = ver;
+    let new_ver = store
+        .insert_version(
+            &rend.id,
+            next,
+            basis,
+            &user.display_name,
+            req.note.as_deref().unwrap_or(""),
+            &frag,
+            "normal",
+        )
+        .map_err(bad)?;
+    Ok(Json(json!({ "version": new_ver })))
 }
 
 // ---------------- custom groups / shares / library (§3.17, §7.7) ----------------
@@ -3281,6 +3637,12 @@ async fn main() {
         .route("/v1/attachments/:id/download", get(download_attachment))
         .route("/v1/showroom", get(list_showroom).post(submit_showroom))
         .route("/v1/showroom/:id/review", post(review_showroom))
+        .route("/v1/trash", get(list_trash).post(add_trash))
+        .route("/v1/trash/purge-all", post(purge_all_trash))
+        .route("/v1/trash/:id/restore", post(restore_trash))
+        .route("/v1/trash/:id/purge", post(purge_trash))
+        .route("/v1/versions/:id/page-text", get(version_page_text))
+        .route("/v1/versions/:id/edit-pages", post(edit_version_pages))
         .route("/v1/showroom/:id/export", post(export_showroom))
         .route("/v1/custom-groups", get(list_custom_groups).post(create_custom_group))
         .route("/v1/custom-groups/:id/members", post(add_custom_group_member))

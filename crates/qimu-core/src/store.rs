@@ -316,6 +316,21 @@ pub struct PageBindingRec {
     pub created_ms: i64,
 }
 
+/// One row of the trash (soft-delete overlay). `kind` is the client
+/// filter vocabulary: index | unit | showroom. `origin` is the
+/// human-readable place the object lived (folder / source view),
+/// shown in the trash as 「原位置」.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrashRec {
+    pub id: String,
+    pub kind: String,
+    pub object_id: String,
+    pub title: String,
+    pub origin: String,
+    pub deleted_by: String,
+    pub deleted_ms: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShowroomRec {
     pub id: String,
@@ -326,6 +341,15 @@ pub struct ShowroomRec {
     pub submitted_by: String,
     pub state: String, // pending | live | rejected
     pub created_ms: i64,
+    /// Review outcome (approval queue): the reason recorded when the
+    /// item was rejected (empty for approvals / not yet reviewed),
+    /// who reviewed it and when. Defaults keep old rows readable.
+    #[serde(default)]
+    pub review_note: String,
+    #[serde(default)]
+    pub reviewed_by: String,
+    #[serde(default)]
+    pub reviewed_ms: i64,
     /// Visibility scope (org-model DESIGN §2.1). This phase only
     /// 'org_public' is produced or consumed; the remaining tiers
     /// are reserved vocabulary, not enabled behavior.
@@ -389,6 +413,7 @@ CREATE TABLE IF NOT EXISTS exports(id TEXT PRIMARY KEY, index_id TEXT NOT NULL, 
 CREATE TABLE IF NOT EXISTS attachments(id TEXT PRIMARY KEY, parent_type TEXT NOT NULL, parent_id TEXT NOT NULL, filename TEXT NOT NULL, hash TEXT NOT NULL, size INTEGER NOT NULL, uploader TEXT NOT NULL, created_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS version_tags(id TEXT PRIMARY KEY, version_id TEXT NOT NULL, dim TEXT NOT NULL, value TEXT NOT NULL, strength TEXT NOT NULL DEFAULT 'fits', author TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS showroom(id TEXT PRIMARY KEY, title TEXT NOT NULL, intro TEXT NOT NULL DEFAULT '', source_index_id TEXT, commit_id TEXT, submitted_by TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending', created_ms INTEGER NOT NULL, scope TEXT NOT NULL DEFAULT 'org_public');
+CREATE TABLE IF NOT EXISTS trash_items(id TEXT PRIMARY KEY, kind TEXT NOT NULL, object_id TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', origin TEXT NOT NULL DEFAULT '', deleted_by TEXT NOT NULL DEFAULT '', deleted_ms INTEGER NOT NULL DEFAULT 0, UNIQUE(kind, object_id));
 CREATE TABLE IF NOT EXISTS assemblies(id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, entries_json TEXT NOT NULL, created_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS page_bindings(id TEXT PRIMARY KEY, unit_id TEXT NOT NULL, from_version_id TEXT NOT NULL, from_slot INTEGER NOT NULL, to_version_id TEXT NOT NULL, to_slot INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'manual', author TEXT NOT NULL, created_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS custom_groups(id TEXT PRIMARY KEY, name TEXT NOT NULL, owner_id TEXT NOT NULL, created_ms INTEGER NOT NULL);
@@ -451,6 +476,9 @@ impl Store {
             ("sessions", "kind", "TEXT NOT NULL DEFAULT 'user'"),
             ("sessions", "client_ip", "TEXT"),
             ("sessions", "last_seen_ms", "INTEGER NOT NULL DEFAULT 0"),
+            ("showroom", "review_note", "TEXT NOT NULL DEFAULT ''"),
+            ("showroom", "reviewed_by", "TEXT NOT NULL DEFAULT ''"),
+            ("showroom", "reviewed_ms", "INTEGER NOT NULL DEFAULT 0"),
         ] {
             let has: bool = conn
                 .prepare(&format!("PRAGMA table_info({table})"))
@@ -1129,6 +1157,11 @@ impl Store {
                 .map_err(db_err)?;
             rows
         };
+        let trashed = self.trashed_ids("unit")?;
+        let all: Vec<UnitRec> = all
+            .into_iter()
+            .filter(|u| !trashed.contains(&u.id))
+            .collect();
         Ok(match visible {
             None => all,
             Some(set) => all
@@ -1665,6 +1698,11 @@ impl Store {
             .map_err(db_err)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(db_err)?;
+        let trashed = self.trashed_ids("index")?;
+        let rows: Vec<IndexRec> = rows
+            .into_iter()
+            .filter(|i| !trashed.contains(&i.id))
+            .collect();
         Ok(match visible {
             None => rows,
             Some(set) => rows
@@ -2157,6 +2195,9 @@ impl Store {
             state: state.into(),
             created_ms: now_ms(),
             scope: SCOPE_ORG_PUBLIC.to_string(),
+            review_note: String::new(),
+            reviewed_by: String::new(),
+            reviewed_ms: 0,
         };
         self.conn
             .execute(
@@ -2180,7 +2221,7 @@ impl Store {
     pub fn list_showroom(&self, state: Option<&str>) -> SResult<Vec<ShowroomRec>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, title, intro, source_index_id, commit_id, submitted_by, state, created_ms, scope FROM showroom ORDER BY created_ms DESC")
+            .prepare("SELECT id, title, intro, source_index_id, commit_id, submitted_by, state, created_ms, scope, review_note, reviewed_by, reviewed_ms FROM showroom ORDER BY created_ms DESC")
             .map_err(db_err)?;
         let rows = stmt
             .query_map([], |r| {
@@ -2194,15 +2235,42 @@ impl Store {
                     state: r.get(6)?,
                     created_ms: r.get(7)?,
                     scope: r.get(8)?,
+                    review_note: r.get(9)?,
+                    reviewed_by: r.get(10)?,
+                    reviewed_ms: r.get(11)?,
                 })
             })
             .map_err(db_err)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(db_err)?;
+        let trashed = self.trashed_ids("showroom")?;
+        let rows: Vec<ShowroomRec> = rows
+            .into_iter()
+            .filter(|r| !trashed.contains(&r.id))
+            .collect();
         Ok(match state {
             None => rows,
             Some(s) => rows.into_iter().filter(|r| r.state == s).collect(),
         })
+    }
+
+    /// Record a review decision (approval queue): the new state plus
+    /// who decided, when, and the note (the rejection reason, which
+    /// the prototype requires to travel back to the submitter).
+    pub fn review_showroom(
+        &self,
+        id: &str,
+        state: &str,
+        note: &str,
+        reviewed_by: &str,
+    ) -> SResult<()> {
+        self.conn
+            .execute(
+                "UPDATE showroom SET state=?2, review_note=?3, reviewed_by=?4, reviewed_ms=?5 WHERE id=?1",
+                params![id, state, note, reviewed_by, now_ms()],
+            )
+            .map_err(db_err)?;
+        Ok(())
     }
 
     pub fn set_showroom_state(&self, id: &str, state: &str) -> SResult<()> {
@@ -2213,6 +2281,178 @@ impl Store {
             )
             .map_err(db_err)?;
         Ok(())
+    }
+
+    // ---------- trash (soft delete, prototype #trashView) ----------
+    // Deleting is an overlay: the object row stays in its own table
+    // and a trash_items row hides it from the normal lists, so a
+    // restore is just dropping the overlay row ("原版本与语言绑定
+    // 原样保留"). Purge is the only destructive step and cascades
+    // per kind. Fragment files are content-addressed and shared, so
+    // purge never touches the file store.
+
+    /// Move an object to the trash. Idempotent: re-deleting an
+    /// already-trashed object returns the existing row.
+    pub fn trash_add(
+        &self,
+        kind: &str,
+        object_id: &str,
+        title: &str,
+        origin: &str,
+        deleted_by: &str,
+    ) -> SResult<TrashRec> {
+        if let Some(existing) = self.trash_find(kind, object_id)? {
+            return Ok(existing);
+        }
+        let rec = TrashRec {
+            id: new_id("trs"),
+            kind: kind.into(),
+            object_id: object_id.into(),
+            title: title.into(),
+            origin: origin.into(),
+            deleted_by: deleted_by.into(),
+            deleted_ms: now_ms(),
+        };
+        self.conn
+            .execute(
+                "INSERT INTO trash_items(id, kind, object_id, title, origin, deleted_by, deleted_ms) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    rec.id,
+                    rec.kind,
+                    rec.object_id,
+                    rec.title,
+                    rec.origin,
+                    rec.deleted_by,
+                    rec.deleted_ms
+                ],
+            )
+            .map_err(db_err)?;
+        Ok(rec)
+    }
+
+    pub fn trash_find(&self, kind: &str, object_id: &str) -> SResult<Option<TrashRec>> {
+        Ok(self
+            .trash_list()?
+            .into_iter()
+            .find(|t| t.kind == kind && t.object_id == object_id))
+    }
+
+    pub fn trash_list(&self) -> SResult<Vec<TrashRec>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, kind, object_id, title, origin, deleted_by, deleted_ms FROM trash_items ORDER BY deleted_ms DESC")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(TrashRec {
+                    id: r.get(0)?,
+                    kind: r.get(1)?,
+                    object_id: r.get(2)?,
+                    title: r.get(3)?,
+                    origin: r.get(4)?,
+                    deleted_by: r.get(5)?,
+                    deleted_ms: r.get(6)?,
+                })
+            })
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(rows)
+    }
+
+    pub fn trash_get(&self, id: &str) -> SResult<TrashRec> {
+        self.trash_list()?
+            .into_iter()
+            .find(|t| t.id == id)
+            .ok_or_else(|| "trash item not found".to_string())
+    }
+
+    /// The object ids currently hidden by the trash, for one kind.
+    pub fn trashed_ids(&self, kind: &str) -> SResult<std::collections::HashSet<String>> {
+        Ok(self
+            .trash_list()?
+            .into_iter()
+            .filter(|t| t.kind == kind)
+            .map(|t| t.object_id)
+            .collect())
+    }
+
+    /// Restore: drop the overlay row; the object reappears in its
+    /// normal lists exactly as it was.
+    pub fn trash_restore(&self, id: &str) -> SResult<TrashRec> {
+        let rec = self.trash_get(id)?;
+        self.conn
+            .execute("DELETE FROM trash_items WHERE id=?1", params![rec.id])
+            .map_err(db_err)?;
+        Ok(rec)
+    }
+
+    /// Purge: permanently delete the object (cascade per kind), then
+    /// drop the overlay row. Returns the purged trash record.
+    pub fn trash_purge(&self, id: &str) -> SResult<TrashRec> {
+        let rec = self.trash_get(id)?;
+        let oid = rec.object_id.as_str();
+        match rec.kind.as_str() {
+            "unit" => {
+                self.conn
+                    .execute(
+                        "DELETE FROM version_tags WHERE version_id IN (SELECT v.id FROM versions v JOIN renditions r ON v.rendition_id = r.id WHERE r.unit_id = ?1)",
+                        params![oid],
+                    )
+                    .map_err(db_err)?;
+                self.conn
+                    .execute(
+                        "DELETE FROM versions WHERE rendition_id IN (SELECT id FROM renditions WHERE unit_id = ?1)",
+                        params![oid],
+                    )
+                    .map_err(db_err)?;
+                self.conn
+                    .execute("DELETE FROM renditions WHERE unit_id = ?1", params![oid])
+                    .map_err(db_err)?;
+                self.conn
+                    .execute("DELETE FROM page_bindings WHERE unit_id = ?1", params![oid])
+                    .map_err(db_err)?;
+                self.conn
+                    .execute("DELETE FROM units WHERE id = ?1", params![oid])
+                    .map_err(db_err)?;
+            }
+            "index" => {
+                self.conn
+                    .execute("DELETE FROM index_branches WHERE index_id = ?1", params![oid])
+                    .map_err(db_err)?;
+                self.conn
+                    .execute("DELETE FROM index_commits WHERE index_id = ?1", params![oid])
+                    .map_err(db_err)?;
+                self.conn
+                    .execute("DELETE FROM index_tags WHERE index_id = ?1", params![oid])
+                    .map_err(db_err)?;
+                self.conn
+                    .execute("DELETE FROM indexes_tbl WHERE id = ?1", params![oid])
+                    .map_err(db_err)?;
+            }
+            "showroom" => {
+                self.conn
+                    .execute(
+                        "DELETE FROM library_entries WHERE item_kind = 'showroom' AND item_id = ?1",
+                        params![oid],
+                    )
+                    .map_err(db_err)?;
+                self.conn
+                    .execute(
+                        "DELETE FROM shares WHERE item_kind = 'showroom' AND item_id = ?1",
+                        params![oid],
+                    )
+                    .map_err(db_err)?;
+                self.conn
+                    .execute("DELETE FROM showroom WHERE id = ?1", params![oid])
+                    .map_err(db_err)?;
+            }
+            other => return Err(format!("unknown trash kind: {other}")),
+        }
+        self.conn
+            .execute("DELETE FROM trash_items WHERE id=?1", params![rec.id])
+            .map_err(db_err)?;
+        Ok(rec)
     }
 
     pub fn save_assembly(

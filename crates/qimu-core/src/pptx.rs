@@ -703,3 +703,111 @@ mod tests {
         );
     }
 }
+
+// ---------- page-level text-run access (visual page editor) ----------
+
+fn xml_unescape_text(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+/// The text runs (`<a:t>` contents, XML-unescaped, in document order)
+/// of one slide of the package. `slide_idx` is 0-based deck order.
+/// This is the read side of the page-level visual editor: the client
+/// shows one editable field per run.
+pub fn slide_text_runs(pkg: &Package, slide_idx: usize) -> PptxResult<Vec<String>> {
+    let refs = slides(pkg)?;
+    let sref = refs
+        .get(slide_idx)
+        .ok_or_else(|| format!("slide index {slide_idx} out of range"))?;
+    let xml = pkg.get_text(&sref.part)?;
+    let mut out = Vec::new();
+    let mut rest = xml.as_str();
+    while let Some(s) = rest.find("<a:t>") {
+        let after = &rest[s + 5..];
+        match after.find("</a:t>") {
+            Some(e) => {
+                out.push(xml_unescape_text(&after[..e]));
+                rest = &after[e + 6..];
+            }
+            None => break,
+        }
+    }
+    Ok(out)
+}
+
+/// Replace the contents of individual text runs of one slide, in
+/// place. `edits` are (run_index, new_text); run indices follow
+/// `slide_text_runs`. New text is XML-escaped on write. Returns the
+/// number of runs actually replaced. Runs are plain `<a:t>` elements
+/// (the same authoring assumption `personalize` makes: a placeholder
+/// or editable string sits inside a single run).
+pub fn replace_slide_text_runs(
+    pkg: &mut Package,
+    slide_idx: usize,
+    edits: &[(usize, String)],
+) -> PptxResult<usize> {
+    if edits.is_empty() {
+        return Ok(0);
+    }
+    let refs = slides(pkg)?;
+    let sref = refs
+        .get(slide_idx)
+        .ok_or_else(|| format!("slide index {slide_idx} out of range"))?;
+    let part = sref.part.clone();
+    let xml = pkg.get_text(&part)?;
+    // Split the slide XML at every <a:t>...</a:t> run, keeping the
+    // separators, so replacements can be spliced by run index.
+    let mut segments: Vec<String> = Vec::new(); // even: literal, odd: run content
+    let mut rest = xml.as_str();
+    loop {
+        match rest.find("<a:t>") {
+            Some(s) => {
+                let after = &rest[s + 5..];
+                match after.find("</a:t>") {
+                    Some(e) => {
+                        segments.push(format!("{}<a:t>", &rest[..s]));
+                        segments.push(after[..e].to_string());
+                        rest = &after[e + 6..];
+                    }
+                    None => {
+                        segments.push(rest.to_string());
+                        rest = "";
+                        break;
+                    }
+                }
+            }
+            None => {
+                segments.push(rest.to_string());
+                break;
+            }
+        }
+        if rest.is_empty() {
+            break;
+        }
+    }
+    let run_count = segments.len() / 2;
+    let mut applied = 0usize;
+    let mut new_segments = segments.clone();
+    for (run, text) in edits {
+        if *run < run_count {
+            new_segments[run * 2 + 1] = xml_escape_text(text);
+            applied += 1;
+        }
+    }
+    if applied == 0 {
+        return Ok(0);
+    }
+    let mut out = String::with_capacity(xml.len());
+    for (idx, seg) in new_segments.iter().enumerate() {
+        out.push_str(seg);
+        if idx % 2 == 1 {
+            out.push_str("</a:t>");
+        }
+    }
+    pkg.parts.insert(part, out.into_bytes());
+    Ok(applied)
+}

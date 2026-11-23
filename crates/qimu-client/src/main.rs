@@ -316,6 +316,16 @@ pub const CHIP_GRAY_BG: egui::Color32 = egui::Color32::from_rgb(0x1D, 0x1D, 0x23
 /// Danger pair — the prototype's --rose / --rose-soft.
 pub const ROSE: egui::Color32 = egui::Color32::from_rgb(0xF2, 0x55, 0x5A);
 pub const ROSE_SOFT_BG: egui::Color32 = egui::Color32::from_rgba_unmultiplied(0xF2, 0x55, 0x5A, 36);
+/// Accent-soft fill (prototype accent-soft — the same value as
+/// SEL_BG): the Soft segmented selected state and accent-tinted
+/// fills introduced by the five-features line.
+pub const ACCENT_SOFT: egui::Color32 = egui::Color32::from_rgba_unmultiplied(0x2F, 0x6B, 0xF5, 41);
+/// Badge Bad tone: the prototype's --rose over its soft pair
+/// (identical values to ROSE / ROSE_SOFT_BG above).
+pub const BADGE_BAD_FG: egui::Color32 = egui::Color32::from_rgb(0xF2, 0x55, 0x5A);
+pub const BADGE_BAD_BG: egui::Color32 = egui::Color32::from_rgba_unmultiplied(0xF2, 0x55, 0x5A, 36);
+/// Danger button fill (prototype --rose, solid).
+pub const DANGER_BG: egui::Color32 = egui::Color32::from_rgb(0xF2, 0x55, 0x5A);
 
 /// Ghost text action — the boards draw secondary actions as plain text
 /// (no box): 开始演示 in accent, the rest in main/weak text color.
@@ -793,6 +803,276 @@ struct SettingsState {
     grant_capability: String,
 }
 
+/// === Drill-down navigation stack (PageHost, prototype A9) =======
+/// Architecture rule (user, 2026-11-23): a top-level page's
+/// sub-pages are an explicit frame stack, never Option fields
+/// toggled inside the main frame. Drill-in pushes a typed frame
+/// carrying the identity of what it shows (list -> detail(id) ->
+/// version(id) -> page(id)); back pops; the breadcrumb renders the
+/// whole stack and any crumb can be clicked to jump back. A frame's
+/// state is created on push and destroyed on pop (draft-retention
+/// policy is noted per frame type where it matters). Modal tasks
+/// live on a separate overlay stack above the frames: Esc closes
+/// the top overlay first, then pops a frame. Switching top-level
+/// pages never clears another page's stack. The legacy pages keep
+/// their existing Option-based sub-pages until the retrofit package
+/// moves them; everything written from this line on follows the
+/// stack rule.
+struct NavStack<F> {
+    frames: Vec<F>,
+}
+
+impl<F> NavStack<F> {
+    fn new(root: F) -> Self {
+        Self { frames: vec![root] }
+    }
+    fn depth(&self) -> usize {
+        self.frames.len()
+    }
+    fn top(&self) -> &F {
+        self.frames
+            .last()
+            .expect("a nav stack always keeps its root frame")
+    }
+    fn top_mut(&mut self) -> &mut F {
+        self.frames
+            .last_mut()
+            .expect("a nav stack always keeps its root frame")
+    }
+    fn push(&mut self, frame: F) {
+        self.frames.push(frame);
+    }
+    /// Pop one frame; the root frame is never popped. Returns
+    /// whether a frame was actually popped.
+    fn pop(&mut self) -> bool {
+        if self.frames.len() > 1 {
+            self.frames.pop();
+            true
+        } else {
+            false
+        }
+    }
+    /// Breadcrumb jump: keep the frames up to and including `depth`.
+    fn pop_to(&mut self, depth: usize) {
+        if depth + 1 < self.frames.len() {
+            self.frames.truncate(depth + 1);
+        }
+    }
+}
+
+/// Breadcrumb bar: renders the whole stack; returns the depth of a
+/// clicked crumb (the top crumb is current and not clickable).
+fn crumb_bar(ui: &mut egui::Ui, crumbs: &[&str]) -> Option<usize> {
+    let mut clicked = None;
+    ui.horizontal(|ui| {
+        for (idx, label) in crumbs.iter().enumerate() {
+            if idx > 0 {
+                ui.label(egui::RichText::new("›").color(TEXT_FAINT));
+            }
+            if idx + 1 == crumbs.len() {
+                ui.label(
+                    egui::RichText::new(*label)
+                        .size(12.5)
+                        .color(TEXT_MAIN)
+                        .strong(),
+                );
+            } else if text_action(ui, label, ACCENT, 12.5) {
+                clicked = Some(idx);
+            }
+        }
+    });
+    clicked
+}
+
+/// Home is a launcher: its stack holds only the root frame today
+/// (actions navigate to other pages rather than drilling in), but
+/// it follows the same stack discipline so recent-item detail can
+/// drill in later without a second mechanism.
+enum HomeFrame {
+    Root,
+}
+
+/// Trash frames (prototype #trashView). The list frame owns the
+/// filter and the multi-selection — both die with the frame, which
+/// is the point: leaving the trash resets the batch selection.
+/// The item data itself is a page-level cache on TrashState (it
+/// survives frame pops; only view state is per-frame).
+enum TrashFrame {
+    List(TrashListState),
+    Preview(TrashPreviewState),
+}
+
+#[derive(Default)]
+struct TrashListState {
+    filter: usize, // 0 all | 1 index | 2 unit | 3 showroom
+    selected: std::collections::HashSet<String>, // trash row ids
+}
+
+struct TrashPreviewState {
+    trash_id: String,
+    kind: String,
+    title: String,
+    version_id: String, // cover version whose pages are previewed
+    page_count: usize,
+    page: usize,
+}
+
+struct TrashState {
+    stack: NavStack<TrashFrame>,
+    items: Vec<Value>,
+    loaded: bool,
+    load_error: String,
+}
+
+impl TrashState {
+    fn new() -> Self {
+        Self {
+            stack: NavStack::new(TrashFrame::List(TrashListState::default())),
+            items: vec![],
+            loaded: false,
+            load_error: String::new(),
+        }
+    }
+}
+
+/// Approval-queue frames (prototype settings 审批 section). The
+/// detail frame owns the rejection draft: the reason text lives and
+/// dies with the frame — popping the frame abandons the draft,
+/// which is deliberate (a half-written rejection must never leak
+/// into another item's decision).
+enum ReviewFrame {
+    Queue(ReviewQueueState),
+    Detail(ReviewDetailState),
+}
+
+#[derive(Default)]
+struct ReviewQueueState {
+    tab: usize, // 0 pending | 1 processed records
+}
+
+struct ReviewDetailState {
+    item_id: String,
+    reject_open: bool,
+    reject_text: String,
+    deck: Option<Value>, // source index detail, for the page preview
+    deck_loaded: bool,
+}
+
+struct ReviewState {
+    stack: NavStack<ReviewFrame>,
+    records: Vec<Value>,
+    records_loaded: bool,
+}
+
+impl ReviewState {
+    fn new() -> Self {
+        Self {
+            stack: NavStack::new(ReviewFrame::Queue(ReviewQueueState::default())),
+            records: vec![],
+            records_loaded: false,
+        }
+    }
+}
+
+/// Built-in presenter state (prototype playDlg, A28). One deck,
+/// flattened to (version_id, page) pairs like the showroom deck
+/// view builds them; scripts align with the flattened pages.
+struct PresentState {
+    title: String,
+    pages: Vec<(String, usize)>,
+    scripts: Vec<String>,
+    cur: usize,
+    speaker: bool,
+    blackout: bool,
+    started: std::time::Instant,
+}
+
+/// Page-level visual editor state (prototype craftDlg, A29).
+/// Text runs are loaded per page from the server; `base` keeps the
+/// loaded text and `work` the working copy, so the pending edit set
+/// is the diff at save time. Scripts ride along (saved through the
+/// scripts endpoint, which never bumps — §3.16). All of it is
+/// overlay state: closing the editor discards it, after the dirty
+/// check routes through the Confirm overlay (prototype saveAskDlg).
+struct PageEditState {
+    version_id: String,
+    unit_name: String,
+    semver: String,
+    page_count: usize,
+    page: usize,
+    base: std::collections::HashMap<usize, Vec<String>>,
+    work: std::collections::HashMap<usize, Vec<String>>,
+    scripts: Vec<String>,
+    scripts_base: Vec<String>,
+    bump: usize, // 0 major | 1 minor | 2 patch — the publish dialog's rule
+    note: String,
+}
+
+impl PageEditState {
+    fn dirty(&self) -> bool {
+        if self.scripts != self.scripts_base {
+            return true;
+        }
+        self.work.iter().any(|(p, runs)| {
+            self.base
+                .get(p)
+                .map(|b| b != runs)
+                .unwrap_or(false)
+        })
+    }
+    /// The flat edit list for the save call: (page, run, new text)
+    /// for every run whose working copy differs from the baseline.
+    fn edits(&self) -> Vec<(usize, usize, String)> {
+        let mut out = Vec::new();
+        let mut pages: Vec<usize> = self.work.keys().cloned().collect();
+        pages.sort();
+        for p in pages {
+            let (Some(w), Some(b)) = (self.work.get(&p), self.base.get(&p)) else {
+                continue;
+            };
+            for (r, text) in w.iter().enumerate() {
+                if b.get(r) != Some(text) {
+                    out.push((p, r, text.clone()));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// 「从模板新建」 picker state (home launcher): choose an existing
+/// index as the template; its resolved entries seed the new index's
+/// first commit.
+struct PickTemplateState {
+    new_name: String,
+    template_id: String,
+}
+
+/// The overlay stack's payloads. Overlays render above the page
+/// frames in stack order; Confirm is the top-most kind and is the
+/// only one allowed to stack over another overlay (over PageEdit).
+enum Overlay {
+    Present(PresentState),
+    PageEdit(PageEditState),
+    PickTemplate(PickTemplateState),
+    Confirm(ConfirmState),
+}
+
+struct ConfirmState {
+    title: String,
+    body: String,
+    confirm_label: String,
+    danger: bool,
+    action: ConfirmAction,
+}
+
+enum ConfirmAction {
+    PurgeTrash(String), // trash row id
+    PurgeTrashMany(Vec<String>),
+    EmptyTrash,
+    DiscardPageEdit,
+}
+
 struct App {
     server: String,
     username: String,
@@ -816,7 +1096,15 @@ struct App {
     sr_deck: Option<Value>,
     sr_preview: Option<(String, usize)>,
     page: Page,
-    trash_filter: usize, // 0 all | 1 index | 2 content | 3 showroom
+    /// Five-features surfaces (2026-11-23): the trash and the
+    /// approval queue run on drill-down frame stacks; the home
+    /// launcher holds a (root-only) stack by the same discipline;
+    /// the presenter, the page editor, the template picker and the
+    /// confirmations run on the overlay stack above the frames.
+    trash: TrashState,
+    review: ReviewState,
+    nav_home: NavStack<HomeFrame>,
+    overlays: Vec<Overlay>,
     msg: String,
     folders: Vec<Value>,
     groups: Vec<Value>,
@@ -1483,7 +1771,10 @@ impl App {
                 Ok("settings") => Page::Settings,
                 _ => Page::Showroom,
             },
-            trash_filter: 0,
+            trash: TrashState::new(),
+            review: ReviewState::new(),
+            nav_home: NavStack::new(HomeFrame::Root),
+            overlays: vec![],
             msg: String::new(),
             folders: vec![],
             groups: vec![],
@@ -2429,6 +2720,15 @@ impl App {
                     self.content.publish_form = s(first, "form");
                     self.content.publish_lang = s(first, "lang");
                 }
+                if let Some(u) = v.get("unit") {
+                    let rev = i(u, "current_revision");
+                    let ver = if rev > 0 {
+                        format!("r{rev}")
+                    } else {
+                        String::new()
+                    };
+                    self.note_recent("unit", unit_id, &s(u, "name"), &ver);
+                }
                 self.content.detail = Some(v);
                 self.load_attachments(unit_id);
                 self.content.bind_from.clear();
@@ -2658,6 +2958,10 @@ impl App {
     fn open_index_detail(&mut self, index_id: &str) {
         self.index.selected = Some(index_id.to_string());
         self.load_index_detail();
+        if let Some(d) = &self.index.detail {
+            let idx = d.get("index").cloned().unwrap_or(json!({}));
+            self.note_recent("index", index_id, &s(&idx, "name"), "");
+        }
     }
 
     fn load_index_detail(&mut self) {
@@ -3147,6 +3451,209 @@ fn workspace_tab(ui: &mut egui::Ui, active: bool, label: &str) -> egui::Response
     resp
 }
 
+
+fn client_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// The device-local recent-use record (home launcher, A27): newest
+/// first, entries are {kind, id, title, ver, ms}.
+fn recent_items() -> Vec<Value> {
+    client_settings()
+        .get("recent_items")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// === First-tier shared components (component re-audit 2026-11-23) ==
+/// The prototype's shared components, extracted with the client's
+/// existing rendering as the baseline: extraction must not change
+/// what existing surfaces draw, so Btn's Primary/Default delegate
+/// to the phase-1 buttons below with identical parameters, and the
+/// legacy per-view inline cards stay untouched until their pages
+/// migrate. New surfaces are written with these components only.
+
+/// Btn (A5) — the button system: Primary / Default / Ghost / Danger.
+fn btn_primary(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    q_primary_button(ui, label)
+}
+
+fn btn_default(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    q_ghost_button(ui, label)
+}
+
+fn btn_ghost(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(egui::RichText::new(label).size(12.5).color(TEXT_MAIN))
+            .fill(egui::Color32::TRANSPARENT)
+            .stroke(egui::Stroke::new(1.0, FIELD_BORDER))
+            .corner_radius(6)
+            .min_size(egui::vec2(0.0, 30.0)),
+    )
+}
+
+fn btn_danger(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(egui::RichText::new(label).size(12.5).color(egui::Color32::WHITE))
+            .fill(DANGER_BG)
+            .corner_radius(6)
+            .min_size(egui::vec2(0.0, 30.0)),
+    )
+}
+
+/// Segmented selected-state styles (A6). The prototype carries
+/// three paradigms whose division of labour is not yet ruled
+/// （未清账清单 #1): pending that rule, NEW surfaces use Soft
+/// （主色软底） and legacy call sites keep Solid through
+/// q_seg_pills. Do not spread a third paradigm.
+#[derive(Clone, Copy, PartialEq)]
+enum SegStyle {
+    Solid,
+    Soft,
+}
+
+fn segmented(
+    ui: &mut egui::Ui,
+    labels: &[&str],
+    selected: usize,
+    style: SegStyle,
+) -> Option<usize> {
+    match style {
+        SegStyle::Solid => q_seg_pills(ui, labels, selected),
+        SegStyle::Soft => {
+            let mut changed = None;
+            ui.horizontal(|ui| {
+                for (i, label) in labels.iter().enumerate() {
+                    let active = i == selected;
+                    let btn = egui::Button::new(
+                        egui::RichText::new(tr(*label))
+                            .size(12.0)
+                            .color(if active { ACCENT } else { TEXT_WEAK }),
+                    )
+                    .fill(if active { ACCENT_SOFT } else { BTN_BG })
+                    .corner_radius(255)
+                    .min_size(egui::vec2(0.0, 26.0));
+                    if ui.add(btn).clicked() && !active {
+                        changed = Some(i);
+                    }
+                }
+            });
+            changed
+        }
+    }
+}
+
+/// Badge (A7): the semantic tone table — one place decides what
+/// ok / warn / bad / info / pin look like (chip geometry underneath).
+#[derive(Clone, Copy, PartialEq)]
+enum BadgeTone {
+    Neutral,
+    Ok,
+    Warn,
+    Bad,
+    Info,
+    Pin,
+}
+
+fn badge(ui: &mut egui::Ui, text: &str, tone: BadgeTone) {
+    let (fg, bg) = match tone {
+        BadgeTone::Neutral => (CHIP_GRAY_FG, CHIP_GRAY_BG),
+        BadgeTone::Ok => (CHIP_GREEN_FG, CHIP_GREEN_BG),
+        BadgeTone::Warn | BadgeTone::Pin => (CHIP_ORANGE_FG, CHIP_ORANGE_BG),
+        BadgeTone::Bad => (BADGE_BAD_FG, BADGE_BAD_BG),
+        BadgeTone::Info => (ACCENT_DEEP, CHIP_BLUE_BG),
+    };
+    chip(ui, text, fg, bg);
+}
+
+/// Dashed separator rule (B4): the card family's row divider —
+/// 1px dashed line in a 9px strip.
+fn dashed_rule(ui: &mut egui::Ui) {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 9.0), egui::Sense::hover());
+    let painter = ui.painter();
+    let y = rect.center().y;
+    let stroke = egui::Stroke::new(1.0, SEPARATOR);
+    let mut x = rect.min.x;
+    while x < rect.max.x {
+        let x2 = (x + 4.0).min(rect.max.x);
+        painter.line_segment([egui::pos2(x, y), egui::pos2(x2, y)], stroke);
+        x += 7.0;
+    }
+}
+
+/// StdCard (A1): the one card skeleton — cover slot, title, badge
+/// row, meta row (below the dashed rule), sub row, action row. The
+/// caller fills the slots in order inside the closure. `selected`
+/// draws the accent outline (the prototype's selected state).
+fn std_card(ui: &mut egui::Ui, selected: bool, add: impl FnOnce(&mut egui::Ui)) {
+    let frame = if selected {
+        card_frame().stroke(egui::Stroke::new(1.5, ACCENT))
+    } else {
+        card_frame()
+    };
+    frame.show(ui, |ui| {
+        ui.vertical(|ui| add(ui));
+    });
+}
+
+/// The meta slot of a StdCard: content below the dashed rule.
+fn std_card_meta(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    dashed_rule(ui);
+    add(ui);
+}
+
+/// SlideCover (A2): a slide's face — the real page thumbnail when
+/// one is available, otherwise the prototype's drawn slide (colour
+/// block + eyebrow + title + foot row), at card scale.
+fn slide_cover(
+    ui: &mut egui::Ui,
+    tex: Option<egui::TextureHandle>,
+    eyebrow: &str,
+    title: &str,
+    foot: &str,
+    width: f32,
+) {
+    let h = width * 9.0 / 16.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, h), egui::Sense::hover());
+    let painter = ui.painter();
+    if let Some(tex) = tex {
+        painter.image(
+            tex.id(),
+            rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+        return;
+    }
+    painter.rect_filled(rect, 4.0, HOVER_BG);
+    let inner = rect.shrink(8.0);
+    let eyebrow_font = egui::FontId::new(9.0, egui::FontFamily::Proportional);
+    let g = painter.layout_no_wrap(eyebrow.to_string(), eyebrow_font, TEXT_FAINT);
+    painter.galley(egui::pos2(inner.min.x, inner.min.y), g, TEXT_FAINT);
+    let title_font = egui::FontId::new(12.0, egui::FontFamily::Proportional);
+    let g = painter.layout(
+        title.to_string(),
+        title_font,
+        TEXT_MAIN,
+        inner.width(),
+    );
+    painter.galley(egui::pos2(inner.min.x, inner.min.y + 14.0), g, TEXT_MAIN);
+    if !foot.is_empty() {
+        let foot_font = egui::FontId::new(9.0, egui::FontFamily::Proportional);
+        let g = painter.layout_no_wrap(foot.to_string(), foot_font, TEXT_FAINT);
+        painter.galley(
+            egui::pos2(inner.min.x, inner.max.y - g.size().y),
+            g,
+            TEXT_FAINT,
+        );
+    }
+}
+
 /// === Phase-1 unified components (2026-11-23) ===
 /// The HTML prototype grew five button flavours and four segmented
 /// controls; the client standardises on ONE primary button, ONE
@@ -3194,13 +3701,13 @@ fn q_seg_pills(ui: &mut egui::Ui, labels: &[&str], selected: usize) -> Option<us
 }
 
 impl App {
-    /// Home / launchpad (prototype #homeView): welcome line, the
-    /// four quick-action cards, an at-a-glance count strip and the
-    /// recent-index list. Plain page (no dock workspace): the
-    /// prototype's home is a single scrolling surface, and keeping
-    /// it out of the dock framework keeps the four docked pages'
-    /// layouts untouched. Data comes from the already-loaded app
-    /// state (indexes / units / showroom), so no new requests.
+    /// Home / launchpad (prototype #homeView, A27): welcome line
+    /// with the app version, the four prototype action cards and
+    /// the recent-use table. Plain page (no dock workspace). The
+    /// launcher's stack holds only its root frame — the actions
+    /// navigate to the other pages instead of drilling in. Recent
+    /// use is recorded on this device (client settings), so the
+    /// launcher is fully useful with no server at all.
     fn page_home(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.add_space(18.0);
@@ -3210,10 +3717,30 @@ impl App {
                     .color(TEXT_MAIN),
             );
             ui.label(
-                egui::RichText::new(tr("PPT 内容管理与原地更新 · 局域网版"))
-                    .size(12.5)
-                    .color(TEXT_WEAK),
+                egui::RichText::new(format!(
+                    "{} · 版本 {}",
+                    tr("PPT 内容管理与索引系统"),
+                    env!("CARGO_PKG_VERSION")
+                ))
+                .size(12.5)
+                .color(TEXT_WEAK),
             );
+            ui.add_space(6.0);
+            // Connection state, stated neutrally: the launcher and
+            // every local feature work the same with no server; the
+            // line only says what this device can currently reach.
+            let conn_line = if self.token.is_some() {
+                format!("{} · {}", tr("已连接服务器"), self.active_server_label())
+            } else if self
+                .conns
+                .iter()
+                .any(|c| c.status == ConnStatus::Connected)
+            {
+                format!("{} · {}", tr("已连接服务器（匿名）"), self.active_server_label())
+            } else {
+                tr("单机模式：未连接服务器，本地功能完整可用").to_string()
+            };
+            ui.label(egui::RichText::new(conn_line).size(12.0).color(TEXT_FAINT));
             ui.add_space(16.0);
             if self.user.is_none() {
                 ui.horizontal(|ui| {
@@ -3243,63 +3770,42 @@ impl App {
                 });
                 ui.add_space(12.0);
             }
-            // Quick actions — the prototype's four launch cards.
+            // The prototype's four launch cards.
+            let mut act: Option<&'static str> = None;
             ui.horizontal_wrapped(|ui| {
-                card_frame().show(ui, |ui| {
-                    ui.set_min_width(180.0);
-                    ui.label(egui::RichText::new(tr("新建索引")).size(14.0).color(TEXT_MAIN));
-                    ui.label(
-                        egui::RichText::new(tr("把内容块编成一份可发布的索引"))
-                            .size(11.5)
-                            .color(TEXT_WEAK),
-                    );
-                    ui.add_space(8.0);
-                    if q_primary_button(ui, tr("去新建")).clicked() {
-                        self.act_new_index();
-                    }
-                });
-                card_frame().show(ui, |ui| {
-                    ui.set_min_width(180.0);
-                    ui.label(egui::RichText::new(tr("导入整稿")).size(14.0).color(TEXT_MAIN));
-                    ui.label(
-                        egui::RichText::new(tr("把一份 PPT 拆成内容块入库"))
-                            .size(11.5)
-                            .color(TEXT_WEAK),
-                    );
-                    ui.add_space(8.0);
-                    if q_primary_button(ui, tr("去导入")).clicked() {
-                        self.page = Page::Content;
-                        self.act_import_ppt();
-                    }
-                });
-                card_frame().show(ui, |ui| {
-                    ui.set_min_width(180.0);
-                    ui.label(egui::RichText::new(tr("打开演示厅")).size(14.0).color(TEXT_MAIN));
-                    ui.label(
-                        egui::RichText::new(tr("浏览已发布的成品与分享"))
-                            .size(11.5)
-                            .color(TEXT_WEAK),
-                    );
-                    ui.add_space(8.0);
-                    if q_primary_button(ui, tr("去演示厅")).clicked() {
-                        self.page = Page::Showroom;
-                    }
-                });
-                card_frame().show(ui, |ui| {
-                    ui.set_min_width(180.0);
-                    ui.label(egui::RichText::new(tr("连接服务器")).size(14.0).color(TEXT_MAIN));
-                    ui.label(
-                        egui::RichText::new(tr("添加或切换启幕服务器地址"))
-                            .size(11.5)
-                            .color(TEXT_WEAK),
-                    );
-                    ui.add_space(8.0);
-                    if q_primary_button(ui, tr("去设置")).clicked() {
-                        self.page = Page::Settings;
-                        self.settings.section = 0;
-                    }
-                });
+                if self.home_action_card(ui, "icon-doc-add", *ICON_DOC_ADD, tr("新建索引")) {
+                    act = Some("new");
+                }
+                if self.home_action_card(ui, "icon-play", *ICON_PLAY, tr("打开示例项目")) {
+                    act = Some("sample");
+                }
+                if self.home_action_card(ui, "icon-upload", *ICON_UPLOAD, tr("导入素材…")) {
+                    act = Some("import");
+                }
+                if self.home_action_card(ui, "icon-all-apps", *ICON_ALL_APPS, tr("从模板新建")) {
+                    act = Some("template");
+                }
             });
+            match act {
+                Some("new") => self.act_new_index(),
+                Some("sample") => self.open_sample_project(),
+                Some("import") => {
+                    self.page = Page::Content;
+                    self.act_import_ppt();
+                }
+                Some("template") => {
+                    let first = self
+                        .indexes
+                        .first()
+                        .map(|x| s(x, "id"))
+                        .unwrap_or_default();
+                    self.overlays.push(Overlay::PickTemplate(PickTemplateState {
+                        new_name: String::new(),
+                        template_id: first,
+                    }));
+                }
+                _ => {}
+            }
             ui.add_space(16.0);
             // At-a-glance counts from loaded state.
             ui.label(
@@ -3317,70 +3823,686 @@ impl App {
                 .color(TEXT_WEAK),
             );
             ui.add_space(14.0);
-            ui.label(egui::RichText::new(tr("最近的索引")).size(14.0).color(TEXT_MAIN));
+            ui.label(egui::RichText::new(tr("最近使用")).size(14.0).color(TEXT_MAIN));
             ui.add_space(6.0);
-            if self.indexes.is_empty() {
+            let recents = recent_items();
+            if recents.is_empty() {
                 ui.label(
-                    egui::RichText::new(tr("暂无索引。点上方「新建索引」创建第一个。"))
-                        .size(12.0)
-                        .color(TEXT_WEAK),
+                    egui::RichText::new(tr(
+                        "暂无最近使用。打开过的索引、内容块和演示成品会出现在这里。",
+                    ))
+                    .size(12.0)
+                    .color(TEXT_WEAK),
                 );
             } else {
-                for idx in self.indexes.iter().take(8) {
-                    let name = s(idx, "name");
-                    if q_ghost_button(ui, &name).clicked() {
-                        self.page = Page::Index;
+                // Borderless table (A27): name / kind / version /
+                // last opened; a row click reopens the item.
+                let mut open: Option<Value> = None;
+                for r in &recents {
+                    let (rect, resp) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), 30.0),
+                        egui::Sense::click(),
+                    );
+                    let painter = ui.painter();
+                    if resp.hovered() {
+                        painter.rect_filled(rect, 6.0, HOVER_BG);
                     }
-                    ui.add_space(4.0);
+                    let kind_label = match s(r, "kind").as_str() {
+                        "index" => tr("索引"),
+                        "unit" => tr("内容块"),
+                        "showroom" => tr("演示成品"),
+                        _ => "",
+                    };
+                    let cols: [(String, f32); 4] = [
+                        (s(r, "title"), 0.0),
+                        (kind_label.to_string(), rect.max.x - 330.0),
+                        (s(r, "ver"), rect.max.x - 240.0),
+                        (fmt_time(i(r, "ms")), rect.max.x - 150.0),
+                    ];
+                    for (j, (text, x)) in cols.iter().enumerate() {
+                        let font = egui::FontId::new(12.0, egui::FontFamily::Proportional);
+                        let color = if j == 0 { TEXT_MAIN } else { TEXT_WEAK };
+                        let g = painter.layout_no_wrap(text.clone(), font, color);
+                        let gx = if j == 0 { rect.min.x + 8.0 } else { *x };
+                        painter.galley(
+                            egui::pos2(gx, rect.center().y - g.size().y / 2.0),
+                            g,
+                            color,
+                        );
+                    }
+                    if resp.clicked() {
+                        open = Some(r.clone());
+                    }
+                }
+                if let Some(r) = open {
+                    match s(&r, "kind").as_str() {
+                        "index" => {
+                            self.page = Page::Index;
+                            self.open_index_detail(&s(&r, "id"));
+                        }
+                        "unit" => {
+                            self.page = Page::Content;
+                            self.open_unit_detail(&s(&r, "id"));
+                        }
+                        "showroom" => {
+                            self.page = Page::Showroom;
+                            self.open_deck_for_ref("showroom", &s(&r, "id"), &s(&r, "title"));
+                        }
+                        _ => {}
+                    }
                 }
             }
             ui.add_space(18.0);
         });
     }
 
-    /// Trash (prototype #trashView): standalone view shell with the
-    /// prototype's three-kind filter. DATA WIRING IS PENDING: the
-    /// server has per-object lifecycle/delete actions but no
-    /// "list deleted items" endpoint yet, so this page renders its
-    /// frame and an honest empty state instead of fabricating rows.
-    /// Tracked in the phase-1 report.
+    /// One launcher action card (A27): 22px icon + label on a
+    /// 66px-tall card; the whole card is the button.
+    fn home_action_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        name: &'static str,
+        bytes: &'static [u8],
+        label: &str,
+    ) -> bool {
+        let tex = self.tex_icon(ui, name, bytes);
+        let (rect, resp) =
+            ui.allocate_exact_size(egui::vec2(216.0, 66.0), egui::Sense::click());
+        let painter = ui.painter();
+        let fill = if resp.hovered() { HOVER_BG } else { CARD_BG };
+        painter.rect_filled(rect, 10.0, fill);
+        painter.rect_stroke(
+            rect,
+            10.0,
+            egui::Stroke::new(1.0, CARD_BORDER),
+            egui::StrokeKind::Inside,
+        );
+        let ir = egui::Rect::from_min_size(
+            egui::pos2(rect.min.x + 16.0, rect.center().y - 11.0),
+            egui::vec2(22.0, 22.0),
+        );
+        painter.image(
+            tex,
+            ir,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            ICON_TINT,
+        );
+        let font = egui::FontId::new(13.5, egui::FontFamily::Proportional);
+        let g = painter.layout_no_wrap(label.to_string(), font, TEXT_MAIN);
+        painter.galley(
+            egui::pos2(rect.min.x + 50.0, rect.center().y - g.size().y / 2.0),
+            g,
+            TEXT_MAIN,
+        );
+        resp.clicked()
+    }
+
+    /// 「打开示例项目」: the server seeds groups and folders but no
+    /// sample deck, so the sample is whatever the deployment
+    /// prepared — an index or showroom item named 示例 first, else
+    /// the first live showroom item; the empty case says so plainly.
+    fn open_sample_project(&mut self) {
+        if let Some(idx) = self
+            .indexes
+            .iter()
+            .find(|x| s(x, "name").contains("示例"))
+            .cloned()
+        {
+            self.page = Page::Index;
+            self.open_index_detail(&s(&idx, "id"));
+            return;
+        }
+        let item = self
+            .showroom_live
+            .iter()
+            .find(|x| s(x, "title").contains("示例"))
+            .cloned()
+            .or_else(|| self.showroom_live.first().cloned());
+        match item {
+            Some(it) => {
+                self.page = Page::Showroom;
+                self.open_showroom_deck(&it);
+            }
+            None => {
+                self.msg = "示例项目尚未准备：当前服务器没有示例内容".into();
+            }
+        }
+    }
+
+    /// Record a recent-use entry (home launcher): newest first,
+    /// de-duplicated by (kind, id), capped at 10, persisted in the
+    /// local client settings — recent use is a property of this
+    /// device, not of the account.
+    fn note_recent(&mut self, kind: &str, id: &str, title: &str, ver: &str) {
+        if id.is_empty() || title.is_empty() {
+            return;
+        }
+        let mut items = recent_items();
+        items.retain(|x| !(s(x, "kind") == kind && s(x, "id") == id));
+        items.insert(
+            0,
+            json!({
+                "kind": kind, "id": id, "title": title, "ver": ver,
+                "ms": client_now_ms(),
+            }),
+        );
+        items.truncate(10);
+        save_client_settings(json!({ "recent_items": items }));
+    }
+
+    /// Trash (prototype #trashView): a standalone page on a
+    /// drill-down frame stack — the list frame (kind filter + batch
+    /// selection) and a preview frame for items whose cover version
+    /// is known. Data comes from GET /v1/trash (the store's
+    /// soft-delete overlay): restore drops the overlay row and is
+    /// lossless; purge is the only destructive step and always goes
+    /// through the Confirm overlay.
     fn page_trash(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical().show(ui, |ui| {
+        if self.token.is_none() {
+            // Explicit not-connected state (not an error): the trash
+            // lives on the server. Local work is unaffected, and the
+            // page says exactly what connecting unlocks.
             ui.add_space(14.0);
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(tr("回收站")).size(18.0).color(TEXT_MAIN));
-                ui.add_space(12.0);
-                if let Some(i) = q_seg_pills(
-                    ui,
-                    &["全部", "索引", "内容块", "演示成品"],
-                    self.trash_filter,
-                ) {
-                    self.trash_filter = i;
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if q_ghost_button(ui, tr("清空回收站")).clicked() {
-                        self.msg = tr("回收站数据接口尚未接通，暂不能清空").into();
-                    }
-                });
-            });
+            ui.label(egui::RichText::new(tr("回收站")).size(18.0).color(TEXT_MAIN));
             ui.add_space(16.0);
             card_frame().show(ui, |ui| {
                 ui.label(
-                    egui::RichText::new(tr("回收站暂无可显示的已删条目"))
+                    egui::RichText::new(tr("回收站保存的是服务器上的已删条目"))
                         .size(13.0)
                         .color(TEXT_MAIN),
                 );
                 ui.label(
                     egui::RichText::new(tr(
-                        "说明：已删条目清单接口（服务端）尚未提供，本页先落界面壳；接口到位后此处将列出可恢复 / 可彻底删除的条目。",
+                        "连接并登录服务器后可查看、恢复或彻底删除；未连接不影响本地的索引、内容与演示功能。",
                     ))
                     .size(11.5)
                     .color(TEXT_WEAK),
                 );
+                ui.add_space(8.0);
+                if btn_primary(ui, tr("登录")).clicked() {
+                    self.login_open = true;
+                }
             });
+            return;
+        }
+        if !self.trash.loaded {
+            self.trash_load();
+        }
+        let in_preview = matches!(self.trash.stack.top(), TrashFrame::Preview(_));
+        if in_preview {
+            self.trash_preview_ui(ui);
+        } else {
+            self.trash_list_ui(ui);
+        }
+    }
+
+    fn trash_load(&mut self) {
+        match self.call("GET", "/v1/trash", None) {
+            Ok(v) => {
+                self.trash.items = v
+                    .get("items")
+                    .and_then(|x| x.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                self.trash.loaded = true;
+                self.trash.load_error.clear();
+            }
+            Err(e) => {
+                // Stay loaded (no per-frame retry spin); the list
+                // frame shows the error with an explicit retry.
+                self.trash.loaded = true;
+                self.trash.load_error = e;
+            }
+        }
+    }
+
+    /// Move an object to the trash (soft delete) — the producers:
+    /// unit detail, index detail, showroom cards.
+    fn trash_add(&mut self, kind: &str, object_id: &str) {
+        match self.call(
+            "POST",
+            "/v1/trash",
+            Some(json!({ "kind": kind, "object_id": object_id })),
+        ) {
+            Ok(_) => {
+                self.msg = "已移入回收站，可随时恢复".into();
+                self.trash.loaded = false;
+                self.refresh_all();
+            }
+            Err(e) => self.msg = format!("删除失败：{e}"),
+        }
+    }
+
+    fn trash_restore(&mut self, trash_id: &str) {
+        match self.call("POST", &format!("/v1/trash/{trash_id}/restore"), Some(json!({}))) {
+            Ok(_) => {
+                self.msg = "已恢复".into();
+                self.trash.loaded = false;
+                self.refresh_all();
+            }
+            Err(e) => self.msg = format!("恢复失败：{e}"),
+        }
+    }
+
+    fn trash_purge(&mut self, trash_id: &str) {
+        match self.call("POST", &format!("/v1/trash/{trash_id}/purge"), Some(json!({}))) {
+            Ok(_) => {
+                self.msg = "已彻底删除".into();
+                self.trash.loaded = false;
+                // If the preview frame shows the purged item, leave it.
+                let showing = match self.trash.stack.top() {
+                    TrashFrame::Preview(p) => p.trash_id == trash_id,
+                    _ => false,
+                };
+                if showing {
+                    self.trash.stack.pop();
+                }
+                self.refresh_all();
+            }
+            Err(e) => self.msg = format!("彻底删除失败：{e}"),
+        }
+    }
+
+    fn trash_list_ui(&mut self, ui: &mut egui::Ui) {
+        // Frame state snapshot (the frame itself is mutated after
+        // rendering, from the collected intents).
+        let (filter, selected) = match self.trash.stack.top() {
+            TrashFrame::List(ls) => (ls.filter, ls.selected.clone()),
+            _ => (0, std::collections::HashSet::new()),
+        };
+        let items = self.trash.items.clone();
+        let count_of = |kind: &str| items.iter().filter(|t| s(t, "kind") == kind).count();
+        let shown: Vec<Value> = items
+            .iter()
+            .filter(|t| match filter {
+                1 => s(t, "kind") == "index",
+                2 => s(t, "kind") == "unit",
+                3 => s(t, "kind") == "showroom",
+                _ => true,
+            })
+            .cloned()
+            .collect();
+
+        let mut new_filter: Option<usize> = None;
+        let mut toggle: Option<String> = None;
+        let mut restore: Option<String> = None;
+        let mut purge: Option<(String, String)> = None;
+        let mut preview: Option<Value> = None;
+        let mut batch: Option<&'static str> = None;
+        let mut empty_all = false;
+        let mut retry = false;
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(tr("回收站")).size(18.0).color(TEXT_MAIN));
+                ui.add_space(12.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} {} · {}",
+                        tr("共"),
+                        items.len(),
+                        tr("项 · 原版本与语言绑定原样保留")
+                    ))
+                    .size(11.5)
+                    .color(TEXT_FAINT),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if btn_ghost(ui, tr("清空回收站")).clicked() && !items.is_empty() {
+                        empty_all = true;
+                    }
+                    if btn_ghost(ui, tr("刷新")).clicked() {
+                        retry = true;
+                    }
+                });
+            });
+            ui.add_space(10.0);
+            let labels: Vec<String> = vec![
+                format!("{} {}", tr("全部"), items.len()),
+                format!("{} {}", tr("索引"), count_of("index")),
+                format!("{} {}", tr("内容块"), count_of("unit")),
+                format!("{} {}", tr("演示成品"), count_of("showroom")),
+            ];
+            let label_refs: Vec<&str> = labels.iter().map(|x| x.as_str()).collect();
+            if let Some(i) = segmented(ui, &label_refs, filter, SegStyle::Soft) {
+                new_filter = Some(i);
+            }
+            ui.add_space(10.0);
+            if !selected.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{} {} {}", tr("已选"), selected.len(), tr("项")))
+                            .size(12.0)
+                            .color(TEXT_MAIN),
+                    );
+                    if btn_default(ui, tr("批量恢复")).clicked() {
+                        batch = Some("restore");
+                    }
+                    if btn_danger(ui, tr("批量彻底删除")).clicked() {
+                        batch = Some("purge");
+                    }
+                    if btn_ghost(ui, tr("取消选择")).clicked() {
+                        batch = Some("clear");
+                    }
+                });
+                ui.add_space(10.0);
+            }
+            if !self.trash.load_error.is_empty() {
+                card_frame().show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{}：{}", tr("回收站加载失败"), self.trash.load_error))
+                            .size(12.5)
+                            .color(TEXT_MAIN),
+                    );
+                    if btn_primary(ui, tr("重试")).clicked() {
+                        retry = true;
+                    }
+                });
+                ui.add_space(10.0);
+            }
+            if shown.is_empty() {
+                card_frame().show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(if items.is_empty() {
+                            tr("回收站是空的——删除的内容块和索引会先放进这里，可随时恢复。")
+                        } else {
+                            tr("这个板块暂无已删除项。")
+                        })
+                        .size(12.5)
+                        .color(TEXT_WEAK),
+                    );
+                });
+            }
+            for t in &shown {
+                let tid = s(t, "id");
+                let kind = s(t, "kind");
+                let checked = selected.contains(&tid);
+                let cover_vid = s(t, "cover_version_id");
+                let tex = if cover_vid.is_empty() {
+                    None
+                } else {
+                    self.thumb(&cover_vid, 0)
+                };
+                let (kind_label, tone) = match kind.as_str() {
+                    "index" => (tr("索引"), BadgeTone::Info),
+                    "unit" => (tr("内容块"), BadgeTone::Info),
+                    _ => (tr("演示成品"), BadgeTone::Neutral),
+                };
+                let title = s(t, "title");
+                let origin = s(t, "origin");
+                let by = s(t, "deleted_by");
+                let at = fmt_time(i(t, "deleted_ms"));
+                let mut check_change = false;
+                std_card(ui, checked, |ui| {
+                    ui.horizontal(|ui| {
+                        let mut c = checked;
+                        if ui.checkbox(&mut c, "").changed() {
+                            check_change = true;
+                        }
+                        slide_cover(ui, tex, kind_label, &title, "", 84.0);
+                        ui.vertical(|ui| {
+                            ui.label(
+                                egui::RichText::new(&title).size(13.0).color(TEXT_MAIN),
+                            );
+                            ui.horizontal(|ui| {
+                                badge(ui, kind_label, tone);
+                            });
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                            ui.vertical(|ui| {
+                                if btn_danger(ui, tr("彻底删除")).clicked() {
+                                    purge = Some((tid.clone(), title.clone()));
+                                }
+                                if btn_default(ui, tr("恢复")).clicked() {
+                                    restore = Some(tid.clone());
+                                }
+                                if !cover_vid.is_empty()
+                                    && btn_ghost(ui, tr("预览")).clicked()
+                                {
+                                    preview = Some(t.clone());
+                                }
+                            });
+                        });
+                    });
+                    std_card_meta(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{}「{}」 · {} {} · {}",
+                                tr("原位置"),
+                                origin,
+                                by,
+                                tr("删除"),
+                                at
+                            ))
+                            .size(11.0)
+                            .color(TEXT_FAINT),
+                        );
+                    });
+                });
+                if check_change {
+                    toggle = Some(tid.clone());
+                }
+                ui.add_space(8.0);
+            }
             ui.add_space(14.0);
         });
+
+        // Apply intents.
+        if retry {
+            self.trash.loaded = false;
+        }
+        if let Some(f) = new_filter {
+            if let TrashFrame::List(ls) = self.trash.stack.top_mut() {
+                ls.filter = f;
+            }
+        }
+        if let Some(tid) = toggle {
+            if let TrashFrame::List(ls) = self.trash.stack.top_mut() {
+                if !ls.selected.remove(&tid) {
+                    ls.selected.insert(tid);
+                }
+            }
+        }
+        if let Some(tid) = restore {
+            self.trash_restore(&tid);
+        }
+        if let Some((tid, title)) = purge {
+            self.overlays.push(Overlay::Confirm(ConfirmState {
+                title: tr("彻底删除").to_string(),
+                body: format!(
+                    "「{}」{}",
+                    title,
+                    tr("将被永久删除（全部版本与绑定），不可恢复。")
+                ),
+                confirm_label: tr("彻底删除").to_string(),
+                danger: true,
+                action: ConfirmAction::PurgeTrash(tid),
+            }));
+        }
+        if let Some(t) = preview {
+            self.trash.stack.push(TrashFrame::Preview(TrashPreviewState {
+                trash_id: s(&t, "id"),
+                kind: s(&t, "kind"),
+                title: s(&t, "title"),
+                version_id: s(&t, "cover_version_id"),
+                page_count: i(&t, "page_count").max(0) as usize,
+                page: 0,
+            }));
+        }
+        match batch {
+            Some("clear") => {
+                if let TrashFrame::List(ls) = self.trash.stack.top_mut() {
+                    ls.selected.clear();
+                }
+            }
+            Some("restore") => {
+                let ids: Vec<String> = selected.iter().cloned().collect();
+                let mut ok = 0usize;
+                for id in &ids {
+                    if self
+                        .call("POST", &format!("/v1/trash/{id}/restore"), Some(json!({})))
+                        .is_ok()
+                    {
+                        ok += 1;
+                    }
+                }
+                self.msg = format!("{} {} {}", tr("已恢复"), ok, tr("项"));
+                if let TrashFrame::List(ls) = self.trash.stack.top_mut() {
+                    ls.selected.clear();
+                }
+                self.trash.loaded = false;
+                self.refresh_all();
+            }
+            Some("purge") => {
+                let ids: Vec<String> = selected.iter().cloned().collect();
+                self.overlays.push(Overlay::Confirm(ConfirmState {
+                    title: tr("批量彻底删除").to_string(),
+                    body: format!(
+                        "{} {} {}",
+                        tr("选中的"),
+                        ids.len(),
+                        tr("项将被永久删除，不可恢复。")
+                    ),
+                    confirm_label: tr("彻底删除").to_string(),
+                    danger: true,
+                    action: ConfirmAction::PurgeTrashMany(ids),
+                }));
+            }
+            _ => {}
+        }
+        if empty_all {
+            self.overlays.push(Overlay::Confirm(ConfirmState {
+                title: tr("清空回收站").to_string(),
+                body: format!(
+                    "{} {} {}",
+                    tr("回收站中的"),
+                    items.len(),
+                    tr("项将被永久删除，不可恢复。")
+                ),
+                confirm_label: tr("清空回收站").to_string(),
+                danger: true,
+                action: ConfirmAction::EmptyTrash,
+            }));
+        }
     }
+
+    fn trash_preview_ui(&mut self, ui: &mut egui::Ui) {
+        let (trash_id, kind, title, version_id, page_count, page) =
+            match self.trash.stack.top() {
+                TrashFrame::Preview(p) => (
+                    p.trash_id.clone(),
+                    p.kind.clone(),
+                    p.title.clone(),
+                    p.version_id.clone(),
+                    p.page_count,
+                    p.page,
+                ),
+                _ => return,
+            };
+        let row = self
+            .trash
+            .items
+            .iter()
+            .find(|t| s(t, "id") == trash_id)
+            .cloned();
+        let mut go_back = false;
+        let mut new_page: Option<usize> = None;
+        let mut do_restore = false;
+        let mut do_purge = false;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.add_space(10.0);
+            if let Some(d) = crumb_bar(ui, &[tr("回收站"), &title]) {
+                if d == 0 {
+                    go_back = true;
+                }
+            }
+            ui.add_space(10.0);
+            ui.vertical_centered(|ui| {
+                self.thumb_ui(ui, &version_id, page, 820.0);
+            });
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(page > 0, egui::Button::new(tr("上一页")))
+                    .clicked()
+                {
+                    new_page = Some(page - 1);
+                }
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} {} / {} {}",
+                        tr("第"),
+                        page + 1,
+                        page_count.max(1),
+                        tr("页")
+                    ))
+                    .size(12.0)
+                    .color(TEXT_WEAK),
+                );
+                if ui
+                    .add_enabled(page + 1 < page_count, egui::Button::new(tr("下一页")))
+                    .clicked()
+                {
+                    new_page = Some(page + 1);
+                }
+                ui.add_space(24.0);
+                if btn_primary(ui, tr("恢复")).clicked() {
+                    do_restore = true;
+                }
+                if btn_danger(ui, tr("彻底删除")).clicked() {
+                    do_purge = true;
+                }
+            });
+            if let Some(t) = &row {
+                ui.add_space(8.0);
+                let kind_label = match kind.as_str() {
+                    "index" => tr("索引"),
+                    "unit" => tr("内容块"),
+                    _ => tr("演示成品"),
+                };
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} · {}「{}」 · {} {} · {}",
+                        kind_label,
+                        tr("原位置"),
+                        s(t, "origin"),
+                        s(t, "deleted_by"),
+                        tr("删除"),
+                        fmt_time(i(t, "deleted_ms"))
+                    ))
+                    .size(11.5)
+                    .color(TEXT_FAINT),
+                );
+            }
+            ui.add_space(14.0);
+        });
+        if let Some(p) = new_page {
+            if let TrashFrame::Preview(pv) = self.trash.stack.top_mut() {
+                pv.page = p;
+            }
+        }
+        if do_restore {
+            self.trash_restore(&trash_id);
+            self.trash.stack.pop();
+        }
+        if do_purge {
+            self.overlays.push(Overlay::Confirm(ConfirmState {
+                title: tr("彻底删除").to_string(),
+                body: format!(
+                    "「{}」{}",
+                    title,
+                    tr("将被永久删除（全部版本与绑定），不可恢复。")
+                ),
+                confirm_label: tr("彻底删除").to_string(),
+                danger: true,
+                action: ConfirmAction::PurgeTrash(trash_id.clone()),
+            }));
+        }
+        if go_back {
+            self.trash.stack.pop();
+        }
+    }
+
 }
 
 /// Panel permissions inside Qimu workspaces: LOCKED (James
@@ -3586,6 +4708,7 @@ impl App {
         }
         if role == "super" {
             sections.extend([
+                "审批队列",
                 "内容组与授权",
                 "公司公共资料",
                 "内容语言",
@@ -4161,6 +5284,7 @@ impl eframe::App for App {
         self.toast(ui, screen);
         self.login_window(ui);
         self.about_window(ui);
+        self.overlay_stack_ui(ui, screen);
     }
 }
 
@@ -4510,6 +5634,7 @@ impl App {
     /// index so its resolved entries can be paged through.
     fn open_showroom_deck(&mut self, item: &Value) {
         self.sr_detail = Some(item.clone());
+        self.note_recent("showroom", &s(item, "id"), &s(item, "title"), "");
         self.sr_deck = None;
         self.sr_preview = None;
         let src = s(item, "source_index_id");
@@ -4801,10 +5926,13 @@ impl App {
             .size(11.5)
             .color(TEXT_FAINT),
         );
+        if text_action(ui, "用系统应用打开", TEXT_WEAK, 11.5) {
+            self.present_showroom(&s(&item, "id"), &s(&item, "title"));
+        }
         ui.add_space(8.0);
         match act {
             Some("play") => {
-                self.present_showroom(&s(&item, "id"), &s(&item, "title"));
+                self.start_present_from_deck(ui);
             }
             Some("export") => {
                 match self.call(
@@ -5398,18 +6526,468 @@ impl App {
                                 );
                                 self.refresh_all();
                             }
-                            if ui.button("驳回").clicked() && self.need_identity("审批演示厅投稿") {
-                                let _ = self.call(
-                                    "POST",
-                                    &format!("/v1/showroom/{}/review", s(&item, "id")),
-                                    Some(json!({ "state": "rejected" })),
-                                );
-                                self.refresh_all();
+                            if ui.button("驳回").clicked() {
+                                // A rejection now requires a reason
+                                // (server-enforced) — continue in the
+                                // approval queue's detail frame, which
+                                // carries the reason form.
+                                self.page = Page::Settings;
+                                let sections = self.settings_sections();
+                                if let Some(pos) =
+                                    sections.iter().position(|x| *x == "审批队列")
+                                {
+                                    self.settings.section = pos;
+                                }
+                                self.review.stack.push(ReviewFrame::Detail(
+                                    ReviewDetailState {
+                                        item_id: s(&item, "id"),
+                                        reject_open: true,
+                                        reject_text: String::new(),
+                                        deck: None,
+                                        deck_loaded: false,
+                                    },
+                                ));
                             }
                         });
                     }
                 });
             });
+    }
+
+    fn find_showroom_item(&self, id: &str) -> Option<Value> {
+        self.showroom_pending
+            .iter()
+            .chain(self.review.records.iter())
+            .chain(self.showroom_live.iter())
+            .find(|x| s(x, "id") == id)
+            .cloned()
+    }
+
+    /// One review decision against the server's manual approval
+    /// flow. Rejection requires a reason (server-enforced).
+    fn review_act(&mut self, item_id: &str, state: &str, note: &str) -> bool {
+        if !self.need_identity("审批演示厅投稿") {
+            return false;
+        }
+        let mut body = json!({ "state": state });
+        if !note.is_empty() {
+            body["note"] = json!(note);
+        }
+        match self.call(
+            "POST",
+            &format!("/v1/showroom/{item_id}/review"),
+            Some(body),
+        ) {
+            Ok(_) => {
+                self.msg = if state == "live" {
+                    "已通过".into()
+                } else {
+                    "已驳回".into()
+                };
+                self.review.records_loaded = false;
+                self.refresh_all();
+                true
+            }
+            Err(e) => {
+                self.msg = format!("审批失败：{e}");
+                false
+            }
+        }
+    }
+
+    /// Handled records = approved + rejected items that carry a
+    /// review stamp (reviewer / time / reason).
+    fn review_records_load(&mut self) {
+        let mut all: Vec<Value> = Vec::new();
+        for st in ["live", "rejected"] {
+            if let Ok(v) = self.call("GET", &format!("/v1/showroom?state={st}"), None) {
+                if let Some(arr) = v.get("items").and_then(|x| x.as_array()) {
+                    all.extend(arr.iter().cloned());
+                }
+            }
+        }
+        all.retain(|x| i(x, "reviewed_ms") > 0);
+        all.sort_by_key(|x| -i(x, "reviewed_ms"));
+        self.review.records = all;
+        self.review.records_loaded = true;
+    }
+
+    /// Approval queue (Settings, super only): the GUI face of the
+    /// server's manual review flow, on a drill-down stack — Queue
+    /// frame (待审批 / 已处理记录 tabs) → Detail frame (source pages
+    /// + approve / reject-with-reason). Governance settings are a
+    /// later phase (route plan); this is the queue only.
+    fn review_queue_body(&mut self, ui: &mut egui::Ui) {
+        if matches!(self.review.stack.top(), ReviewFrame::Detail(_)) {
+            self.review_detail_body(ui);
+            return;
+        }
+        let tab = match self.review.stack.top() {
+            ReviewFrame::Queue(q) => q.tab,
+            _ => 0,
+        };
+        if tab == 1 && !self.review.records_loaded {
+            self.review_records_load();
+        }
+        let mut new_tab: Option<usize> = None;
+        if let Some(t) = segmented(
+            ui,
+            &[tr("待审批"), tr("已处理记录")],
+            tab,
+            SegStyle::Soft,
+        ) {
+            new_tab = Some(t);
+        }
+        ui.add_space(10.0);
+        let mut open_detail: Option<(String, bool)> = None;
+        let mut approve: Option<String> = None;
+        if tab == 0 {
+            let pending = self.showroom_pending.clone();
+            if pending.is_empty() {
+                ui.label(
+                    egui::RichText::new(tr("暂无待审批的演示成品。新提交会先进入这里，人工通过后才公开展示。"))
+                        .size(12.5)
+                        .color(TEXT_WEAK),
+                );
+            }
+            for item in &pending {
+                let iid = s(item, "id");
+                let cover_vid = self
+                    .index_covers
+                    .get(&s(item, "source_index_id"))
+                    .cloned()
+                    .unwrap_or_default();
+                let tex = if cover_vid.is_empty() {
+                    None
+                } else {
+                    self.thumb(&cover_vid, 0)
+                };
+                let title = s(item, "title");
+                let src_name = self
+                    .indexes
+                    .iter()
+                    .find(|x| s(x, "id") == s(item, "source_index_id"))
+                    .map(|x| s(x, "name"))
+                    .unwrap_or_else(|| s(item, "source_index_id"));
+                std_card(ui, false, |ui| {
+                    ui.horizontal(|ui| {
+                        slide_cover(ui, tex, tr("演示成品"), &title, "", 84.0);
+                        ui.vertical(|ui| {
+                            ui.label(
+                                egui::RichText::new(&title).size(13.0).color(TEXT_MAIN),
+                            );
+                            ui.horizontal(|ui| {
+                                badge(ui, tr("待审"), BadgeTone::Warn);
+                            });
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                            ui.vertical(|ui| {
+                                if btn_primary(ui, tr("通过")).clicked() {
+                                    approve = Some(iid.clone());
+                                }
+                                if btn_danger(ui, tr("驳回…")).clicked() {
+                                    open_detail = Some((iid.clone(), true));
+                                }
+                                if btn_default(ui, tr("查看")).clicked() {
+                                    open_detail = Some((iid.clone(), false));
+                                }
+                            });
+                        });
+                    });
+                    std_card_meta(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} {} · {} · {} {}",
+                                tr("提交人"),
+                                s(item, "submitted_by"),
+                                fmt_time(i(item, "created_ms")),
+                                tr("来源索引"),
+                                src_name
+                            ))
+                            .size(11.0)
+                            .color(TEXT_FAINT),
+                        );
+                    });
+                });
+                ui.add_space(8.0);
+            }
+        } else {
+            let records = self.review.records.clone();
+            if records.is_empty() {
+                ui.label(
+                    egui::RichText::new(tr("暂无已处理记录。"))
+                        .size(12.5)
+                        .color(TEXT_WEAK),
+                );
+            }
+            for item in &records {
+                let rejected = s(item, "state") == "rejected";
+                card_frame().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(s(item, "title"))
+                                .size(13.0)
+                                .color(TEXT_MAIN),
+                        );
+                        badge(
+                            ui,
+                            if rejected { tr("已驳回") } else { tr("已通过") },
+                            if rejected { BadgeTone::Bad } else { BadgeTone::Ok },
+                        );
+                    });
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} {} · {}",
+                            tr("审批人"),
+                            s(item, "reviewed_by"),
+                            fmt_time(i(item, "reviewed_ms"))
+                        ))
+                        .size(11.0)
+                        .color(TEXT_FAINT),
+                    );
+                    let note = s(item, "review_note");
+                    if !note.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!("{}：{}", tr("理由"), note))
+                                .size(11.5)
+                                .color(TEXT_WEAK),
+                        );
+                    }
+                });
+                ui.add_space(8.0);
+            }
+        }
+        if let Some(t) = new_tab {
+            if let ReviewFrame::Queue(q) = self.review.stack.top_mut() {
+                q.tab = t;
+            }
+        }
+        if let Some(iid) = approve {
+            self.review_act(&iid, "live", "");
+        }
+        if let Some((iid, reject)) = open_detail {
+            self.review.stack.push(ReviewFrame::Detail(ReviewDetailState {
+                item_id: iid,
+                reject_open: reject,
+                reject_text: String::new(),
+                deck: None,
+                deck_loaded: false,
+            }));
+        }
+    }
+
+    fn review_detail_body(&mut self, ui: &mut egui::Ui) {
+        let item_id = match self.review.stack.top() {
+            ReviewFrame::Detail(d) => d.item_id.clone(),
+            _ => return,
+        };
+        if self.find_showroom_item(&item_id).is_none() && !self.review.records_loaded {
+            self.review_records_load();
+        }
+        // Load the source deck once per detail frame.
+        let need_deck = match self.review.stack.top() {
+            ReviewFrame::Detail(d) => !d.deck_loaded,
+            _ => false,
+        };
+        if need_deck {
+            let src = self
+                .find_showroom_item(&item_id)
+                .map(|it| s(&it, "source_index_id"))
+                .unwrap_or_default();
+            let deck = if src.is_empty() {
+                None
+            } else {
+                self.call("GET", &format!("/v1/indexes/{src}"), None).ok()
+            };
+            if let ReviewFrame::Detail(d) = self.review.stack.top_mut() {
+                d.deck = deck;
+                d.deck_loaded = true;
+            }
+        }
+        let item = self.find_showroom_item(&item_id);
+        let (deck, reject_open) = match self.review.stack.top() {
+            ReviewFrame::Detail(d) => (d.deck.clone(), d.reject_open),
+            _ => (None, false),
+        };
+        let mut go_back = false;
+        let mut approve = false;
+        let mut open_reject = false;
+        let mut cancel_reject = false;
+        let mut confirm_reject = false;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            let title = item
+                .as_ref()
+                .map(|it| s(it, "title"))
+                .unwrap_or_else(|| item_id.clone());
+            if let Some(d) = crumb_bar(ui, &[tr("审批队列"), &title]) {
+                if d == 0 {
+                    go_back = true;
+                }
+            }
+            ui.add_space(10.0);
+            let Some(it) = &item else {
+                ui.label(
+                    egui::RichText::new(tr("这条提交已不在队列中（可能已被处理或删除）。"))
+                        .size(12.5)
+                        .color(TEXT_WEAK),
+                );
+                return;
+            };
+            let state = s(it, "state");
+            card_frame().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(s(it, "title")).size(14.0).color(TEXT_MAIN),
+                    );
+                    match state.as_str() {
+                        "pending" => badge(ui, tr("待审"), BadgeTone::Warn),
+                        "live" => badge(ui, tr("已通过"), BadgeTone::Ok),
+                        "rejected" => badge(ui, tr("已驳回"), BadgeTone::Bad),
+                        _ => {}
+                    }
+                });
+                let intro = s(it, "intro");
+                if !intro.is_empty() {
+                    ui.label(egui::RichText::new(intro).size(12.0).color(TEXT_WEAK));
+                }
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} {} · {}",
+                        tr("提交人"),
+                        s(it, "submitted_by"),
+                        fmt_time(i(it, "created_ms"))
+                    ))
+                    .size(11.0)
+                    .color(TEXT_FAINT),
+                );
+                if state != "pending" && i(it, "reviewed_ms") > 0 {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} {} · {}",
+                            tr("审批人"),
+                            s(it, "reviewed_by"),
+                            fmt_time(i(it, "reviewed_ms"))
+                        ))
+                        .size(11.0)
+                        .color(TEXT_FAINT),
+                    );
+                    let note = s(it, "review_note");
+                    if !note.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!("{}：{}", tr("理由"), note))
+                                .size(11.5)
+                                .color(TEXT_WEAK),
+                        );
+                    }
+                }
+            });
+            ui.add_space(12.0);
+            // Source pages, resolved exactly like the deck view.
+            if let Some(deck) = &deck {
+                let resolved = deck
+                    .get("resolved_entries")
+                    .and_then(|r| r.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let mut pages: Vec<(String, usize, usize)> = Vec::new();
+                for re in &resolved {
+                    let ver = re.get("resolved").cloned().unwrap_or(Value::Null);
+                    if !ver.is_object() {
+                        continue;
+                    }
+                    let vid = s(&ver, "id");
+                    let total = i(&ver, "page_count");
+                    for p in 0..total {
+                        pages.push((vid.clone(), p as usize, pages.len() + 1));
+                    }
+                }
+                ui.horizontal_wrapped(|ui| {
+                    for (vid, p, n) in &pages {
+                        ui.vertical(|ui| {
+                            self.thumb_ui(ui, vid, *p, 216.0);
+                            ui.label(
+                                egui::RichText::new(format!("{} {n} {}", tr("第"), tr("页")))
+                                    .size(11.0)
+                                    .color(TEXT_FAINT),
+                            );
+                        });
+                    }
+                });
+            } else {
+                ui.label(
+                    egui::RichText::new(tr("来源索引暂不可用，无法预览页面。"))
+                        .size(12.0)
+                        .color(TEXT_WEAK),
+                );
+            }
+            ui.add_space(14.0);
+            if state == "pending" {
+                ui.horizontal(|ui| {
+                    if btn_primary(ui, tr("通过")).clicked() {
+                        approve = true;
+                    }
+                    if !reject_open && btn_danger(ui, tr("驳回…")).clicked() {
+                        open_reject = true;
+                    }
+                });
+                if reject_open {
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(tr("驳回理由（必填，将随结果一并记录）"))
+                            .size(12.0)
+                            .color(TEXT_MAIN),
+                    );
+                    if let ReviewFrame::Detail(d) = self.review.stack.top_mut() {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut d.reject_text)
+                                .desired_width(420.0)
+                                .desired_rows(3),
+                        );
+                    }
+                    ui.horizontal(|ui| {
+                        let empty = match self.review.stack.top() {
+                            ReviewFrame::Detail(d) => d.reject_text.trim().is_empty(),
+                            _ => true,
+                        };
+                        if ui
+                            .add_enabled(!empty, egui::Button::new(tr("确认驳回")))
+                            .clicked()
+                        {
+                            confirm_reject = true;
+                        }
+                        if btn_ghost(ui, tr("取消")).clicked() {
+                            cancel_reject = true;
+                        }
+                    });
+                }
+            }
+            ui.add_space(14.0);
+        });
+        if open_reject {
+            if let ReviewFrame::Detail(d) = self.review.stack.top_mut() {
+                d.reject_open = true;
+            }
+        }
+        if cancel_reject {
+            if let ReviewFrame::Detail(d) = self.review.stack.top_mut() {
+                d.reject_open = false;
+            }
+        }
+        if approve && self.review_act(&item_id, "live", "") {
+            self.review.stack.pop();
+        }
+        if confirm_reject {
+            let note = match self.review.stack.top() {
+                ReviewFrame::Detail(d) => d.reject_text.trim().to_string(),
+                _ => String::new(),
+            };
+            if !note.is_empty() && self.review_act(&item_id, "rejected", &note) {
+                self.review.stack.pop();
+            }
+        }
+        if go_back {
+            self.review.stack.pop();
+        }
     }
 
     fn showroom_body(&mut self, ui: &mut egui::Ui) {
@@ -5507,7 +7085,21 @@ impl App {
                             ui.add_space(6.0);
                             ui.horizontal(|ui| {
                                 if text_action(ui, "开始演示", ACCENT, 13.0) {
-                                    self.present_showroom(&s(&item, "id"), &s(&item, "title"));
+                                    self.open_showroom_deck(&item);
+                                    self.start_present_from_deck(ui);
+                                }
+                                let my_name = self
+                                    .user
+                                    .as_ref()
+                                    .map(|u| s(u, "display_name"))
+                                    .unwrap_or_default();
+                                if self.role() == "super"
+                                    || (!my_name.is_empty()
+                                        && my_name == s(&item, "submitted_by"))
+                                {
+                                    if text_action(ui, "删除", BADGE_BAD_FG, 13.0) {
+                                        self.trash_add("showroom", &s(&item, "id"));
+                                    }
                                 }
                             let src = s(&item, "source_index_id");
                             if !src.is_empty() {
@@ -5917,6 +7509,14 @@ impl App {
                 i(&unit, "current_revision"),
                 s(&unit, "maintainer")
             ));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if btn_danger(ui, "删除内容块").clicked() {
+                    let uid = s(&unit, "id");
+                    self.trash_add("unit", &uid);
+                    self.content.detail = None;
+                    self.content.selected_unit = None;
+                }
+            });
         });
         ui.separator();
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -6062,6 +7662,38 @@ impl App {
                                     if let Some(uid) = self.content.selected_unit.clone() {
                                         self.open_unit_detail(&uid);
                                     }
+                                }
+                                if s(v, "status") != "recalled" && ui.button("编辑页面").clicked() {
+                                    // Page-level visual editing (overlay):
+                                    // text runs + speaker notes of this
+                                    // version; saving publishes a new
+                                    // version under the §8 bump rule.
+                                    let mut scripts: Vec<String> = v
+                                        .get("scripts")
+                                        .and_then(|x| x.as_array())
+                                        .map(|arr| {
+                                            arr.iter()
+                                                .map(|t| t.as_str().unwrap_or("").to_string())
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
+                                    let pages = i(v, "page_count") as usize;
+                                    while scripts.len() < pages {
+                                        scripts.push(String::new());
+                                    }
+                                    self.overlays.push(Overlay::PageEdit(PageEditState {
+                                        version_id: s(v, "id"),
+                                        unit_name: s(&unit, "name"),
+                                        semver: s(v, "semver"),
+                                        page_count: pages,
+                                        page: 0,
+                                        base: Default::default(),
+                                        work: Default::default(),
+                                        scripts_base: scripts.clone(),
+                                        scripts,
+                                        bump: 1,
+                                        note: String::new(),
+                                    }));
                                 }
                             });
                         }
@@ -6624,6 +8256,845 @@ impl App {
             return;
         }
         self.folder_delete_confirm = Some((id.to_string(), name.to_string()));
+    }
+
+    /// The overlay stack: modal tasks rendered above the frame
+    /// stacks, in push order. Esc routing lives here — it closes
+    /// the top overlay first (with the page editor's unsaved
+    /// guard) and never touches the frame stacks below.
+    fn overlay_stack_ui(&mut self, ui: &mut egui::Ui, screen: egui::Rect) {
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) && !self.overlays.is_empty() {
+            match self.overlays.last() {
+                Some(Overlay::Confirm(_)) => {
+                    self.overlays.pop();
+                }
+                Some(Overlay::PageEdit(_)) => {
+                    let dirty = match self.overlays.last() {
+                        Some(Overlay::PageEdit(pe)) => pe.dirty(),
+                        _ => false,
+                    };
+                    if dirty {
+                        self.overlays.push(Overlay::Confirm(ConfirmState {
+                            title: "放弃未保存的修改？".into(),
+                            body: "页面编辑尚未保存为新版本，关闭将丢弃这些修改。".into(),
+                            confirm_label: "放弃修改".into(),
+                            danger: true,
+                            action: ConfirmAction::DiscardPageEdit,
+                        }));
+                    } else {
+                        self.overlays.pop();
+                    }
+                }
+                Some(Overlay::Present(_)) => {
+                    self.overlays.pop();
+                    self.end_present(ui);
+                }
+                Some(Overlay::PickTemplate(_)) => {
+                    self.overlays.pop();
+                }
+                None => {}
+            }
+        }
+        // Render bottom-to-top. Each surface takes ownership of its
+        // state and hands it back when it stays open, so surfaces
+        // can freely call back into the app while rendering.
+        let mut idx = 0;
+        while idx < self.overlays.len() {
+            let ov = self.overlays.remove(idx);
+            match self.overlay_ui(ui, screen, ov) {
+                Some(back) => {
+                    self.overlays.insert(idx, back);
+                    idx += 1;
+                }
+                None => {}
+            }
+        }
+    }
+
+    fn overlay_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        screen: egui::Rect,
+        ov: Overlay,
+    ) -> Option<Overlay> {
+        match ov {
+            Overlay::Confirm(c) => self.confirm_ui(ui, c),
+            Overlay::PickTemplate(t) => self.pick_template_ui(ui, t),
+            Overlay::PageEdit(pe) => self.page_edit_ui(ui, screen, pe),
+            Overlay::Present(p) => self.present_ui(ui, screen, p),
+        }
+    }
+
+    fn confirm_ui(&mut self, ui: &mut egui::Ui, c: ConfirmState) -> Option<Overlay> {
+        let mut open = true;
+        let mut confirmed = false;
+        egui::Window::new(&c.title)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ui.ctx(), |ui| {
+                ui.set_width(360.0);
+                ui.label(egui::RichText::new(&c.body).size(12.5).color(TEXT_MAIN));
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let b = if c.danger {
+                            btn_danger(ui, &c.confirm_label)
+                        } else {
+                            btn_primary(ui, &c.confirm_label)
+                        };
+                        if b.clicked() {
+                            confirmed = true;
+                        }
+                        if btn_ghost(ui, tr("取消")).clicked() {
+                            open = false;
+                        }
+                    });
+                });
+            });
+        if !open {
+            return None;
+        }
+        if confirmed {
+            match c.action {
+                ConfirmAction::PurgeTrash(id) => self.trash_purge(&id),
+                ConfirmAction::PurgeTrashMany(ids) => {
+                    let mut ok = 0usize;
+                    for id in &ids {
+                        if self
+                            .call(
+                                "POST",
+                                &format!("/v1/trash/{id}/purge"),
+                                Some(json!({})),
+                            )
+                            .is_ok()
+                        {
+                            ok += 1;
+                        }
+                    }
+                    self.msg = format!("{} {} {}", tr("已彻底删除"), ok, tr("项"));
+                    if let TrashFrame::List(ls) = self.trash.stack.top_mut() {
+                        ls.selected.clear();
+                    }
+                    self.trash.loaded = false;
+                    self.refresh_all();
+                }
+                ConfirmAction::EmptyTrash => {
+                    match self.call("POST", "/v1/trash/purge-all", Some(json!({}))) {
+                        Ok(_) => {
+                            self.msg = "已清空回收站".into();
+                            self.trash.stack = NavStack::new(TrashFrame::List(
+                                TrashListState {
+                                    filter: 0,
+                                    selected: Default::default(),
+                                },
+                            ));
+                            self.trash.loaded = false;
+                            self.refresh_all();
+                        }
+                        Err(e) => self.msg = format!("清空失败：{e}"),
+                    }
+                }
+                ConfirmAction::DiscardPageEdit => {
+                    if let Some(pos) = self
+                        .overlays
+                        .iter()
+                        .rposition(|o| matches!(o, Overlay::PageEdit(_)))
+                    {
+                        self.overlays.remove(pos);
+                    }
+                }
+            }
+            return None;
+        }
+        Some(Overlay::Confirm(c))
+    }
+
+    fn pick_template_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        mut t: PickTemplateState,
+    ) -> Option<Overlay> {
+        let mut open = true;
+        let mut create = false;
+        egui::Window::new(tr("从模板新建"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ui.ctx(), |ui| {
+                ui.set_width(380.0);
+                ui.label(
+                    egui::RichText::new(tr("选择模板（现有索引将作为模板）"))
+                        .size(12.5)
+                        .color(TEXT_MAIN),
+                );
+                ui.add_space(6.0);
+                if self.indexes.is_empty() {
+                    ui.label(
+                        egui::RichText::new(tr("暂无可用模板：先创建一个索引，之后就能以它为模板新建。"))
+                            .size(12.0)
+                            .color(TEXT_WEAK),
+                    );
+                } else {
+                    egui::ScrollArea::vertical()
+                        .max_height(180.0)
+                        .show(ui, |ui| {
+                            for idx in self.indexes.clone() {
+                                ui.radio_value(
+                                    &mut t.template_id,
+                                    s(&idx, "id"),
+                                    s(&idx, "name"),
+                                );
+                            }
+                        });
+                }
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new(tr("新索引名称")).size(12.5).color(TEXT_MAIN));
+                ui.add(
+                    egui::TextEdit::singleline(&mut t.new_name)
+                        .desired_width(360.0)
+                        .margin(egui::vec2(10.0, 6.0)),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let ready = !t.new_name.trim().is_empty()
+                            && !t.template_id.is_empty();
+                        if ui
+                            .add_enabled(ready, egui::Button::new(tr("创建")))
+                            .clicked()
+                        {
+                            create = true;
+                        }
+                        if btn_ghost(ui, tr("取消")).clicked() {
+                            open = false;
+                        }
+                    });
+                });
+            });
+        if !open {
+            return None;
+        }
+        if create {
+            let group_id = self
+                .indexes
+                .iter()
+                .find(|x| s(x, "id") == t.template_id)
+                .map(|x| s(x, "group_id"))
+                .unwrap_or_default();
+            // The template's resolved entries: the create call takes
+            // the minimal shape; a follow-up commit restores the
+            // locked policies and page excerpts verbatim.
+            let mut entries_min: Vec<Value> = Vec::new();
+            let mut entries_raw: Vec<Value> = Vec::new();
+            if let Ok(detail) =
+                self.call("GET", &format!("/v1/indexes/{}", t.template_id), None)
+            {
+                if let Some(res) = detail
+                    .get("resolved_entries")
+                    .and_then(|r| r.as_array())
+                {
+                    for re in res {
+                        if let Some(e) = re.get("entry") {
+                            entries_raw.push(e.clone());
+                            entries_min.push(json!({
+                                "unit_id": s(e, "unit_id"),
+                                "rendition_id": s(e, "rendition_id"),
+                            }));
+                        }
+                    }
+                }
+            }
+            let r = self.call(
+                "POST",
+                "/v1/indexes",
+                Some(json!({
+                    "name": t.new_name.trim(),
+                    "group_id": group_id,
+                    "scope": "company",
+                    "entries": entries_min,
+                })),
+            );
+            match r {
+                Ok(v) => {
+                    let new_id = s(&v, "id");
+                    if !entries_raw.is_empty() {
+                        let _ = self.call(
+                            "POST",
+                            &format!("/v1/indexes/{new_id}/commits"),
+                            Some(json!({
+                                "branch": "main",
+                                "message": "从模板创建",
+                                "entries": entries_raw,
+                            })),
+                        );
+                    }
+                    self.msg = "已从模板创建".into();
+                    self.page = Page::Index;
+                    self.refresh_all();
+                    if !new_id.is_empty() {
+                        self.open_index_detail(&new_id);
+                    }
+                    return None;
+                }
+                Err(e) => {
+                    self.msg = format!("创建失败：{e}");
+                }
+            }
+        }
+        Some(Overlay::PickTemplate(t))
+    }
+
+    /// Built-in presenter (prototype A28): full-screen stage on
+    /// the overlay stack. Pages render through the existing server
+    /// thumbnail pipeline (DeckCraft CLI server-side, LibreOffice
+    /// fallback) — the same textures as the deck grid; local
+    /// DeckCraft rendering is route phase 2. Cached offline decks
+    /// keep the external open (no thumbs without a server).
+    fn start_present_from_deck(&mut self, ui: &egui::Ui) {
+        let Some(detail) = self.sr_detail.clone() else {
+            return;
+        };
+        let Some(deck) = self.sr_deck.clone() else {
+            self.msg = "演示内容尚未加载".into();
+            return;
+        };
+        let resolved = deck
+            .get("resolved_entries")
+            .and_then(|r| r.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut pages: Vec<(String, usize)> = Vec::new();
+        let mut scripts: Vec<String> = Vec::new();
+        for re in &resolved {
+            let ver = re.get("resolved").cloned().unwrap_or(Value::Null);
+            if !ver.is_object() {
+                continue;
+            }
+            let vid = s(&ver, "id");
+            let ver_scripts: Vec<String> = ver
+                .get("scripts")
+                .and_then(|x| x.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .map(|t| t.as_str().unwrap_or("").to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let total = i(&ver, "page_count").max(0) as usize;
+            for p in 0..total {
+                pages.push((vid.clone(), p));
+                scripts.push(ver_scripts.get(p).cloned().unwrap_or_default());
+            }
+        }
+        if pages.is_empty() {
+            self.msg = "没有可放映的页面".into();
+            return;
+        }
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+        self.overlays.push(Overlay::Present(PresentState {
+            title: s(&detail, "title"),
+            pages,
+            scripts,
+            cur: 0,
+            speaker: false,
+            blackout: false,
+            started: std::time::Instant::now(),
+        }));
+    }
+
+    fn end_present(&mut self, ui: &egui::Ui) {
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+    }
+
+    fn present_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        screen: egui::Rect,
+        mut p: PresentState,
+    ) -> Option<Overlay> {
+        if p.pages.is_empty() {
+            self.end_present(ui);
+            return None;
+        }
+        // Navigation input: → / ↓ / Space / Enter advance, ← / ↑
+        // go back, wheel too; B toggles the blackout.
+        let (fwd, back, black) = ui.input(|i| {
+            (
+                i.key_pressed(egui::Key::ArrowRight)
+                    || i.key_pressed(egui::Key::ArrowDown)
+                    || i.key_pressed(egui::Key::Space)
+                    || i.key_pressed(egui::Key::Enter),
+                i.key_pressed(egui::Key::ArrowLeft) || i.key_pressed(egui::Key::ArrowUp),
+                i.key_pressed(egui::Key::B),
+            )
+        });
+        let wheel = ui.input(|i| i.smooth_scroll_delta.y);
+        if fwd || wheel < -10.0 {
+            p.cur = (p.cur + 1).min(p.pages.len() - 1);
+        }
+        if back || wheel > 10.0 {
+            p.cur = p.cur.saturating_sub(1);
+        }
+        if black {
+            p.blackout = !p.blackout;
+        }
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(500));
+
+        let mut exit = false;
+        let mut toggle_speaker = false;
+        let mut toggle_black = false;
+        egui::Area::new(egui::Id::new("presenter"))
+            .fixed_pos(screen.min)
+            .order(egui::Order::Foreground)
+            .show(ui.ctx(), |ui| {
+                let (rect, resp) =
+                    ui.allocate_exact_size(screen.size(), egui::Sense::click());
+                let painter = ui.painter();
+                // A28 stage black (prototype value, an intentional
+                // exception to the app token set).
+                let stage_bg = egui::Color32::from_rgb(0x0B, 0x0D, 0x0C);
+                painter.rect_filled(rect, 0.0, stage_bg);
+                let top_h = if p.speaker { 40.0 } else { 0.0 };
+                let rail_w = if p.speaker { 300.0 } else { 0.0 };
+                let stage = egui::Rect::from_min_max(
+                    egui::pos2(rect.min.x, rect.min.y + top_h),
+                    egui::pos2(rect.max.x - rail_w, rect.max.y),
+                );
+                if !p.blackout {
+                    let (vid, page) = &p.pages[p.cur];
+                    if let Some(tex) = self.thumb(vid, *page) {
+                        let ts = tex.size_vec2();
+                        if ts.x > 0.0 && ts.y > 0.0 {
+                            let scale =
+                                (stage.width() / ts.x).min(stage.height() / ts.y);
+                            let r = egui::Rect::from_center_size(
+                                stage.center(),
+                                ts * scale,
+                            );
+                            painter.image(
+                                tex.id(),
+                                r,
+                                egui::Rect::from_min_max(
+                                    egui::pos2(0.0, 0.0),
+                                    egui::pos2(1.0, 1.0),
+                                ),
+                                egui::Color32::WHITE,
+                            );
+                        }
+                    }
+                }
+                // Progress: a thin accent line along the bottom.
+                let frac = (p.cur + 1) as f32 / p.pages.len() as f32;
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(rect.min.x, rect.max.y - 3.0),
+                        egui::pos2(rect.min.x + rect.width() * frac, rect.max.y),
+                    ),
+                    0.0,
+                    ACCENT,
+                );
+                if p.speaker {
+                    // Speaker top bar: title / timer / position.
+                    let secs = p.started.elapsed().as_secs();
+                    let bar_text = format!(
+                        "{}    {:02}:{:02}    {} / {}",
+                        p.title,
+                        secs / 60,
+                        secs % 60,
+                        p.cur + 1,
+                        p.pages.len()
+                    );
+                    let font = egui::FontId::new(13.0, egui::FontFamily::Proportional);
+                    let g = painter.layout_no_wrap(
+                        bar_text,
+                        font,
+                        egui::Color32::from_gray(220),
+                    );
+                    painter.galley(
+                        egui::pos2(rect.min.x + 16.0, rect.min.y + 12.0),
+                        g,
+                        egui::Color32::from_gray(220),
+                    );
+                    // Right rail: next page preview + this page's
+                    // speaker notes.
+                    let rail = egui::Rect::from_min_max(
+                        egui::pos2(rect.max.x - rail_w, rect.min.y + top_h),
+                        rect.max,
+                    );
+                    painter.rect_filled(
+                        rail,
+                        0.0,
+                        egui::Color32::from_rgb(0x14, 0x17, 0x15),
+                    );
+                    let mut y = rail.min.y + 14.0;
+                    let small = egui::FontId::new(11.5, egui::FontFamily::Proportional);
+                    let gray = egui::Color32::from_gray(160);
+                    let g = painter.layout_no_wrap(tr("下一页").to_string(), small.clone(), gray);
+                    painter.galley(egui::pos2(rail.min.x + 14.0, y), g, gray);
+                    y += 22.0;
+                    if p.cur + 1 < p.pages.len() {
+                        let (nvid, npage) = &p.pages[p.cur + 1];
+                        if let Some(tex) = self.thumb(nvid, *np) {
+                            let w = rail.width() - 28.0;
+                            let h = w * tex.size_vec2().y / tex.size_vec2().x.max(1.0);
+                            let r = egui::Rect::from_min_size(
+                                egui::pos2(rail.min.x + 14.0, y),
+                                egui::vec2(w, h),
+                            );
+                            painter.image(
+                                tex.id(),
+                                r,
+                                egui::Rect::from_min_max(
+                                    egui::pos2(0.0, 0.0),
+                                    egui::pos2(1.0, 1.0),
+                                ),
+                                egui::Color32::WHITE,
+                            );
+                            y += h + 14.0;
+                        }
+                    } else {
+                        let g = painter.layout_no_wrap(
+                            tr("（最后一页）").to_string(),
+                            small.clone(),
+                            gray,
+                        );
+                        painter.galley(egui::pos2(rail.min.x + 14.0, y), g, gray);
+                        y += 22.0;
+                    }
+                    let g = painter.layout_no_wrap(tr("讲稿").to_string(), small.clone(), gray);
+                    painter.galley(egui::pos2(rail.min.x + 14.0, y), g, gray);
+                    y += 22.0;
+                    let script = p
+                        .scripts
+                        .get(p.cur)
+                        .cloned()
+                        .unwrap_or_default();
+                    let body_font =
+                        egui::FontId::new(12.5, egui::FontFamily::Proportional);
+                    let g = painter.layout(
+                        if script.is_empty() {
+                            tr("（本页无讲稿）").to_string()
+                        } else {
+                            script
+                        },
+                        body_font,
+                        egui::Color32::from_gray(225),
+                        rail.width() - 28.0,
+                    );
+                    painter.galley(egui::pos2(rail.min.x + 14.0, y), g, egui::Color32::from_gray(225));
+                }
+                if resp.clicked() && !p.speaker {
+                    p.cur = (p.cur + 1).min(p.pages.len() - 1);
+                }
+                resp.context_menu(|ui| {
+                    if ui.button(tr("黑屏")).clicked() {
+                        toggle_black = true;
+                        ui.close_menu();
+                    }
+                    if ui.button(tr("演讲者视图")).clicked() {
+                        toggle_speaker = true;
+                        ui.close_menu();
+                    }
+                    if ui.button(tr("结束放映")).clicked() {
+                        exit = true;
+                        ui.close_menu();
+                    }
+                });
+            });
+        if toggle_black {
+            p.blackout = !p.blackout;
+        }
+        if toggle_speaker {
+            p.speaker = !p.speaker;
+        }
+        if exit {
+            self.end_present(ui);
+            return None;
+        }
+        Some(Overlay::Present(p))
+    }
+
+    /// Page-level visual editor (prototype A29 shell): page rail,
+    /// large preview, per-run text editing and the speaker notes
+    /// of the page. Saving publishes a NEW version under the §8
+    /// bump rule (the bump choice + note ride along) — the edited
+    /// version itself is never mutated.
+    fn page_edit_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        screen: egui::Rect,
+        mut pe: PageEditState,
+    ) -> Option<Overlay> {
+        // Load the current page's text runs once.
+        if !pe.work.contains_key(&pe.page) {
+            let vid = pe.version_id.clone();
+            let page = pe.page;
+            match self.call(
+                "GET",
+                &format!("/v1/versions/{vid}/page-text?page={page}"),
+                None,
+            ) {
+                Ok(v) => {
+                    let runs: Vec<String> = v
+                        .get("runs")
+                        .and_then(|x| x.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .map(|t| t.as_str().unwrap_or("").to_string())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    pe.base.insert(page, runs.clone());
+                    pe.work.insert(page, runs);
+                }
+                Err(e) => {
+                    self.msg = format!("读取页面文本失败：{e}");
+                    pe.base.insert(page, Vec::new());
+                    pe.work.insert(page, Vec::new());
+                }
+            }
+        }
+        while pe.scripts.len() < pe.page_count {
+            pe.scripts.push(String::new());
+            pe.scripts_base.push(String::new());
+        }
+        let mut close = false;
+        let mut save = false;
+        egui::Area::new(egui::Id::new("page_edit"))
+            .fixed_pos(screen.min)
+            .order(egui::Order::Foreground)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::NONE.fill(PANEL_BG).show(ui, |ui| {
+                    ui.set_min_size(screen.size());
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(14.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} · v{} · {}",
+                                pe.unit_name,
+                                pe.semver,
+                                tr("页面编辑")
+                            ))
+                            .size(14.0)
+                            .color(TEXT_MAIN),
+                        );
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.add_space(14.0);
+                                if text_action(ui, "✕ 关闭", TEXT_MAIN, 13.0) {
+                                    close = true;
+                                }
+                            },
+                        );
+                    });
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.horizontal_top(|ui| {
+                        // Page rail.
+                        egui::ScrollArea::vertical()
+                            .max_width(124.0)
+                            .show(ui, |ui| {
+                                for pno in 0..pe.page_count {
+                                    if self.thumb_button(
+                                        ui,
+                                        &pe.version_id.clone(),
+                                        pno,
+                                        104.0,
+                                        pno == pe.page,
+                                    ) {
+                                        pe.page = pno;
+                                    }
+                                }
+                            });
+                        ui.separator();
+                        // Stage + run editors.
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            self.thumb_ui(ui, &pe.version_id.clone(), pe.page, 620.0);
+                            ui.add_space(10.0);
+                            ui.label(
+                                egui::RichText::new(tr("文本内容（逐段编辑，保存后生成新版本）"))
+                                    .size(12.5)
+                                    .color(TEXT_MAIN),
+                            );
+                            ui.add_space(6.0);
+                            let has_runs = pe
+                                .work
+                                .get(&pe.page)
+                                .map(|r| !r.is_empty())
+                                .unwrap_or(false);
+                            if !has_runs {
+                                ui.label(
+                                    egui::RichText::new(tr("本页没有可编辑的文本段。"))
+                                        .size(12.0)
+                                        .color(TEXT_WEAK),
+                                );
+                            }
+                            if let Some(runs) = pe.work.get_mut(&pe.page) {
+                                for (ri, run) in runs.iter_mut().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{} {}",
+                                                tr("文本"),
+                                                ri + 1
+                                            ))
+                                            .size(11.5)
+                                            .color(TEXT_FAINT),
+                                        );
+                                        ui.add(
+                                            egui::TextEdit::singleline(run)
+                                                .desired_width(520.0)
+                                                .margin(egui::vec2(8.0, 5.0)),
+                                        );
+                                    });
+                                }
+                            }
+                            ui.add_space(12.0);
+                        });
+                        ui.separator();
+                        // Page side panel: position + speaker notes.
+                        ui.vertical(|ui| {
+                            ui.set_width(210.0);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} {} / {} {}",
+                                    tr("第"),
+                                    pe.page + 1,
+                                    pe.page_count,
+                                    tr("页")
+                                ))
+                                .size(12.0)
+                                .color(TEXT_WEAK),
+                            );
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new(tr("讲稿"))
+                                    .size(12.5)
+                                    .color(TEXT_MAIN),
+                            );
+                            if pe.page < pe.scripts.len() {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut pe.scripts[pe.page])
+                                        .desired_width(196.0)
+                                        .desired_rows(10),
+                                );
+                            }
+                        });
+                    });
+                    ui.separator();
+                    // Footer (B5): bump choice per the §8 rule, the
+                    // publish note, cancel / save-as-new-version.
+                    ui.horizontal(|ui| {
+                        ui.add_space(14.0);
+                        if let Some(b) = segmented(
+                            ui,
+                            &[tr("大版本"), tr("小版本"), tr("修订号")],
+                            pe.bump,
+                            SegStyle::Soft,
+                        ) {
+                            pe.bump = b;
+                        }
+                        ui.add(
+                            egui::TextEdit::singleline(&mut pe.note)
+                                .hint_text(tr("发布说明"))
+                                .desired_width(220.0)
+                                .margin(egui::vec2(8.0, 5.0)),
+                        );
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.add_space(14.0);
+                                let can_save = !pe.edits().is_empty()
+                                    || pe.scripts != pe.scripts_base;
+                                if ui
+                                    .add_enabled(
+                                        can_save,
+                                        egui::Button::new(tr("保存并发布新版本")),
+                                    )
+                                    .clicked()
+                                {
+                                    save = true;
+                                }
+                                if btn_ghost(ui, tr("取消")).clicked() {
+                                    close = true;
+                                }
+                            },
+                        );
+                    });
+                    ui.add_space(10.0);
+                });
+            });
+        if close {
+            if pe.dirty() {
+                self.overlays.push(Overlay::Confirm(ConfirmState {
+                    title: "放弃未保存的修改？".into(),
+                    body: "页面编辑尚未保存为新版本，关闭将丢弃这些修改。".into(),
+                    confirm_label: "放弃修改".into(),
+                    danger: true,
+                    action: ConfirmAction::DiscardPageEdit,
+                }));
+                return Some(Overlay::PageEdit(pe));
+            }
+            return None;
+        }
+        if save {
+            let edits = pe.edits();
+            let mut target_vid = pe.version_id.clone();
+            let mut new_semver = String::new();
+            if !edits.is_empty() {
+                let payload = json!({
+                    "edits": edits.iter().map(|(p, r, t)| json!({
+                        "page": p, "run": r, "text": t,
+                    })).collect::<Vec<_>>(),
+                    "bump": ["major", "minor", "patch"][pe.bump],
+                    "note": pe.note,
+                });
+                match self.call(
+                    "POST",
+                    &format!("/v1/versions/{}/edit-pages", pe.version_id),
+                    Some(payload),
+                ) {
+                    Ok(v) => {
+                        let ver = v.get("version").cloned().unwrap_or(json!({}));
+                        target_vid = s(&ver, "id");
+                        new_semver = s(&ver, "semver");
+                    }
+                    Err(e) => {
+                        self.msg = format!("保存失败：{e}");
+                        return Some(Overlay::PageEdit(pe));
+                    }
+                }
+            }
+            if pe.scripts != pe.scripts_base {
+                if let Err(e) = self.call(
+                    "PUT",
+                    &format!("/v1/versions/{target_vid}/scripts"),
+                    Some(json!({ "scripts": pe.scripts })),
+                ) {
+                    self.msg = format!("讲稿保存失败：{e}");
+                    return Some(Overlay::PageEdit(pe));
+                }
+            }
+            self.msg = if new_semver.is_empty() {
+                "已保存".into()
+            } else {
+                format!("已保存为新版本 v{new_semver}")
+            };
+            if let Some(uid) = self.content.selected_unit.clone() {
+                self.open_unit_detail(&uid);
+            }
+            self.refresh_all();
+            return None;
+        }
+        Some(Overlay::PageEdit(pe))
     }
 
     fn folder_delete_window(&mut self, ui: &mut egui::Ui) {
@@ -7276,6 +9747,13 @@ impl App {
             }
             if text_action(ui, "导出（公用版）", TEXT_MAIN, 13.0) {
                 self.export_index_file(&index, "company");
+            }
+            ui.add_space(24.0);
+            if text_action(ui, "删除索引", BADGE_BAD_FG, 13.0) {
+                let iid = s(&index, "id");
+                self.trash_add("index", &iid);
+                self.index.detail = None;
+                self.index.selected = None;
             }
             ui.add_space(24.0);
             ui.add(
@@ -8182,6 +10660,9 @@ impl App {
                         }
                         "离线缓存" => {
                             self.cache_path_ui(ui);
+                        }
+                        "审批队列" => {
+                            self.review_queue_body(ui);
                         }
                         "个人资料" => {
                             // Board: label column + 380×34 fields on a 54
