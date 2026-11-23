@@ -9,8 +9,14 @@ produced PDF's own bytes:
 
   1. the export succeeds and yields a %PDF with the expected pages;
   2. page 1 carries REAL text: extractable text containing the deck's
-     known slide-1 string, and text-showing operators (Tj/TJ) in the
-     page content stream — i.e. text is selectable, not only pixels;
+     known slide-1 string, and text-showing operators (Tj/TJ/…)
+     among the page content stream's parsed operators — i.e. text is
+     selectable, not only pixels. NOTE: the operators must be looked
+     up token-wise, never as space-prefixed byte substrings: krilla /
+     pdf-writer serialise compactly (pretty=false), so a hex string
+     or array operand is followed IMMEDIATELY by its operator with
+     no whitespace (`<…>Tj`, `[…]TJ`) — legal PDF, since `>` / `]`
+     are delimiter characters, but invisible to a `b" Tj"` search;
   3. the handout and notes forms export successfully too.
 
 It also CHARACTERISES the form honestly (printed, and the notes form
@@ -27,6 +33,7 @@ Exit: 0 = gate pass, 1 = gate fail, 2 = environment problem.
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -86,6 +93,28 @@ def content_stream(reader, idx):
         return b""
 
 
+TEXT_SHOWING_OPS = {b"Tj", b"TJ", b"'", b'"'}
+
+
+def text_operators(reader, idx):
+    """Text-showing operators actually used on a page, token-wise.
+
+    Primary evidence: pypdf's own parse of the (decoded) content
+    stream — its tokenizer understands delimiter-adjacent operators
+    (`<…>Tj`, `[…]TJ`), which a byte-substring search cannot see.
+    Fallback (older/newer pypdf quirks): a delimiter-aware scan of
+    the decoded stream for the Tj/TJ tokens.
+    """
+    try:
+        ops = {op for _operands, op in reader.pages[idx].get_contents().operations}
+        return ops & TEXT_SHOWING_OPS, "parsed operations"
+    except Exception as e:  # noqa: BLE001
+        print(f"  (operations parse page {idx} raised: {e}; falling back to token scan)")
+    stream = content_stream(reader, idx)
+    found = {m.group(0) for m in re.finditer(rb"(?<![A-Za-z0-9])(Tj|TJ)(?![A-Za-z0-9])", stream)}
+    return found, "token scan of decoded stream"
+
+
 def image_xobjects(reader, idx):
     try:
         res = reader.pages[idx]["/Resources"]
@@ -115,10 +144,25 @@ def main():
     if SLIDE1_ASCII not in text1:
         failures.append("slide-1 text NOT extractable (no selectable text layer?)")
     stream = content_stream(r1, 0)
-    has_ops = (b" Tj" in stream) or (b" TJ" in stream) or stream.rstrip().endswith(b"Tj")
-    print(f"slides[0]: content stream {len(stream)} B; text-showing ops (Tj/TJ): {has_ops}")
+    ops, ops_how = text_operators(r1, 0)
+    has_ops = bool(ops)
+    print(f"slides[0]: content stream {len(stream)} B (decoded); text-showing ops "
+          f"via {ops_how}: {sorted(o.decode() for o in ops) if ops else 'NONE'}")
     if not has_ops:
-        failures.append("no Tj/TJ operators in page content stream")
+        failures.append("no text-showing operators (Tj/TJ) in page content stream")
+    if SLIDE1_CJK not in text1:
+        # Informational, NOT a gate failure — but name it for what the
+        # evidence shows: the CJK glyphs are drawn in the text layer
+        # yet extract as placeholders, i.e. their ToUnicode mapping is
+        # missing on the EXPORT side (krilla writes a ToUnicode entry
+        # only for glyphs with a non-empty text range). ASCII text on
+        # the same page extracts verbatim through the same pipeline,
+        # so this is not an extractor limitation. Tracked as an
+        # export-side defect; see the qimu-pdf-verify-fix report.
+        print("slides[0]: KNOWN DEFECT (export side, informational): CJK title "
+              "glyphs are in the text layer but NOT extractable — ToUnicode "
+              "mapping missing for the CJK runs; copied CJK text will be "
+              "garbage/empty in readers")
     imgs = image_xobjects(r1, 0)
     print(f"slides[0]: image XObjects on page: {imgs}")
 
@@ -140,6 +184,17 @@ def main():
         failures.append("notes export produced no pages")
     if SLIDE1_ASCII not in all_notes_text:
         failures.append("notes form lost the slide text")
+    if NOTES_CJK not in all_notes_text:
+        # Informational, NOT a gate failure — and worse than the slide
+        # case: the notes body is typeset with the UI font (Inter,
+        # deckcraft_fonts::DEFAULT_FAMILY), which has NO CJK glyphs
+        # and no fallback shaping on that path, so CJK notes are set
+        # in .notdef — they neither extract nor visibly render.
+        # Export-side defect; see the qimu-pdf-verify-fix report.
+        print("notes: KNOWN DEFECT (export side, informational): CJK speaker "
+              "notes not extractable — notes body is set in the Inter UI "
+              "font (no CJK glyphs, no fallback), so CJK notes render as "
+              ".notdef and carry no ToUnicode mapping")
 
     # --- honest form verdict ---
     if imgs and imgs > 0:
