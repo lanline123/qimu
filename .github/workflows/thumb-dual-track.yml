@@ -1,0 +1,91 @@
+# 启幕缩略图双轨判定 —— DeckCraft 原生渲染 vs LibreOffice（路线阶段 2 · 决策③）
+#
+# 手动触发 (workflow_dispatch)。本工作流是 LibreOffice 退役的验收门:
+#   1. checkout 带子模块 (vendor/deckcraft -> lanline123/deckcraft);
+#   2. 工具链钉 Rust 1.95, 原生构建 deckcraft-cli (vendor 子模块);
+#   3. 装 LibreOffice (impress) + poppler-utils + ffmpeg 与字体
+#      (Noto CJK + Carlito —— Carlito 与 Calibri 度量兼容, 压低字体
+#      替代噪声; 稿内 CJK 字体名的回退两侧同环境, 测的是渲染器差异);
+#   4. 生成样本: Case2 (tools/make_case2.py) + 结构样本 5 稿
+#      (tools/make_thumb_samples.py)。真实业务稿按仓规 (*.pptx 不入仓)
+#      不在样本内 —— 判定范围以合成结构样本为限, verdict.md 会明示;
+#   5. 双轨渲染比对: tools/pilot_deckcraft_render.py —— 与服务端
+#      render_thumbs_lo 逐参数一致的 LO 路径 (soffice -> pdf ->
+#      pdftoppm -r 55) 对 deckcraft-cli render --all, 逐页像素差;
+#   6. 判定: tools/thumb_verdict.py —— 不达标即判红; verdict 与全部
+#      渲染图作为 artifact 留档 (if: always)。
+#
+# 注意 (落仓须知): 本文件受 GitHub App 权限限制, 无法经 Muse 的
+# GitHub App 推送, 需经 PAT Contents API 或 GitHub 网页端落仓后生效。
+
+name: thumb-dual-track
+
+on:
+  workflow_dispatch:
+
+jobs:
+  dual-track:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Verify submodule checkout
+        run: |
+          test -f vendor/deckcraft/apps/deckcraft-cli/Cargo.toml
+          git submodule status
+
+      - name: Install Rust 1.95
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95"
+
+      - name: Build deckcraft-cli (native)
+        working-directory: vendor/deckcraft
+        run: |
+          cargo build --release -p deckcraft-cli
+          test -x target/release/deckcraft-cli
+
+      - name: Install LibreOffice + poppler + fonts
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libreoffice-impress poppler-utils ffmpeg fonts-noto-cjk fonts-crosextra-carlito
+          which soffice pdftoppm ffmpeg
+
+      - name: Install Python deps
+        run: python3 -m pip install --quiet python-pptx Pillow
+
+      - name: Generate sample decks
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/thumb-samples"
+          QIMU_CASE2_OUT="$GITHUB_WORKSPACE/thumb-samples/Case2_Charts_Animation.pptx" \
+            python3 tools/make_case2.py
+          QIMU_THUMB_SAMPLES_OUT="$GITHUB_WORKSPACE/thumb-samples" \
+            python3 tools/make_thumb_samples.py
+          ls -la "$GITHUB_WORKSPACE/thumb-samples"
+
+      - name: Dual-track render + pixel metrics
+        run: |
+          python3 tools/pilot_deckcraft_render.py \
+            "$GITHUB_WORKSPACE/vendor/deckcraft/target/release/deckcraft-cli" \
+            "$GITHUB_WORKSPACE"/thumb-samples/*.pptx
+
+      - name: Verdict gate
+        run: python3 tools/thumb_verdict.py /tmp/deckcraft-pilot/report.json verdict-out
+
+      - name: Publish verdict to step summary
+        if: always()
+        run: |
+          if [ -f verdict-out/verdict.md ]; then
+            cat verdict-out/verdict.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: thumb-dual-track-evidence
+          path: |
+            /tmp/deckcraft-pilot
+            verdict-out
