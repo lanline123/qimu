@@ -1168,8 +1168,11 @@ enum ConnStatus {
 /// {name, url, username, token, anon}. The client holds several at
 /// once; one is "active" and feeds every API call (pages show the
 /// active server). An anonymous connection (anon = true) is a guest
-/// session on its server — it never carries a token and lives next
-/// to, never instead of, a named connection for the same address.
+/// session on its server and lives next to, never instead of, a
+/// named connection for the same address. Since org-model G1 the
+/// anonymous connection carries a server-issued *guest* token in
+/// its token field; the anon flag — never token presence — is
+/// what marks the connection as identity-less.
 #[derive(Clone)]
 struct Conn {
     name: String,
@@ -1258,6 +1261,19 @@ fn save_conns(conns: &[Conn]) {
         dir.join("servers.json"),
         serde_json::to_string_pretty(&Value::Array(arr)).unwrap_or_default(),
     );
+}
+
+/// Ask a server for an anonymous guest session (org-model G1):
+/// POST /v1/auth/guest with nothing but the connection itself.
+/// Returns None on a pre-G1 server (no such endpoint) — callers
+/// fall back to the tokenless guest probe there.
+fn issue_guest_token(url: &str) -> Option<String> {
+    raw_call(url, None, "POST", "/v1/auth/guest", None, true)
+        .ok()?
+        .get("token")
+        .and_then(|t| t.as_str())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
 }
 
 /// One HTTP call against an explicit server/token (App::call delegates
@@ -1376,6 +1392,24 @@ fn find_server_exe() -> Option<std::path::PathBuf> {
     }
 }
 
+/// Best-effort: mark the bundled server's data directory as a
+/// standalone installation (a standalone.on marker the server
+/// honors when QIMU_STANDALONE is unset — the installer-autostarted
+/// instance never sees the env the client would have spawned it
+/// with). Only ever touches the data dir beside this executable;
+/// an organization server's directory sits on another machine and
+/// is unreachable from here.
+fn mark_local_standalone() {
+    if let Some(exe) = find_server_exe() {
+        if let Some(dir) = exe.parent() {
+            let data = dir.join("qimu-data");
+            if std::fs::create_dir_all(&data).is_ok() {
+                let _ = std::fs::write(data.join("standalone.on"), "standalone\n");
+            }
+        }
+    }
+}
+
 /// Start the bundled server next to this executable, detached, with its
 /// data in a `qimu-data` folder beside it (the server also resolves that
 /// itself; the env makes it explicit).
@@ -1384,7 +1418,12 @@ fn spawn_local_server(exe: &std::path::Path) -> bool {
     let data = dir.join("qimu-data");
     let _ = std::fs::create_dir_all(&data);
     let mut cmd = std::process::Command::new(exe);
+    // The bundled server is this machine's own data plane: it runs
+    // in standalone mode, where tokenless loopback requests act as
+    // the owner (org-model standalone gap). An organization server
+    // is started by hand and never sees this env.
     cmd.env("QIMU_DATA_DIR", &data)
+        .env("QIMU_STANDALONE", "1")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -1543,7 +1582,7 @@ impl App {
         // start path: QIMU_OPEN=showroom:<item-id> opens the deck view;
         // QIMU_PICK=pages:<index-id>:<pos> / insert:<index-id>:<at>
         // enters the content-page pick modes.
-        if app.token.is_some() {
+        if app.user.is_some() {
             if let Ok(sec) = std::env::var("QIMU_SECTION") {
                 if let Ok(n) = sec.parse::<usize>() {
                     app.settings.section = n;
@@ -1737,7 +1776,14 @@ impl App {
             if let Some(c) = self.conns.get(i) {
                 self.server = c.url.clone();
                 self.username = c.username.clone();
-                self.token = if c.status == ConnStatus::Connected {
+                // A named session mirrors its user token; an
+                // anonymous connection mirrors its guest token
+                // (org-model G1), so guest reads carry the
+                // session. Identity decisions never key on this
+                // field — the connection's anon flag is the key.
+                self.token = if c.status == ConnStatus::Connected
+                    || c.status == ConnStatus::Anonymous
+                {
                     c.token.clone()
                 } else {
                     None
@@ -1756,9 +1802,27 @@ impl App {
             (c.url.clone(), c.token.clone())
         };
         if self.conns[i].anon {
-            // Anonymous connection: no session to validate — probe
-            // the guest surface instead; reachable means connected.
-            let ok = raw_call(&url, None, "GET", "/v1/showroom?state=live", None, true).is_ok();
+            // Anonymous connection (org-model G1): the connection
+            // holds a server-issued guest token; validation probes
+            // the guest surface *with* it. An expired guest session
+            // (24h by design) is silently re-issued — guest expiry
+            // must be invisible. A pre-G1 server never issued a
+            // token and refuses bearer probes; there the tokenless
+            // probe remains the check, and a stale token is dropped.
+            let probe = |t: Option<&str>| {
+                raw_call(&url, t, "GET", "/v1/showroom?state=live", None, true).is_ok()
+            };
+            let mut ok = probe(token.as_deref());
+            if !ok {
+                if let Some(t) = issue_guest_token(&url) {
+                    self.conns[i].token = Some(t.clone());
+                    ok = probe(Some(&t));
+                }
+            }
+            if !ok && self.conns[i].token.is_some() && probe(None) {
+                self.conns[i].token = None;
+                ok = true;
+            }
             self.conns[i].status = if ok {
                 ConnStatus::Anonymous
             } else {
@@ -1795,7 +1859,7 @@ impl App {
         }
         self.sync_from_active();
         self.persist_conns();
-        if self.token.is_some() {
+        if self.conns[i].status == ConnStatus::Connected {
             self.msg = format!("已切换到服务器 {}", self.conns[i].name);
             self.refresh_all();
         } else if self.conns[i].status == ConnStatus::Anonymous {
@@ -1807,6 +1871,27 @@ impl App {
         }
     }
 
+    /// Standalone local form (org-model standalone gap): when the
+    /// bundled server runs in standalone mode it answers a
+    /// tokenless /v1/me as the machine's owner — adopt that
+    /// identity so the local library loads in full, with no
+    /// account anywhere in sight. Any other answer (an organization
+    /// server, or standalone mode off) leaves the client on the
+    /// guest surface, exactly as before.
+    fn try_adopt_local_owner(&mut self) -> bool {
+        match raw_call(&self.server, None, "GET", "/v1/me", None, true) {
+            Ok(v) => match v.get("user").cloned() {
+                Some(u) => {
+                    self.user = Some(u);
+                    self.refresh_all();
+                    true
+                }
+                None => false,
+            },
+            Err(_) => false,
+        }
+    }
+
     /// Startup path when no env-driven login was requested: load saved
     /// connections, validate them, enter through the remembered active
     /// one (or the first that still answers). With nothing saved, make
@@ -1815,12 +1900,17 @@ impl App {
         self.conns = load_conns();
         if self.conns.is_empty() {
             self.autostart_local_server();
-            self.refresh_guest();
+            if !self.try_adopt_local_owner() {
+                self.refresh_guest();
+            }
             return;
         }
         for i in 0..self.conns.len() {
             self.validate_conn(i);
         }
+        // Validation may have re-issued guest sessions (G1); keep
+        // the fresh tokens across restarts.
+        self.persist_conns();
         let saved = client_settings()
             .get("active_server")
             .and_then(|v| v.as_str())
@@ -1851,11 +1941,11 @@ impl App {
                 }
             }
             self.sync_from_active();
-            if self.token.is_some() {
+            if self.conns[i].status == ConnStatus::Connected {
                 self.refresh_all();
             }
         }
-        if self.token.is_none() {
+        if self.token.is_none() || self.anon_active() {
             self.refresh_guest();
         }
     }
@@ -1864,6 +1954,7 @@ impl App {
     /// listening on 127.0.0.1:8730, launch the server bundled beside
     /// this executable and wait for its port.
     fn autostart_local_server(&mut self) {
+        mark_local_standalone();
         if tcp_reachable(8730) {
             self.server = "http://127.0.0.1:8730".into();
             return;
@@ -1938,22 +2029,35 @@ impl App {
     /// can browse the server's public content and nothing more.
     /// The anonymous connection is a separate saved entry from any
     /// named one for the same address, so entering anonymously
-    /// never touches a saved named session. The guest surface is
-    /// probed first: an unreachable (or pre-guest-surface) server
-    /// is reported, not silently "connected".
+    /// never touches a saved named session. A guest session is
+    /// issued first (org-model G1); an unreachable (or
+    /// pre-guest-surface) server is reported, not silently
+    /// "connected".
     fn activate_anonymous(&mut self, url: &str) -> bool {
         let url = normalize_url(url);
         if url.is_empty() {
             self.msg = "请先填写服务器地址".into();
             return false;
         }
-        if raw_call(&url, None, "GET", "/v1/showroom?state=live", None, true).is_err() {
+        // Org-model G1: entering anonymously takes a real guest
+        // session from the server (POST /v1/auth/guest) — the
+        // token is what the reads ride on, and what makes the
+        // anonymous surface revocable and auditable server-side.
+        // A pre-G1 server issues nothing; there the historical
+        // tokenless probe decides, unchanged.
+        let issued = issue_guest_token(&url);
+        if issued.is_none()
+            && raw_call(&url, None, "GET", "/v1/showroom?state=live", None, true).is_err()
+        {
             self.msg = format!("无法匿名连接 {url}：服务器不可达，或版本过旧不支持匿名浏览");
             return false;
         }
         let idx = match self.conns.iter().position(|c| c.url == url && c.anon) {
             Some(i) => {
                 self.conns[i].status = ConnStatus::Anonymous;
+                if issued.is_some() {
+                    self.conns[i].token = issued.clone();
+                }
                 i
             }
             None => {
@@ -1961,7 +2065,7 @@ impl App {
                     name: conn_display_name(&url),
                     url: url.clone(),
                     username: String::new(),
-                    token: None,
+                    token: issued.clone(),
                     status: ConnStatus::Anonymous,
                     anon: true,
                 });
@@ -1970,7 +2074,7 @@ impl App {
         };
         self.active = Some(idx);
         self.server = url;
-        self.token = None;
+        self.token = issued;
         self.user = None;
         self.persist_conns();
         // A different identity context than whatever was on screen:
@@ -2037,7 +2141,11 @@ impl App {
         if let Some(i) = self.active {
             if let Some(c) = self.conns.get_mut(i) {
                 c.token = None;
-                c.status = ConnStatus::LoggedOut;
+                c.status = if c.anon {
+                    ConnStatus::Anonymous
+                } else {
+                    ConnStatus::LoggedOut
+                };
             }
             self.persist_conns();
         }
@@ -2073,8 +2181,9 @@ impl App {
     /// True when the active connection is an anonymous (guest)
     /// session: connected for reading, carrying no named identity.
     /// Keyed on the connection's anon flag rather than on token
-    /// presence, so the mode survives the planned move to
-    /// server-issued guest tokens (org-model G1) unchanged.
+    /// presence, so the mode survived the move to server-issued
+    /// guest tokens (org-model G1) unchanged — the guest token now
+    /// rides in the same token fields a named session uses.
     fn anon_active(&self) -> bool {
         self.active
             .and_then(|i| self.conns.get(i))
@@ -3106,7 +3215,7 @@ impl App {
                     .color(TEXT_WEAK),
             );
             ui.add_space(16.0);
-            if self.token.is_none() {
+            if self.user.is_none() {
                 ui.horizontal(|ui| {
                     if self.anon_active() {
                         ui.label(
@@ -3461,8 +3570,10 @@ impl App {
     /// Settings sections visible to the current role — sections a
     /// role may not see are not rendered at all (§7.9).
     fn settings_sections(&self) -> Vec<&'static str> {
-        if self.token.is_none() {
-            // Logged out: only the local sections — connecting a
+        if self.user.is_none() {
+            // No named identity (logged out, anonymous guest, or
+            // standalone before the owner is adopted): only the
+            // local sections — connecting a
             // server (and logging in there) plus the on-device
             // offline cache. Identity-bound sections appear after
             // login, per role, as before.
@@ -3806,7 +3917,7 @@ impl eframe::App for App {
                 egui::MenuBar::new().ui(ui, |ui| {
                     ui.menu_button(egui::RichText::new(tr("文件")).size(12.0), |ui| {
                         ui.set_min_width(160.0);
-                        if self.token.is_some() {
+                        if self.user.is_some() {
                             if ui.button(tr("退出登录")).clicked() {
                                 self.logout();
                                 ui.close();
@@ -3888,7 +3999,7 @@ impl eframe::App for App {
                     match self.page {
                         Page::Showroom => {
                             if self.tool_slot(ui, false, tr("刷新"), "refresh", *ICON_REFRESH) {
-                                if self.token.is_some() {
+                                if self.user.is_some() {
                                     self.refresh_all();
                                 } else {
                                     self.refresh_guest();
@@ -3936,7 +4047,7 @@ impl eframe::App for App {
                         Page::Settings => {}
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if self.token.is_some() {
+                        if self.user.is_some() {
                             if self.tool_slot(ui, false, tr("退出"), "power", *ICON_POWER) {
                                 self.logout();
                             }
@@ -3953,7 +4064,7 @@ impl eframe::App for App {
                             self.login_open = true;
                         }
                         ui.add_space(6.0);
-                        let user_text = if self.token.is_some() {
+                        let user_text = if self.user.is_some() {
                             let name = self
                                 .user
                                 .as_ref()
@@ -7772,7 +7883,11 @@ impl App {
                 "disconnect" => {
                     if let Some(c) = self.conns.get_mut(i) {
                         c.token = None;
-                        c.status = ConnStatus::LoggedOut;
+                        c.status = if c.anon {
+                            ConnStatus::Anonymous
+                        } else {
+                            ConnStatus::LoggedOut
+                        };
                     }
                     if self.active == Some(i) {
                         self.token = None;
@@ -7789,10 +7904,16 @@ impl App {
                                 self.active = (0..self.conns.len())
                                     .find(|&j| self.conns[j].status == ConnStatus::Connected);
                                 self.sync_from_active();
-                                if self.token.is_some() {
+                                if matches!(
+                                    self.active.and_then(|a| self.conns.get(a)),
+                                    Some(c) if c.status == ConnStatus::Connected
+                                ) {
                                     self.refresh_all();
                                 } else {
                                     self.user = None;
+                                    if self.anon_active() {
+                                        self.refresh_guest();
+                                    }
                                 }
                             }
                             Some(a) if a > i => self.active = Some(a - 1),

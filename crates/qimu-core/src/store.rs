@@ -326,13 +326,55 @@ pub struct ShowroomRec {
     pub submitted_by: String,
     pub state: String, // pending | live | rejected
     pub created_ms: i64,
+    /// Visibility scope (org-model DESIGN §2.1). This phase only
+    /// 'org_public' is produced or consumed; the remaining tiers
+    /// are reserved vocabulary, not enabled behavior.
+    pub scope: String,
+}
+
+/// The one scope tier this phase enables (org-model DESIGN §2.1):
+/// content any connection of the organization — named or
+/// anonymous — may read. Reserved, not yet produced or consumed:
+/// `scoped:<dept_id>:<descendants>` (the subtree / node tiers),
+/// `users:<id,id,...>`, `private`.
+pub const SCOPE_ORG_PUBLIC: &str = "org_public";
+
+/// Whether an anonymous (guest) session may read content carrying
+/// this scope. Only the explicit org_public tier — a guest's
+/// visible set is never derived from any position in the org tree
+/// (DESIGN §2.3: the root-node reading would dissolve every
+/// scoped tier).
+pub fn scope_allows_guest(scope: &str) -> bool {
+    scope == SCOPE_ORG_PUBLIC
+}
+
+/// Session lifetimes (org-model DESIGN §4.2; user-ruled
+/// 2026-11-23): guest sessions live 24h from issue (the client
+/// silently re-issues); named sessions expire after 30 days
+/// idle, sliding — activity pushes the window forward.
+pub const GUEST_TTL_MS: i64 = 24 * 3600 * 1000;
+pub const USER_IDLE_TTL_MS: i64 = 30 * 24 * 3600 * 1000;
+const SESSION_TOUCH_MS: i64 = 60 * 1000;
+
+/// One row of the sessions table (org-model G1): named user
+/// sessions and anonymous guest sessions share the table and the
+/// opaque-token form; `kind` is the only distinction, and a guest
+/// row's user_id is NULL — never a fake user row, which would
+/// poison every authorization walk over the users table (§4.2).
+#[derive(Debug, Clone)]
+pub struct SessionRec {
+    pub kind: String, // user | guest
+    pub user_id: Option<String>,
+    pub client_ip: Option<String>,
+    pub created_ms: i64,
+    pub last_seen_ms: i64,
 }
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS departments(id TEXT PRIMARY KEY, name TEXT NOT NULL, parent_id TEXT);
 CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, display_name TEXT NOT NULL, password_hash TEXT NOT NULL, dept_id TEXT, role TEXT NOT NULL DEFAULT 'member', disabled INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS user_depts(user_id TEXT NOT NULL, dept_id TEXT NOT NULL, PRIMARY KEY(user_id, dept_id));
-CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, user_id TEXT NOT NULL, created_ms INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, user_id TEXT, created_ms INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'user', client_ip TEXT, last_seen_ms INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS folders(id TEXT PRIMARY KEY, name TEXT NOT NULL, parent_id TEXT, sort INTEGER NOT NULL DEFAULT 0, main_index_id TEXT);
 CREATE TABLE IF NOT EXISTS groups_tbl(id TEXT PRIMARY KEY, name TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS group_grants(id TEXT PRIMARY KEY, group_id TEXT NOT NULL, subject_type TEXT NOT NULL, subject_id TEXT NOT NULL, capability TEXT NOT NULL);
@@ -346,7 +388,7 @@ CREATE TABLE IF NOT EXISTS index_tags(id TEXT PRIMARY KEY, index_id TEXT NOT NUL
 CREATE TABLE IF NOT EXISTS exports(id TEXT PRIMARY KEY, index_id TEXT NOT NULL, branch TEXT NOT NULL, commit_id TEXT NOT NULL, tag TEXT, user_id TEXT NOT NULL, created_ms INTEGER NOT NULL, deck_hash TEXT NOT NULL, page_count INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'personal', deck_id TEXT NOT NULL DEFAULT '', manifest_json TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS attachments(id TEXT PRIMARY KEY, parent_type TEXT NOT NULL, parent_id TEXT NOT NULL, filename TEXT NOT NULL, hash TEXT NOT NULL, size INTEGER NOT NULL, uploader TEXT NOT NULL, created_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS version_tags(id TEXT PRIMARY KEY, version_id TEXT NOT NULL, dim TEXT NOT NULL, value TEXT NOT NULL, strength TEXT NOT NULL DEFAULT 'fits', author TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS showroom(id TEXT PRIMARY KEY, title TEXT NOT NULL, intro TEXT NOT NULL DEFAULT '', source_index_id TEXT, commit_id TEXT, submitted_by TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending', created_ms INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS showroom(id TEXT PRIMARY KEY, title TEXT NOT NULL, intro TEXT NOT NULL DEFAULT '', source_index_id TEXT, commit_id TEXT, submitted_by TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending', created_ms INTEGER NOT NULL, scope TEXT NOT NULL DEFAULT 'org_public');
 CREATE TABLE IF NOT EXISTS assemblies(id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, entries_json TEXT NOT NULL, created_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS page_bindings(id TEXT PRIMARY KEY, unit_id TEXT NOT NULL, from_version_id TEXT NOT NULL, from_slot INTEGER NOT NULL, to_version_id TEXT NOT NULL, to_slot INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'manual', author TEXT NOT NULL, created_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS custom_groups(id TEXT PRIMARY KEY, name TEXT NOT NULL, owner_id TEXT NOT NULL, created_ms INTEGER NOT NULL);
@@ -368,12 +410,47 @@ impl Store {
         std::fs::create_dir_all(root.join("files")).map_err(|e| e.to_string())?;
         let conn = Connection::open(root.join("qimu.db")).map_err(db_err)?;
         conn.execute_batch(SCHEMA).map_err(db_err)?;
+        // Sessions rebuild (org-model G1): guest sessions carry a
+        // NULL user_id, which the original `user_id TEXT NOT NULL`
+        // shape forbids, so a pre-G1 sessions table is rebuilt in
+        // the new shape. Rows are preserved as kind='user';
+        // last_seen_ms starts at the migration moment, so no
+        // existing login is cut off by the new 30-day idle expiry
+        // the day it lands — the window simply starts at upgrade.
+        {
+            let user_id_notnull: i64 = conn
+                .query_row(
+                    "SELECT \"notnull\" FROM pragma_table_info('sessions') WHERE name='user_id'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if user_id_notnull == 1 {
+                conn.execute_batch(
+                    "CREATE TABLE sessions_new(token TEXT PRIMARY KEY, user_id TEXT, created_ms INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'user', client_ip TEXT, last_seen_ms INTEGER NOT NULL DEFAULT 0);",
+                )
+                .map_err(db_err)?;
+                conn.execute(
+                    "INSERT INTO sessions_new(token, user_id, created_ms, kind, client_ip, last_seen_ms) SELECT token, user_id, created_ms, 'user', NULL, ?1 FROM sessions",
+                    params![now_ms()],
+                )
+                .map_err(db_err)?;
+                conn.execute_batch(
+                    "DROP TABLE sessions; ALTER TABLE sessions_new RENAME TO sessions;",
+                )
+                .map_err(db_err)?;
+            }
+        }
         // migrations for databases created before these columns existed
         for (table, col, decl) in [
             ("exports", "deck_id", "TEXT NOT NULL DEFAULT ''"),
             ("exports", "manifest_json", "TEXT NOT NULL DEFAULT ''"),
             ("versions", "scripts_json", "TEXT NOT NULL DEFAULT '[]'"),
             ("folders", "main_index_id", "TEXT"),
+            ("showroom", "scope", "TEXT NOT NULL DEFAULT 'org_public'"),
+            ("sessions", "kind", "TEXT NOT NULL DEFAULT 'user'"),
+            ("sessions", "client_ip", "TEXT"),
+            ("sessions", "last_seen_ms", "INTEGER NOT NULL DEFAULT 0"),
         ] {
             let has: bool = conn
                 .prepare(&format!("PRAGMA table_info({table})"))
@@ -505,6 +582,15 @@ impl Store {
     }
 
     pub fn login(&self, username: &str, password: &str) -> SResult<(String, UserRec)> {
+        self.login_with_ip(username, password, None)
+    }
+
+    pub fn login_with_ip(
+        &self,
+        username: &str,
+        password: &str,
+        client_ip: Option<&str>,
+    ) -> SResult<(String, UserRec)> {
         let (user, hash) = self
             .conn
             .query_row(
@@ -532,25 +618,153 @@ impl Store {
             return Err("用户名或密码不正确".into());
         }
         let token = new_token();
+        let now = now_ms();
         self.conn
             .execute(
-                "INSERT INTO sessions(token, user_id, created_ms) VALUES(?1,?2,?3)",
-                params![token, user.id, now_ms()],
+                "INSERT INTO sessions(token, user_id, created_ms, kind, client_ip, last_seen_ms) VALUES(?1,?2,?3,'user',?4,?3)",
+                params![token, user.id, now, client_ip],
             )
             .map_err(db_err)?;
         Ok((token, user))
     }
 
+    /// Load a session row, enforcing its lifetime: an expired row
+    /// is deleted on sight and reads as absent. Guest sessions age
+    /// from issue (created_ms, 24h); named sessions age from last
+    /// activity (last_seen_ms, 30 days) and slide forward on use —
+    /// the touch is throttled so plain reads stay reads, mostly.
+    pub fn session_by_token(&self, token: &str) -> SResult<Option<SessionRec>> {
+        let row = self.conn.query_row(
+            "SELECT kind, user_id, client_ip, created_ms, last_seen_ms FROM sessions WHERE token=?1",
+            params![token],
+            |r| {
+                Ok(SessionRec {
+                    kind: r.get(0)?,
+                    user_id: r.get(1)?,
+                    client_ip: r.get(2)?,
+                    created_ms: r.get(3)?,
+                    last_seen_ms: r.get(4)?,
+                })
+            },
+        );
+        let s = match row {
+            Ok(s) => s,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => return Err(db_err(e)),
+        };
+        let now = now_ms();
+        let expired = if s.kind == "guest" {
+            now - s.created_ms > GUEST_TTL_MS
+        } else {
+            now - s.last_seen_ms > USER_IDLE_TTL_MS
+        };
+        if expired {
+            let _ = self
+                .conn
+                .execute("DELETE FROM sessions WHERE token=?1", params![token]);
+            return Ok(None);
+        }
+        if s.kind != "guest" && now - s.last_seen_ms > SESSION_TOUCH_MS {
+            let _ = self.conn.execute(
+                "UPDATE sessions SET last_seen_ms=?2 WHERE token=?1",
+                params![token, now],
+            );
+        }
+        Ok(Some(s))
+    }
+
     pub fn user_by_token(&self, token: &str) -> SResult<UserRec> {
-        let uid: String = self
+        let s = self
+            .session_by_token(token)?
+            .ok_or_else(|| "未登录".to_string())?;
+        // A guest session is not a user session: its NULL user_id
+        // must not open any named-identity door.
+        let uid = s.user_id.ok_or_else(|| "未登录".to_string())?;
+        self.user_by_id(&uid)
+    }
+
+    /// Issue an anonymous guest session (org-model G1): the client
+    /// presents only the server address it connects to; the server
+    /// hands back an opaque token whose row remembers the issuing
+    /// IP and time. That row is the whole of the minimal audit
+    /// trail for anonymous reads this phase (G4 — no separate
+    /// audit table). Expired guest rows are swept opportunistically
+    /// here.
+    pub fn create_guest_session(&self, client_ip: Option<&str>) -> SResult<String> {
+        let now = now_ms();
+        let _ = self.conn.execute(
+            "DELETE FROM sessions WHERE kind='guest' AND created_ms < ?1",
+            params![now - GUEST_TTL_MS],
+        );
+        let token = new_token();
+        self.conn
+            .execute(
+                "INSERT INTO sessions(token, user_id, created_ms, kind, client_ip, last_seen_ms) VALUES(?1,NULL,?2,'guest',?3,?2)",
+                params![token, now, client_ip],
+            )
+            .map_err(db_err)?;
+        Ok(token)
+    }
+
+    /// Revoke every guest session issued to one IP (the abuse
+    /// response the guest surface is governed by; named sessions
+    /// are revoked per user — see set_user_disabled).
+    pub fn delete_guest_sessions_for_ip(&self, ip: &str) -> SResult<usize> {
+        self.conn
+            .execute(
+                "DELETE FROM sessions WHERE kind='guest' AND client_ip=?1",
+                params![ip],
+            )
+            .map_err(db_err)
+    }
+
+    /// The seeded owner of a standalone installation: the first
+    /// super-admin account (ensure_seed creates exactly one).
+    pub fn seed_owner(&self) -> SResult<UserRec> {
+        self.conn
+            .query_row(
+                "SELECT id, username, display_name, dept_id, role, disabled FROM users WHERE role='super' ORDER BY rowid LIMIT 1",
+                [],
+                Self::row_to_user,
+            )
+            .map_err(db_err)
+    }
+
+    /// Standalone local-server mapping (org-model standalone gap;
+    /// standalone-fix §4 option 1): a tokenless loopback request is
+    /// the machine's owner. The mapping runs through a formal
+    /// session row — an existing unexpired owner session from this
+    /// IP is reused (and slid forward by session_by_token's touch),
+    /// otherwise one is minted with the normal session insert.
+    /// Callers gate on standalone mode + loopback themselves; this
+    /// only maintains the session.
+    pub fn standalone_owner_session(&self, client_ip: Option<&str>) -> SResult<UserRec> {
+        let owner = self.seed_owner()?;
+        if owner.disabled {
+            return Err("种子所有者账号已停用".into());
+        }
+        let existing: Option<String> = self
             .conn
             .query_row(
-                "SELECT user_id FROM sessions WHERE token=?1",
-                params![token],
+                "SELECT token FROM sessions WHERE user_id=?1 AND kind='user' AND client_ip IS ?2 ORDER BY created_ms DESC LIMIT 1",
+                params![owner.id, client_ip],
                 |r| r.get(0),
             )
-            .map_err(|_| "未登录".to_string())?;
-        self.user_by_id(&uid)
+            .ok();
+        if let Some(t) = existing {
+            if self.session_by_token(&t)?.is_some() {
+                return Ok(owner);
+            }
+        }
+        let token = new_token();
+        let now = now_ms();
+        self.conn
+            .execute(
+                "INSERT INTO sessions(token, user_id, created_ms, kind, client_ip, last_seen_ms) VALUES(?1,?2,?3,'user',?4,?3)",
+                params![token, owner.id, now, client_ip],
+            )
+            .map_err(db_err)?;
+        Ok(owner)
     }
 
     pub fn logout(&self, token: &str) -> SResult<()> {
@@ -1942,10 +2156,11 @@ impl Store {
             submitted_by: submitted_by.into(),
             state: state.into(),
             created_ms: now_ms(),
+            scope: SCOPE_ORG_PUBLIC.to_string(),
         };
         self.conn
             .execute(
-                "INSERT INTO showroom(id, title, intro, source_index_id, commit_id, submitted_by, state, created_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                "INSERT INTO showroom(id, title, intro, source_index_id, commit_id, submitted_by, state, created_ms, scope) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
                 params![
                     rec.id,
                     rec.title,
@@ -1954,7 +2169,8 @@ impl Store {
                     rec.commit_id,
                     rec.submitted_by,
                     rec.state,
-                    rec.created_ms
+                    rec.created_ms,
+                    rec.scope
                 ],
             )
             .map_err(db_err)?;
@@ -1964,7 +2180,7 @@ impl Store {
     pub fn list_showroom(&self, state: Option<&str>) -> SResult<Vec<ShowroomRec>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, title, intro, source_index_id, commit_id, submitted_by, state, created_ms FROM showroom ORDER BY created_ms DESC")
+            .prepare("SELECT id, title, intro, source_index_id, commit_id, submitted_by, state, created_ms, scope FROM showroom ORDER BY created_ms DESC")
             .map_err(db_err)?;
         let rows = stmt
             .query_map([], |r| {
@@ -1977,6 +2193,7 @@ impl Store {
                     submitted_by: r.get(5)?,
                     state: r.get(6)?,
                     created_ms: r.get(7)?,
+                    scope: r.get(8)?,
                 })
             })
             .map_err(db_err)?
@@ -2359,6 +2576,65 @@ impl Store {
                     }
                 }
                 _ => {}
+            }
+        }
+        Ok(false)
+    }
+
+    /// Guest (anonymous) visibility of a showroom item (org-model
+    /// G2/G3): live, and carrying the org_public scope. That is the
+    /// whole of the anonymous visible set this phase (DESIGN §2.3).
+    pub fn guest_item_visible(&self, item: &ShowroomRec) -> bool {
+        item.state == "live" && scope_allows_guest(&item.scope)
+    }
+
+    /// The commit a showroom item publishes: the one pinned at
+    /// submit time, else the source index's current main head —
+    /// the same resolution export_showroom performs.
+    pub fn guest_item_commit(&self, item: &ShowroomRec) -> SResult<Option<CommitRec>> {
+        match &item.commit_id {
+            Some(cid) => Ok(self.get_commit(cid).ok()),
+            None => match &item.source_index_id {
+                Some(idx) => match self.branch_head(idx, "main")? {
+                    Some(head) => Ok(self.get_commit(&head).ok()),
+                    None => Ok(None),
+                },
+                None => Ok(None),
+            },
+        }
+    }
+
+    /// The newest live org_public item sourced from an index — the
+    /// entry point of the guest source chain for that index.
+    pub fn guest_source_item(&self, index_id: &str) -> SResult<Option<ShowroomRec>> {
+        Ok(self
+            .list_showroom(Some("live"))?
+            .into_iter()
+            .find(|i| {
+                i.source_index_id.as_deref() == Some(index_id) && scope_allows_guest(&i.scope)
+            }))
+    }
+
+    /// Whether a version is among the published versions of some
+    /// live org_public showroom item (org-model G2, the entry
+    /// funnel): a guest session may reach a version's resources
+    /// only through a published item's source chain, never by bare
+    /// version id — an unpublished version simply does not
+    /// resolve here.
+    pub fn guest_published_version(&self, version_id: &str) -> SResult<bool> {
+        for item in self.list_showroom(Some("live"))? {
+            if !scope_allows_guest(&item.scope) {
+                continue;
+            }
+            let Some(commit) = self.guest_item_commit(&item)? else {
+                continue;
+            };
+            for e in &commit.entries {
+                if let Some(v) = self.resolve_entry_version(e)? {
+                    if v.id == version_id {
+                        return Ok(true);
+                    }
+                }
             }
         }
         Ok(false)

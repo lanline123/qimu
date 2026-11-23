@@ -23,6 +23,12 @@ use std::sync::{Arc, Mutex};
 struct AppState {
     store: Mutex<Store>,
     data_dir: std::path::PathBuf,
+    /// Standalone local-server mode (org-model standalone gap):
+    /// tokenless loopback requests act as the seed owner. On only
+    /// for the bundled single-machine install — the QIMU_STANDALONE
+    /// env wins; unset falls back to a standalone.on marker in the
+    /// data dir. An organization server never enables it.
+    standalone: bool,
 }
 
 type St = Arc<AppState>;
@@ -44,37 +50,134 @@ fn not_found() -> (StatusCode, Json<Value>) {
     err(StatusCode::NOT_FOUND, "不存在")
 }
 
-fn auth(st: &St, headers: &HeaderMap) -> Result<UserRec, (StatusCode, Json<Value>)> {
-    let token = headers
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "未登录"))?;
+        .map(|v| v.trim().to_string())
+}
+
+/// Peer IP as stamped by the peer_ip_layer middleware (the value
+/// is written by the server itself from the TCP peer; a
+/// client-sent header of the same name is overwritten in transit,
+/// never read).
+fn peer_ip_str(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-qimu-peer-ip")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+}
+
+fn peer_is_loopback(headers: &HeaderMap) -> bool {
+    peer_ip_str(headers)
+        .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+/// Resolve the session behind the Authorization header:
+/// Ok(Some(user)) for a named session; Ok(None) when there is no
+/// header, or the header carries a valid *guest* session
+/// (org-model G1); Err(401) when a header is present but the
+/// session is unknown or expired — a stale token surfaces as 401
+/// instead of silently downgrading (entry-fix ruling, kept).
+fn session_user(st: &St, headers: &HeaderMap) -> Result<Option<UserRec>, (StatusCode, Json<Value>)> {
+    let Some(token) = bearer_token(headers) else {
+        return Ok(None);
+    };
+    let store = st.store.lock().unwrap();
+    match store.session_by_token(&token) {
+        Ok(Some(s)) => match s.user_id {
+            Some(uid) => store
+                .user_by_id(&uid)
+                .map(Some)
+                .map_err(|e| err(StatusCode::UNAUTHORIZED, e)),
+            None => Ok(None),
+        },
+        _ => Err(err(StatusCode::UNAUTHORIZED, "会话无效或已过期，请重新登录")),
+    }
+}
+
+/// The standalone local-server mapping (standalone-fix §4 option
+/// 1, org-model G1 phase): with standalone mode on, a *tokenless*
+/// request from the loopback peer is the machine's owner — the
+/// bundled server is the user's own data plane, so "installed and
+/// usable with zero accounts" holds. Any presented token, and any
+/// non-loopback peer, bypasses the mapping entirely; an
+/// organization server runs with the mode off.
+fn standalone_owner(st: &St, headers: &HeaderMap) -> Option<UserRec> {
+    if !st.standalone || bearer_token(headers).is_some() || !peer_is_loopback(headers) {
+        return None;
+    }
     let store = st.store.lock().unwrap();
     store
-        .user_by_token(token)
-        .map_err(|e| err(StatusCode::UNAUTHORIZED, e))
+        .standalone_owner_session(peer_ip_str(headers).as_deref())
+        .ok()
+}
+
+fn auth(st: &St, headers: &HeaderMap) -> Result<UserRec, (StatusCode, Json<Value>)> {
+    if let Some(user) = session_user(st, headers)? {
+        return Ok(user);
+    }
+    if bearer_token(headers).is_none() {
+        if let Some(owner) = standalone_owner(st, headers) {
+            return Ok(owner);
+        }
+        return Err(err(StatusCode::UNAUTHORIZED, "未登录"));
+    }
+    // A valid guest session was presented at a named-identity door:
+    // guests read public content, they do not act under a name.
+    Err(err(StatusCode::UNAUTHORIZED, "该操作需要实名登录"))
 }
 
 /// Optional auth for the anonymous guest read surface (user ruling
 /// 2026-11-23: the client opens without login). Returns the user
-/// when a valid session token is present, None when the header is
-/// absent — and rejects a *present but invalid* token, so a stale
-/// session still surfaces as 401 instead of silently downgrading.
+/// when a valid named session is present, None for guests (no
+/// header, or a valid guest session) — and rejects a *present but
+/// invalid* token, so a stale session still surfaces as 401
+/// instead of silently downgrading. In standalone mode a tokenless
+/// loopback request resolves to the owner, as in auth().
 fn auth_opt(st: &St, headers: &HeaderMap) -> Result<Option<UserRec>, (StatusCode, Json<Value>)> {
-    let token = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|v| v.trim().to_string());
-    match token {
-        None => Ok(None),
-        Some(t) => {
+    match session_user(st, headers)? {
+        Some(user) => Ok(Some(user)),
+        None => Ok(standalone_owner(st, headers)),
+    }
+}
+
+/// Whether the request carries a valid guest session (org-model
+/// G1/G2): the key that opens the entry-funneled guest reads.
+fn has_guest_session(st: &St, headers: &HeaderMap) -> bool {
+    let Some(token) = bearer_token(headers) else {
+        return false;
+    };
+    let store = st.store.lock().unwrap();
+    matches!(store.session_by_token(&token), Ok(Some(s)) if s.kind == "guest")
+}
+
+/// Read access for the version resource endpoints (org-model G2):
+/// a named user passes the group ACL as before; failing that, a
+/// guest session passes only when a live org_public showroom item
+/// publishes this version — the entry funnel (DESIGN §2.3), never
+/// the bare version id.
+fn version_read_allowed(
+    st: &St,
+    headers: &HeaderMap,
+    auth_res: &Result<UserRec, (StatusCode, Json<Value>)>,
+    version_id: &str,
+    group_id: &str,
+) -> Result<bool, (StatusCode, Json<Value>)> {
+    match auth_res {
+        Ok(user) => {
             let store = st.store.lock().unwrap();
-            store
-                .user_by_token(&t)
-                .map(Some)
-                .map_err(|e| err(StatusCode::UNAUTHORIZED, e))
+            store.can_see_group(user, group_id).map_err(bad)
+        }
+        Err(_) => {
+            if !has_guest_session(st, headers) {
+                return Ok(false);
+            }
+            let store = st.store.lock().unwrap();
+            store.guest_published_version(version_id).map_err(bad)
         }
     }
 }
@@ -117,21 +220,45 @@ struct LoginReq {
     password: String,
 }
 
-async fn login(State(st): State<St>, Json(req): Json<LoginReq>) -> Api<Value> {
+async fn login(State(st): State<St>, headers: HeaderMap, Json(req): Json<LoginReq>) -> Api<Value> {
     let store = st.store.lock().unwrap();
-    let (token, user) = store.login(&req.username, &req.password).map_err(bad)?;
+    let (token, user) = store
+        .login_with_ip(&req.username, &req.password, peer_ip_str(&headers).as_deref())
+        .map_err(bad)?;
     Ok(Json(json!({ "token": token, "user": user })))
 }
 
-async fn logout(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
-    let _ = auth(&st, &headers)?;
-    let token = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .unwrap_or("");
+/// Anonymous guest session issuance (org-model G1): the client
+/// presents nothing but the server address it is connecting to;
+/// the server returns an opaque guest token (24h, revocable,
+/// IP-stamped — the row doubles as the minimal audit record for
+/// anonymous reads, G4). A guest session reads org_public content
+/// through the entry funnel only; auth() rejects it at every
+/// named-identity door.
+async fn guest_auth(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
     let store = st.store.lock().unwrap();
-    store.logout(token).map_err(bad)?;
+    let token = store
+        .create_guest_session(peer_ip_str(&headers).as_deref())
+        .map_err(bad)?;
+    Ok(Json(json!({
+        "token": token,
+        "kind": "guest",
+        "ttl_ms": GUEST_TTL_MS,
+    })))
+}
+
+async fn logout(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
+    // Any live session may end itself — named or guest (dropping
+    // its guest session is how an anonymous client disconnects
+    // cleanly).
+    let token = bearer_token(&headers)
+        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "未登录"))?;
+    let store = st.store.lock().unwrap();
+    match store.session_by_token(&token) {
+        Ok(Some(_)) => {}
+        _ => return Err(err(StatusCode::UNAUTHORIZED, "未登录")),
+    }
+    store.logout(&token).map_err(bad)?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -1184,14 +1311,21 @@ async fn version_fragment(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Api<Value> {
-    let user = auth(&st, &headers)?;
-    let store = st.store.lock().unwrap();
-    let ver = store.get_version(&id).map_err(|_| not_found())?;
-    let rend = store.get_rendition(&ver.rendition_id).map_err(bad)?;
-    let unit = store.get_unit(&rend.unit_id).map_err(bad)?;
-    if !store.can_see_group(&user, &unit.group_id).map_err(bad)? {
-        return Err(not_found());
+    let auth_res = auth(&st, &headers);
+    let (ver, group_id) = {
+        let store = st.store.lock().unwrap();
+        let ver = store.get_version(&id).map_err(|_| not_found())?;
+        let rend = store.get_rendition(&ver.rendition_id).map_err(bad)?;
+        let unit = store.get_unit(&rend.unit_id).map_err(bad)?;
+        (ver, unit.group_id)
+    };
+    if !version_read_allowed(&st, &headers, &auth_res, &id, &group_id)? {
+        return Err(match auth_res {
+            Ok(_) => not_found(),
+            Err(e) => e,
+        });
     }
+    let store = st.store.lock().unwrap();
     let bytes = store.file_get(&ver.fragment_hash).map_err(bad)?;
     Ok(Json(json!({ "version": ver, "data_base64": b64e(&bytes) })))
 }
@@ -1370,15 +1504,22 @@ async fn version_thumb(
     headers: HeaderMap,
     Path((id, page)): Path<(String, usize)>,
 ) -> Api<Value> {
-    let user = auth(&st, &headers)?;
+    let auth_res = auth(&st, &headers);
     let (root, frag) = {
-        let store = st.store.lock().unwrap();
-        let ver = store.get_version(&id).map_err(|_| not_found())?;
-        let rend = store.get_rendition(&ver.rendition_id).map_err(bad)?;
-        let unit = store.get_unit(&rend.unit_id).map_err(bad)?;
-        if !store.can_see_group(&user, &unit.group_id).map_err(bad)? {
-            return Err(not_found());
+        let (ver, group_id) = {
+            let store = st.store.lock().unwrap();
+            let ver = store.get_version(&id).map_err(|_| not_found())?;
+            let rend = store.get_rendition(&ver.rendition_id).map_err(bad)?;
+            let unit = store.get_unit(&rend.unit_id).map_err(bad)?;
+            (ver, unit.group_id)
+        };
+        if !version_read_allowed(&st, &headers, &auth_res, &id, &group_id)? {
+            return Err(match auth_res {
+                Ok(_) => not_found(),
+                Err(e) => e,
+            });
         }
+        let store = st.store.lock().unwrap();
         let frag = store.file_get(&ver.fragment_hash).map_err(bad)?;
         (store.root().to_path_buf(), frag)
     };
@@ -1482,13 +1623,19 @@ async fn get_version(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Api<Value> {
-    let user = auth(&st, &headers)?;
-    let store = st.store.lock().unwrap();
-    let v = store.get_version(&id).map_err(|_| not_found())?;
-    let rend = store.get_rendition(&v.rendition_id).map_err(bad)?;
-    let unit = store.get_unit(&rend.unit_id).map_err(bad)?;
-    if !store.can_see_group(&user, &unit.group_id).map_err(bad)? {
-        return Err(not_found());
+    let auth_res = auth(&st, &headers);
+    let (v, group_id) = {
+        let store = st.store.lock().unwrap();
+        let v = store.get_version(&id).map_err(|_| not_found())?;
+        let rend = store.get_rendition(&v.rendition_id).map_err(bad)?;
+        let unit = store.get_unit(&rend.unit_id).map_err(bad)?;
+        (v, unit.group_id)
+    };
+    if !version_read_allowed(&st, &headers, &auth_res, &id, &group_id)? {
+        return Err(match auth_res {
+            Ok(_) => not_found(),
+            Err(e) => e,
+        });
     }
     Ok(Json(json!({ "version": v })))
 }
@@ -1665,21 +1812,41 @@ async fn get_index(
     Path(id): Path<String>,
     Query(q): Query<BranchQuery>,
 ) -> Api<Value> {
-    let user = auth(&st, &headers)?;
     let branch = q.branch.unwrap_or_else(|| "main".to_string());
-    let (index, branches, tags, head) = {
-        let store = st.store.lock().unwrap();
-        let index = store.get_index(&id).map_err(|_| not_found())?;
-        if !store.can_see_group(&user, &index.group_id).map_err(bad)? {
-            return Err(not_found());
+    let (index, branches, tags, head) = match auth(&st, &headers) {
+        Ok(user) => {
+            let store = st.store.lock().unwrap();
+            let index = store.get_index(&id).map_err(|_| not_found())?;
+            if !store.can_see_group(&user, &index.group_id).map_err(bad)? {
+                return Err(not_found());
+            }
+            let branches = store.list_branches(&id).map_err(bad)?;
+            let tags = store.list_tags(&id).map_err(bad)?;
+            let head = match store.branch_head(&id, &branch).map_err(bad)? {
+                Some(cid) => Some(store.get_commit(&cid).map_err(bad)?),
+                None => None,
+            };
+            (index, branches, tags, head)
         }
-        let branches = store.list_branches(&id).map_err(bad)?;
-        let tags = store.list_tags(&id).map_err(bad)?;
-        let head = match store.branch_head(&id, &branch).map_err(bad)? {
-            Some(cid) => Some(store.get_commit(&cid).map_err(bad)?),
-            None => None,
-        };
-        (index, branches, tags, head)
+        Err(e) => {
+            // Guest entry funnel (org-model G2): a guest session
+            // may resolve an index only as the source chain of a
+            // live org_public showroom item, and only at the item's
+            // pinned commit — branches, tags and the moving head
+            // stay named-session territory. This is what lets
+            // anonymous plaza cards resolve covers and pages.
+            if !has_guest_session(&st, &headers) {
+                return Err(e);
+            }
+            let store = st.store.lock().unwrap();
+            let item = store
+                .guest_source_item(&id)
+                .map_err(bad)?
+                .ok_or_else(|| not_found())?;
+            let index = store.get_index(&id).map_err(|_| not_found())?;
+            let head = store.guest_item_commit(&item).map_err(bad)?;
+            (index, Vec::new(), Vec::new(), head)
+        }
     };
     let entries = head.as_ref().map(|c| resolved_entries(&st, c));
     Ok(Json(json!({
@@ -1867,7 +2034,7 @@ async fn set_lifecycle(
 /// manifest. Returns (deck bytes, manifest, page count).
 fn build_export(
     st: &St,
-    user: &UserRec,
+    user: Option<&UserRec>,
     entries: &[IndexEntry],
     source: Option<SourceRef>,
     kind: &str,
@@ -1949,9 +2116,12 @@ fn build_export(
                 values.insert(token.to_string(), v);
             }
         }
+        // No named exporter (a guest export through the showroom
+        // funnel) takes the company path: personal placeholders
+        // are scrubbed, never filled from anyone's profile.
         let scrub: &[&str] = if kind == "company" {
             personalize::PERSONAL_FIELDS
-        } else {
+        } else if let Some(user) = user {
             values.insert("name".to_string(), user.display_name.clone());
             for (k, v) in store.profile(&user.id).map_err(bad)? {
                 if !v.is_empty() {
@@ -1959,6 +2129,8 @@ fn build_export(
                 }
             }
             &[]
+        } else {
+            personalize::PERSONAL_FIELDS
         };
         let missing = personalize::substitute(&mut assembled, &values, scrub);
         if !missing.is_empty() {
@@ -2027,7 +2199,7 @@ async fn export_index(
     };
     let (deck, manifest, page_count) = build_export(
         &st,
-        &user,
+        Some(&user),
         &commit.entries,
         Some(source),
         kind,
@@ -2721,23 +2893,37 @@ async fn remove_library_entry(
 }
 
 /// Export a showroom item's deck at item level: live item + (source
-/// group visible OR item shared to me / in my library / mine).
+/// group visible OR item shared to me / in my library / mine). A
+/// guest session exports a live org_public item through the same
+/// funnel, always as the company edition (org-model G2).
 async fn export_showroom(
     State(st): State<St>,
     headers: HeaderMap,
     Path(id): Path<String>,
     Json(req): Json<ExportReq>,
 ) -> Api<Value> {
-    let user = auth(&st, &headers)?;
-    let (item, entries, source) = {
+    let auth_res = auth(&st, &headers);
+    let guest = has_guest_session(&st, &headers);
+    let (entries, source, exporter, kind) = {
         let store = st.store.lock().unwrap();
         let item = store
             .get_showroom(&id)
             .map_err(bad)?
             .ok_or_else(|| not_found())?;
-        if !store.showroom_item_access(&user, &item).map_err(bad)? {
-            return Err(not_found());
-        }
+        let exporter: Option<UserRec> = match auth_res {
+            Ok(user) => {
+                if !store.showroom_item_access(&user, &item).map_err(bad)? {
+                    return Err(not_found());
+                }
+                Some(user)
+            }
+            Err(e) => {
+                if !guest || !store.guest_item_visible(&item) {
+                    return Err(e);
+                }
+                None
+            }
+        };
         let idx_id = item.source_index_id.clone().ok_or_else(|| bad("该条目没有来源索引"))?;
         let commit = match &item.commit_id {
             Some(cid) => store.get_commit(cid).map_err(bad)?,
@@ -2755,13 +2941,18 @@ async fn export_showroom(
             commit_id: commit.id.clone(),
             tag: None,
         };
-        (item, commit.entries.clone(), source)
+        // Guests always receive the company edition; named
+        // exporters keep their choice of kind.
+        let kind = if exporter.is_some() {
+            req.kind.as_deref().unwrap_or("personal")
+        } else {
+            "company"
+        };
+        (commit.entries.clone(), source, exporter, kind)
     };
-    let _ = item;
-    let kind = req.kind.as_deref().unwrap_or("personal");
     let (deck, manifest, page_count) = build_export(
         &st,
-        &user,
+        exporter.as_ref(),
         &entries,
         Some(source),
         kind,
@@ -2819,7 +3010,7 @@ async fn export_assembly(
     };
     let (deck, manifest, page_count) = build_export(
         &st,
-        &user,
+        Some(&user),
         &entries,
         None,
         req.kind.as_deref().unwrap_or("personal"),
@@ -2830,6 +3021,21 @@ async fn export_assembly(
         "manifest": manifest,
         "data_base64": b64e(&deck),
     })))
+}
+
+/// Stamp every request with its TCP peer IP (header
+/// `x-qimu-peer-ip`) for session records and the standalone
+/// loopback mapping. The value is written here, from the socket —
+/// a client-sent header of the same name is replaced, never read.
+async fn peer_ip_layer(
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if let Ok(v) = addr.ip().to_string().parse::<axum::http::HeaderValue>() {
+        req.headers_mut().insert("x-qimu-peer-ip", v);
+    }
+    next.run(req).await
 }
 
 // ---------------- LAN discovery (§4: clients auto-find servers) -------
@@ -2992,15 +3198,25 @@ async fn main() {
         }
         println!("首次启动：已创建超级管理员 admin / {pw}（请登录后修改；可用环境变量 QIMU_ADMIN_PASSWORD 指定）");
     }
+    let standalone = match std::env::var("QIMU_STANDALONE").as_deref() {
+        Ok("1") | Ok("true") => true,
+        Ok("0") | Ok("false") => false,
+        _ => data_dir.join("standalone.on").exists(),
+    };
+    if standalone {
+        println!("单机模式：回环来源的免登录请求按本机所有者处理（设 QIMU_STANDALONE=0 可禁用）");
+    }
     let state: St = Arc::new(AppState {
         store: Mutex::new(store),
         data_dir: data_dir.clone(),
+        standalone,
     });
     let app = Router::new()
         .route("/health", get(|| async { Json(json!({ "status": "ok", "service": "qimu-server" })) }))
         .route("/update/releases.json", get(update_releases))
         .route("/update/:tag/:name", get(update_asset))
         .route("/v1/auth/login", post(login))
+        .route("/v1/auth/guest", post(guest_auth))
         .route("/v1/auth/logout", post(logout))
         .route("/v1/me", get(me))
         .route("/v1/me/profile", axum::routing::put(put_profile))
@@ -3078,6 +3294,7 @@ async fn main() {
         .route("/v1/assemblies", get(list_assemblies).post(create_assembly))
         .route("/v1/assemblies/:id/export", post(export_assembly))
         .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
+        .layer(axum::middleware::from_fn(peer_ip_layer))
         .with_state(state);
     let port: u16 = std::env::var("QIMU_PORT")
         .ok()
@@ -3106,7 +3323,12 @@ async fn main() {
         data_dir.display()
     );
     tokio::spawn(discovery_task(port));
-    if let Err(e) = axum::serve(listener, app).await {
+    if let Err(e) = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    {
         fatal_startup(&format!("服务器运行中断：{e}"));
     }
 }
