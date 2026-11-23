@@ -2821,7 +2821,7 @@ fn q_seg_pills(ui: &mut egui::Ui, labels: &[&str], selected: usize) -> Option<us
                     .color(if active { egui::Color32::WHITE } else { TEXT_WEAK }),
             )
             .fill(if active { ACCENT } else { BTN_BG })
-            .corner_radius(999)
+            .corner_radius(255)
             .min_size(egui::vec2(0.0, 26.0));
             if ui.add(btn).clicked() && !active {
                 changed = Some(i);
