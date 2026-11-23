@@ -57,63 +57,77 @@ fn install_cjk_font(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-/// Design language benchmarked on the EffectCraft main window (spec:
-/// design/设计规范-EffectCraft风格.md, 2026-11-15 six-dimension rewrite):
-/// chrome pressed to near-black — top bar #17181C, side panels #1A1B1F,
-/// canvas #121212; cards #1E1F24 layer by brightness over the canvas with
-/// only a #2C2D33 hairline to finish them; fields are inset #1A1A1A with
-/// no stroke; one blue accent #2D8CEB, spent only on interaction,
-/// selection marks, key values and focus; selection is gray, never an
-/// accent flood. State ladder, one step per state (§5): secondary button
-/// #26262B → hover #2C2C2C → pressed #36363C.
-/// Phase-1 UI alignment (2026-11-23): accent follows the HTML
-/// prototype's --accent #2f6bf5 (user ruling: prototype is the UI
-/// authority). Was design-spec #2D8CEB; deviation logged in the
-/// phase-1 report.
+/// Visual authority (user ruling 2026-11-23): the HTML prototype
+/// (启幕原型-内容索引页.html, repo root) is the single source of truth
+/// for ALL visual parameters — colors, radii, type scale, spacing,
+/// shadows, borders. The constants below transcribe its CSS custom
+/// properties (dark theme = the prototype default) one-to-one; token
+/// names in the comments are the prototype's. History: this theme was
+/// first benchmarked on the EffectCraft design spec (design/设计规范-
+/// EffectCraft风格.md — canvas #121212, cards #1E1F24, accent
+/// #2D8CEB, widget radius 5); phase 1 (2026-11-23) moved only the
+/// accent to the prototype's #2F6BF5; this alignment completes the
+/// move for every remaining parameter. Do not re-align to the design
+/// spec. The prototype's light-theme tokens are catalogued in the
+/// alignment report; the client is dark-only today.
+/// State ladder (prototype): rest --panel → row hover --panel2
+/// (.tree button:hover) / button hover --panel3 (.btn:hover) →
+/// pressed/open --panel3; selected list rows take --accent-soft fill
+/// with accent text (.tree button.active).
 pub const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x2F, 0x6B, 0xF5);
-pub const ACCENT_DEEP: egui::Color32 = egui::Color32::from_rgb(0x6C, 0xB2, 0xF5);
-/// Side panel fill (#1A1B1F).
-pub const CHROME: egui::Color32 = egui::Color32::from_rgb(0x1A, 0x1B, 0x1F);
-pub const APP_BG: egui::Color32 = egui::Color32::from_rgb(0x12, 0x12, 0x12);
-pub const CARD_BG: egui::Color32 = egui::Color32::from_rgb(0x1E, 0x1F, 0x24);
-pub const CARD_BORDER: egui::Color32 = egui::Color32::from_rgb(0x2C, 0x2D, 0x33);
-pub const SEPARATOR: egui::Color32 = egui::Color32::from_rgb(0x26, 0x26, 0x2B);
-pub const TEXT_MAIN: egui::Color32 = egui::Color32::from_rgb(0xF2, 0xF2, 0xF2);
-pub const TEXT_WEAK: egui::Color32 = egui::Color32::from_rgb(0x9E, 0x9E, 0x9E);
-pub const TEXT_FAINT: egui::Color32 = egui::Color32::from_rgb(0x6E, 0x6E, 0x6E);
-/// Hover fill — one step up from the secondary-button fill (§5).
-pub const HOVER_BG: egui::Color32 = egui::Color32::from_rgb(0x2C, 0x2C, 0x2C);
-/// Pressed/active fill — one more step up the same ladder (§5).
-pub const PRESSED_BG: egui::Color32 = egui::Color32::from_rgb(0x36, 0x36, 0x3C);
-/// Menu/tool row fill — EffectCraft header_bg #1F1F1F (its theme
-/// tokens, crates/ui-egui theme.rs; the framework's two chrome rows).
-pub const HEADER_BG: egui::Color32 = egui::Color32::from_rgb(0x1F, 0x1F, 0x1F);
-/// Dock panel fill — EffectCraft panel_bg #232323: tab strips and
-/// panel bodies share it (design/EffectCraft主页布局拆解.md §3).
-pub const PANEL_BG: egui::Color32 = egui::Color32::from_rgb(0x23, 0x23, 0x23);
-/// Dock tab text: inactive #9A9A9A / active #E3E3E3 (color-only
+/// Secondary blue — the prototype's --blue (info text, version meta).
+pub const ACCENT_DEEP: egui::Color32 = egui::Color32::from_rgb(0x5B, 0x8C, 0xFF);
+/// Canvas / panel fill — the prototype's --bg: side panels and page
+/// canvases sit directly on it (the prototype's bars and aside are
+/// transparent over --bg).
+pub const CHROME: egui::Color32 = egui::Color32::from_rgb(0x0B, 0x0B, 0x0D);
+pub const APP_BG: egui::Color32 = egui::Color32::from_rgb(0x0B, 0x0B, 0x0D);
+pub const CARD_BG: egui::Color32 = egui::Color32::from_rgb(0x15, 0x15, 0x19);
+pub const CARD_BORDER: egui::Color32 = egui::Color32::from_rgb(0x28, 0x28, 0x30);
+pub const SEPARATOR: egui::Color32 = egui::Color32::from_rgb(0x28, 0x28, 0x30);
+pub const TEXT_MAIN: egui::Color32 = egui::Color32::from_rgb(0xE9, 0xE9, 0xEF);
+pub const TEXT_WEAK: egui::Color32 = egui::Color32::from_rgb(0x8B, 0x8B, 0x97);
+/// Third text tier — derived: --muted at 62% alpha (the prototype
+/// defines only --ink and --muted).
+pub const TEXT_FAINT: egui::Color32 = egui::Color32::from_rgba_unmultiplied(0x8B, 0x8B, 0x97, 158);
+/// Row/ghost hover fill — the prototype's --panel2 (.tree button:hover).
+pub const HOVER_BG: egui::Color32 = egui::Color32::from_rgb(0x1D, 0x1D, 0x23);
+/// Button hover / pressed / open fill — the prototype's --panel3
+/// (.btn:hover; segmented .on).
+pub const PRESSED_BG: egui::Color32 = egui::Color32::from_rgb(0x26, 0x26, 0x2E);
+/// Menu/tool row fill — the prototype's bars sit on --bg.
+pub const HEADER_BG: egui::Color32 = egui::Color32::from_rgb(0x0B, 0x0B, 0x0D);
+/// Dock panel fill — the prototype's --panel: tab strips and panel
+/// bodies share it.
+pub const PANEL_BG: egui::Color32 = egui::Color32::from_rgb(0x15, 0x15, 0x19);
+/// Dock tab text: inactive --muted / active --ink (color-only
 /// difference — no fill, no underline on panel tabs).
-pub const TAB_TEXT: egui::Color32 = egui::Color32::from_rgb(0x9A, 0x9A, 0x9A);
-pub const TAB_TEXT_ACTIVE: egui::Color32 = egui::Color32::from_rgb(0xE3, 0xE3, 0xE3);
+pub const TAB_TEXT: egui::Color32 = egui::Color32::from_rgb(0x8B, 0x8B, 0x97);
+pub const TAB_TEXT_ACTIVE: egui::Color32 = egui::Color32::from_rgb(0xE9, 0xE9, 0xEF);
 /// Workspace-tab active blue — EffectCraft hot_text #3D8FF5; used
 /// ONLY on the tool row's workspace tabs (text + 2px underline).
 /// Aligned to the prototype accent #2f6bf5 in phase 1 (was
 /// EffectCraft's #3D8FF5) so tabs and accents speak one blue.
 pub const HOT: egui::Color32 = egui::Color32::from_rgb(0x2F, 0x6B, 0xF5);
-/// Field border #3A3A3A (toast outline, per the framework's toast).
-pub const FIELD_BORDER: egui::Color32 = egui::Color32::from_rgb(0x3A, 0x3A, 0x3A);
-/// Tool-row vertical separator — EffectCraft separator #343434.
-pub const LINE_34: egui::Color32 = egui::Color32::from_rgb(0x34, 0x34, 0x34);
-/// Icon tint at rest — EffectCraft icon #B4B4B4.
-pub const ICON_TINT: egui::Color32 = egui::Color32::from_rgb(0xB4, 0xB4, 0xB4);
-/// Icon-slot hover fill — EffectCraft hover #303030.
-pub const ICON_HOVER: egui::Color32 = egui::Color32::from_rgb(0x30, 0x30, 0x30);
-/// Text-field fill (#1A1A1A, inset darker than the panel, no stroke).
-pub const FIELD_BG: egui::Color32 = egui::Color32::from_rgb(0x1A, 0x1A, 0x1A);
-/// Secondary button fill (#26262B) — the darkest chrome control fill.
-pub const BTN_BG: egui::Color32 = egui::Color32::from_rgb(0x26, 0x26, 0x2B);
-/// Selected row fill (#2E2F36) — gray, never the accent.
-pub const SEL_BG: egui::Color32 = egui::Color32::from_rgb(0x2E, 0x2F, 0x36);
+/// Strong border — the prototype's --line2 (toast outline, hover
+/// outlines).
+pub const FIELD_BORDER: egui::Color32 = egui::Color32::from_rgb(0x3A, 0x3A, 0x44);
+/// Tool-row vertical separator — the prototype's --line.
+pub const LINE_34: egui::Color32 = egui::Color32::from_rgb(0x28, 0x28, 0x30);
+/// Icon tint at rest — the prototype's --muted (.icon-btn color).
+pub const ICON_TINT: egui::Color32 = egui::Color32::from_rgb(0x8B, 0x8B, 0x97);
+/// Icon-slot hover fill — the prototype's --panel3 (.icon-btn:hover).
+pub const ICON_HOVER: egui::Color32 = egui::Color32::from_rgb(0x26, 0x26, 0x2E);
+/// Text-field fill — the prototype's --panel (.search input), with
+/// the 1px --line border the prototype draws on inputs.
+pub const FIELD_BG: egui::Color32 = egui::Color32::from_rgb(0x15, 0x15, 0x19);
+/// Secondary button fill — the prototype's --panel (.btn), finished
+/// with the 1px --line border the prototype draws on buttons.
+pub const BTN_BG: egui::Color32 = egui::Color32::from_rgb(0x15, 0x15, 0x19);
+/// Selected list-row fill — the prototype's --accent-soft
+/// (rgba(47,107,245,.16); .tree button.active pairs it with accent
+/// text).
+pub const SEL_BG: egui::Color32 = egui::Color32::from_rgba_unmultiplied(0x2F, 0x6B, 0xF5, 41);
 /// Layout tokens: page content inset inside a dock frame (the dock
 /// frames carry the panel widths now — 300 left frames, 240 for the
 /// settings nav, per the framework's Default workspace).
@@ -132,32 +146,39 @@ fn apply_modern_style(ctx: &egui::Context) {
     // than panels and cards alike, no stroke (spec §1).
     v.extreme_bg_color = FIELD_BG;
     v.faint_bg_color = CHROME;
-    // Text selection: the family value (deckcraft theme) — translucent
-    // mid blue; the selection stroke doubles as the focused text field's
-    // outline, so it carries the accent (spec §5, figcraft model).
-    v.selection.bg_fill = egui::Color32::from_rgba_unmultiplied(0x5A, 0x8F, 0xE0, 90);
+    // Text selection: the prototype accent's hue (the prototype sets
+    // no ::selection rule, so the framework's alpha 90 is kept); the
+    // selection stroke doubles as the focused text field's outline,
+    // so it carries the accent.
+    v.selection.bg_fill = egui::Color32::from_rgba_unmultiplied(0x2F, 0x6B, 0xF5, 90);
     v.selection.stroke = egui::Stroke::new(1.0, ACCENT);
     v.hyperlink_color = ACCENT;
     v.override_text_color = Some(TEXT_MAIN);
+    // Windows/dialogs: the prototype's dialog cascade resolves to
+    // 10px (18px → 14px → 10px rules of equal specificity, last wins).
     v.window_corner_radius = egui::CornerRadius::same(10);
-    v.menu_corner_radius = egui::CornerRadius::same(8);
-    // Shadows live only on windows/popups (spec §2): chrome and cards
-    // layer by brightness alone.
+    // Menus/popovers take the same 10px tier.
+    v.menu_corner_radius = egui::CornerRadius::same(10);
+    // Shadows live only on windows/popups: the prototype's single
+    // --shadow token (0 14px 34px rgba(0,0,0,.5)); cards and chrome
+    // layer by brightness + border alone.
     v.window_shadow = egui::epaint::Shadow {
-        offset: [0, 8],
-        blur: 24,
+        offset: [0, 14],
+        blur: 34,
         spread: 0,
-        color: egui::Color32::from_black_alpha(90),
+        color: egui::Color32::from_black_alpha(128),
     };
     v.popup_shadow = egui::epaint::Shadow {
-        offset: [0, 4],
-        blur: 16,
+        offset: [0, 14],
+        blur: 34,
         spread: 0,
-        color: egui::Color32::from_black_alpha(90),
+        color: egui::Color32::from_black_alpha(128),
     };
-    // Widget-level corner radius 5 across the board (spec §2; the Craft
-    // family themes use CornerRadius::same(5) for every control).
-    let r = egui::CornerRadius::same(5);
+    // Widget-level corner radius 10 across the board: the prototype's
+    // control tier (.btn / .search input / .tree button are all 10px).
+    // egui has a single widget radius, so the prototype's 8px
+    // small-control tier (stat chips, seg pills) lives at call sites.
+    let r = egui::CornerRadius::same(10);
     for w in [
         &mut v.widgets.noninteractive,
         &mut v.widgets.inactive,
@@ -168,36 +189,37 @@ fn apply_modern_style(ctx: &egui::Context) {
         w.corner_radius = r;
     }
     v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, SEPARATOR);
-    // State ladder (§5): one brightness step per state, applied
-    // instantly — no color tweening anywhere. Ghost controls keep a
-    // transparent weak fill; the strong fill is the button gray.
+    // State ladder (prototype): buttons/fields rest on --panel with
+    // the 1px --line border the prototype draws on .btn and inputs;
+    // button hover steps to --panel3 (.btn:hover), weak/ghost hover
+    // to --panel2 (.tree button:hover); pressed/open sit on --panel3.
+    // State colors apply instantly — no color tweening anywhere.
     v.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
     v.widgets.inactive.bg_fill = BTN_BG;
-    v.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, SEPARATOR);
     v.widgets.hovered.weak_bg_fill = HOVER_BG;
-    v.widgets.hovered.bg_fill = HOVER_BG;
-    v.widgets.hovered.bg_stroke = egui::Stroke::NONE;
-    v.widgets.active.weak_bg_fill = SEL_BG;
+    v.widgets.hovered.bg_fill = PRESSED_BG;
+    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, SEPARATOR);
+    v.widgets.active.weak_bg_fill = PRESSED_BG;
     v.widgets.active.bg_fill = PRESSED_BG;
-    v.widgets.active.bg_stroke = egui::Stroke::NONE;
+    v.widgets.active.bg_stroke = egui::Stroke::new(1.0, SEPARATOR);
     v.widgets.open.weak_bg_fill = HOVER_BG;
-    v.widgets.open.bg_fill = HOVER_BG;
-    v.widgets.open.bg_stroke = egui::Stroke::NONE;
+    v.widgets.open.bg_fill = PRESSED_BG;
+    v.widgets.open.bg_stroke = egui::Stroke::new(1.0, SEPARATOR);
     style.visuals = v;
     use egui::{FontFamily, FontId, TextStyle};
-    // Type ladder (spec §6): page title 18 / section 16 / card title
-    // 13.5; the ambient styles take the framework's measured values
-    // (EffectCraft theme.rs: Body 12 / Button 12 / Small 11).
+    // Type ladder (prototype): ambient text 12.5–13px (.btn 12.5,
+    // body copy 12.5/13), small 11, page titles 17–19 (crumb 18).
     style.text_styles.insert(
         TextStyle::Heading,
         FontId::new(18.0, FontFamily::Proportional),
     );
     style
         .text_styles
-        .insert(TextStyle::Body, FontId::new(12.0, FontFamily::Proportional));
+        .insert(TextStyle::Body, FontId::new(12.5, FontFamily::Proportional));
     style.text_styles.insert(
         TextStyle::Button,
-        FontId::new(12.0, FontFamily::Proportional),
+        FontId::new(12.5, FontFamily::Proportional),
     );
     style.text_styles.insert(
         TextStyle::Small,
@@ -207,7 +229,7 @@ fn apply_modern_style(ctx: &egui::Context) {
         .text_styles
         .insert(TextStyle::Monospace, FontId::new(12.0, FontFamily::Monospace));
     style.spacing.item_spacing = egui::vec2(8.0, 5.0);
-    style.spacing.button_padding = egui::vec2(8.0, 4.0);
+    style.spacing.button_padding = egui::vec2(10.0, 4.0);
     // Product floor (§8): desktop hit targets stay ≈28–30 high.
     style.spacing.interact_size.y = 28.0;
     // Motion (spec §4): the family's whole character is 0.2s linear for
@@ -228,20 +250,21 @@ fn apply_modern_style(ctx: &egui::Context) {
         active_handle_opacity: 0.8,
         ..Default::default()
     };
-    style.spacing.indent = 14.0;
-    style.spacing.window_margin = egui::Margin::same(10);
+    style.spacing.indent = 10.0;
+    style.spacing.window_margin = egui::Margin::same(12);
     ctx.set_global_style(style);
 }
 
-/// The one standard card (§4.2), EffectCraft-benchmarked: #1E1F24
-/// surface layered by brightness over the canvas, #2C2D33 hairline as
-/// the only finish, 6px radius, 12px inner margin, NO shadow —
+/// The one standard card: the prototype's --panel surface over the
+/// --bg canvas, 1px --line hairline as the only finish, 12px radius
+/// (--radius; the final .std-card cascade), 12px inner margin, NO
+/// shadow (the final .std-card rule sets box-shadow:none) —
 /// cover-first layout.
 fn card_frame() -> egui::Frame {
     egui::Frame::NONE
         .fill(CARD_BG)
         .stroke(egui::Stroke::new(1.0, CARD_BORDER))
-        .corner_radius(egui::CornerRadius::same(6))
+        .corner_radius(egui::CornerRadius::same(12))
         .inner_margin(egui::Margin::same(12))
         .shadow(egui::epaint::Shadow {
             offset: [0, 0],
@@ -251,9 +274,11 @@ fn card_frame() -> egui::Frame {
         })
 }
 
-/// Square-corner variant used by the index entry (PPT) cards.
+/// Index entry (PPT) card variant: the same 12px card tier as every
+/// other card under the prototype (its square corners were a
+/// spec-era deviation); kept as a named variant for its call site.
 fn card_frame_square() -> egui::Frame {
-    card_frame().corner_radius(egui::CornerRadius::ZERO)
+    card_frame().corner_radius(egui::CornerRadius::same(12))
 }
 
 /// Flush variant (no inner margin) for cover-first cards: the cover
@@ -279,13 +304,18 @@ fn chip(ui: &mut egui::Ui, text: &str, fg: egui::Color32, bg: egui::Color32) {
     );
 }
 
-pub const CHIP_GREEN_FG: egui::Color32 = egui::Color32::from_rgb(0x35, 0xB2, 0x6B);
-pub const CHIP_GREEN_BG: egui::Color32 = egui::Color32::from_rgb(0x1E, 0x3A, 0x2A);
-pub const CHIP_ORANGE_FG: egui::Color32 = egui::Color32::from_rgb(0xE8, 0xA1, 0x3A);
-pub const CHIP_ORANGE_BG: egui::Color32 = egui::Color32::from_rgb(0x3D, 0x2E, 0x1A);
-pub const CHIP_BLUE_BG: egui::Color32 = egui::Color32::from_rgb(0x1B, 0x2A, 0x3F);
-pub const CHIP_GRAY_FG: egui::Color32 = egui::Color32::from_rgb(0x9E, 0x9E, 0x9E);
-pub const CHIP_GRAY_BG: egui::Color32 = egui::Color32::from_rgb(0x26, 0x26, 0x2B);
+/// Status chips: the prototype's semantic pairs (fg over its *-soft
+/// bg; gray = --muted on --panel2).
+pub const CHIP_GREEN_FG: egui::Color32 = egui::Color32::from_rgb(0x3F, 0xAE, 0x74);
+pub const CHIP_GREEN_BG: egui::Color32 = egui::Color32::from_rgba_unmultiplied(0x3F, 0xAE, 0x74, 38);
+pub const CHIP_ORANGE_FG: egui::Color32 = egui::Color32::from_rgb(0xE0, 0x91, 0x3A);
+pub const CHIP_ORANGE_BG: egui::Color32 = egui::Color32::from_rgba_unmultiplied(0xE0, 0x91, 0x3A, 36);
+pub const CHIP_BLUE_BG: egui::Color32 = egui::Color32::from_rgba_unmultiplied(0x5B, 0x8C, 0xFF, 41);
+pub const CHIP_GRAY_FG: egui::Color32 = egui::Color32::from_rgb(0x8B, 0x8B, 0x97);
+pub const CHIP_GRAY_BG: egui::Color32 = egui::Color32::from_rgb(0x1D, 0x1D, 0x23);
+/// Danger pair — the prototype's --rose / --rose-soft.
+pub const ROSE: egui::Color32 = egui::Color32::from_rgb(0xF2, 0x55, 0x5A);
+pub const ROSE_SOFT_BG: egui::Color32 = egui::Color32::from_rgba_unmultiplied(0xF2, 0x55, 0x5A, 36);
 
 /// Ghost text action — the boards draw secondary actions as plain text
 /// (no box): 开始演示 in accent, the rest in main/weak text color.
@@ -294,7 +324,7 @@ fn text_action(ui: &mut egui::Ui, label: &str, color: egui::Color32, size: f32) 
         egui::Button::new(egui::RichText::new(label).size(size).color(color))
             .fill(egui::Color32::TRANSPARENT)
             .stroke(egui::Stroke::NONE)
-            .corner_radius(egui::CornerRadius::same(6)),
+            .corner_radius(egui::CornerRadius::same(10)),
     )
     .clicked()
 }
@@ -332,9 +362,9 @@ fn tree_row(
         ui.allocate_exact_size(egui::vec2(width, 24.0), egui::Sense::click());
     let painter = ui.painter();
     if selected {
-        painter.rect_filled(rect, 4.0, SEL_BG);
+        painter.rect_filled(rect, 10.0, SEL_BG);
     } else if resp.hovered() {
-        painter.rect_filled(rect, 4.0, HOVER_BG);
+        painter.rect_filled(rect, 10.0, HOVER_BG);
     }
     let mut tx = rect.min.x + 10.0 + indent;
     if let Some(tex) = icon {
@@ -351,7 +381,7 @@ fn tree_row(
         tx += 14.0 + 6.0;
     }
     let font = egui::FontId::new(size, egui::FontFamily::Proportional);
-    let color = if selected { TEXT_MAIN } else { TEXT_WEAK };
+    let color = if selected { ACCENT } else { TEXT_WEAK };
     let galley = painter.layout_no_wrap(label.to_string(), font, color);
     let ty = rect.center().y - galley.size().y / 2.0;
     painter.galley(egui::pos2(tx, ty), galley, color);
@@ -2671,7 +2701,7 @@ impl App {
         let mut cancel = false;
         egui::Frame::NONE
             .fill(CHIP_BLUE_BG)
-            .corner_radius(6)
+            .corner_radius(8)
             .inner_margin(egui::Margin::symmetric(14, 8))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -2707,7 +2737,7 @@ impl App {
                                             .color(egui::Color32::WHITE),
                                     )
                                     .fill(ACCENT)
-                                    .corner_radius(14),
+                                    .corner_radius(10),
                                 )
                                 .clicked()
                         {
@@ -2833,7 +2863,7 @@ impl App {
                             [92.0, 28.0],
                             egui::Button::new(egui::RichText::new("新建空白块").size(11.5))
                                 .fill(BTN_BG)
-                                .corner_radius(6),
+                                .corner_radius(10),
                         )
                         .clicked()
                     {
@@ -2844,7 +2874,7 @@ impl App {
                             [104.0, 28.0],
                             egui::Button::new(egui::RichText::new("粘贴 PPT 页新建").size(11.5))
                                 .fill(BTN_BG)
-                                .corner_radius(6),
+                                .corner_radius(10),
                         )
                         .clicked()
                     {
@@ -2983,12 +3013,12 @@ fn tool_vsep(ui: &mut egui::Ui) {
     ui.add_space(6.0);
 }
 
-/// EffectCraft workspace tab (tool row, right side): 12px text, 26
-/// high; active = hot blue #3D8FF5 text + a 2px underline in the same
-/// blue; inactive = dim text, no fill anywhere.
+/// Workspace tab (tool row, right side): 12.5px text, 26 high;
+/// active = accent text + a 2px underline in the same accent;
+/// inactive = dim text, no fill anywhere.
 fn workspace_tab(ui: &mut egui::Ui, active: bool, label: &str) -> egui::Response {
     let color = if active { HOT } else { TAB_TEXT };
-    let btn = egui::Button::new(egui::RichText::new(label).size(12.0).color(color))
+    let btn = egui::Button::new(egui::RichText::new(label).size(12.5).color(color))
         .fill(egui::Color32::TRANSPARENT)
         .stroke(egui::Stroke::NONE)
         .corner_radius(egui::CornerRadius::ZERO)
@@ -3018,7 +3048,7 @@ fn q_primary_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     ui.add(
         egui::Button::new(egui::RichText::new(label).size(12.5).color(egui::Color32::WHITE))
             .fill(ACCENT)
-            .corner_radius(6)
+            .corner_radius(10)
             .min_size(egui::vec2(0.0, 30.0)),
     )
 }
@@ -3027,7 +3057,7 @@ fn q_ghost_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     ui.add(
         egui::Button::new(egui::RichText::new(label).size(12.5).color(TEXT_MAIN))
             .fill(BTN_BG)
-            .corner_radius(6)
+            .corner_radius(10)
             .min_size(egui::vec2(0.0, 30.0)),
     )
 }
@@ -3287,7 +3317,7 @@ fn qimu_dock_style(ui: &egui::Ui) -> craft_ui::docking::DockStyle {
     style.inactive_text = TAB_TEXT;
     style.accent = ACCENT;
     style.floating_background = PANEL_BG;
-    style.font = egui::FontId::proportional(12.0);
+    style.font = egui::FontId::proportional(12.5);
     style.min_tab_width = 12.0 * 2.5 + 24.0;
     style.float_label = "浮动".into();
     style.close_label = "关闭".into();
@@ -3624,9 +3654,15 @@ impl App {
             .order(egui::Order::Foreground)
             .show(ui.ctx(), |ui| {
                 egui::Frame::NONE
-                    .fill(PANEL_BG)
+                    .fill(PRESSED_BG)
                     .stroke(egui::Stroke::new(1.0, FIELD_BORDER))
-                    .corner_radius(egui::CornerRadius::same(6))
+                    .corner_radius(egui::CornerRadius::same(8))
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 14],
+                        blur: 34,
+                        spread: 0,
+                        color: egui::Color32::from_black_alpha(128),
+                    })
                     .inner_margin(egui::Margin {
                         left: 12,
                         right: 12,
@@ -3910,7 +3946,7 @@ impl eframe::App for App {
                                     egui::RichText::new(tr("登录")).size(11.5).color(ACCENT),
                                 )
                                 .fill(BTN_BG)
-                                .corner_radius(6),
+                                .corner_radius(10),
                             )
                             .clicked()
                         {
@@ -3947,7 +3983,7 @@ impl eframe::App for App {
                                     egui::RichText::new(srv_label).size(11.5).color(TEXT_WEAK),
                                 )
                                 .fill(BTN_BG)
-                                .corner_radius(6),
+                                .corner_radius(10),
                             )
                             .clicked()
                         {
@@ -4110,7 +4146,7 @@ impl App {
             // not the text gray — a #9E9E9E stroke reads as a bright
             // white line against the dark panels.
             ui.painter()
-                .rect_stroke(rect, 0.0, egui::Stroke::new(1.0, SEL_BG), egui::StrokeKind::Middle);
+                .rect_stroke(rect, 0.0, egui::Stroke::new(1.0, FIELD_BORDER), egui::StrokeKind::Middle);
         }
         resp.clicked()
     }
@@ -4441,10 +4477,10 @@ impl App {
         };
         let style = craft_ui::buttons::IconButtonStyle {
             normal: visuals(egui::Color32::TRANSPARENT),
-            hovered: visuals(HOVER_BG),
+            hovered: visuals(ICON_HOVER),
             pressed: None,
-            selected: visuals(HOVER_BG),
-            corner_radius: egui::CornerRadius::same(6),
+            selected: visuals(ICON_HOVER),
+            corner_radius: egui::CornerRadius::same(7),
             focus_stroke: egui::Stroke::new(1.0, ACCENT),
         };
         let resp = craft_ui::buttons::IconButton::new(label, egui::vec2(30.0, 30.0), &style)
@@ -4487,7 +4523,7 @@ impl App {
             hovered: visuals(ICON_HOVER, ICON_TINT),
             pressed: None,
             selected: visuals(ACCENT, egui::Color32::WHITE),
-            corner_radius: egui::CornerRadius::same(4),
+            corner_radius: egui::CornerRadius::same(7),
             focus_stroke: egui::Stroke::new(1.0, ACCENT),
         };
         let resp = craft_ui::buttons::IconButton::new(label, egui::vec2(26.0, 26.0), &style)
@@ -4523,10 +4559,10 @@ impl App {
         };
         let style = craft_ui::buttons::IconButtonStyle {
             normal: visuals(egui::Color32::TRANSPARENT),
-            hovered: visuals(HOVER_BG),
+            hovered: visuals(ICON_HOVER),
             pressed: None,
-            selected: visuals(HOVER_BG),
-            corner_radius: egui::CornerRadius::same(4),
+            selected: visuals(ICON_HOVER),
+            corner_radius: egui::CornerRadius::same(7),
             focus_stroke: egui::Stroke::new(1.0, ACCENT),
         };
         let resp = craft_ui::buttons::IconButton::new(label, egui::vec2(22.0, 22.0), &style)
@@ -5705,7 +5741,7 @@ impl App {
                                                         .color(egui::Color32::WHITE),
                                                 )
                                                 .fill(ACCENT)
-                                                .corner_radius(14),
+                                                .corner_radius(10),
                                             )
                                             .clicked()
                                         {
@@ -6629,7 +6665,7 @@ impl App {
                                 .color(egui::Color32::WHITE),
                         )
                         .fill(ACCENT)
-                        .corner_radius(6)
+                        .corner_radius(10)
                         .min_size(egui::vec2(110.0, 36.0));
                         if ui.add(login_btn).clicked() {
                             self.do_login();
@@ -6778,7 +6814,7 @@ impl App {
                         egui::RichText::new("＋ 新建索引").color(egui::Color32::WHITE),
                     )
                     .fill(ACCENT)
-                    .corner_radius(17),
+                    .corner_radius(255),
                 )
                 .clicked()
             {
@@ -6842,17 +6878,20 @@ impl App {
                 for x in items {
                     let xid = s(&x, "id");
                     let selected = self.index.overview_selected.as_deref() == Some(xid.as_str());
+                    // Scope ring colors: the prototype's .std-card
+                    // scope palette (company/ancestor/deptsub/dept/none).
                     let scope_color = match s(&x, "scope").as_str() {
-                        "company" => ACCENT,
-                        "dept_sub" => egui::Color32::from_rgb(0x35, 0xB2, 0x6B),
-                        "dept" => egui::Color32::from_rgb(0xE8, 0xA1, 0x3A),
-                        _ => egui::Color32::from_rgb(0x6E, 0x6E, 0x6E),
+                        "company" => egui::Color32::from_rgb(0x3B, 0x82, 0xC4),
+                        "ancestor" => egui::Color32::from_rgb(0x8B, 0x7C, 0xC9),
+                        "dept_sub" => egui::Color32::from_rgb(0x4D, 0xA6, 0x74),
+                        "dept" => egui::Color32::from_rgb(0xD0, 0x8A, 0x3E),
+                        _ => egui::Color32::from_rgb(0x9A, 0xA3, 0x9C),
                     };
                     let resp = ui.allocate_ui(egui::vec2(300.0, 284.0), |ui| {
                         ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
                             egui::Frame::NONE
                                 .fill(CARD_BG)
-                                .corner_radius(6)
+                                .corner_radius(12)
                                 .stroke(egui::Stroke::new(1.0, scope_color))
                                 .show(ui, |ui| {
                                     ui.set_min_size(egui::vec2(300.0, 284.0));
@@ -6920,8 +6959,8 @@ impl App {
                                                     "void" => chip(
                                                         ui,
                                                         "已作废",
-                                                        egui::Color32::from_rgb(0xE5, 0x53, 0x4B),
-                                                        egui::Color32::from_rgb(0x3D, 0x1F, 0x1E),
+                                                        ROSE,
+                                                        ROSE_SOFT_BG,
                                                     ),
                                                     _ => {}
                                                 }
@@ -7093,7 +7132,7 @@ impl App {
                             .color(egui::Color32::WHITE),
                     )
                     .fill(ACCENT)
-                    .corner_radius(15)
+                    .corner_radius(10)
                     .min_size(egui::vec2(88.0, 30.0)),
                 )
                 .clicked()
@@ -7279,7 +7318,7 @@ impl App {
                                         if ui
                                             .button(
                                                 egui::RichText::new("×")
-                                                    .color(egui::Color32::from_rgb(0xE5, 0x53, 0x4B))
+                                                    .color(ROSE)
                                                     .size(17.0)
                                                     .strong(),
                                             )
@@ -7676,7 +7715,7 @@ impl App {
             egui::Frame::NONE
                 .fill(CARD_BG)
                 .stroke(egui::Stroke::new(1.0, CARD_BORDER))
-                .corner_radius(egui::CornerRadius::same(6))
+                .corner_radius(egui::CornerRadius::same(12))
                 .inner_margin(egui::Margin::same(12))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -7707,8 +7746,8 @@ impl App {
                     });
                     ui.add_space(4.0);
                     let (status, color) = match c.status {
-                        ConnStatus::Connected => ("已连接", egui::Color32::from_rgb(0x35, 0xB2, 0x6B)),
-                        ConnStatus::Failed => ("连接失败", egui::Color32::from_rgb(0xE5, 0x53, 0x4B)),
+                        ConnStatus::Connected => ("已连接", CHIP_GREEN_FG),
+                        ConnStatus::Failed => ("连接失败", ROSE),
                         ConnStatus::LoggedOut => ("未登录", TEXT_WEAK),
                         ConnStatus::Anonymous => ("匿名连接", egui::Color32::from_rgb(0x2F, 0x6B, 0xF5)),
                     };
@@ -7803,7 +7842,7 @@ impl App {
                 .add(
                     egui::Button::new(egui::RichText::new("登录并添加").color(egui::Color32::WHITE))
                         .fill(ACCENT)
-                        .corner_radius(15)
+                        .corner_radius(10)
                         .min_size(egui::vec2(120.0, 30.0)),
                 )
                 .clicked()
@@ -7813,7 +7852,7 @@ impl App {
             if ui
                 .add(
                     egui::Button::new(egui::RichText::new("匿名添加"))
-                        .corner_radius(15)
+                        .corner_radius(10)
                         .min_size(egui::vec2(120.0, 30.0)),
                 )
                 .clicked()
@@ -7853,7 +7892,7 @@ impl App {
             egui::Frame::NONE
                 .fill(CARD_BG)
                 .stroke(egui::Stroke::new(1.0, CARD_BORDER))
-                .corner_radius(egui::CornerRadius::same(6))
+                .corner_radius(egui::CornerRadius::same(12))
                 .inner_margin(egui::Margin::same(12))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -8067,7 +8106,7 @@ impl App {
                                                         .color(egui::Color32::WHITE),
                                                 )
                                                 .fill(ACCENT)
-                                                .corner_radius(19)
+                                                .corner_radius(10)
                                                 .min_size(egui::vec2(120.0, 38.0)),
                                             )
                                             .clicked()
@@ -8388,7 +8427,7 @@ impl App {
                                             .color(egui::Color32::WHITE),
                                     )
                                     .fill(ACCENT)
-                                    .corner_radius(15),
+                                    .corner_radius(10),
                                 )
                                 .clicked()
                             {
@@ -8522,7 +8561,7 @@ impl App {
                                             .color(egui::Color32::WHITE),
                                     )
                                     .fill(ACCENT)
-                                    .corner_radius(15),
+                                    .corner_radius(10),
                                 )
                                 .clicked()
                             {
