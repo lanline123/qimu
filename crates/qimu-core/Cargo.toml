@@ -4,6 +4,15 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
+[features]
+# DeckCraft native section write-back (PLAN §3.3 / §8 decision 5):
+# OFF until the P0 section round-trip probe
+# (tests/deckcraft_section_probe.rs, run in CI) passes. While OFF,
+# `section_link::section_mode()` reports ManifestOnly — sections act
+# as import split hints only, assembly writes no sections, and block
+# boundaries live in the manifest alone (the accepted degradation).
+deckcraft-sections = []
+
 [dependencies]
 zip = "2"
 sha2 = "0.10"
@@ -13,4 +22,20 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 argon2 = "0.5"
 rand = "0.8"
 # storytold/craft-libs (MIT OR Apache-2.0), pinned git rev — see design/组件接入台账.md
+# NOTE (P0, PLAN §7 risk 1 / §8 decision 2): craft-atomic has no
+# counterpart in DeckCraft's dependency graph, so it is NOT part of
+# the DeckCraft-baseline alignment and stays on 0c144b7. The aligned
+# crates (craft-ui / craft-update / craft-i18n -> 63196e6) are pinned
+# in qimu-client's manifest.
 craft-atomic = { git = "https://github.com/storytold/craft-libs", rev = "0c144b7d983899d4b5b281046dd03a8b1ab35fbb" }
+
+# DeckCraft (lanline123/deckcraft, MIT OR Apache-2.0) enters as a git
+# submodule at vendor/deckcraft (PLAN §4 form 1). P0 wires ONLY the
+# section round-trip probe's minimal surface (model + pptx) and only
+# as dev-dependencies, so production builds of core/server/cli stay
+# DeckCraft-free until P1. P1 will promote render/engine/ui-egui
+# path deps into qimu-client (reserved block there).
+[dev-dependencies]
+deckcraft-model = { path = "../../vendor/deckcraft/crates/model" }
+deckcraft-pptx = { path = "../../vendor/deckcraft/crates/pptx" }
+zip = "2"

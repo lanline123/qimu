@@ -21,16 +21,16 @@ serde_json = "1"
 ureq = { version = "2", features = ["json"] }
 base64 = "0.22"
 rfd = "0.15"
-# craft-i18n (storytold/craft-libs@0c144b7, MIT OR Apache-2.0): the
+# craft-i18n (storytold/craft-libs@63196e6, MIT OR Apache-2.0): the
 # source-keyed localization runtime; catalogs live in locales/*.tsv in
 # the storytold/craft-i18n TSV format.
-craft-i18n = { git = "https://github.com/storytold/craft-libs", rev = "0c144b7d983899d4b5b281046dd03a8b1ab35fbb" }
-# craft-ui (storytold/craft-libs@0c144b7, MIT OR Apache-2.0): the Craft
+craft-i18n = { git = "https://github.com/storytold/craft-libs", rev = "63196e66f3033a6623eb629af95a104d26986725" }
+# craft-ui (storytold/craft-libs@63196e6, MIT OR Apache-2.0): the Craft
 # component library on the egui fork; adopted component by component
 # with its native interaction model (step 6b: buttons::IconButton;
 # framework round: docking — the feature set matches EffectCraft's
 # own workspace pin: "serde" unlocks docking::DockCommand).
-craft-ui = { git = "https://github.com/storytold/craft-libs", rev = "0c144b7d983899d4b5b281046dd03a8b1ab35fbb", features = ["serde"] }
+craft-ui = { git = "https://github.com/storytold/craft-libs", rev = "63196e66f3033a6623eb629af95a104d26986725", features = ["serde"] }
 aes-gcm = "0.10"
 image = "0.25"
 # storytold/craft-libs (MIT OR Apache-2.0), pinned git rev — see design/组件接入台账.md
@@ -38,7 +38,31 @@ craft-atomic = { git = "https://github.com/storytold/craft-libs", rev = "0c144b7
 # PdfCraft page rasterizer (storytold/pdfcraft@27287c2, MIT OR Apache-2.0):
 # renders attachment PDFs to page images for the in-client preview.
 pdfcraft-render = { git = "https://github.com/storytold/pdfcraft", rev = "27287c297d25d505a8720ea6da2e7af38693bfa9" }
-# craft-update protocol layer (storytold/craft-libs@0c144b7, MIT OR
+# craft-update protocol layer (storytold/craft-libs@63196e6, MIT OR
 # Apache-2.0): parse_github_release_list + offers_update +
 # download_url_under_mirror drive the LAN update-mirror check (prompt only).
-craft-update = { git = "https://github.com/storytold/craft-libs", rev = "0c144b7d983899d4b5b281046dd03a8b1ab35fbb" }
+craft-update = { git = "https://github.com/storytold/craft-libs", rev = "63196e66f3033a6623eb629af95a104d26986725" }
+
+# ---------------------------------------------------------------------------
+# DeckCraft baseline alignment (P0, PLAN §7 risk 1 / §8 decision 2):
+# craft-ui / craft-update / craft-i18n moved 0c144b7 -> 63196e6, the
+# revs DeckCraft itself pins, so a single copy of each craft crate
+# exists in the unified graph once DeckCraft crates join (two copies
+# of craft-ui 0.1.0 at different revs are different crates to rustc;
+# any type crossing the qimu-client <-> deckcraft-ui-egui seam would
+# fail to compile). craft-atomic stays on 0c144b7: DeckCraft's graph
+# has no craft-atomic. Alignment is gated by CI (P0 workflow): if the
+# 63196e6 APIs drifted from what this client was written against,
+# CI goes red and the drift gets fixed against the new baseline —
+# the pins do not move back.
+#
+# P1 reserved wiring (PLAN §4 consumption surface / §6 P1) — enable
+# by uncommenting when the read-only capabilities land (thumbnails,
+# deck viewing, show + presenter embedding):
+# deckcraft-model  = { path = "../../vendor/deckcraft/crates/model" }
+# deckcraft-render = { path = "../../vendor/deckcraft/crates/render" }
+# deckcraft-engine = { path = "../../vendor/deckcraft/crates/engine" }
+# deckcraft-ui-egui = { path = "../../vendor/deckcraft/crates/ui-egui" }
+# deckcraft-pdf    = { path = "../../vendor/deckcraft/crates/pdf" }
+# deckcraft-pptx   = { path = "../../vendor/deckcraft/crates/pptx" }
+# ---------------------------------------------------------------------------

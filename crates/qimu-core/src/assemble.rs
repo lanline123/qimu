@@ -10,6 +10,15 @@
 //! their notes-master reference is repointed at the base deck's notes
 //! master. Correctness over size: shared parts are duplicated per
 //! fragment, content-hash dedup is a later optimization.
+//!
+//! SECTION WIRING POINT (PLAN §3.3 item 2, §8 decision 5): when
+//! `crate::section_link::section_mode()` is `Native`, this is where
+//! each assembled content block is additionally written as a
+//! same-named PPT section (`p14:sectionLst`) and the manifest
+//! records the block-id <-> section mapping. While the mode is
+//! `ManifestOnly` (the P0 default), assembly stays byte-for-byte
+//! the pre-integration behaviour: no sections written, block
+//! boundaries live in the manifest alone.
 
 use crate::pptx::{attr, parse_rels, resolve_target, scan_elements, slides, Package};
 use std::collections::BTreeMap;

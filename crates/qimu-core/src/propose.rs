@@ -3,6 +3,13 @@
 //! proposer is a deterministic heuristic (section-opener detection);
 //! the interface is the seam where an AI proposer plugs in later —
 //! proposals are always confirmed by a human before import.
+//!
+//! SECTION WIRING POINT (PLAN §3.3 item 1, §8 decision 5): in BOTH
+//! section modes a source deck's real sections are the preferred
+//! split boundaries here (one section = one proposed block, named
+//! after the section) and this heuristic only arbitrates decks
+//! without sections. The modes differ only in what assembly writes
+//! back — see `crate::section_link`.
 
 use crate::pptx::Package;
 use crate::text::{extract_texts, slide_title};

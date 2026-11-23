@@ -12,6 +12,7 @@ pub mod model;
 pub mod personalize;
 pub mod pptx;
 pub mod propose;
+pub mod section_link;
 pub mod semver;
 pub mod store;
 pub mod text;
