@@ -1,0 +1,70 @@
+# 启幕 Windows 试装包构建 —— 客户端与服务器两个独立安装包
+#
+# 路径与作者本机出包一致: ubuntu + mingw 交叉编译 x86_64-pc-windows-gnu
+# (release) -> makensis 出两个 NSIS 包 -> 作为 artifact 上传。
+# 手动触发 (workflow_dispatch), 也可在推送到 main 时按需开启 push 触发。
+#
+# 注意 (落仓须知): 本文件受 GitHub App 权限限制, 无法经 Muse 的
+# GitHub App 推送 (App 无 .github/workflows 写权限), 需经 GitHub 网页端
+# 或 PAT 写入仓库后才会生效。见 ~/workspace/qimu-ui-update/REPORT.md。
+
+name: build-windows
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mingw + NSIS
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-mingw-w64-x86-64 nsis
+
+      - name: Install Rust (gnu target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Optional — embed Alibaba PuHuiTi font
+        # 字体文件不入仓 (见 crates/qimu-client/assets/README.md)。
+        # 若仓库变量 QIMU_FONT_URL 已配置, 下载并按 README 中的
+        # SHA-256 校验后放进 assets/; 未配置则跳过, 客户端回退系统字体。
+        if: ${{ vars.QIMU_FONT_URL != '' }}
+        run: |
+          curl -fL "${{ vars.QIMU_FONT_URL }}" -o crates/qimu-client/assets/AlibabaPuHuiTi-3-55-Regular.ttf
+          echo "be33bc8d45ced30fa5c542f6f056565baf85003d4e079522110d76016f8a04e2  crates/qimu-client/assets/AlibabaPuHuiTi-3-55-Regular.ttf" | sha256sum -c -
+
+      - name: Build client + server + cli (release, windows-gnu)
+        run: cargo build --release --target x86_64-pc-windows-gnu -p qimu-client -p qimu-server -p qimu-cli
+
+      - name: Stage binaries for NSIS
+        run: |
+          mkdir -p packaging/win
+          cp target/x86_64-pc-windows-gnu/release/qimu-client.exe packaging/win/
+          cp target/x86_64-pc-windows-gnu/release/qimu-server.exe packaging/win/
+          cp target/x86_64-pc-windows-gnu/release/qimu.exe packaging/win/
+          cp packaging/使用说明.txt packaging/win/
+
+      - name: Build client installer
+        working-directory: packaging
+        run: |
+          cp 启幕-客户端.nsi qimu-client-setup.nsi
+          LC_ALL=C.UTF-8 makensis qimu-client-setup.nsi
+
+      - name: Build server installer
+        working-directory: packaging
+        run: |
+          cp 启幕-服务器.nsi qimu-server-setup.nsi
+          LC_ALL=C.UTF-8 makensis qimu-server-setup.nsi
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: qimu-windows-setups
+          path: |
+            packaging/启幕客户端-Setup.exe
+            packaging/启幕服务器-Setup.exe
