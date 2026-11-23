@@ -1289,7 +1289,6 @@ dependencies = [
 [[package]]
 name = "craft-atomic"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=0c144b7d983899d4b5b281046dd03a8b1ab35fbb#0c144b7d983899d4b5b281046dd03a8b1ab35fbb"
 dependencies = [
  "rustix 1.1.6",
 ]
@@ -1297,13 +1296,12 @@ dependencies = [
 [[package]]
 name = "craft-cfb"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=8048f8ef92da80fb3ce5a056d59ca591ee66faf1#8048f8ef92da80fb3ce5a056d59ca591ee66faf1"
 
 [[package]]
 name = "craft-drawingml"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=8048f8ef92da80fb3ce5a056d59ca591ee66faf1#8048f8ef92da80fb3ce5a056d59ca591ee66faf1"
 dependencies = [
+ "chrono",
  "craft-xml",
  "kurbo",
  "log",
@@ -1311,14 +1309,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "craft-font-catalog"
+version = "0.1.0"
+source = "git+https://github.com/lanline123/craft-libs?rev=b9c7b6970382acb1da090d83eb21e51f7006763a#b9c7b6970382acb1da090d83eb21e51f7006763a"
+dependencies = [
+ "harfrust 0.13.3",
+ "kurbo",
+ "skrifa 0.47.0",
+ "thiserror 2.0.21",
+ "unicode-bidi",
+ "unicode-segmentation",
+ "windows-registry",
+]
+
+[[package]]
 name = "craft-fonts-build"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=63196e66f3033a6623eb629af95a104d26986725#63196e66f3033a6623eb629af95a104d26986725"
 
 [[package]]
 name = "craft-i18n"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=63196e66f3033a6623eb629af95a104d26986725#63196e66f3033a6623eb629af95a104d26986725"
 dependencies = [
  "fixed_decimal",
  "icu_decimal",
@@ -1341,7 +1351,6 @@ dependencies = [
 [[package]]
 name = "craft-opc"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=8048f8ef92da80fb3ce5a056d59ca591ee66faf1#8048f8ef92da80fb3ce5a056d59ca591ee66faf1"
 dependencies = [
  "craft-xml",
  "craft-zip",
@@ -1352,7 +1361,6 @@ dependencies = [
 [[package]]
 name = "craft-pdf"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=e2dc681a3#e2dc681a3ad8a47038da2f11ddd2c5e1c0454991"
 dependencies = [
  "aes 0.9.4",
  "chrono",
@@ -1370,7 +1378,6 @@ dependencies = [
 [[package]]
 name = "craft-pptx"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=8048f8ef92da80fb3ce5a056d59ca591ee66faf1#8048f8ef92da80fb3ce5a056d59ca591ee66faf1"
 dependencies = [
  "craft-drawingml",
  "craft-opc",
@@ -1385,18 +1392,16 @@ dependencies = [
 [[package]]
 name = "craft-stream-codecs"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=e2dc681a3#e2dc681a3ad8a47038da2f11ddd2c5e1c0454991"
 dependencies = [
  "fax",
  "hayro-ccitt",
- "hayro-jbig2",
+ "hayro-jbig2 0.3.0",
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "craft-ui"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=63196e66f3033a6623eb629af95a104d26986725#63196e66f3033a6623eb629af95a104d26986725"
 dependencies = [
  "craft-fonts-build",
  "craft-i18n",
@@ -1417,7 +1422,6 @@ dependencies = [
 [[package]]
 name = "craft-update"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=63196e66f3033a6623eb629af95a104d26986725#63196e66f3033a6623eb629af95a104d26986725"
 dependencies = [
  "chrono",
  "dunce",
@@ -1442,7 +1446,6 @@ dependencies = [
 [[package]]
 name = "craft-xml"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=8048f8ef92da80fb3ce5a056d59ca591ee66faf1#8048f8ef92da80fb3ce5a056d59ca591ee66faf1"
 dependencies = [
  "quick-xml 0.41.0",
  "serde",
@@ -1452,7 +1455,6 @@ dependencies = [
 [[package]]
 name = "craft-zip"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=8048f8ef92da80fb3ce5a056d59ca591ee66faf1#8048f8ef92da80fb3ce5a056d59ca591ee66faf1"
 dependencies = [
  "flate2",
  "thiserror 2.0.21",
@@ -1897,7 +1899,7 @@ dependencies = [
  "emath",
  "epaint_default_fonts",
  "font-types 0.12.7",
- "harfrust",
+ "harfrust 0.12.0",
  "log",
  "nohash-hasher",
  "parking_lot",
@@ -2454,6 +2456,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "harfrust"
+version = "0.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "948d0741125ba89cd3e1c23e5642415b6ade7e1d29d67ba25fb925b533e989d6"
+dependencies = [
+ "bitflags 2.13.2",
+ "bytemuck",
+ "once_cell",
+ "read-fonts 0.43.3",
+ "smallvec",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2540,6 +2555,13 @@ dependencies = [
 [[package]]
 name = "hayro-jbig2"
 version = "0.3.0"
+dependencies = [
+ "hayro-ccitt",
+]
+
+[[package]]
+name = "hayro-jbig2"
+version = "0.3.0"
 source = "git+https://github.com/storytold/pdfcraft?rev=27287c297d25d505a8720ea6da2e7af38693bfa9#27287c297d25d505a8720ea6da2e7af38693bfa9"
 dependencies = [
  "fearless_simd",
@@ -2568,7 +2590,7 @@ source = "git+https://github.com/storytold/pdfcraft?rev=27287c297d25d505a8720ea6
 dependencies = [
  "flate2",
  "hayro-ccitt",
- "hayro-jbig2",
+ "hayro-jbig2 0.3.0 (git+https://github.com/storytold/pdfcraft?rev=27287c297d25d505a8720ea6da2e7af38693bfa9)",
  "hayro-jpeg2000",
  "memchr",
  "rustc-hash 2.1.3",
@@ -2704,7 +2726,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.58.0",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -4022,7 +4044,7 @@ name = "pdfcraft-fonts"
 version = "0.21.1"
 source = "git+https://github.com/storytold/pdfcraft?rev=27287c297d25d505a8720ea6da2e7af38693bfa9#27287c297d25d505a8720ea6da2e7af38693bfa9"
 dependencies = [
- "harfrust",
+ "harfrust 0.12.0",
  "pdfcraft-cos",
  "skrifa 0.44.0",
  "unicode-bidi",
@@ -4419,6 +4441,7 @@ dependencies = [
  "aes-gcm",
  "base64 0.22.1",
  "craft-atomic",
+ "craft-font-catalog",
  "craft-i18n",
  "craft-ui",
  "craft-update",
@@ -4431,6 +4454,7 @@ dependencies = [
  "rfd",
  "serde_json",
  "ureq 2.12.1",
+ "winresource",
 ]
 
 [[package]]
@@ -4439,6 +4463,8 @@ version = "0.1.0"
 dependencies = [
  "argon2",
  "craft-atomic",
+ "craft-opc",
+ "craft-xml",
  "deckcraft-model",
  "deckcraft-pptx",
  "rand 0.8.8",
@@ -4690,6 +4716,17 @@ name = "read-fonts"
 version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "046a7d674daf459825b32f5062056d6882db0d2f5a479fbd76ccfc870ac18709"
+dependencies = [
+ "bytemuck",
+ "font-types 0.12.7",
+ "once_cell",
+]
+
+[[package]]
+name = "read-fonts"
+version = "0.43.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "005c8acf251756c478b0bf402885bfd88a1476020c4c7e6060edc1aa68da38ea"
 dependencies = [
  "bytemuck",
  "font-types 0.12.7",
@@ -5069,6 +5106,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.10",
+]
+
+[[package]]
+name = "serde_spanned"
+version = "1.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c187e0a369471c550af028cba56d4f4fa2a489ad28151ae95a4d340a2a8b782"
+dependencies = [
+ "serde_core",
 ]
 
 [[package]]
@@ -5550,6 +5596,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "toml"
+version = "1.2.2+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5426cb1b964690d913f6c5c1a1ae0b42f428ec506bb4d452876d7a209c9bca3b"
+dependencies = [
+ "indexmap",
+ "serde_core",
+ "serde_spanned",
+ "toml_datetime",
+ "toml_parser",
+ "toml_writer",
+ "winnow",
+]
+
+[[package]]
 name = "toml_datetime"
 version = "1.1.3+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5572,12 +5633,18 @@ dependencies = [
 
 [[package]]
 name = "toml_parser"
-version = "1.1.5+spec-1.1.0"
+version = "1.1.6+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "baa693a8032d7e1cada7d0041e96126df243179ff061456783ac7f12bda4744c"
+checksum = "e6769c452d71ba30696c6b37770c439a9cc9110f47f7d5cdbeda79840ef5ea31"
 dependencies = [
  "winnow",
 ]
+
+[[package]]
+name = "toml_writer"
+version = "1.2.0+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "009dbb7700f11c55ef83aebbe4c0e9cf1f1ac0844bd8d6f00dc38f302026e13a"
 
 [[package]]
 name = "tower"
@@ -6707,6 +6774,16 @@ checksum = "cb5a765337c50e9ec252c2069be9bf91c7df47afb103b642ba3a53bf8101be97"
 dependencies = [
  "cfg-if",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "winresource"
+version = "0.1.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2bc6d36480b829272a5bdabf08e6dca8004761c1da7e35efef800540c66221b"
+dependencies = [
+ "toml",
+ "version_check",
 ]
 
 [[package]]
