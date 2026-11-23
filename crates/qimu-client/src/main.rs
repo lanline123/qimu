@@ -9050,11 +9050,12 @@ impl App {
             let mut target_vid = pe.version_id.clone();
             let mut new_semver = String::new();
             if !edits.is_empty() {
+                let bump = ["major", "minor", "patch"][pe.bump];
                 let payload = json!({
                     "edits": edits.iter().map(|(p, r, t)| json!({
                         "page": p, "run": r, "text": t,
                     })).collect::<Vec<_>>(),
-                    "bump": ["major", "minor", "patch"][pe.bump],
+                    "bump": bump,
                     "note": pe.note,
                 });
                 match self.call(
