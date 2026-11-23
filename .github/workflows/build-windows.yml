@@ -24,6 +24,15 @@ jobs:
         with:
           submodules: true
 
+      # Bundled fonts source: the user's own craft-fonts fork, pinned
+      # by full commit SHA (bump deliberately, like every other pin).
+      # Public repo; the fonts themselves never enter this repo.
+      - uses: actions/checkout@v4
+        with:
+          repository: lanline123/craft-fonts
+          ref: 26a79230872f9b2acd3dd68500677e294350ab94
+          path: craft-fonts
+
       - name: Install mingw + NSIS
         run: |
           sudo apt-get update
@@ -51,13 +60,78 @@ jobs:
       - name: Build client + server + cli (release, windows-gnu)
         run: cargo build --release --target x86_64-pc-windows-gnu -p qimu-client -p qimu-server -p qimu-cli
 
+      # deckcraft-cli: the server's thumbnail renderer (and the PDF
+      # export engine once that endpoint lands). The server resolves
+      # the binary next to qimu-server.exe (QIMU_DECKCRAFT_CLI env,
+      # then exe-dir, then PATH), so it must ship inside the server
+      # installer — until now the installer never carried it and
+      # clean installs silently fell back to LibreOffice. Built from
+      # the vendor/deckcraft submodule workspace, the same workspace
+      # thumb-dual-track builds natively for the verdict.
+      # NOTE: the windows-gnu cross build of the deckcraft engine is
+      # verified by THIS step (test -f below): if it fails, the run
+      # goes red here instead of shipping a renderer-less server.
+      - name: Build deckcraft-cli (release, windows-gnu)
+        working-directory: vendor/deckcraft
+        run: |
+          cargo build --release --target x86_64-pc-windows-gnu -p deckcraft-cli
+          test -f target/x86_64-pc-windows-gnu/release/deckcraft-cli.exe
+
       - name: Stage binaries for NSIS
         run: |
           mkdir -p packaging/win
           cp target/x86_64-pc-windows-gnu/release/qimu-client.exe packaging/win/
           cp target/x86_64-pc-windows-gnu/release/qimu-server.exe packaging/win/
           cp target/x86_64-pc-windows-gnu/release/qimu.exe packaging/win/
+          cp vendor/deckcraft/target/x86_64-pc-windows-gnu/release/deckcraft-cli.exe packaging/win/
           cp packaging/使用说明.txt packaging/win/
+
+      - name: Stage bundled fonts (craft-fonts, Simplified Chinese + Latin)
+        # User ruling 2026-11-23: the installer bundles ONLY the
+        # Simplified Chinese manifest and the Latin manifest of
+        # craft-fonts — no other scripts. Every file's SHA-256 is
+        # verified against its manifest line; any mismatch or missing
+        # file fails the build (a release must not silently ship
+        # without its fonts). Payload lands in packaging/win/fonts/,
+        # which the client NSI installs as fonts/ beside the exe and
+        # the client loads through craft-font-catalog at startup.
+        run: |
+          python3 - <<'PYEOF'
+          import hashlib, pathlib, shutil, sys
+          root = pathlib.Path("craft-fonts")
+          out = pathlib.Path("packaging/win/fonts")
+          manifests = ["simplified-chinese-manifest.txt", "latin-manifest.txt"]
+          total = 0
+          count = 0
+          licences = set()
+          for name in manifests:
+              mpath = root / "fonts" / name
+              for line in mpath.read_text(encoding="utf-8").splitlines():
+                  line = line.strip()
+                  if not line or line.startswith("#"):
+                      continue
+                  f = [x.strip() for x in line.split("|")]
+                  file, licence_file, sha = f[2], f[5], f[6]
+                  src = root / file
+                  if hashlib.sha256(src.read_bytes()).hexdigest() != sha:
+                      sys.exit(f"sha256 mismatch: {file}")
+                  dst = out / pathlib.Path(file).relative_to("fonts")
+                  dst.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copyfile(src, dst)
+                  total += src.stat().st_size
+                  count += 1
+                  licences.add(licence_file)
+          for lf in sorted(licences):
+              src = root / lf
+              dst = out / pathlib.Path(lf).relative_to("fonts")
+              dst.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copyfile(src, dst)
+              total += src.stat().st_size
+          for name in manifests:
+              shutil.copyfile(root / "fonts" / name, out / name)
+              total += (root / "fonts" / name).stat().st_size
+          print(f"bundled fonts: {count} faces staged into {out}, {total} bytes total")
+          PYEOF
 
       - name: Generate installer icon (brand logo)
         shell: pwsh
