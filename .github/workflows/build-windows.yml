@@ -59,6 +59,32 @@ jobs:
           cp target/x86_64-pc-windows-gnu/release/qimu.exe packaging/win/
           cp packaging/使用说明.txt packaging/win/
 
+      - name: Generate installer icon (brand logo)
+        shell: pwsh
+        run: |
+          # Single source of truth: crates/qimu-client/assets/logo.png.b64
+          # (the same asset the GUI renders and build.rs embeds in the
+          # exe). Wrap the PNG in a single-image .ico for NSIS: the
+          # installer header icon (packaging/qimu.ico) and the payload
+          # icon both .nsi scripts install as win/qimu.ico.
+          $b64 = (Get-Content -Raw crates/qimu-client/assets/logo.png.b64) -replace '\s', ''
+          $png = [Convert]::FromBase64String($b64)
+          $w = [BitConverter]::ToUInt32(@($png[19], $png[18], $png[17], $png[16]), 0)
+          $h = [BitConverter]::ToUInt32(@($png[23], $png[22], $png[21], $png[20]), 0)
+          if ($w -lt 1 -or $w -gt 256 -or $h -lt 1 -or $h -gt 256) { throw "logo PNG size ${w}x${h} not wrappable" }
+          $ms = New-Object System.IO.MemoryStream
+          $bw = New-Object System.IO.BinaryWriter($ms)
+          $bw.Write([uint16]0); $bw.Write([uint16]1); $bw.Write([uint16]1)
+          $bw.Write([byte]($(if ($w -eq 256) { 0 } else { $w })))
+          $bw.Write([byte]($(if ($h -eq 256) { 0 } else { $h })))
+          $bw.Write([byte]0); $bw.Write([byte]0)
+          $bw.Write([uint16]1); $bw.Write([uint16]32)
+          $bw.Write([uint32]$png.Length); $bw.Write([uint32]22)
+          $bw.Write($png); $bw.Flush()
+          [System.IO.File]::WriteAllBytes("packaging/qimu.ico", $ms.ToArray())
+          Copy-Item packaging/qimu.ico packaging/win/qimu.ico
+          Write-Host "qimu.ico generated: $((Get-Item packaging/qimu.ico).Length) bytes"
+
       - name: Build client installer
         working-directory: packaging
         run: |
