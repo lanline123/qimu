@@ -9,11 +9,124 @@ use eframe::egui;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
+/// The UI faces the client takes from the bundled craft-fonts set,
+/// as (catalog family, style, egui font key). The installer stages
+/// the payload into `fonts/` beside the executable — CI copies it
+/// from the lanline123/craft-fonts checkout at a pinned commit and
+/// verifies every file's SHA-256 against the two bundled manifests
+/// (fonts/simplified-chinese-manifest.txt + fonts/latin-manifest.txt;
+/// user ruling 2026-11-23: Simplified Chinese + Latin only, no other
+/// scripts in the package). egui's chains need exactly one Regular
+/// face per slot — glyph fallback is per character along the family
+/// list, weight and italic are not selected from it — so the rest of
+/// the payload (Inter's other faces, the Latin presentation
+/// families) stays on disk for the DeckCraft render path, which
+/// resolves document fonts from the same directory through the same
+/// catalog.
+const BUNDLED_FONT_PLAN: [(&str, &str, &str); 3] = [
+    ("Inter", "Regular", "craft-inter"),
+    ("LXGW WenKai Lite", "Regular", "craft-wenkai"),
+    ("Liberation Mono", "Regular", "craft-mono"),
+];
+
+/// Which of the planned bundled faces were actually installed.
+#[derive(Default)]
+struct BundledFonts {
+    inter: bool,
+    wenkai: bool,
+    mono: bool,
+}
+
+/// The directory the installer stages the bundled fonts into:
+/// `fonts/` beside the executable. `QIMU_FONTS_DIR` overrides it
+/// (portable layouts, development runs without an installer).
+fn bundled_fonts_dir() -> Option<std::path::PathBuf> {
+    if let Ok(dir) = std::env::var("QIMU_FONTS_DIR") {
+        let dir = std::path::PathBuf::from(dir);
+        if dir.is_dir() {
+            return Some(dir);
+        }
+    }
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?.join("fonts");
+    if dir.is_dir() {
+        Some(dir)
+    } else {
+        None
+    }
+}
+
+/// The bytes of one face of `family` in `style`, taken only from the
+/// catalog's app-dir source (a system font that happens to share the
+/// family name must not shadow the packaged payload, whose bytes the
+/// installer verified). Falls back to any app-dir face of the family
+/// — a renamed style must not lose the whole family.
+fn catalog_app_face(
+    catalog: &craft_font_catalog::Catalog,
+    family: &str,
+    style: &str,
+) -> Option<Vec<u8>> {
+    let faces = catalog.load_family(family);
+    let from_app = |f: &craft_font_catalog::LoadedFace| {
+        f.info.source == craft_font_catalog::Source::App && f.info.index == 0
+    };
+    let face = faces
+        .iter()
+        .filter(|f| from_app(f))
+        .find(|f| f.info.style == style)
+        .or_else(|| faces.iter().find(|f| from_app(f)))?;
+    Some(Vec::from(&face.data.bytes[..]))
+}
+
+/// Discover and load the planned UI faces from the bundled `fonts/`
+/// directory through craft-font-catalog, registering them in
+/// `fonts`. The catalog is the suite's font manager: the app dir is
+/// set before the catalog's first lookup, so its first scan picks
+/// the directory up (the client is the catalog's only consumer
+/// today; a later consumer must likewise set its dirs before its
+/// first lookup or rescan). Soft failure throughout: no directory,
+/// no face or an unreadable file only leaves a flag unset.
+fn install_bundled_fonts(fonts: &mut egui::FontDefinitions) -> BundledFonts {
+    let mut installed = BundledFonts::default();
+    let Some(dir) = bundled_fonts_dir() else {
+        return installed;
+    };
+    let catalog: &craft_font_catalog::Catalog = craft_font_catalog::Catalog::global();
+    catalog.set_app_dirs(vec![dir]);
+    for (family, style, key) in BUNDLED_FONT_PLAN {
+        if let Some(bytes) = catalog_app_face(catalog, family, style) {
+            fonts.font_data.insert(
+                key.to_owned(),
+                std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+            );
+            match key {
+                "craft-inter" => installed.inter = true,
+                "craft-wenkai" => installed.wenkai = true,
+                "craft-mono" => installed.mono = true,
+                _ => {}
+            }
+        }
+    }
+    installed
+}
+
 fn install_cjk_font(ctx: &egui::Context) {
-    // Default UI font: Alibaba PuHuiTi 3.0, embedded at build time when
-    // the font file is present in assets/ (see build.rs). egui's bundled
-    // fonts have no CJK glyphs, so a system CJK font is the fallback.
+    // Font installation. egui resolves glyphs per character along
+    // each family's list, so the chains below are fallback chains:
+    //   1. the bundled craft-fonts faces (Inter for Latin,
+    //      PuHuiTi/WenKai for Han, Liberation Mono for monospace);
+    //   2. egui's own bundled fonts (kept, after the packaged set);
+    //   3. the first readable system CJK font, appended last.
+    // Alibaba PuHuiTi 3.0 is embedded at build time when the font
+    // file was present in assets/ (see build.rs); it stays the first
+    // Han face when embedded — it is a UI sans, where WenKai is a
+    // Kai face — and WenKai Lite, which the package always carries,
+    // guarantees Han coverage on machines where neither PuHuiTi nor
+    // a system CJK font exists. Every layer is optional: a missing
+    // fonts dir or face only shortens the chain, and the caller
+    // additionally guards this whole function with catch_unwind.
     let mut fonts = egui::FontDefinitions::default();
+    let bundled = install_bundled_fonts(&mut fonts);
     #[cfg(puhuiti)]
     {
         fonts.font_data.insert(
@@ -22,13 +135,35 @@ fn install_cjk_font(ctx: &egui::Context) {
                 "../assets/AlibabaPuHuiTi-3-55-Regular.ttf"
             ))),
         );
-        for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-            fonts
-                .families
-                .entry(fam)
-                .or_default()
-                .insert(0, "puhuiti".to_owned());
+    }
+    // Assemble the chains: packaged faces first, then the families
+    // egui itself bundles, in their default order.
+    let mut proportional: Vec<String> = Vec::new();
+    if bundled.inter {
+        proportional.push("craft-inter".to_owned());
+    }
+    #[cfg(puhuiti)]
+    proportional.push("puhuiti".to_owned());
+    if bundled.wenkai {
+        proportional.push("craft-wenkai".to_owned());
+    }
+    let mut monospace: Vec<String> = Vec::new();
+    if bundled.mono {
+        monospace.push("craft-mono".to_owned());
+    }
+    monospace.extend(proportional.iter().cloned());
+    for (fam, prefix) in [
+        (egui::FontFamily::Proportional, proportional),
+        (egui::FontFamily::Monospace, monospace),
+    ] {
+        let entry = fonts.families.entry(fam).or_default();
+        let mut chain = prefix;
+        for key in entry.iter() {
+            if !chain.contains(key) {
+                chain.push(key.clone());
+            }
         }
+        *entry = chain;
     }
     let candidates = [
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
@@ -54,6 +189,10 @@ fn install_cjk_font(ctx: &egui::Context) {
             break;
         }
     }
+    startup_log(&format!(
+        "fonts: bundled inter={} wenkai={} mono={}",
+        bundled.inter, bundled.wenkai, bundled.mono
+    ));
     ctx.set_fonts(fonts);
 }
 
@@ -331,6 +470,23 @@ pub const DANGER_BG: egui::Color32 = egui::Color32::from_rgb(0xF2, 0x55, 0x5A);
 /// (no box): 开始演示 in accent, the rest in main/weak text color.
 fn text_action(ui: &mut egui::Ui, label: &str, color: egui::Color32, size: f32) -> bool {
     ui.add(
+        egui::Button::new(egui::RichText::new(label).size(size).color(color))
+            .fill(egui::Color32::TRANSPARENT)
+            .stroke(egui::Stroke::NONE)
+            .corner_radius(egui::CornerRadius::same(10)),
+    )
+    .clicked()
+}
+
+fn text_action_enabled(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    label: &str,
+    color: egui::Color32,
+    size: f32,
+) -> bool {
+    ui.add_enabled(
+        enabled,
         egui::Button::new(egui::RichText::new(label).size(size).color(color))
             .fill(egui::Color32::TRANSPARENT)
             .stroke(egui::Stroke::NONE)
@@ -733,15 +889,53 @@ enum QPanel {
     StMain,
 }
 
-#[derive(Default)]
+/// Content page state. Only page-level fields live here: the
+/// folder filter (driven by the nav frame, covers every frame)
+/// and the import group (wall toolbar). The
+/// open block's detail and forms — formerly Option-assembled on
+/// this struct — live in the frames of `stack` now (drill-down
+/// discipline: a frame owns its identity and its drafts, created
+/// on push, destroyed on pop).
 struct ContentState {
     folder_filter: Option<String>,
-    selected_unit: Option<String>,
-    detail: Option<Value>,
+    import_group: String,
+    stack: NavStack<ContentFrame>,
+}
+
+impl Default for ContentState {
+    fn default() -> Self {
+        Self {
+            folder_filter: None,
+            import_group: String::new(),
+            stack: NavStack::new(ContentFrame::Wall(WallState::default())),
+        }
+    }
+}
+
+/// Content frames: the maintenance wall (prototype wallView) and
+/// the block drill-down (prototype drillView).
+enum ContentFrame {
+    Wall(WallState),
+    Unit(UnitState),
+}
+
+#[derive(Default)]
+struct WallState {
     search_text: String,
     search_hits: Option<Value>,
-    import_group: String,
-    new_unit_name: String,
+    /// Single-click selection on the wall (the accent ring). The
+    /// drill-down itself is the Unit frame, not this field.
+    selected: Option<String>,
+}
+
+/// One open content block: its detail payload plus every
+/// detail-period form (publish, per-page language bindings,
+/// scripts editor, AI translation target). Drafts die with the
+/// frame — what used to leak from one block into the next through
+/// ContentState now cannot.
+struct UnitState {
+    unit_id: String,
+    detail: Value,
     publish_bump: usize, // 0 major 1 minor 2 patch
     publish_form: String,
     publish_lang: String,
@@ -754,29 +948,112 @@ struct ContentState {
     scripts_for: Option<String>, // version id whose 讲稿 is being edited
     scripts_edit: Vec<String>,
     translate_to: String,
+    /// Set by the frame's own close actions （返回 / 删除内容块）;
+    /// the dispatcher pops instead of putting the frame back.
+    closed: bool,
 }
 
-#[derive(Default)]
+impl UnitState {
+    fn new(unit_id: &str, detail: Value) -> Self {
+        Self {
+            unit_id: unit_id.to_string(),
+            detail,
+            publish_bump: 1, // default preselect: minor （小版本）, as at App::new before
+            publish_form: String::new(),
+            publish_lang: String::new(),
+            publish_note: String::new(),
+            publish_file: None,
+            bindings: Vec::new(),
+            bind_from: String::new(),
+            bind_to: String::new(),
+            bind_from_slot: None,
+            scripts_for: None,
+            scripts_edit: Vec::new(),
+            translate_to: String::new(),
+            closed: false,
+        }
+    }
+}
+
 struct IndexState {
+    /// 概览按文件夹筛选（页级：概览帧与导航树共用）。
     overview_folder: Option<String>,
-    overview_selected: Option<String>,
+    stack: NavStack<IndexFrame>,
+}
+
+impl Default for IndexState {
+    fn default() -> Self {
+        Self {
+            overview_folder: None,
+            stack: NavStack::new(IndexFrame::Overview(OverviewState::default())),
+        }
+    }
+}
+
+/// One frame of the index page's drill stack (design §3).
+enum IndexFrame {
+    Overview(OverviewState),
+    Detail(IndexDetailState),
+    Create(CreateState),
+}
+
+/// 概览帧状态：卡片墙的选中索引（单选高亮）。
+#[derive(Default)]
+struct OverviewState {
     selected: Option<String>,
-    detail: Option<Value>,
+}
+
+/// 索引详情帧状态：一个打开的索引的全部工作状态，随帧销毁。
+struct IndexDetailState {
+    index_id: String,
+    detail: Value,
     branch: String,
-    tag_name: String,
-    new_branch: String,
-    creating: bool,
-    new_name: String,
-    new_group: String,
-    pick: Vec<(String, String, bool)>, // unit_id, rendition_id, checked
     commits: Option<Value>,
     exports: Option<Value>,
+    /// rendition_id -> versions, semver desc（打开时预取）。
+    unit_versions: std::collections::HashMap<String, Vec<Value>>,
+    tag_name: String,
+    new_branch: String,
     merge_from: String,
     merge_preview: Option<Value>,
     merge_resolutions: std::collections::HashMap<String, String>,
     include_notes: bool,
-    unit_versions: std::collections::HashMap<String, Vec<Value>>, // rendition_id -> versions, semver desc
-    more_for: Option<usize>,
+    /// Set by in-frame close actions; the dispatcher pops.
+    closed: bool,
+}
+
+impl IndexDetailState {
+    fn new(index_id: &str, branch: String) -> Self {
+        Self {
+            index_id: index_id.to_string(),
+            detail: json!({}),
+            branch,
+            commits: None,
+            exports: None,
+            unit_versions: Default::default(),
+            tag_name: String::new(),
+            new_branch: String::new(),
+            merge_from: String::new(),
+            merge_preview: None,
+            merge_resolutions: Default::default(),
+            include_notes: true,
+            closed: false,
+        }
+    }
+}
+
+/// 新建索引帧状态（整页单帧呈现）。表单随帧销毁（旧实现跨次
+/// 保留 new_name/new_group 的泄漏在此收敛，见 REPORT §3.5）。
+#[derive(Default)]
+struct CreateState {
+    new_name: String,
+    new_group: String,
+    /// unit_id, rendition_id, checked
+    pick: Vec<(String, String, bool)>,
+    /// Set by 取消/创建成功；the dispatcher pops.
+    closed: bool,
+    /// 创建成功后要打开的新索引 id（分发器在弹帧后执行）。
+    open_after: Option<String>,
 }
 
 #[derive(Default)]
@@ -857,6 +1134,28 @@ impl<F> NavStack<F> {
         if depth + 1 < self.frames.len() {
             self.frames.truncate(depth + 1);
         }
+    }
+
+    /// Swap the top frame out (frame-state take-out: a frame's form
+    /// state is rendered alongside `&mut App`, which borrowing the
+    /// stack would forbid; the caller renders the taken frame and
+    /// swaps it back — or drops it and pops the placeholder to
+    /// close). The placeholder is never rendered.
+    fn replace_top(&mut self, frame: F) -> F {
+        std::mem::replace(
+            self.frames
+                .last_mut()
+                .expect("a nav stack always keeps its root frame"),
+            frame,
+        )
+    }
+
+    /// The root frame (page-level view state that other pages'
+    /// actions occasionally reset, e.g. the wall selection).
+    fn root_mut(&mut self) -> &mut F {
+        self.frames
+            .first_mut()
+            .expect("a nav stack always keeps its root frame")
     }
 }
 
@@ -962,6 +1261,10 @@ struct ReviewState {
     stack: NavStack<ReviewFrame>,
     records: Vec<Value>,
     records_loaded: bool,
+    /// Cross-page deep-jump source (nav ruler 3): the showroom
+    /// review bar's reject action lands on the detail frame here;
+    /// at the queue root a back row returns to the source page.
+    jump_source: Option<Page>,
 }
 
 impl ReviewState {
@@ -970,6 +1273,7 @@ impl ReviewState {
             stack: NavStack::new(ReviewFrame::Queue(ReviewQueueState::default())),
             records: vec![],
             records_loaded: false,
+            jump_source: None,
         }
     }
 }
@@ -987,13 +1291,217 @@ struct PresentState {
     started: std::time::Instant,
 }
 
-/// Page-level visual editor state (prototype craftDlg, A29).
-/// Text runs are loaded per page from the server; `base` keeps the
-/// loaded text and `work` the working copy, so the pending edit set
-/// is the diff at save time. Scripts ride along (saved through the
-/// scripts endpoint, which never bumps — §3.16). All of it is
-/// overlay state: closing the editor discards it, after the dirty
-/// check routes through the Confirm overlay (prototype saveAskDlg).
+/// Working copy of one text run in the v2 element editor (mirrors
+/// core's ElRun; style fields are `None` when the run inherits).
+#[derive(Clone, PartialEq)]
+struct RunWork {
+    text: String,
+    sz: Option<f32>,
+    b: Option<bool>,
+    color: Option<String>,
+}
+
+#[derive(Clone, PartialEq)]
+struct ParaWork {
+    runs: Vec<RunWork>,
+}
+
+/// Working copy of one slide element (mirrors core's SlideElement;
+/// geometry in EMU). `new_image` is a pending picture replacement —
+/// (extension, bytes) picked by the user, uploaded at save time and
+/// stored through the server's content-addressed file layer.
+#[derive(Clone, PartialEq)]
+struct ElWork {
+    kind: String,
+    name: String,
+    x: i64,
+    y: i64,
+    cx: i64,
+    cy: i64,
+    has_xfrm: bool,
+    media: Option<String>,
+    paras: Vec<ParaWork>,
+    new_image: Option<(String, Vec<u8>)>,
+}
+
+/// An in-progress stage drag (move or resize), anchored at the
+/// pointer position and the element geometry when the drag started,
+/// so per-frame updates never accumulate drift.
+#[derive(Clone, Copy, PartialEq)]
+struct ElDrag {
+    el: usize,
+    resize: bool,
+    start_pos: egui::Pos2,
+    x: i64,
+    y: i64,
+    cx: i64,
+    cy: i64,
+}
+
+fn el_kind_label(kind: &str) -> &str {
+    match kind {
+        "text" => tr("文本"),
+        "shape" => tr("形状"),
+        "picture" => tr("图片"),
+        "line" => tr("线条"),
+        "graphic" => tr("图表"),
+        "group" => tr("组合"),
+        _ => tr("元素"),
+    }
+}
+
+/// One undoable editor state: the flat run lists (v1 path), the
+/// element working copies (v2 path) and the speaker notes. Undo/redo
+/// are session-level: they never touch the published version, only
+/// this overlay's working state.
+#[derive(Clone, PartialEq)]
+struct EditSnapshot {
+    work: std::collections::HashMap<usize, Vec<String>>,
+    elems: std::collections::HashMap<usize, Vec<ElWork>>,
+    scripts: Vec<String>,
+}
+
+fn elwork_from_json(v: &Value) -> ElWork {
+    let paras = v
+        .get("paras")
+        .and_then(|x| x.as_array())
+        .map(|ps| {
+            ps.iter()
+                .map(|p| ParaWork {
+                    runs: p
+                        .get("runs")
+                        .and_then(|x| x.as_array())
+                        .map(|rs| {
+                            rs.iter()
+                                .map(|r| {
+                                    let st = r.get("style").cloned().unwrap_or(json!({}));
+                                    RunWork {
+                                        text: s(r, "text"),
+                                        sz: st
+                                            .get("sz")
+                                            .and_then(|x| x.as_f64())
+                                            .map(|f| f as f32),
+                                        b: st.get("b").and_then(|x| x.as_bool()),
+                                        color: st
+                                            .get("color")
+                                            .and_then(|x| x.as_str())
+                                            .map(str::to_string),
+                                    }
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    ElWork {
+        kind: s(v, "kind"),
+        name: s(v, "name"),
+        x: i(v, "x") as i64,
+        y: i(v, "y") as i64,
+        cx: i(v, "cx") as i64,
+        cy: i(v, "cy") as i64,
+        has_xfrm: v
+            .get("has_xfrm")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false),
+        media: v.get("media").and_then(|x| x.as_str()).map(str::to_string),
+        paras,
+        new_image: None,
+    }
+}
+
+fn emu_mm(v: i64) -> f32 {
+    v as f32 / 36000.0
+}
+
+fn mm_emu(v: f32) -> i64 {
+    (v * 36000.0).round() as i64
+}
+
+fn hex_color32(hex: &str) -> egui::Color32 {
+    let p = |a: usize| {
+        hex.get(a..a + 2)
+            .and_then(|h| u8::from_str_radix(h, 16).ok())
+            .unwrap_or(0)
+    };
+    egui::Color32::from_rgb(p(0), p(2), p(4))
+}
+
+fn color32_hex(c: egui::Color32) -> String {
+    format!("{:02X}{:02X}{:02X}", c.r(), c.g(), c.b())
+}
+
+/// Diff-style op for one run whose working style differs from base.
+/// Only fields that are set in the working copy are sent — clearing
+/// an explicit style back to "inherited" is not expressible in the
+/// op set (the run keeps its last explicit value).
+fn push_style_op(
+    out: &mut Vec<Value>,
+    page: usize,
+    el: usize,
+    para: usize,
+    run: usize,
+    wr: &RunWork,
+    br: &RunWork,
+) {
+    let mut op = json!({"kind": "set_style", "page": page, "el": el, "para": para, "run": run});
+    let mut any = false;
+    if wr.sz != br.sz {
+        if let Some(v) = wr.sz {
+            op["sz"] = json!(v);
+            any = true;
+        }
+    }
+    if wr.b != br.b {
+        if let Some(v) = wr.b {
+            op["b"] = json!(v);
+            any = true;
+        }
+    }
+    if wr.color != br.color {
+        if let Some(v) = &wr.color {
+            op["color"] = json!(v);
+            any = true;
+        }
+    }
+    if any {
+        out.push(op);
+    }
+}
+
+/// Full-style op for a run created during this session (no base run
+/// to diff against): every set field is shipped.
+fn push_full_style_op(
+    out: &mut Vec<Value>,
+    page: usize,
+    el: usize,
+    para: usize,
+    run: usize,
+    wr: &RunWork,
+) {
+    let mut op = json!({"kind": "set_style", "page": page, "el": el, "para": para, "run": run});
+    let mut any = false;
+    if let Some(v) = wr.sz {
+        op["sz"] = json!(v);
+        any = true;
+    }
+    if let Some(v) = wr.b {
+        op["b"] = json!(v);
+        any = true;
+    }
+    if let Some(v) = &wr.color {
+        op["color"] = json!(v);
+        any = true;
+    }
+    if any {
+        out.push(op);
+    }
+}
+
+/// Page-level visual editor state: v1 flat run lists (`base` /
+/// `work`) plus the v2 element working copies (`elems`).
 struct PageEditState {
     version_id: String,
     unit_name: String,
@@ -1006,11 +1514,26 @@ struct PageEditState {
     scripts_base: Vec<String>,
     bump: usize, // 0 major | 1 minor | 2 patch — the publish dialog's rule
     note: String,
+    // v2 element editing (2026-11-23 completion): per-page element
+    // working copies loaded from the page-text endpoint's element
+    // model. Pages present in `elems` save through the op list;
+    // pages absent from it keep the v1 flat-run path.
+    elems: std::collections::HashMap<usize, Vec<ElWork>>,
+    elems_base: std::collections::HashMap<usize, Vec<ElWork>>,
+    slide_cx: i64,
+    slide_cy: i64,
+    sel: Option<usize>,
+    drag: Option<ElDrag>,
+    undo: Vec<EditSnapshot>,
+    redo: Vec<EditSnapshot>,
 }
 
 impl PageEditState {
     fn dirty(&self) -> bool {
         if self.scripts != self.scripts_base {
+            return true;
+        }
+        if self.elems != self.elems_base {
             return true;
         }
         self.work.iter().any(|(p, runs)| {
@@ -1038,6 +1561,436 @@ impl PageEditState {
         }
         out
     }
+    /// Legacy flat edits restricted to pages that have no element
+    /// model (v2 pages save exclusively through `ops()`, so a text
+    /// change is never applied twice).
+    fn legacy_edits(&self) -> Vec<(usize, usize, String)> {
+        self.edits()
+            .into_iter()
+            .filter(|(p, _, _)| !self.elems.contains_key(p))
+            .collect()
+    }
+    fn snapshot(&self) -> EditSnapshot {
+        EditSnapshot {
+            work: self.work.clone(),
+            elems: self.elems.clone(),
+            scripts: self.scripts.clone(),
+        }
+    }
+    /// Record the current state as an undo step. Called BEFORE a
+    /// mutation lands (or, for focus-driven text fields, on the
+    /// frame focus is gained — before any character changes).
+    /// Consecutive identical snapshots coalesce.
+    fn push_undo(&mut self) {
+        let snap = self.snapshot();
+        if self.undo.last() == Some(&snap) {
+            return;
+        }
+        self.undo.push(snap);
+        if self.undo.len() > 100 {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+    fn do_undo(&mut self) {
+        if let Some(snap) = self.undo.pop() {
+            let cur = self.snapshot();
+            self.redo.push(cur);
+            self.work = snap.work;
+            self.elems = snap.elems;
+            self.scripts = snap.scripts;
+        }
+    }
+    fn do_redo(&mut self) {
+        if let Some(snap) = self.redo.pop() {
+            let cur = self.snapshot();
+            self.undo.push(cur);
+            self.work = snap.work;
+            self.elems = snap.elems;
+            self.scripts = snap.scripts;
+        }
+    }
+    /// The v2 save payload: element operations for every page with
+    /// an element model, in the index-safe order the core applies
+    /// (per element: replacement/geometry, run updates, run
+    /// deletions descending, run insertions, paragraph deletions
+    /// descending, paragraph insertions ascending).
+    fn ops(&self) -> Vec<Value> {
+        let mut out: Vec<Value> = Vec::new();
+        let mut pages: Vec<usize> = self.elems.keys().cloned().collect();
+        pages.sort_unstable();
+        for p in pages {
+            let (Some(w), Some(b)) = (self.elems.get(&p), self.elems_base.get(&p)) else {
+                continue;
+            };
+            for (ei, (we, be)) in w.iter().zip(b.iter()).enumerate() {
+                if let Some((ext, bytes)) = &we.new_image {
+                    out.push(json!({
+                        "kind": "replace_pic", "page": p, "el": ei,
+                        "ext": ext, "data_base64": b64e(bytes),
+                    }));
+                }
+                if (we.x, we.y) != (be.x, be.y) {
+                    out.push(json!({
+                        "kind": "move", "page": p, "el": ei,
+                        "x": we.x, "y": we.y,
+                    }));
+                }
+                if (we.cx, we.cy) != (be.cx, be.cy) {
+                    out.push(json!({
+                        "kind": "resize", "page": p, "el": ei,
+                        "cx": we.cx, "cy": we.cy,
+                    }));
+                }
+                let common = we.paras.len().min(be.paras.len());
+                for pi in 0..common {
+                    let (wp, bp) = (&we.paras[pi], &be.paras[pi]);
+                    let rcommon = wp.runs.len().min(bp.runs.len());
+                    for ri in 0..rcommon {
+                        let (wr, br) = (&wp.runs[ri], &bp.runs[ri]);
+                        if wr.text != br.text {
+                            out.push(json!({
+                                "kind": "set_text", "page": p, "el": ei,
+                                "para": pi, "run": ri, "text": wr.text,
+                            }));
+                        }
+                        push_style_op(&mut out, p, ei, pi, ri, wr, br);
+                    }
+                    for ri in (rcommon..bp.runs.len()).rev() {
+                        out.push(json!({
+                            "kind": "del_run", "page": p, "el": ei,
+                            "para": pi, "run": ri,
+                        }));
+                    }
+                    for ri in rcommon..wp.runs.len() {
+                        let wr = &wp.runs[ri];
+                        out.push(json!({
+                            "kind": "add_run", "page": p, "el": ei,
+                            "para": pi, "text": wr.text,
+                        }));
+                        push_full_style_op(&mut out, p, ei, pi, ri, wr);
+                    }
+                }
+                for pi in (common..be.paras.len()).rev() {
+                    out.push(json!({
+                        "kind": "del_para", "page": p, "el": ei, "para": pi,
+                    }));
+                }
+                for pi in common..we.paras.len() {
+                    let wp = &we.paras[pi];
+                    let first = wp.runs.first();
+                    out.push(json!({
+                        "kind": "add_para", "page": p, "el": ei,
+                        "para": if pi == 0 { Value::Null } else { json!(pi - 1) },
+                        "text": first.map(|r| r.text.clone()).unwrap_or_default(),
+                    }));
+                    if let Some(fr) = first {
+                        push_full_style_op(&mut out, p, ei, pi, 0, fr);
+                    }
+                    for ri in 1..wp.runs.len() {
+                        let wr = &wp.runs[ri];
+                        out.push(json!({
+                            "kind": "add_run", "page": p, "el": ei,
+                            "para": pi, "text": wr.text,
+                        }));
+                        push_full_style_op(&mut out, p, ei, pi, ri, wr);
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+
+/// A millimetre field for an EMU value; returns the new EMU value on
+/// change. Focus gain raises `want_snapshot` (see the inspector's
+/// undo discipline).
+fn mm_field(
+    ui: &mut egui::Ui,
+    label: &str,
+    emu: i64,
+    want_snapshot: &mut bool,
+) -> Option<i64> {
+    let mut v = emu_mm(emu);
+    let mut out = None;
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(label).size(11.5).color(TEXT_FAINT));
+        let resp = ui.add(
+            egui::DragValue::new(&mut v)
+                .speed(0.1)
+                .range(0.0..=1000.0)
+                .suffix(" mm"),
+        );
+        if resp.gained_focus() {
+            *want_snapshot = true;
+        }
+        if resp.changed() {
+            out = Some(mm_emu(v));
+        }
+    });
+    out
+}
+
+/// The v2 editor's side-panel inspector: the page's element list
+/// plus the selected element's editors. It works on a CLONE of the
+/// selected element and returns it through `commit`; the caller
+/// snapshots the pre-edit state (when `want_snapshot` was raised)
+/// before landing the commit, which keeps every mutation made here
+/// undoable at session level.
+fn page_edit_inspector(
+    ui: &mut egui::Ui,
+    pe: &PageEditState,
+    want_snapshot: &mut bool,
+    commit: &mut Option<(usize, ElWork)>,
+    sel_req: &mut Option<Option<usize>>,
+) {
+    let Some(list) = pe.elems.get(&pe.page) else {
+        return;
+    };
+    ui.label(
+        egui::RichText::new(format!("{}（{}）", tr("元素"), list.len()))
+            .size(12.5)
+            .color(TEXT_MAIN),
+    );
+    ui.add_space(4.0);
+    if list.is_empty() {
+        ui.label(
+            egui::RichText::new(tr("本页没有元素。"))
+                .size(12.0)
+                .color(TEXT_WEAK),
+        );
+        return;
+    }
+    for (idx, el) in list.iter().enumerate() {
+        let label = format!(
+            "{} · {}",
+            el_kind_label(&el.kind),
+            if el.name.is_empty() {
+                format!("{} {}", tr("元素"), idx + 1)
+            } else {
+                el.name.clone()
+            }
+        );
+        if ui.selectable_label(pe.sel == Some(idx), label).clicked() {
+            *sel_req = Some(Some(idx));
+        }
+    }
+    let Some(sel) = pe.sel.filter(|s| *s < list.len()) else {
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(tr("点选画布或列表中的元素进行编辑。"))
+                .size(12.0)
+                .color(TEXT_WEAK),
+        );
+        return;
+    };
+    let orig = list[sel].clone();
+    let mut elw = orig.clone();
+    ui.add_space(8.0);
+    ui.separator();
+    ui.label(
+        egui::RichText::new(format!(
+            "{} · {}",
+            el_kind_label(&elw.kind),
+            if elw.name.is_empty() {
+                tr("未命名元素")
+            } else {
+                elw.name.as_str()
+            }
+        ))
+        .size(12.5)
+        .color(TEXT_MAIN),
+    );
+    ui.add_space(4.0);
+    // Geometry (EMU on the wire, millimetres in the panel).
+    if elw.has_xfrm {
+        if let Some(v) = mm_field(ui, tr("位置 X"), elw.x, want_snapshot) {
+            elw.x = v;
+        }
+        if let Some(v) = mm_field(ui, tr("位置 Y"), elw.y, want_snapshot) {
+            elw.y = v;
+        }
+        if let Some(v) = mm_field(ui, tr("宽度"), elw.cx, want_snapshot) {
+            elw.cx = v.max(20000);
+        }
+        if let Some(v) = mm_field(ui, tr("高度"), elw.cy, want_snapshot) {
+            elw.cy = v.max(20000);
+        }
+    } else {
+        ui.label(
+            egui::RichText::new(tr("位置由版式决定，不可拖动（可改文本与样式）。"))
+                .size(11.5)
+                .color(TEXT_FAINT),
+        );
+    }
+    ui.add_space(6.0);
+    match elw.kind.as_str() {
+        "picture" => {
+            if let Some(m) = &elw.media {
+                ui.label(
+                    egui::RichText::new(format!("{}：{}", tr("当前图片"), m))
+                        .size(11.5)
+                        .color(TEXT_WEAK),
+                );
+            }
+            if elw.new_image.is_some() {
+                ui.label(
+                    egui::RichText::new(tr("已选择新图片，保存后替换。"))
+                        .size(11.5)
+                        .color(ACCENT),
+                );
+            }
+            if ui.button(tr("替换图片…")).clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("图片", &["png", "jpg", "jpeg", "gif", "bmp"])
+                    .pick_file()
+                {
+                    if let Ok(bytes) = std::fs::read(&path) {
+                        let ext = path
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or("png")
+                            .to_lowercase();
+                        elw.new_image = Some((ext, bytes));
+                        *want_snapshot = true;
+                    }
+                }
+            }
+        }
+        "text" | "shape" => {
+            let para_count = elw.paras.len();
+            let mut del_para_req: Option<usize> = None;
+            for (pi, para) in elw.paras.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{} {}", tr("段"), pi + 1))
+                            .size(11.5)
+                            .color(TEXT_FAINT),
+                    );
+                    if ui.small_button(tr("＋文本")).clicked() {
+                        para.runs.push(RunWork {
+                            text: tr("新文本").to_string(),
+                            sz: None,
+                            b: None,
+                            color: None,
+                        });
+                        *want_snapshot = true;
+                    }
+                    if para_count > 1 && ui.small_button(tr("删段")).clicked() {
+                        del_para_req = Some(pi);
+                        *want_snapshot = true;
+                    }
+                });
+                let mut del_run_req: Option<usize> = None;
+                for (ri, run) in para.runs.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("{}", ri + 1))
+                                .size(11.5)
+                                .color(TEXT_FAINT),
+                        );
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut run.text)
+                                .desired_width(168.0)
+                                .margin(egui::vec2(6.0, 4.0)),
+                        );
+                        if resp.gained_focus() {
+                            *want_snapshot = true;
+                        }
+                        if ui.small_button(tr("删")).clicked() {
+                            del_run_req = Some(ri);
+                            *want_snapshot = true;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_space(14.0);
+                        ui.label(
+                            egui::RichText::new(tr("字号"))
+                                .size(11.0)
+                                .color(TEXT_FAINT),
+                        );
+                        let mut szv = run.sz.unwrap_or(18.0);
+                        let resp = ui.add(
+                            egui::DragValue::new(&mut szv)
+                                .speed(0.25)
+                                .range(6.0..=96.0)
+                                .suffix(" pt"),
+                        );
+                        if resp.gained_focus() {
+                            *want_snapshot = true;
+                        }
+                        if resp.changed() {
+                            run.sz = Some(szv);
+                        }
+                        if run.sz.is_none() {
+                            ui.label(
+                                egui::RichText::new(tr("继承"))
+                                    .size(11.0)
+                                    .color(TEXT_FAINT),
+                            );
+                        }
+                        let mut bv = run.b.unwrap_or(false);
+                        if ui.checkbox(&mut bv, tr("加粗")).changed() {
+                            run.b = Some(bv);
+                            *want_snapshot = true;
+                        }
+                        let mut cc = run
+                            .color
+                            .as_deref()
+                            .map(hex_color32)
+                            .unwrap_or(egui::Color32::WHITE);
+                        if ui.color_edit_button_srgba(&mut cc).changed() {
+                            run.color = Some(color32_hex(cc));
+                            *want_snapshot = true;
+                        }
+                    });
+                }
+                if let Some(ri) = del_run_req {
+                    para.runs.remove(ri);
+                }
+            }
+            if let Some(pi) = del_para_req {
+                elw.paras.remove(pi);
+            }
+            if ui.button(tr("＋ 加一段")).clicked() {
+                elw.paras.push(ParaWork {
+                    runs: vec![RunWork {
+                        text: tr("新文本").to_string(),
+                        sz: None,
+                        b: None,
+                        color: None,
+                    }],
+                });
+                *want_snapshot = true;
+            }
+        }
+        "line" => {
+            ui.label(
+                egui::RichText::new(tr("线条：可移动与缩放；改色与线宽暂不支持。"))
+                    .size(11.5)
+                    .color(TEXT_FAINT),
+            );
+        }
+        "graphic" => {
+            ui.label(
+                egui::RichText::new(tr("图表：仅位置与大小可调，数据请回源文件编辑。"))
+                    .size(11.5)
+                    .color(TEXT_FAINT),
+            );
+        }
+        "group" => {
+            ui.label(
+                egui::RichText::new(tr("组合：可整体移动与缩放；组内元素单独编辑暂不支持。"))
+                    .size(11.5)
+                    .color(TEXT_FAINT),
+            );
+        }
+        _ => {}
+    }
+    if elw != orig {
+        *commit = Some((sel, elw));
+    }
 }
 
 /// 「从模板新建」 picker state (home launcher): choose an existing
@@ -1052,6 +2005,8 @@ struct PickTemplateState {
 /// frames in stack order; Confirm is the top-most kind and is the
 /// only one allowed to stack over another overlay (over PageEdit).
 enum Overlay {
+    PagePreview { version_id: String, page: usize, global: usize, item: Value },
+    AllVersions { entry_pos: usize },
     Present(PresentState),
     PageEdit(PageEditState),
     PickTemplate(PickTemplateState),
@@ -1073,6 +2028,48 @@ enum ConfirmAction {
     DiscardPageEdit,
 }
 
+/// Showroom page state (drill retrofit): zone + folder filter
+/// are page-level; the deck is a frame. The live/pending lists
+/// stay App-level data caches, like units/indexes.
+struct ShowroomState {
+    zone: String, // plaza | library | inbox | groups
+    folder: Option<String>,
+    stack: NavStack<SrFrame>,
+}
+
+impl Default for ShowroomState {
+    fn default() -> Self {
+        Self {
+            zone: std::env::var("QIMU_ZONE").unwrap_or_else(|_| "plaza".into()),
+            folder: None,
+            stack: NavStack::new(SrFrame::Wall),
+        }
+    }
+}
+
+/// One frame of the showroom drill stack (design §4).
+enum SrFrame {
+    Wall,
+    Deck(DeckState),
+}
+
+/// 演示 deck 帧状态：条目本体 + 已解析的来源索引（可空：个人
+/// 组装或加载失败时逐页列表不可用，与旧 sr_deck=None 同义）。
+struct DeckState {
+    item: Value,
+    deck: Option<Value>,
+    /// Set by the header 返回 action; the dispatcher pops.
+    closed: bool,
+}
+
+/// Events from the AI-translation worker thread: progress ticks
+/// while the server job runs, then exactly one terminal result (the
+/// same payload the synchronous translate endpoint returns).
+enum TranslateEvent {
+    Progress(usize, usize),
+    Done(Result<Value, String>),
+}
+
 struct App {
     server: String,
     username: String,
@@ -1089,12 +2086,13 @@ struct App {
     disc_scanning: bool,
     cache_dir_input: String,
     pick: Option<PickState>,
+    /// Cross-page deep-jump source (nav ruler 3): set when Home
+    /// opens a detail on another page; that page's root then shows
+    /// a back row returning here. Manual tab/menu switches clear it.
+    deep_source: Option<Page>,
     folder_edit: Option<FolderEdit>,
     folder_edit_focus: bool,
     folder_delete_confirm: Option<(String, String)>,
-    sr_detail: Option<Value>,
-    sr_deck: Option<Value>,
-    sr_preview: Option<(String, usize)>,
     page: Page,
     /// Five-features surfaces (2026-11-23): the trash and the
     /// approval queue run on drill-down frame stacks; the home
@@ -1114,19 +2112,13 @@ struct App {
     grants: Vec<Value>,
     showroom_live: Vec<Value>,
     showroom_pending: Vec<Value>,
-    sr_title: String,
-    sr_index: String,
-    sr_zone: String, // plaza | library | inbox | groups
-    sr_folder: Option<String>,
+    showroom: ShowroomState,
     my_assemblies: Vec<Value>,
     inbox: Vec<Value>,
     group_spaces: Vec<Value>,
     my_teams: Vec<Value>,
     library_refs: Vec<Value>,
     my_id: String,
-    share_for: Option<String>, // showroom item id being shared
-    share_kind: String,        // user | dept | group
-    share_target: String,
     new_team_name: String,
     team_member_pick: String,
     cache_entries: Vec<Value>,
@@ -1163,6 +2155,18 @@ struct App {
     upd_note: Option<String>,
     upd_tx: std::sync::mpsc::Sender<(bool, Result<Option<String>, String>)>,
     upd_rx: std::sync::mpsc::Receiver<(bool, Result<Option<String>, String>)>,
+    /// AI translation: worker channel plus, while a job is in flight,
+    /// (unit id, runs done, runs total) for the progress readout next
+    /// to the translate button.
+    translate_tx: std::sync::mpsc::Sender<TranslateEvent>,
+    translate_rx: std::sync::mpsc::Receiver<TranslateEvent>,
+    translating: Option<(String, usize, usize)>,
+    /// Last /v1/ai/status payload (provider / configured / model) —
+    /// drives the "stub placeholder" hint by the translate button.
+    ai_status: Option<Value>,
+    /// (code, label) target-language options from the server's
+    /// languages setting; codes are what renditions store.
+    lang_options: Vec<(String, String)>,
     /// Dock workspaces (craft-ui docking), one per top-level page,
     /// built lazily on first show. Layout variants that replace the
     /// split (content detail, index creation, the showroom review
@@ -1741,6 +2745,7 @@ impl App {
         let (thumb_tx, thumb_rx) = std::sync::mpsc::channel();
         let (pdf_tx, pdf_rx) = std::sync::mpsc::channel();
         let (upd_tx, upd_rx) = std::sync::mpsc::channel();
+        let (translate_tx, translate_rx) = std::sync::mpsc::channel();
         let mut app = App {
             server: std::env::var("QIMU_SERVER").unwrap_or_else(|_| "http://127.0.0.1:8730".into()),
             username: std::env::var("QIMU_USERNAME").unwrap_or_else(|_| "admin".into()),
@@ -1757,12 +2762,10 @@ impl App {
             disc_scanning: false,
             cache_dir_input: cache_dir().to_string_lossy().into_owned(),
             pick: None,
+            deep_source: None,
             folder_edit: None,
             folder_edit_focus: false,
             folder_delete_confirm: None,
-            sr_detail: None,
-            sr_deck: None,
-            sr_preview: None,
             page: match std::env::var("QIMU_PAGE").as_deref() {
                 Ok("home") => Page::Home,
                 Ok("content") => Page::Content,
@@ -1784,29 +2787,20 @@ impl App {
             grants: vec![],
             showroom_live: vec![],
             showroom_pending: vec![],
-            sr_title: String::new(),
-            sr_index: String::new(),
-            sr_zone: std::env::var("QIMU_ZONE").unwrap_or_else(|_| "plaza".into()),
-            sr_folder: None,
+            showroom: ShowroomState::default(),
             my_assemblies: vec![],
             inbox: vec![],
             group_spaces: vec![],
             my_teams: vec![],
             library_refs: vec![],
             my_id: String::new(),
-            share_for: None,
-            share_kind: "user".into(),
-            share_target: String::new(),
             new_team_name: String::new(),
             team_member_pick: String::new(),
             cache_entries: load_cache_index(),
             cache_policy: json!({ "allowed": true, "max_mb": 500 }),
             index_covers: std::collections::HashMap::new(),
             index_tags: std::collections::HashMap::new(),
-            content: ContentState {
-                publish_bump: 1, // default preselect: minor （小版本）
-                ..Default::default()
-            },
+            content: ContentState::default(),
             index: IndexState::default(),
             settings: SettingsState {
                 grant_subject_type: "dept".into(),
@@ -1827,6 +2821,11 @@ impl App {
             upd_note: None,
             upd_tx,
             upd_rx,
+            translate_tx,
+            translate_rx,
+            translating: None,
+            ai_status: None,
+            lang_options: Vec::new(),
             ws_sr: None,
             ws_sr_review: false,
             ws_ct: None,
@@ -2545,9 +3544,7 @@ impl App {
         self.library_refs.clear();
         self.index_covers.clear();
         self.index_tags.clear();
-        self.sr_detail = None;
-        self.sr_deck = None;
-        self.sr_preview = None;
+        self.showroom.stack.pop_to(0);
         self.my_id.clear();
     }
 
@@ -2669,7 +3666,33 @@ impl App {
                     .filter_map(|x| x.as_str())
                     .collect::<Vec<_>>()
                     .join(", ");
+                let codes: Vec<String> = v
+                    .get("codes")
+                    .and_then(|p| p.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !codes.is_empty() {
+                    self.lang_options = codes
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, code)| {
+                            let label = l
+                                .get(idx)
+                                .and_then(|x| x.as_str())
+                                .unwrap_or(code.as_str())
+                                .to_string();
+                            (code.clone(), label)
+                        })
+                        .collect();
+                }
             }
+        }
+        if let Ok(v) = self.call("GET", "/v1/ai/status", None) {
+            self.ai_status = Some(v);
         }
         if self.content.import_group.is_empty() {
             if let Some(g) = self.groups.first() {
@@ -2707,9 +3730,13 @@ impl App {
     }
 
     fn open_unit_detail(&mut self, unit_id: &str) {
-        self.content.selected_unit = Some(unit_id.to_string());
+        // The wall ring follows the open block, as selected_unit did.
+        if let ContentFrame::Wall(w) = self.content.stack.root_mut() {
+            w.selected = Some(unit_id.to_string());
+        }
         match self.call("GET", &format!("/v1/units/{unit_id}"), None) {
             Ok(v) => {
+                let mut st = UnitState::new(unit_id, v.clone());
                 // default the publish target to the unit's first rendition
                 if let Some(first) = v
                     .get("renditions")
@@ -2717,8 +3744,8 @@ impl App {
                     .and_then(|a| a.first())
                     .and_then(|r| r.get("rendition"))
                 {
-                    self.content.publish_form = s(first, "form");
-                    self.content.publish_lang = s(first, "lang");
+                    st.publish_form = s(first, "form");
+                    st.publish_lang = s(first, "lang");
                 }
                 if let Some(u) = v.get("unit") {
                     let rev = i(u, "current_revision");
@@ -2729,20 +3756,30 @@ impl App {
                     };
                     self.note_recent("unit", unit_id, &s(u, "name"), &ver);
                 }
-                self.content.detail = Some(v);
                 self.load_attachments(unit_id);
-                self.content.bind_from.clear();
-                self.content.bind_to.clear();
-                self.content.bind_from_slot = None;
-                self.content.bindings = self
+                st.bindings = self
                     .call("GET", &format!("/v1/units/{unit_id}/page-bindings"), None)
                     .ok()
                     .and_then(|b| {
                         b.get("bindings").and_then(|x| x.as_array()).cloned()
                     })
                     .unwrap_or_default();
+                // Opening replaces the drill-down, as the single
+                // detail slot did: reset to the wall, then push.
+                self.content.stack.pop_to(0);
+                self.content.stack.push(ContentFrame::Unit(st));
             }
             Err(e) => self.msg = format!("打开失败：{e}"),
+        }
+    }
+
+    /// Close the block drill-down (the former detail = None):
+    /// pop the content stack back to the wall and clear the wall
+    /// selection, exactly what the old field pair did.
+    fn close_unit_detail(&mut self) {
+        self.content.stack.pop_to(0);
+        if let ContentFrame::Wall(w) = self.content.stack.root_mut() {
+            w.selected = None;
         }
     }
 
@@ -2834,14 +3871,20 @@ impl App {
         let mut delta: Option<isize> = None;
         let mut close = false;
         ui.horizontal(|ui| {
-            if ui.small_button("‹ 上一页").clicked() && page > 0 {
+            if ui
+                .add_enabled(page > 0, egui::Button::new("‹ 上一页").small())
+                .clicked()
+            {
                 delta = Some(-1);
             }
             ui.label(
                 egui::RichText::new(format!("第 {} / {} 页", page + 1, pages.max(1)))
                     .color(TEXT_WEAK),
             );
-            if ui.small_button("下一页 ›").clicked() && page + 1 < pages {
+            if ui
+                .add_enabled(page + 1 < pages, egui::Button::new("下一页 ›").small())
+                .clicked()
+            {
                 delta = Some(1);
             }
             if ui.small_button("关闭预览").clicked() {
@@ -2956,43 +3999,92 @@ impl App {
     }
 
     fn open_index_detail(&mut self, index_id: &str) {
-        self.index.selected = Some(index_id.to_string());
-        self.load_index_detail();
-        if let Some(d) = &self.index.detail {
-            let idx = d.get("index").cloned().unwrap_or(json!({}));
-            self.note_recent("index", index_id, &s(&idx, "name"), "");
+        // The branch carries over from the previously open index,
+        // as it did when branch was a page-level field.
+        let branch = match self.index.stack.top() {
+            IndexFrame::Detail(d) => d.branch.clone(),
+            _ => String::new(),
+        };
+        self.open_index_detail_as(index_id, branch);
+    }
+
+    /// Open from the overview wall goes through here with branch
+    /// "main": the old overview double-click reset the branch
+    /// selector before opening.
+    fn open_index_detail_as(&mut self, index_id: &str, branch: String) {
+        // Load first; only drill in on success (the old behavior on
+        // a failed load was to stay on the overview).
+        let mut st = IndexDetailState::new(index_id, branch);
+        let b = if st.branch.is_empty() {
+            "main".to_string()
+        } else {
+            st.branch.clone()
+        };
+        match self.call("GET", &format!("/v1/indexes/{index_id}?branch={b}"), None) {
+            Ok(v) => st.detail = v,
+            Err(e) => {
+                self.msg = format!("打开索引失败：{e}");
+                return;
+            }
         }
+        let idx = st.detail.get("index").cloned().unwrap_or(json!({}));
+        self.index.stack.pop_to(0);
+        self.index.stack.push(IndexFrame::Detail(st));
+        self.load_index_related(index_id);
+        self.note_recent("index", index_id, &s(&idx, "name"), "");
     }
 
     fn load_index_detail(&mut self) {
-        let Some(id) = self.index.selected.clone() else {
-            return;
-        };
-        let branch = if self.index.branch.is_empty() {
-            "main".to_string()
-        } else {
-            self.index.branch.clone()
+        let (id, branch) = match self.index.stack.top() {
+            IndexFrame::Detail(d) => (
+                d.index_id.clone(),
+                if d.branch.is_empty() {
+                    "main".to_string()
+                } else {
+                    d.branch.clone()
+                },
+            ),
+            _ => return,
         };
         match self.call("GET", &format!("/v1/indexes/{id}?branch={branch}"), None) {
-            Ok(v) => self.index.detail = Some(v),
+            Ok(v) => {
+                if let IndexFrame::Detail(d) = self.index.stack.top_mut() {
+                    d.detail = v;
+                }
+            }
             Err(e) => self.msg = format!("打开索引失败：{e}"),
         }
-        self.load_attachments(&id);
+        self.load_index_related(&id);
+    }
+
+    /// Attachments, per-rendition version prefetch, commits and
+    /// exports for the open index (split out of load_index_detail
+    /// so open_index_detail can load the detail before drilling in).
+    fn load_index_related(&mut self, id: &str) {
+        let branch = match self.index.stack.top() {
+            IndexFrame::Detail(d) if d.branch.is_empty() => "main".to_string(),
+            IndexFrame::Detail(d) => d.branch.clone(),
+            _ => "main".to_string(),
+        };
+        self.load_attachments(id);
         // prefetch version history per rendition for the quick-switch strips
-        self.index.unit_versions.clear();
+        let detail = match self.index.stack.top() {
+            IndexFrame::Detail(d) => d.detail.clone(),
+            _ => Value::Null,
+        };
         let mut seen_units: Vec<String> = Vec::new();
-        if let Some(d) = self.index.detail.clone() {
-            if let Some(arr) = d.get("resolved_entries").and_then(|r| r.as_array()) {
-                for re in arr {
-                    if let Some(e) = re.get("entry") {
-                        let uid = s(e, "unit_id");
-                        if !uid.is_empty() && !seen_units.contains(&uid) {
-                            seen_units.push(uid);
-                        }
+        if let Some(arr) = detail.get("resolved_entries").and_then(|r| r.as_array()) {
+            for re in arr {
+                if let Some(e) = re.get("entry") {
+                    let uid = s(e, "unit_id");
+                    if !uid.is_empty() && !seen_units.contains(&uid) {
+                        seen_units.push(uid);
                     }
                 }
             }
         }
+        let mut unit_versions: std::collections::HashMap<String, Vec<Value>> =
+            Default::default();
         for uid in seen_units {
             if let Ok(u) = self.call("GET", &format!("/v1/units/{uid}"), None) {
                 if let Some(rends) = u.get("renditions").and_then(|r| r.as_array()) {
@@ -3012,28 +4104,40 @@ impl App {
                                 st.is_empty() || st == "normal"
                             })
                             .collect();
-                        vs.sort_by(|a, b| semver_key(&s(b, "semver")).cmp(&semver_key(&s(a, "semver"))));
-                        self.index.unit_versions.insert(rid, vs);
+                        vs.sort_by(|a, b| {
+                            semver_key(&s(b, "semver")).cmp(&semver_key(&s(a, "semver")))
+                        });
+                        unit_versions.insert(rid, vs);
                     }
                 }
             }
         }
+        if let IndexFrame::Detail(d) = self.index.stack.top_mut() {
+            d.unit_versions = unit_versions;
+        }
         if let Ok(v) = self.call("GET", &format!("/v1/indexes/{id}/commits?branch={branch}"), None) {
-            self.index.commits = Some(v);
+            if let IndexFrame::Detail(d) = self.index.stack.top_mut() {
+                d.commits = Some(v);
+            }
         }
         if let Ok(v) = self.call("GET", &format!("/v1/exports?index_id={id}"), None) {
-            self.index.exports = Some(v);
+            if let IndexFrame::Detail(d) = self.index.stack.top_mut() {
+                d.exports = Some(v);
+            }
         }
     }
 
     fn commit_entries(&mut self, entries: Vec<Value>, message: &str) {
-        let Some(id) = self.index.selected.clone() else {
-            return;
-        };
-        let branch = if self.index.branch.is_empty() {
-            "main".to_string()
-        } else {
-            self.index.branch.clone()
+        let (id, branch) = match self.index.stack.top() {
+            IndexFrame::Detail(d) => (
+                d.index_id.clone(),
+                if d.branch.is_empty() {
+                    "main".to_string()
+                } else {
+                    d.branch.clone()
+                },
+            ),
+            _ => return,
         };
         let r = self.call(
             "POST",
@@ -3050,10 +4154,12 @@ impl App {
     }
 
     fn current_entries(&self) -> Vec<Value> {
-        self.index
-            .detail
-            .as_ref()
-            .and_then(|d| d.get("resolved_entries"))
+        let detail = match self.index.stack.top() {
+            IndexFrame::Detail(d) => &d.detail,
+            _ => return Vec::new(),
+        };
+        detail
+            .get("resolved_entries")
             .and_then(|r| r.as_array())
             .map(|arr| {
                 arr.iter()
@@ -3064,7 +4170,10 @@ impl App {
     }
 
     fn current_index_name(&self) -> String {
-        let id = self.index.selected.clone().unwrap_or_default();
+        let id = match self.index.stack.top() {
+            IndexFrame::Detail(d) => d.index_id.clone(),
+            _ => String::new(),
+        };
         self.indexes
             .iter()
             .find(|x| s(x, "id") == id)
@@ -3099,7 +4208,6 @@ impl App {
             let fid = s(&unit, "folder_id");
             self.content.folder_filter = if fid.is_empty() { None } else { Some(fid) };
         }
-        self.content.detail = None;
         self.page = Page::Content;
         self.open_unit_detail(&unit_id);
     }
@@ -3144,7 +4252,12 @@ impl App {
                         }
                         if matches!(pick, PickState::Pages { .. })
                             && ui
-                                .add(
+                                .add_enabled(
+                                    matches!(
+                                        &pick,
+                                        PickState::Pages { sel, .. }
+                                            if sel.iter().any(|b| *b)
+                                    ),
                                     egui::Button::new(
                                         egui::RichText::new("确认选页")
                                             .color(egui::Color32::WHITE),
@@ -3170,8 +4283,7 @@ impl App {
 
     fn cancel_pick(&mut self) {
         self.pick = None;
-        self.content.detail = None;
-        self.content.selected_unit = None;
+        self.close_unit_detail();
         self.page = Page::Index;
     }
 
@@ -3202,8 +4314,7 @@ impl App {
                 json!(chosen.iter().map(|n| n.to_string()).collect::<Vec<_>>());
         }
         self.pick = None;
-        self.content.detail = None;
-        self.content.selected_unit = None;
+        self.close_unit_detail();
         self.page = Page::Index;
         self.commit_entries(es, "摘录选页");
     }
@@ -3496,6 +4607,17 @@ fn btn_ghost(ui: &mut egui::Ui, label: &str) -> egui::Response {
     )
 }
 
+fn btn_ghost_enabled(ui: &mut egui::Ui, enabled: bool, label: &str) -> egui::Response {
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(egui::RichText::new(label).size(12.5).color(TEXT_MAIN))
+            .fill(egui::Color32::TRANSPARENT)
+            .stroke(egui::Stroke::new(1.0, FIELD_BORDER))
+            .corner_radius(6)
+            .min_size(egui::vec2(0.0, 30.0)),
+    )
+}
+
 fn btn_danger(ui: &mut egui::Ui, label: &str) -> egui::Response {
     ui.add(
         egui::Button::new(egui::RichText::new(label).size(12.5).color(egui::Color32::WHITE))
@@ -3729,14 +4851,19 @@ impl App {
             // Connection state, stated neutrally: the launcher and
             // every local feature work the same with no server; the
             // line only says what this device can currently reach.
-            let conn_line = if self.token.is_some() {
-                format!("{} · {}", tr("已连接服务器"), self.active_server_label())
-            } else if self
-                .conns
-                .iter()
-                .any(|c| c.status == ConnStatus::Connected)
-            {
+            // Identity keys on the connection's anon flag, never on
+            // token presence: an anonymous connection mirrors a
+            // server-issued guest token into self.token (G1), so a
+            // token-first check would mislabel it as a named session.
+            let conn_line = if self.anon_active() {
                 format!("{} · {}", tr("已连接服务器（匿名）"), self.active_server_label())
+            } else if self.token.is_some()
+                || self
+                    .conns
+                    .iter()
+                    .any(|c| c.status == ConnStatus::Connected)
+            {
+                format!("{} · {}", tr("已连接服务器"), self.active_server_label())
             } else {
                 tr("单机模式：未连接服务器，本地功能完整可用").to_string()
             };
@@ -3875,6 +5002,7 @@ impl App {
                     }
                 }
                 if let Some(r) = open {
+                    self.deep_source = Some(Page::Home);
                     match s(&r, "kind").as_str() {
                         "index" => {
                             self.page = Page::Index;
@@ -3948,6 +5076,7 @@ impl App {
             .find(|x| s(x, "name").contains("示例"))
             .cloned()
         {
+            self.deep_source = Some(Page::Home);
             self.page = Page::Index;
             self.open_index_detail(&s(&idx, "id"));
             return;
@@ -3960,6 +5089,7 @@ impl App {
             .or_else(|| self.showroom_live.first().cloned());
         match item {
             Some(it) => {
+                self.deep_source = Some(Page::Home);
                 self.page = Page::Showroom;
                 self.open_showroom_deck(&it);
             }
@@ -4148,7 +5278,7 @@ impl App {
                     .color(TEXT_FAINT),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if btn_ghost(ui, tr("清空回收站")).clicked() && !items.is_empty() {
+                    if btn_ghost_enabled(ui, !items.is_empty(), tr("清空回收站")).clicked() {
                         empty_all = true;
                     }
                     if btn_ghost(ui, tr("刷新")).clicked() {
@@ -4819,7 +5949,7 @@ impl App {
     /// a block open for maintenance the split gives way to the single
     /// main frame, exactly as the page behaved before the framework.
     fn dock_content(&mut self, ui: &mut egui::Ui) {
-        let detail = self.content.detail.is_some();
+        let detail = matches!(self.content.stack.top(), ContentFrame::Unit(_));
         if self.ws_ct.is_none() || self.ws_ct_detail != detail {
             let root = if detail {
                 q_tabs(&[QPanel::CtMain])
@@ -4839,7 +5969,7 @@ impl App {
     /// Index workspace: folder frame 300 fixed + main frame; the
     /// create flow takes the whole body, as before.
     fn dock_index(&mut self, ui: &mut egui::Ui) {
-        let creating = self.index.creating;
+        let creating = matches!(self.index.stack.top(), IndexFrame::Create(_));
         if self.ws_ix.is_none() || self.ws_ix_creating != creating {
             let root = if creating {
                 q_tabs(&[QPanel::IxMain])
@@ -4987,6 +6117,49 @@ impl eframe::App for App {
             }
             ctx.request_repaint();
         }
+        // Collect AI-translation progress / completion.
+        while let Ok(ev) = self.translate_rx.try_recv() {
+            match ev {
+                TranslateEvent::Progress(d, t) => {
+                    if let Some(tr) = &mut self.translating {
+                        tr.1 = d;
+                        tr.2 = t;
+                    }
+                }
+                TranslateEvent::Done(res) => {
+                    let finished = self.translating.take();
+                    match res {
+                        Ok(v) => {
+                            let runs = i(&v, "translated_runs");
+                            let gloss = v.get("glossary");
+                            let gget = |k: &str| {
+                                gloss
+                                    .and_then(|g| g.get(k))
+                                    .and_then(|x| x.as_i64())
+                                    .unwrap_or(0)
+                            };
+                            let mut m = if s(&v, "provider") == "stub" {
+                                format!("已生成 stub 占位草稿（{runs} 个文本；未配置真实 AI，仅供流程预览，待校对）")
+                            } else {
+                                format!("译文草稿已生成（{runs} 个文本，待校对）")
+                            };
+                            if gget("repaired") > 0 {
+                                m += &format!("；术语已强制修正 {} 处", gget("repaired"));
+                            }
+                            if gget("unresolved") > 0 {
+                                m += &format!("；术语未命中 {} 处，请人工校对", gget("unresolved"));
+                            }
+                            self.msg = m;
+                            if let Some((uid, _, _)) = finished {
+                                self.open_unit_detail(&uid);
+                            }
+                        }
+                        Err(e) => self.msg = format!("翻译失败：{e}"),
+                    }
+                }
+            }
+            ctx.request_repaint();
+        }
         // Collect a finished LAN discovery scan, if one is running.
         if self.disc_rx.is_some() {
             let got = self.disc_rx.as_ref().and_then(|rx| rx.try_recv().ok());
@@ -5066,6 +6239,8 @@ impl eframe::App for App {
                         ] {
                             if ui.button(tr(label)).clicked() {
                                 self.page = page;
+                                self.deep_source = None;
+                                self.review.jump_source = None;
                                 ui.close();
                             }
                         }
@@ -5249,6 +6424,8 @@ impl eframe::App for App {
                         ] {
                             if workspace_tab(ui, self.page == page, tr(label)).clicked() {
                                 self.page = page;
+                                self.deep_source = None;
+                                self.review.jump_source = None;
                             }
                         }
                     });
@@ -5400,15 +6577,15 @@ impl App {
             es[pos]["policy"] = json!({ "locked": { "version_id": version_id } });
             es[pos]["locked_semver"] = json!(semver);
         }
-        self.index.more_for = None;
         self.commit_entries(es, "切换版本");
     }
 
     /// Export the open index to a user-chosen file. kind: personal|company
     /// (§3.14 — the server resolves or blocks on personal placeholders).
     fn export_index_file(&mut self, index: &Value, kind: &str) {
-        let Some(id) = self.index.selected.clone() else {
-            return;
+        let (id, branch, include_notes) = match self.index.stack.top() {
+            IndexFrame::Detail(d) => (d.index_id.clone(), d.branch.clone(), d.include_notes),
+            _ => return,
         };
         let Some(path) = rfd::FileDialog::new()
             .set_file_name(format!("{}.pptx", s(index, "name")))
@@ -5420,9 +6597,9 @@ impl App {
             "POST",
             &format!("/v1/indexes/{id}/export"),
             Some(json!({
-                "branch": self.index.branch,
+                "branch": branch,
                 "kind": kind,
-                "include_notes": self.index.include_notes,
+                "include_notes": include_notes,
             })),
         );
         match r {
@@ -5621,26 +6798,34 @@ impl App {
         {
             self.open_showroom_deck(&it);
         } else {
-            self.sr_detail = Some(json!({
-                "id": item_id, "title": title,
-                "source_index_id": "", "submitted_by": "",
+            self.showroom.stack.pop_to(0);
+            self.showroom.stack.push(SrFrame::Deck(DeckState {
+                item: json!({
+                    "id": item_id, "title": title,
+                    "source_index_id": "", "submitted_by": "",
+                }),
+                deck: None,
+                closed: false,
             }));
-            self.sr_deck = None;
-            self.sr_preview = None;
         }
     }
 
     /// Open a showroom entry's whole-deck view (H): fetch the source
     /// index so its resolved entries can be paged through.
     fn open_showroom_deck(&mut self, item: &Value) {
-        self.sr_detail = Some(item.clone());
         self.note_recent("showroom", &s(item, "id"), &s(item, "title"), "");
-        self.sr_deck = None;
-        self.sr_preview = None;
+        self.showroom.stack.pop_to(0);
+        self.showroom.stack.push(SrFrame::Deck(DeckState {
+            item: item.clone(),
+            deck: None,
+            closed: false,
+        }));
         let src = s(item, "source_index_id");
         if !src.is_empty() {
             if let Ok(v) = self.call("GET", &format!("/v1/indexes/{src}"), None) {
-                self.sr_deck = Some(v);
+                if let SrFrame::Deck(d) = self.showroom.stack.top_mut() {
+                    d.deck = Some(v);
+                }
             }
         }
     }
@@ -5843,12 +7028,49 @@ impl App {
         });
     }
 
+    /// PDF export for the showroom deck on screen (Q21): asks the
+    /// server for the DeckCraft PDF (the whole deck in the chosen
+    /// form, or one deck-global page) and saves it through the same
+    /// file dialog flow as the PPTX export. Works in every session
+    /// state the PPTX export works in, standalone included.
+    fn export_showroom_pdf(&mut self, item: &Value, form: &str, page: Option<usize>) {
+        let title = s(item, "title");
+        let stem = match (form, page) {
+            ("handout", _) => format!("{title}-讲义"),
+            ("notes", _) => format!("{title}-备注页"),
+            (_, Some(p)) => format!("{title}-第{}页", p + 1),
+            _ => title.clone(),
+        };
+        let mut body = json!({ "kind": "personal", "form": form });
+        if let Some(p) = page {
+            body["page"] = json!(p);
+        }
+        match self.call(
+            "POST",
+            &format!("/v1/showroom/{}/export-pdf", s(item, "id")),
+            Some(body),
+        ) {
+            Ok(v) => {
+                if let Some(data) = v.get("data_base64").and_then(|x| x.as_str()) {
+                    if let (Ok(bytes), Some(path)) = (
+                        b64d(data),
+                        rfd::FileDialog::new()
+                            .set_file_name(format!("{stem}.pdf"))
+                            .save_file(),
+                    ) {
+                        let _ = std::fs::write(path, bytes);
+                        self.msg = "已保存".into();
+                    }
+                }
+            }
+            Err(e) => self.msg = format!("导出 PDF 失败：{e}"),
+        }
+    }
+
     /// Whole-deck page view inside the showroom: every page of the deck
     /// in entry order; clicking a page opens the large preview.
-    fn showroom_deck(&mut self, ui: &mut egui::Ui) {
-        let Some(item) = self.sr_detail.clone() else {
-            return;
-        };
+    fn showroom_deck(&mut self, ui: &mut egui::Ui, st: &mut DeckState) {
+        let item = st.item.clone();
         // Header (James 2026-11-15): deck title on the left; the
         // actions as IconPark icons at the top-right — 开始演示 /
         // 导出 / 缓存到本地 in light gray, 返回 in red. No text buttons
@@ -5858,6 +7080,7 @@ impl App {
         // in-server share flow returns with the organization phase).
         let mut go_back = false;
         let mut act: Option<&'static str> = None;
+        let mut pdf_act: Option<(&'static str, Option<usize>)> = None;
         let cache_key = format!("sr_{}", s(&item, "id"));
         let already_cached = self
             .cache_entries
@@ -5902,9 +7125,7 @@ impl App {
             });
         });
         if go_back {
-            self.sr_detail = None;
-            self.sr_deck = None;
-            self.sr_preview = None;
+            st.closed = true;
             return;
         }
         let src_name = self
@@ -5929,6 +7150,22 @@ impl App {
         if text_action(ui, "用系统应用打开", TEXT_WEAK, 11.5) {
             self.present_showroom(&s(&item, "id"), &s(&item, "title"));
         }
+        // PDF export (Q21): whole deck in the three DeckCraft forms.
+        // The single-page variant lives in the page preview window
+        // below. Anonymous (guest) sessions take the same path — the
+        // server forces the company edition for them, exactly like
+        // the PPTX export.
+        ui.horizontal(|ui| {
+            if ui.small_button("导出 PDF").clicked() {
+                pdf_act = Some(("slides", None));
+            }
+            if ui.small_button("讲义版 PDF").clicked() {
+                pdf_act = Some(("handout", None));
+            }
+            if ui.small_button("备注页 PDF").clicked() {
+                pdf_act = Some(("notes", None));
+            }
+        });
         ui.add_space(8.0);
         match act {
             Some("play") => {
@@ -5987,8 +7224,11 @@ impl App {
             }
             _ => {}
         }
+        if let Some((form, page)) = pdf_act {
+            self.export_showroom_pdf(&item, form, page);
+        }
         ui.add_space(10.0);
-        match &self.sr_deck {
+        match &st.deck {
             Some(deck) => {
                 let resolved = deck
                     .get("resolved_entries")
@@ -6018,7 +7258,7 @@ impl App {
                             for (vid, p, n) in row {
                                 ui.vertical(|ui| {
                                     if self.thumb_button(ui, vid, *p, 216.0, false) {
-                                        self.sr_preview = Some((vid.clone(), *p));
+                                        self.overlays.push(Overlay::PagePreview { version_id: vid.clone(), page: *p, global: *n - 1, item: item.clone() });
                                     }
                                     ui.label(
                                         egui::RichText::new(format!("第 {n} 页"))
@@ -6041,21 +7281,6 @@ impl App {
                             .color(TEXT_WEAK),
                     );
                 });
-            }
-        }
-        // large page preview (an allowed overlay)
-        if let Some((vid, page)) = self.sr_preview.clone() {
-            let mut open = true;
-            egui::Window::new(format!("第 {} 页", page + 1))
-                .open(&mut open)
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-                .show(ui.ctx(), |ui| {
-                    self.thumb_ui(ui, &vid, page, 880.0);
-                });
-            if !open {
-                self.sr_preview = None;
             }
         }
     }
@@ -6185,97 +7410,6 @@ impl App {
     /// every entry point that opened it has been removed, so this
     /// is currently unreachable.
     #[allow(dead_code)]
-    fn share_panel(&mut self, ui: &mut egui::Ui) {
-        let item_id = self.share_for.clone().unwrap_or_default();
-        let title = self
-            .showroom_live
-            .iter()
-            .find(|x| s(x, "id") == item_id)
-            .map(|x| s(x, "title"))
-            .unwrap_or_default();
-        card_frame().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(format!("分享「{title}」")).strong());
-                if ui.small_button("关闭").clicked() {
-                    self.share_for = None;
-                }
-            });
-            ui.horizontal(|ui| {
-                for (k, label) in [("user", "给个人"), ("dept", "给部门"), ("group", "给群组")] {
-                    if ui.selectable_label(self.share_kind == k, label).clicked() {
-                        self.share_kind = k.into();
-                        self.share_target.clear();
-                    }
-                }
-            });
-            let users = self
-                .org
-                .get("users")
-                .and_then(|u| u.as_array())
-                .cloned()
-                .unwrap_or_default();
-            let depts = self
-                .org
-                .get("departments")
-                .and_then(|u| u.as_array())
-                .cloned()
-                .unwrap_or_default();
-            let (options, current): (Vec<(String, String)>, String) = match self.share_kind.as_str() {
-                "dept" => (
-                    depts.iter().map(|d| (s(d, "id"), s(d, "name"))).collect(),
-                    depts
-                        .iter()
-                        .find(|d| s(d, "id") == self.share_target)
-                        .map(|d| s(d, "name"))
-                        .unwrap_or_else(|| "选择部门".into()),
-                ),
-                "group" => (
-                    self.my_teams.iter().map(|g| (s(g, "id"), s(g, "name"))).collect(),
-                    self.my_teams
-                        .iter()
-                        .find(|g| s(g, "id") == self.share_target)
-                        .map(|g| s(g, "name"))
-                        .unwrap_or_else(|| "选择群组".into()),
-                ),
-                _ => (
-                    users.iter().map(|u| (s(u, "id"), s(u, "display_name"))).collect(),
-                    users
-                        .iter()
-                        .find(|u| s(u, "id") == self.share_target)
-                        .map(|u| s(u, "display_name"))
-                        .unwrap_or_else(|| "选择同事".into()),
-                ),
-            };
-            ui.horizontal(|ui| {
-                egui::ComboBox::from_id_salt("share_target")
-                    .selected_text(current)
-                    .show_ui(ui, |ui| {
-                        for (id, name) in options {
-                            ui.selectable_value(&mut self.share_target, id, name);
-                        }
-                    });
-                if ui.button("发送分享").clicked() && !self.share_target.is_empty() {
-                    match self.call(
-                        "POST",
-                        "/v1/shares",
-                        Some(json!({
-                            "item_kind": "showroom", "item_id": item_id,
-                            "target_kind": self.share_kind, "target_id": self.share_target,
-                        })),
-                    ) {
-                        Ok(_) => {
-                            self.msg = "已分享".into();
-                            self.share_for = None;
-                            self.refresh_all();
-                        }
-                        Err(e) => self.msg = format!("分享失败：{e}"),
-                    }
-                }
-            });
-        });
-        ui.add_space(6.0);
-    }
-
     fn inbox_view(&mut self, ui: &mut egui::Ui) {
         if self.inbox.is_empty() {
             ui.label(egui::RichText::new("暂无收到的分享").weak());
@@ -6326,7 +7460,13 @@ impl App {
         ui.horizontal(|ui| {
             ui.label("新建群组");
             ui.text_edit_singleline(&mut self.new_team_name);
-            if ui.button("建组").clicked() && !self.new_team_name.trim().is_empty() {
+            if ui
+                .add_enabled(
+                    !self.new_team_name.trim().is_empty(),
+                    egui::Button::new("建组"),
+                )
+                .clicked()
+            {
                 let name = self.new_team_name.clone();
                 match self.call("POST", "/v1/custom-groups", Some(json!({ "name": name }))) {
                     Ok(_) => {
@@ -6388,8 +7528,12 @@ impl App {
                                     );
                                 }
                             });
-                        if ui.small_button("加成员").clicked()
-                            && !self.team_member_pick.is_empty()
+                        if ui
+                            .add_enabled(
+                                !self.team_member_pick.is_empty(),
+                                egui::Button::new("加成员").small(),
+                            )
+                            .clicked()
                         {
                             let pick = self.team_member_pick.clone();
                             match self.call(
@@ -6476,19 +7620,18 @@ impl App {
                 ("inbox", "收到的分享", self.tex_icon(ui, "inbox", *ICON_INBOX)),
                 ("groups", "群组空间", self.tex_icon(ui, "peoples-two", *ICON_PEOPLES2)),
             ] {
-                if tree_row(ui, self.sr_zone == zone, 0.0, Some(icon), label, 12.0).clicked() {
-                    self.sr_zone = zone.to_string();
-                    self.sr_detail = None;
-                    self.sr_deck = None;
-                    self.sr_preview = None;
+                if tree_row(ui, self.showroom.zone == zone, 0.0, Some(icon), label, 12.0).clicked() {
+                    self.showroom.zone = zone.to_string();
+                    // switching zones leaves any open deck
+                    self.showroom.stack.pop_to(0);
                 }
             }
             ui.add_space(6.0);
             ui.separator();
             ui.add_space(6.0);
-            let mut sel = self.sr_folder.clone();
+            let mut sel = self.showroom.folder.clone();
             self.folder_tree(ui, &mut sel);
-            self.sr_folder = sel;
+            self.showroom.folder = sel;
         }
         self.nav_footer(ui, footer_rect);
     }
@@ -6532,6 +7675,7 @@ impl App {
                                 // approval queue's detail frame, which
                                 // carries the reason form.
                                 self.page = Page::Settings;
+                                self.review.jump_source = Some(Page::Showroom);
                                 let sections = self.settings_sections();
                                 if let Some(pos) =
                                     sections.iter().position(|x| *x == "审批队列")
@@ -6621,6 +7765,17 @@ impl App {
         if matches!(self.review.stack.top(), ReviewFrame::Detail(_)) {
             self.review_detail_body(ui);
             return;
+        }
+        // Cross-page deep jump (nav ruler 3): this stack was entered
+        // from the showroom review bar; at its root, offer the way
+        // back to the source frame.
+        if self.review.jump_source.is_some() {
+            ui.horizontal(|ui| {
+                if text_action(ui, "‹ 返回演示厅", ACCENT, 13.0) {
+                    self.page = self.review.jump_source.take().unwrap_or(Page::Showroom);
+                }
+            });
+            ui.add_space(6.0);
         }
         let tab = match self.review.stack.top() {
             ReviewFrame::Queue(q) => q.tab,
@@ -6991,12 +8146,30 @@ impl App {
     }
 
     fn showroom_body(&mut self, ui: &mut egui::Ui) {
-        if self.sr_detail.is_some() {
-            // The deck view carries its own header (title + icon actions);
-            // no "演示厅" heading above it (James 2026-11-15).
-            self.showroom_deck(ui);
-            return;
+        // Frame-state take-out, same pattern as content/index.
+        // The deck view carries its own header (title + icon
+        // actions); no "演示厅" heading above it (James 2026-11-15).
+        let mut frame = self.showroom.stack.replace_top(SrFrame::Wall);
+        let closed = match &mut frame {
+            SrFrame::Deck(st) => {
+                self.showroom_deck(ui, st);
+                st.closed
+            }
+            SrFrame::Wall => {
+                self.showroom_wall(ui);
+                false
+            }
+        };
+        if closed {
+            self.showroom.stack.pop();
+        } else {
+            self.showroom.stack.replace_top(frame);
         }
+    }
+
+    /// The zone wall (root frame body): the plaza card grid, or
+    /// the library / inbox / groups sub-view for the zone.
+    fn showroom_wall(&mut self, ui: &mut egui::Ui) {
         ui.label(
             egui::RichText::new(tr("演示厅"))
                 .strong()
@@ -7004,7 +8177,16 @@ impl App {
                 .color(TEXT_MAIN),
         );
         ui.add_space(6.0);
-        if self.anon_active() && self.sr_zone == "plaza" {
+        if self.deep_source == Some(Page::Home) {
+            ui.horizontal(|ui| {
+                if text_action(ui, "‹ 返回主页", ACCENT, 13.0) {
+                    self.deep_source = None;
+                    self.page = Page::Home;
+                }
+            });
+            ui.add_space(4.0);
+        }
+        if self.anon_active() && self.showroom.zone == "plaza" {
             ui.label(
                 egui::RichText::new(tr("匿名连接：仅显示公开内容，发布与审批需实名登录"))
                     .size(12.0)
@@ -7012,15 +8194,15 @@ impl App {
             );
             ui.add_space(4.0);
         }
-        if self.sr_zone == "library" {
+        if self.showroom.zone == "library" {
             self.library_view(ui);
             return;
         }
-        if self.sr_zone == "inbox" {
+        if self.showroom.zone == "inbox" {
             self.inbox_view(ui);
             return;
         }
-        if self.sr_zone == "groups" {
+        if self.showroom.zone == "groups" {
             self.groups_view(ui);
             return;
         }
@@ -7030,7 +8212,7 @@ impl App {
             ui.horizontal_wrapped(|ui| {
                 for item in self.showroom_live.clone() {
                     if !self.folder_filter_ok(
-                        &self.sr_folder.clone(),
+                        &self.showroom.folder.clone(),
                         &self.index_folder_of(&s(&item, "source_index_id")),
                     ) {
                         continue;
@@ -7277,30 +8459,63 @@ impl App {
     }
 
     fn ct_main_body(&mut self, ui: &mut egui::Ui) {
-        if self.content.detail.is_some() {
-            body_frame().show(ui, |ui| {
-                if self.pick.is_some() {
-                    self.pick_bar(ui);
-                }
-                self.unit_detail(ui);
-            });
-            return;
+        // Frame-state take-out: a frame's form state is rendered
+        // alongside &mut self, which borrowing the stack would
+        // forbid. A placeholder wall frame sits in the taken
+        // frame's place meanwhile — it is never rendered; the
+        // taken frame is what gets drawn.
+        let mut frame = self
+            .content
+            .stack
+            .replace_top(ContentFrame::Wall(WallState::default()));
+        let closed = match &mut frame {
+            ContentFrame::Unit(st) => {
+                body_frame().show(ui, |ui| {
+                    if self.pick.is_some() {
+                        self.pick_bar(ui);
+                    }
+                    self.unit_detail(ui, st);
+                });
+                st.closed
+            }
+            ContentFrame::Wall(w) => {
+                self.content_wall(ui, w);
+                false
+            }
+        };
+        if closed {
+            // Drop the taken frame and pop the placeholder:
+            // the stack is back at the wall.
+            self.content.stack.pop();
+        } else {
+            self.content.stack.replace_top(frame);
         }
+    }
+
+    /// The maintenance wall (root frame body): search, the import
+    /// toolbar and the block card grid.
+    fn content_wall(&mut self, ui: &mut egui::Ui, w: &mut WallState) {
         body_frame().show(ui, |ui| {
         if self.pick.is_some() {
             self.pick_bar(ui);
         }
         if self.pick.is_none() {
         ui.horizontal(|ui| {
+            if self.deep_source == Some(Page::Home) {
+                if text_action(ui, "‹ 返回主页", ACCENT, 13.0) {
+                    self.deep_source = None;
+                    self.page = Page::Home;
+                }
+            }
             let resp = ui.add(
-                egui::TextEdit::singleline(&mut self.content.search_text)
+                egui::TextEdit::singleline(&mut w.search_text)
                     .hint_text("搜索")
                     .desired_width(300.0)
                     .margin(egui::vec2(14.0, 7.0)),
             );
             if resp.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
-                match self.call("GET", &format!("/v1/search?q={}", self.content.search_text), None) {
-                    Ok(v) => self.content.search_hits = Some(v),
+                match self.call("GET", &format!("/v1/search?q={}", w.search_text), None) {
+                    Ok(v) => w.search_hits = Some(v),
                     Err(e) => self.msg = e,
                 }
             }
@@ -7331,7 +8546,7 @@ impl App {
         });
         } // pick.is_none() toolbar block
         ui.add_space(12.0);
-        if let Some(hits) = self.content.search_hits.clone() {
+        if let Some(hits) = w.search_hits.clone() {
             ui.label(egui::RichText::new("搜索结果").strong());
             if let Some(arr) = hits.get("hits").and_then(|h| h.as_array()) {
                 for h in arr {
@@ -7467,7 +8682,7 @@ impl App {
                         egui::Id::new(("unit_card", &uid)),
                         egui::Sense::click(),
                     );
-                    if self.content.selected_unit.as_deref() == Some(uid.as_str()) {
+                    if w.selected.as_deref() == Some(uid.as_str()) {
                         ui.painter().rect_stroke(
                             outer.response.rect,
                             6.0,
@@ -7480,7 +8695,7 @@ impl App {
                             self.open_unit_detail(&uid);
                         }
                     } else if click.clicked() {
-                        self.content.selected_unit = Some(uid.clone());
+                        w.selected = Some(uid.clone());
                     }
                 }
                 // grid-end add card (I): same footprint as a content
@@ -7493,13 +8708,12 @@ impl App {
         });
     }
 
-    fn unit_detail(&mut self, ui: &mut egui::Ui) {
-        let detail = self.content.detail.clone().unwrap();
+    fn unit_detail(&mut self, ui: &mut egui::Ui, st: &mut UnitState) {
+        let detail = st.detail.clone();
         let unit = detail.get("unit").cloned().unwrap_or(json!({}));
         ui.horizontal(|ui| {
             if ui.button("← 返回").clicked() {
-                self.content.detail = None;
-                self.content.selected_unit = None;
+                st.closed = true;
                 self.refresh_all();
                 return;
             }
@@ -7513,8 +8727,7 @@ impl App {
                 if btn_danger(ui, "删除内容块").clicked() {
                     let uid = s(&unit, "id");
                     self.trash_add("unit", &uid);
-                    self.content.detail = None;
-                    self.content.selected_unit = None;
+                    st.closed = true;
                 }
             });
         });
@@ -7650,8 +8863,8 @@ impl App {
                                     while scripts.len() < pages {
                                         scripts.push(String::new());
                                     }
-                                    self.content.scripts_edit = scripts;
-                                    self.content.scripts_for = Some(s(v, "id"));
+                                    st.scripts_edit = scripts;
+                                    st.scripts_for = Some(s(v, "id"));
                                 }
                                 if s(v, "status") != "recalled" && ui.button("撤回").clicked() {
                                     let _ = self.call(
@@ -7659,7 +8872,7 @@ impl App {
                                         &format!("/v1/versions/{}/recall", s(v, "id")),
                                         None,
                                     );
-                                    if let Some(uid) = self.content.selected_unit.clone() {
+                                    if let Some(uid) = st.unit_id.clone() {
                                         self.open_unit_detail(&uid);
                                     }
                                 }
@@ -7693,6 +8906,14 @@ impl App {
                                         scripts,
                                         bump: 1,
                                         note: String::new(),
+                                        elems: Default::default(),
+                                        elems_base: Default::default(),
+                                        slide_cx: 12192000,
+                                        slide_cy: 6858000,
+                                        sel: None,
+                                        drag: None,
+                                        undo: Vec::new(),
+                                        redo: Vec::new(),
                                     }));
                                 }
                             });
@@ -7703,25 +8924,94 @@ impl App {
             ui.separator();
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("AI 翻译（生成草稿）").strong());
-                let cur_to = if self.content.translate_to.is_empty() {
+                // Configuration state from /v1/ai/status: a stub draft
+                // must never look like a real translation.
+                if let Some(st) = &self.ai_status {
+                    if s(st, "provider") == "stub" {
+                        ui.label(
+                            egui::RichText::new("当前为 stub 占位（未配置真实 AI）")
+                                .small()
+                                .color(TEXT_WEAK),
+                        );
+                    } else if st
+                        .get("configured")
+                        .and_then(|x| x.as_bool())
+                        .unwrap_or(false)
+                    {
+                        ui.label(
+                            egui::RichText::new(format!("AI 已配置：{}", s(st, "model")))
+                                .small()
+                                .color(TEXT_WEAK),
+                        );
+                    }
+                }
+                let cur_to = if st.translate_to.is_empty() {
                     "zh".to_string()
                 } else {
-                    self.content.translate_to.clone()
+                    st.translate_to.clone()
                 };
-                egui::ComboBox::from_id_salt("translate_to")
-                    .selected_text(match cur_to.as_str() {
-                        "en" => "英语",
-                        "ja" => "日语",
-                        _ => "中文",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.content.translate_to, "zh".into(), "中文");
-                        ui.selectable_value(&mut self.content.translate_to, "en".into(), "英语");
-                        ui.selectable_value(&mut self.content.translate_to, "ja".into(), "日语");
+                let cur_label = self
+                    .lang_options
+                    .iter()
+                    .find(|(code, _)| *code == cur_to)
+                    .map(|(_, label)| label.clone())
+                    .unwrap_or_else(|| match cur_to.as_str() {
+                        "en" => "英语".to_string(),
+                        "ja" => "日语".to_string(),
+                        _ => "中文".to_string(),
                     });
-                if ui.button("翻译最新版本").clicked() {
+                egui::ComboBox::from_id_salt("translate_to")
+                    .selected_text(cur_label)
+                    .show_ui(ui, |ui| {
+                        if self.lang_options.is_empty() {
+                            ui.selectable_value(
+                                &mut st.translate_to,
+                                "zh".into(),
+                                "中文",
+                            );
+                            ui.selectable_value(
+                                &mut st.translate_to,
+                                "en".into(),
+                                "英语",
+                            );
+                            ui.selectable_value(
+                                &mut st.translate_to,
+                                "ja".into(),
+                                "日语",
+                            );
+                        } else {
+                            for (code, label) in self.lang_options.clone() {
+                                ui.selectable_value(
+                                    &mut st.translate_to,
+                                    code,
+                                    label,
+                                );
+                            }
+                        }
+                    });
+                let busy = self.translating.is_some();
+                let translate_ready = st.unit_id.is_some()
+                    && st
+                        .detail
+                        .as_ref()
+                        .map(|d| {
+                            d.get("renditions")
+                                .and_then(|r| r.as_array())
+                                .and_then(|arr| arr.first())
+                                .and_then(|r| r.get("versions"))
+                                .and_then(|v| v.as_array())
+                                .map(|arr| !arr.is_empty())
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                let btn_text = match &self.translating {
+                    Some((_, d, t)) if *t > 0 => format!("翻译中… {d}/{t}"),
+                    Some(_) => "翻译中…".to_string(),
+                    None => "翻译最新版本".to_string(),
+                };
+                if ui.add_enabled(!busy && translate_ready, egui::Button::new(btn_text)).clicked() {
                     // latest version of the first rendition in the detail
-                    let first_version = self.content.detail.as_ref().and_then(|d| {
+                    let first_version = st.detail.as_ref().and_then(|d| {
                         d.get("renditions")
                             .and_then(|r| r.as_array())
                             .and_then(|arr| arr.first())
@@ -7730,24 +9020,64 @@ impl App {
                             .and_then(|arr| arr.first())
                             .map(|v| s(v, "id"))
                     });
-                    match (self.content.selected_unit.clone(), first_version) {
+                    match (st.unit_id.clone(), first_version) {
                         (Some(uid), Some(vid)) => {
-                            let to = if self.content.translate_to.is_empty() {
+                            let to = if st.translate_to.is_empty() {
                                 "zh".to_string()
                             } else {
-                                self.content.translate_to.clone()
+                                st.translate_to.clone()
                             };
                             match self.call(
                                 "POST",
-                                &format!("/v1/units/{uid}/translate"),
+                                &format!("/v1/units/{uid}/translate-jobs"),
                                 Some(json!({ "version_id": vid, "target_lang": to })),
                             ) {
                                 Ok(v) => {
-                                    self.msg = format!(
-                                        "译文草稿已生成（{} 个文本，待校对）",
-                                        i(&v, "translated_runs")
-                                    );
-                                    self.open_unit_detail(&uid);
+                                    let job_id = s(&v, "job_id");
+                                    self.translating = Some((uid, 0, 0));
+                                    let server = self.server.clone();
+                                    let token = self.token.clone();
+                                    let tx = self.translate_tx.clone();
+                                    std::thread::spawn(move || loop {
+                                        match raw_call(
+                                            &server,
+                                            token.as_deref(),
+                                            "GET",
+                                            &format!("/v1/translate-jobs/{job_id}"),
+                                            None,
+                                            false,
+                                        ) {
+                                            Ok(p) => {
+                                                let _ = tx.send(TranslateEvent::Progress(
+                                                    i(&p, "done") as usize,
+                                                    i(&p, "total") as usize,
+                                                ));
+                                                match s(&p, "state").as_str() {
+                                                    "succeeded" => {
+                                                        let _ = tx.send(TranslateEvent::Done(
+                                                            Ok(p.get("result")
+                                                                .cloned()
+                                                                .unwrap_or(Value::Null)),
+                                                        ));
+                                                        break;
+                                                    }
+                                                    "failed" => {
+                                                        let _ = tx.send(TranslateEvent::Done(
+                                                            Err(s(&p, "error")),
+                                                        ));
+                                                        break;
+                                                    }
+                                                    _ => std::thread::sleep(
+                                                        std::time::Duration::from_millis(700),
+                                                    ),
+                                                }
+                                            }
+                                            Err(e) => {
+                                                let _ = tx.send(TranslateEvent::Done(Err(e)));
+                                                break;
+                                            }
+                                        }
+                                    });
                                 }
                                 Err(e) => self.msg = format!("翻译失败：{e}"),
                             }
@@ -7756,12 +9086,12 @@ impl App {
                     }
                 }
             });
-            if let Some(vid) = self.content.scripts_for.clone() {
+            if let Some(vid) = st.scripts_for.clone() {
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("逐页讲稿（保存不升版本）").strong());
                     if ui.button("保存讲稿").clicked() {
-                        let scripts = self.content.scripts_edit.clone();
+                        let scripts = st.scripts_edit.clone();
                         match self.call(
                             "PUT",
                             &format!("/v1/versions/{vid}/scripts"),
@@ -7769,7 +9099,7 @@ impl App {
                         ) {
                             Ok(_) => {
                                 self.msg = "讲稿已保存".into();
-                                if let Some(uid) = self.content.selected_unit.clone() {
+                                if let Some(uid) = st.unit_id.clone() {
                                     self.open_unit_detail(&uid);
                                 }
                             }
@@ -7777,15 +9107,15 @@ impl App {
                         }
                     }
                     if ui.button("关闭").clicked() {
-                        self.content.scripts_for = None;
+                        st.scripts_for = None;
                     }
                 });
-                let n = self.content.scripts_edit.len();
+                let n = st.scripts_edit.len();
                 for idx in 0..n {
                     ui.horizontal(|ui| {
                         ui.label(format!("第 {} 页", idx + 1));
                         ui.add(
-                            egui::TextEdit::multiline(&mut self.content.scripts_edit[idx])
+                            egui::TextEdit::multiline(&mut st.scripts_edit[idx])
                                 .desired_width(560.0)
                                 .desired_rows(2),
                         );
@@ -7796,41 +9126,48 @@ impl App {
             ui.label(egui::RichText::new("发布新版本").strong());
             ui.horizontal(|ui| {
                 if ui.button("选择片段文件").clicked() {
-                    self.content.publish_file = rfd::FileDialog::new()
+                    st.publish_file = rfd::FileDialog::new()
                         .add_filter("PowerPoint", &["pptx"])
                         .pick_file();
                 }
-                if let Some(p) = &self.content.publish_file {
+                if let Some(p) = &st.publish_file {
                     ui.label(p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
                 }
             });
             ui.horizontal(|ui| {
                 ui.label("形态");
-                ui.add(egui::TextEdit::singleline(&mut self.content.publish_form).desired_width(80.0));
+                ui.add(egui::TextEdit::singleline(&mut st.publish_form).desired_width(80.0));
                 ui.label("语言");
-                ui.add(egui::TextEdit::singleline(&mut self.content.publish_lang).desired_width(60.0));
+                ui.add(egui::TextEdit::singleline(&mut st.publish_lang).desired_width(60.0));
                 ui.label("升版方式");
                 for (idx, label) in [(0usize, "大版本"), (1, "小版本"), (2, "文字调整")] {
-                    ui.radio_value(&mut self.content.publish_bump, idx, label);
+                    ui.radio_value(&mut st.publish_bump, idx, label);
                 }
                 ui.label("备注");
-                ui.text_edit_singleline(&mut self.content.publish_note);
+                ui.text_edit_singleline(&mut st.publish_note);
             });
-            if ui.button("发布").clicked() {
+            if ui
+                .add_enabled(
+                    st.publish_file.is_some()
+                        && st.unit_id.is_some(),
+                    egui::Button::new("发布"),
+                )
+                .clicked()
+            {
                 if let (Some(path), Some(uid)) =
-                    (self.content.publish_file.clone(), self.content.selected_unit.clone())
+                    (st.publish_file.clone(), st.unit_id.clone())
                 {
                     if let Ok(bytes) = std::fs::read(&path) {
-                        let bump = ["major", "minor", "patch"][self.content.publish_bump];
+                        let bump = ["major", "minor", "patch"][st.publish_bump];
                         let r = self.call(
                             "POST",
                             &format!("/v1/units/{uid}/publish"),
                             Some(json!({
                                 "data_base64": b64e(&bytes),
-                                "form": self.content.publish_form,
-                                "lang": self.content.publish_lang,
+                                "form": st.publish_form,
+                                "lang": st.publish_lang,
                                 "bump": bump,
-                                "note": self.content.publish_note,
+                                "note": st.publish_note,
                             })),
                         );
                         match r {
@@ -7868,17 +9205,17 @@ impl App {
                 }
             }
             if all_versions.len() >= 2 {
-                if self.content.bind_from.is_empty() {
-                    self.content.bind_from = all_versions[0].0.clone();
+                if st.bind_from.is_empty() {
+                    st.bind_from = all_versions[0].0.clone();
                 }
-                if self.content.bind_to.is_empty() {
-                    self.content.bind_to = all_versions[1].0.clone();
+                if st.bind_to.is_empty() {
+                    st.bind_to = all_versions[1].0.clone();
                 }
                 ui.horizontal(|ui| {
                     ui.label("基准");
                     let cur = all_versions
                         .iter()
-                        .find(|v| v.0 == self.content.bind_from)
+                        .find(|v| v.0 == st.bind_from)
                         .map(|v| v.1.clone())
                         .unwrap_or_default();
                     egui::ComboBox::from_id_salt("bind_from")
@@ -7886,7 +9223,7 @@ impl App {
                         .show_ui(ui, |ui| {
                             for v in &all_versions {
                                 ui.selectable_value(
-                                    &mut self.content.bind_from,
+                                    &mut st.bind_from,
                                     v.0.clone(),
                                     &v.1,
                                 );
@@ -7895,39 +9232,39 @@ impl App {
                     ui.label("对应");
                     let cur = all_versions
                         .iter()
-                        .find(|v| v.0 == self.content.bind_to)
+                        .find(|v| v.0 == st.bind_to)
                         .map(|v| v.1.clone())
                         .unwrap_or_default();
                     egui::ComboBox::from_id_salt("bind_to")
                         .selected_text(cur)
                         .show_ui(ui, |ui| {
                             for v in &all_versions {
-                                ui.selectable_value(&mut self.content.bind_to, v.0.clone(), &v.1);
+                                ui.selectable_value(&mut st.bind_to, v.0.clone(), &v.1);
                             }
                         });
                 });
                 let from_pages = all_versions
                     .iter()
-                    .find(|v| v.0 == self.content.bind_from)
+                    .find(|v| v.0 == st.bind_from)
                     .map(|v| v.2)
                     .unwrap_or(0);
                 let to_pages = all_versions
                     .iter()
-                    .find(|v| v.0 == self.content.bind_to)
+                    .find(|v| v.0 == st.bind_to)
                     .map(|v| v.2)
                     .unwrap_or(0);
                 ui.label("基准页（点选）：");
                 ui.horizontal(|ui| {
                     for p in 0..from_pages {
                         ui.vertical(|ui| {
-                            let vid = self.content.bind_from.clone();
+                            let vid = st.bind_from.clone();
                             self.thumb_ui(ui, &vid, p as usize, 84.0);
-                            let selected = self.content.bind_from_slot == Some(p);
+                            let selected = st.bind_from_slot == Some(p);
                             if ui
                                 .selectable_label(selected, format!("第{}页", p + 1))
                                 .clicked()
                             {
-                                self.content.bind_from_slot = Some(p);
+                                st.bind_from_slot = Some(p);
                             }
                         });
                     }
@@ -7936,18 +9273,28 @@ impl App {
                 ui.horizontal(|ui| {
                     for p in 0..to_pages {
                         ui.vertical(|ui| {
-                            let vid = self.content.bind_to.clone();
+                            let vid = st.bind_to.clone();
                             self.thumb_ui(ui, &vid, p as usize, 84.0);
-                            let existing = self.content.bindings.iter().find(|b| {
-                                s(b, "from_version_id") == self.content.bind_from
-                                    && self.content.bind_from_slot == Some(i(b, "from_slot"))
-                                    && s(b, "to_version_id") == self.content.bind_to
+                            let existing = st.bindings.iter().find(|b| {
+                                s(b, "from_version_id") == st.bind_from
+                                    && st.bind_from_slot == Some(i(b, "from_slot"))
+                                    && s(b, "to_version_id") == st.bind_to
                                     && i(b, "to_slot") == p
                             }).map(|b| s(b, "id"));
-                            match (self.content.bind_from_slot, existing) {
+                            match (st.bind_from_slot, existing) {
                                 (Some(_), Some(bid)) => {
-                                    if ui.button("已绑定 ✓").clicked() {
-                                        if let Some(uid) = self.content.selected_unit.clone() {
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                egui::RichText::new("已绑定 ✓")
+                                                    .color(CHIP_GREEN_FG),
+                                            )
+                                            .fill(CHIP_GREEN_BG)
+                                            .corner_radius(10),
+                                        )
+                                        .clicked()
+                                    {
+                                        if let Some(uid) = st.unit_id.clone() {
                                             let _ = self.call(
                                                 "POST",
                                                 &format!("/v1/units/{uid}/page-bindings/{bid}/delete"),
@@ -7959,14 +9306,14 @@ impl App {
                                 }
                                 (Some(fs), None) => {
                                     if ui.button("绑定").clicked() {
-                                        if let Some(uid) = self.content.selected_unit.clone() {
+                                        if let Some(uid) = st.unit_id.clone() {
                                             let r = self.call(
                                                 "POST",
                                                 &format!("/v1/units/{uid}/page-bindings"),
                                                 Some(json!({
-                                                    "from_version_id": self.content.bind_from,
+                                                    "from_version_id": st.bind_from,
                                                     "from_slot": fs,
-                                                    "to_version_id": self.content.bind_to,
+                                                    "to_version_id": st.bind_to,
                                                     "to_slot": p,
                                                 })),
                                             );
@@ -7986,9 +9333,9 @@ impl App {
                         });
                     }
                 });
-                if !self.content.bindings.is_empty() {
+                if !st.bindings.is_empty() {
                     ui.label(
-                        egui::RichText::new(format!("已有绑定 {} 条", self.content.bindings.len()))
+                        egui::RichText::new(format!("已有绑定 {} 条", st.bindings.len()))
                             .small()
                             .weak(),
                     );
@@ -7997,7 +9344,7 @@ impl App {
                 ui.label(egui::RichText::new("至少两个版本后可做逐页绑定").weak());
             }
         });
-        if let Some(unit_id) = self.content.selected_unit.clone() {
+        if let Some(unit_id) = st.unit_id.clone() {
             self.attachments_ui(ui, "unit", &unit_id);
         }
     }
@@ -8292,6 +9639,12 @@ impl App {
                 Some(Overlay::PickTemplate(_)) => {
                     self.overlays.pop();
                 }
+                Some(Overlay::AllVersions(_)) => {
+                    self.overlays.pop();
+                }
+                Some(Overlay::PagePreview { .. }) => {
+                    self.overlays.pop();
+                }
                 None => {}
             }
         }
@@ -8311,6 +9664,105 @@ impl App {
         }
     }
 
+    /// 全部历史版本 (drill retrofit): the old index.more_for
+    /// full-history Window, now an overlay above the detail frame.
+    /// Data comes from the open Detail frame; picking a version
+    /// commits through switch_entry_version and closes.
+    /// 大页预览 (drill retrofit): the old sr_preview Window at
+    /// the end of the deck view, now an overlay. Returns false
+    /// when the window was closed.
+    fn page_preview_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        version_id: &str,
+        page: usize,
+        global: usize,
+        item: &Value,
+    ) -> bool {
+        let mut open = true;
+        let mut export_page = false;
+        egui::Window::new(format!("第 {} 页", global + 1))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ui.ctx(), |ui| {
+                self.thumb_ui(ui, version_id, page, 880.0);
+                ui.add_space(6.0);
+                if ui.small_button("导出本页 PDF").clicked() {
+                    export_page = true;
+                }
+            });
+        if export_page {
+            self.export_showroom_pdf(item, "slides", Some(global));
+        }
+        open
+    }
+
+    fn all_versions_ui(&mut self, ui: &mut egui::Ui, entry_pos: usize) -> bool {
+        let entries_now = self.current_entries();
+        let rid = entries_now
+            .get(entry_pos)
+            .map(|e| s(e, "rendition_id"))
+            .unwrap_or_default();
+        let (versions, cur_id) = match self.index.stack.top() {
+            IndexFrame::Detail(d) => (
+                d.unit_versions.get(&rid).cloned().unwrap_or_default(),
+                d.detail
+                    .get("resolved_entries")
+                    .and_then(|r| r.as_array())
+                    .and_then(|a| a.get(entry_pos))
+                    .and_then(|re| re.get("resolved"))
+                    .map(|v| s(v, "id"))
+                    .unwrap_or_default(),
+            ),
+            _ => (Vec::new(), String::new()),
+        };
+        let latest_id = versions.first().map(|v| s(v, "id")).unwrap_or_default();
+        let mut open = true;
+        let mut switch: Option<(String, String, bool)> = None;
+        egui::Window::new("全部历史版本")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ui.ctx(), |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(430.0)
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            for v in &versions {
+                                let vid = s(v, "id");
+                                let is_cur = vid == cur_id;
+                                ui.vertical(|ui| {
+                                    if self.thumb_button(ui, &vid, 0, 110.0, is_cur) {
+                                        switch = Some((
+                                            vid.clone(),
+                                            s(v, "semver"),
+                                            vid == latest_id,
+                                        ));
+                                    }
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "v{} · {} 页",
+                                            s(v, "semver"),
+                                            i(v, "page_count")
+                                        ))
+                                        .small()
+                                        .color(if is_cur { ACCENT } else { TEXT_WEAK }),
+                                    );
+                                });
+                            }
+                        });
+                    });
+            });
+        if let Some((vid, sv, is_latest)) = switch {
+            self.switch_entry_version(entry_pos, &vid, &sv, is_latest);
+            return false;
+        }
+        open
+    }
+
     fn overlay_ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -8319,6 +9771,20 @@ impl App {
     ) -> Option<Overlay> {
         match ov {
             Overlay::Confirm(c) => self.confirm_ui(ui, c),
+            Overlay::PagePreview { version_id, page, global, item } => {
+                if self.page_preview_ui(ui, &version_id, page, global, &item) {
+                    Some(Overlay::PagePreview { version_id, page, global, item })
+                } else {
+                    None
+                }
+            }
+            Overlay::AllVersions { entry_pos } => {
+                if self.all_versions_ui(ui, entry_pos) {
+                    Some(Overlay::AllVersions { entry_pos })
+                } else {
+                    None
+                }
+            }
             Overlay::PickTemplate(t) => self.pick_template_ui(ui, t),
             Overlay::PageEdit(pe) => self.page_edit_ui(ui, screen, pe),
             Overlay::Present(p) => self.present_ui(ui, screen, p),
@@ -8556,10 +10022,11 @@ impl App {
     /// DeckCraft rendering is route phase 2. Cached offline decks
     /// keep the external open (no thumbs without a server).
     fn start_present_from_deck(&mut self, ui: &egui::Ui) {
-        let Some(detail) = self.sr_detail.clone() else {
-            return;
+        let (detail, deck) = match self.showroom.stack.top() {
+            SrFrame::Deck(d) => (d.item.clone(), d.deck.clone()),
+            _ => return,
         };
-        let Some(deck) = self.sr_deck.clone() else {
+        let Some(deck) = deck else {
             self.msg = "演示内容尚未加载".into();
             return;
         };
@@ -8795,11 +10262,21 @@ impl App {
                     p.cur = (p.cur + 1).min(p.pages.len() - 1);
                 }
                 resp.context_menu(|ui| {
-                    if ui.button(tr("黑屏")).clicked() {
+                    if ui
+                        .button(if p.blackout { tr("黑屏 ✓") } else { tr("黑屏") })
+                        .clicked()
+                    {
                         toggle_black = true;
                         ui.close();
                     }
-                    if ui.button(tr("演讲者视图")).clicked() {
+                    if ui
+                        .button(if p.speaker {
+                            tr("演讲者视图 ✓")
+                        } else {
+                            tr("演讲者视图")
+                        })
+                        .clicked()
+                    {
                         toggle_speaker = true;
                         ui.close();
                     }
@@ -8833,7 +10310,8 @@ impl App {
         screen: egui::Rect,
         mut pe: PageEditState,
     ) -> Option<Overlay> {
-        // Load the current page's text runs once.
+        // Load the current page's runs (v1) and element model (v2)
+        // once per page.
         if !pe.work.contains_key(&pe.page) {
             let vid = pe.version_id.clone();
             let page = pe.page;
@@ -8854,6 +10332,20 @@ impl App {
                         .unwrap_or_default();
                     pe.base.insert(page, runs.clone());
                     pe.work.insert(page, runs);
+                    if let Some(els) = v.get("elements").and_then(|x| x.as_array()) {
+                        let list: Vec<ElWork> =
+                            els.iter().map(elwork_from_json).collect();
+                        pe.elems.insert(page, list.clone());
+                        pe.elems_base.insert(page, list);
+                        pe.slide_cx = i(&v, "slide_cx");
+                        pe.slide_cy = i(&v, "slide_cy");
+                        if pe.slide_cx <= 0 {
+                            pe.slide_cx = 12192000;
+                        }
+                        if pe.slide_cy <= 0 {
+                            pe.slide_cy = 6858000;
+                        }
+                    }
                 }
                 Err(e) => {
                     self.msg = format!("读取页面文本失败：{e}");
@@ -8866,8 +10358,17 @@ impl App {
             pe.scripts.push(String::new());
             pe.scripts_base.push(String::new());
         }
+        let v2 = pe.elems.contains_key(&pe.page);
         let mut close = false;
         let mut save = false;
+        let mut undo_req = false;
+        let mut redo_req = false;
+        // Set when a control gains focus (text/drag fields snapshot
+        // on the gain frame, before any character changes) or when
+        // the inspector's clone is about to be committed.
+        let mut want_snapshot = false;
+        let mut commit: Option<(usize, ElWork)> = None;
+        let mut sel_req: Option<Option<usize>> = None;
         egui::Area::new(egui::Id::new("page_edit"))
             .fixed_pos(screen.min)
             .order(egui::Order::Foreground)
@@ -8887,6 +10388,25 @@ impl App {
                             .size(14.0)
                             .color(TEXT_MAIN),
                         );
+                        ui.add_space(10.0);
+                        if ui
+                            .add_enabled(
+                                !pe.undo.is_empty(),
+                                egui::Button::new(tr("撤销")),
+                            )
+                            .clicked()
+                        {
+                            undo_req = true;
+                        }
+                        if ui
+                            .add_enabled(
+                                !pe.redo.is_empty(),
+                                egui::Button::new(tr("重做")),
+                            )
+                            .clicked()
+                        {
+                            redo_req = true;
+                        }
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
@@ -8913,82 +10433,136 @@ impl App {
                                         pno == pe.page,
                                     ) {
                                         pe.page = pno;
+                                        pe.sel = None;
+                                        pe.drag = None;
                                     }
                                 }
                             });
                         ui.separator();
-                        // Stage + run editors.
-                        egui::ScrollArea::vertical().show(ui, |ui| {
-                            self.thumb_ui(ui, &pe.version_id.clone(), pe.page, 620.0);
-                            ui.add_space(10.0);
-                            ui.label(
-                                egui::RichText::new(tr("文本内容（逐段编辑，保存后生成新版本）"))
-                                    .size(12.5)
-                                    .color(TEXT_MAIN),
-                            );
-                            ui.add_space(6.0);
-                            let has_runs = pe
-                                .work
-                                .get(&pe.page)
-                                .map(|r| !r.is_empty())
-                                .unwrap_or(false);
-                            if !has_runs {
+                        // Center: the stage with element boxes (v2) or
+                        // the v1 thumbnail + flat run editors.
+                        if v2 {
+                            ui.vertical(|ui| {
+                                self.page_edit_stage(ui, &mut pe);
+                                ui.add_space(8.0);
+                                let hint = match pe.sel.and_then(|s| {
+                                    pe.elems
+                                        .get(&pe.page)
+                                        .and_then(|l| l.get(s))
+                                }) {
+                                    Some(el) => format!(
+                                        "{} · {}",
+                                        el_kind_label(&el.kind),
+                                        if el.name.is_empty() {
+                                            tr("未命名元素")
+                                        } else {
+                                            el.name.as_str()
+                                        }
+                                    ),
+                                    None => tr("点选画布上的元素进行编辑；拖动移动，拖右下角改大小。")
+                                        .to_string(),
+                                };
                                 ui.label(
-                                    egui::RichText::new(tr("本页没有可编辑的文本段。"))
+                                    egui::RichText::new(hint)
                                         .size(12.0)
                                         .color(TEXT_WEAK),
                                 );
-                            }
-                            if let Some(runs) = pe.work.get_mut(&pe.page) {
-                                for (ri, run) in runs.iter_mut().enumerate() {
-                                    ui.horizontal(|ui| {
-                                        ui.label(
-                                            egui::RichText::new(format!(
-                                                "{} {}",
-                                                tr("文本"),
-                                                ri + 1
-                                            ))
-                                            .size(11.5)
-                                            .color(TEXT_FAINT),
-                                        );
-                                        ui.add(
-                                            egui::TextEdit::singleline(run)
-                                                .desired_width(520.0)
-                                                .margin(egui::vec2(8.0, 5.0)),
-                                        );
-                                    });
-                                }
-                            }
-                            ui.add_space(12.0);
-                        });
-                        ui.separator();
-                        // Page side panel: position + speaker notes.
-                        ui.vertical(|ui| {
-                            ui.set_width(210.0);
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "{} {} / {} {}",
-                                    tr("第"),
-                                    pe.page + 1,
-                                    pe.page_count,
-                                    tr("页")
-                                ))
-                                .size(12.0)
-                                .color(TEXT_WEAK),
-                            );
-                            ui.add_space(8.0);
-                            ui.label(
-                                egui::RichText::new(tr("讲稿"))
-                                    .size(12.5)
-                                    .color(TEXT_MAIN),
-                            );
-                            if pe.page < pe.scripts.len() {
-                                ui.add(
-                                    egui::TextEdit::multiline(&mut pe.scripts[pe.page])
-                                        .desired_width(196.0)
-                                        .desired_rows(10),
+                            });
+                        } else {
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                self.thumb_ui(ui, &pe.version_id.clone(), pe.page, 620.0);
+                                ui.add_space(10.0);
+                                ui.label(
+                                    egui::RichText::new(tr("文本内容（逐段编辑，保存后生成新版本）"))
+                                        .size(12.5)
+                                        .color(TEXT_MAIN),
                                 );
-                            }
+                                ui.add_space(6.0);
+                                let has_runs = pe
+                                    .work
+                                    .get(&pe.page)
+                                    .map(|r| !r.is_empty())
+                                    .unwrap_or(false);
+                                if !has_runs {
+                                    ui.label(
+                                        egui::RichText::new(tr("本页没有可编辑的文本段。"))
+                                            .size(12.0)
+                                            .color(TEXT_WEAK),
+                                    );
+                                }
+                                if let Some(runs) = pe.work.get_mut(&pe.page) {
+                                    for (ri, run) in runs.iter_mut().enumerate() {
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "{} {}",
+                                                    tr("文本"),
+                                                    ri + 1
+                                                ))
+                                                .size(11.5)
+                                                .color(TEXT_FAINT),
+                                            );
+                                            let resp = ui.add(
+                                                egui::TextEdit::singleline(run)
+                                                    .desired_width(520.0)
+                                                    .margin(egui::vec2(8.0, 5.0)),
+                                            );
+                                            if resp.gained_focus() {
+                                                want_snapshot = true;
+                                            }
+                                        });
+                                    }
+                                }
+                                ui.add_space(12.0);
+                            });
+                        }
+                        ui.separator();
+                        // Side panel: element list + inspector (v2)
+                        // or the page position alone (v1), then the
+                        // speaker notes for both.
+                        ui.vertical(|ui| {
+                            ui.set_width(if v2 { 308.0 } else { 210.0 });
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{} {} / {} {}",
+                                        tr("第"),
+                                        pe.page + 1,
+                                        pe.page_count,
+                                        tr("页")
+                                    ))
+                                    .size(12.0)
+                                    .color(TEXT_WEAK),
+                                );
+                                if v2 {
+                                    ui.add_space(8.0);
+                                    page_edit_inspector(
+                                        ui,
+                                        &pe,
+                                        &mut want_snapshot,
+                                        &mut commit,
+                                        &mut sel_req,
+                                    );
+                                }
+                                ui.add_space(10.0);
+                                ui.label(
+                                    egui::RichText::new(tr("讲稿"))
+                                        .size(12.5)
+                                        .color(TEXT_MAIN),
+                                );
+                                if pe.page < pe.scripts.len() {
+                                    let resp = ui.add(
+                                        egui::TextEdit::multiline(
+                                            &mut pe.scripts[pe.page],
+                                        )
+                                        .desired_width(if v2 { 292.0 } else { 196.0 })
+                                        .desired_rows(10),
+                                    );
+                                    if resp.gained_focus() {
+                                        want_snapshot = true;
+                                    }
+                                }
+                            });
                         });
                     });
                     ui.separator();
@@ -9014,7 +10588,8 @@ impl App {
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
                                 ui.add_space(14.0);
-                                let can_save = !pe.edits().is_empty()
+                                let can_save = !pe.legacy_edits().is_empty()
+                                    || !pe.ops().is_empty()
                                     || pe.scripts != pe.scripts_base;
                                 if ui
                                     .add_enabled(
@@ -9034,6 +10609,46 @@ impl App {
                     ui.add_space(10.0);
                 });
             });
+        // Keyboard undo/redo, only when no text field holds focus
+        // (a focused TextEdit keeps Ctrl+Z for its own buffer).
+        if ui.ctx().memory(|m| m.focused().is_none()) {
+            let (undo_key, redo_key) = ui.input(|inp| {
+                (
+                    inp.modifiers.ctrl && !inp.modifiers.shift && inp.key_pressed(egui::Key::Z),
+                    inp.modifiers.ctrl
+                        && (inp.key_pressed(egui::Key::Y)
+                            || (inp.modifiers.shift && inp.key_pressed(egui::Key::Z))),
+                )
+            });
+            if undo_key {
+                undo_req = true;
+            }
+            if redo_key {
+                redo_req = true;
+            }
+        }
+        // Deferred mutations, in undo order: snapshot the pre-edit
+        // state first, then land the inspector's committed clone,
+        // then any undo/redo request.
+        if want_snapshot {
+            pe.push_undo();
+        }
+        if let Some((idx, elw)) = commit {
+            if let Some(list) = pe.elems.get_mut(&pe.page) {
+                if idx < list.len() {
+                    list[idx] = elw;
+                }
+            }
+        }
+        if let Some(s) = sel_req {
+            pe.sel = s;
+        }
+        if undo_req {
+            pe.do_undo();
+        }
+        if redo_req {
+            pe.do_redo();
+        }
         if close {
             if pe.dirty() {
                 self.overlays.push(Overlay::Confirm(ConfirmState {
@@ -9048,15 +10663,17 @@ impl App {
             return None;
         }
         if save {
-            let edits = pe.edits();
+            let edits = pe.legacy_edits();
+            let ops = pe.ops();
             let mut target_vid = pe.version_id.clone();
             let mut new_semver = String::new();
-            if !edits.is_empty() {
+            if !edits.is_empty() || !ops.is_empty() {
                 let bump = ["major", "minor", "patch"][pe.bump];
                 let payload = json!({
                     "edits": edits.iter().map(|(p, r, t)| json!({
                         "page": p, "run": r, "text": t,
                     })).collect::<Vec<_>>(),
+                    "ops": ops,
                     "bump": bump,
                     "note": pe.note,
                 });
@@ -9091,13 +10708,162 @@ impl App {
             } else {
                 format!("已保存为新版本 v{new_semver}")
             };
-            if let Some(uid) = self.content.selected_unit.clone() {
+            let open_uid = match self.content.stack.top() {
+                ContentFrame::Unit(st) => Some(st.unit_id.clone()),
+                _ => None,
+            };
+            if let Some(uid) = open_uid {
                 self.open_unit_detail(&uid);
             }
             self.refresh_all();
             return None;
         }
         Some(Overlay::PageEdit(pe))
+    }
+
+    /// The v2 editor stage: the rendered slide with one selectable
+    /// box per element. Click selects; dragging a box moves the
+    /// element; dragging its bottom-right handle resizes it. The
+    /// slide image is the server's render of the OPENED version —
+    /// pending edits show as box geometry only, until save.
+    fn page_edit_stage(&mut self, ui: &mut egui::Ui, pe: &mut PageEditState) {
+        let page = pe.page;
+        let vid = pe.version_id.clone();
+        let scx = pe.slide_cx.max(1) as f32;
+        let scy = pe.slide_cy.max(1) as f32;
+        let w = 620.0f32;
+        let h = w * scy / scx;
+        let (rect, resp) =
+            ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click_and_drag());
+        if let Some(tex) = self.thumb(&vid, page) {
+            ui.painter().image(
+                tex.id(),
+                rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        } else {
+            ui.painter().rect_filled(rect, 0.0, HOVER_BG);
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                format!("第 {} 页", page + 1),
+                egui::FontId::proportional(13.0),
+                TEXT_WEAK,
+            );
+        }
+        let k = w / scx; // screen points per EMU
+        let elems = pe.elems.get(&page).cloned().unwrap_or_default();
+        let to_rect = |el: &ElWork| {
+            egui::Rect::from_min_size(
+                rect.min + egui::vec2(el.x as f32 * k, el.y as f32 * k),
+                egui::vec2((el.cx as f32 * k).max(2.0), (el.cy as f32 * k).max(2.0)),
+            )
+        };
+        for (idx, el) in elems.iter().enumerate() {
+            let r = to_rect(el);
+            let selected = pe.sel == Some(idx);
+            ui.painter().rect_stroke(
+                r,
+                0.0,
+                egui::Stroke::new(
+                    if selected { 1.8 } else { 1.0 },
+                    if selected { ACCENT } else { TEXT_FAINT },
+                ),
+                egui::StrokeKind::Middle,
+            );
+            if selected {
+                let handle = egui::Rect::from_min_size(
+                    r.max - egui::vec2(9.0, 9.0),
+                    egui::vec2(9.0, 9.0),
+                );
+                ui.painter().rect_filled(handle, 0.0, ACCENT);
+            }
+            if el.new_image.is_some() {
+                ui.painter().text(
+                    r.min + egui::vec2(4.0, 4.0),
+                    egui::Align2::LEFT_TOP,
+                    tr("图片已替换（待保存）"),
+                    egui::FontId::proportional(11.0),
+                    ACCENT,
+                );
+            }
+        }
+        let pointer = resp.interact_pointer_pos();
+        if resp.drag_started() {
+            if let Some(pos) = pointer {
+                let mut target: Option<(usize, bool)> = None;
+                if let Some(si) = pe.sel {
+                    if let Some(el) = elems.get(si) {
+                        let r = to_rect(el);
+                        let handle = egui::Rect::from_min_size(
+                            r.max - egui::vec2(11.0, 11.0),
+                            egui::vec2(11.0, 11.0),
+                        );
+                        if handle.contains(pos) && el.has_xfrm {
+                            target = Some((si, true));
+                        }
+                    }
+                }
+                if target.is_none() {
+                    for (idx, el) in elems.iter().enumerate().rev() {
+                        if to_rect(el).contains(pos) {
+                            pe.sel = Some(idx);
+                            if el.has_xfrm {
+                                target = Some((idx, false));
+                            }
+                            break;
+                        }
+                    }
+                }
+                if let Some((idx, resize)) = target {
+                    let el = &elems[idx];
+                    // Snapshot BEFORE the drag mutates anything.
+                    pe.push_undo();
+                    pe.drag = Some(ElDrag {
+                        el: idx,
+                        resize,
+                        start_pos: pos,
+                        x: el.x,
+                        y: el.y,
+                        cx: el.cx,
+                        cy: el.cy,
+                    });
+                }
+            }
+        }
+        if resp.dragged() {
+            if let (Some(d), Some(pos)) = (pe.drag, pointer) {
+                let dx = ((pos.x - d.start_pos.x) / k) as i64;
+                let dy = ((pos.y - d.start_pos.y) / k) as i64;
+                if let Some(list) = pe.elems.get_mut(&page) {
+                    if let Some(el) = list.get_mut(d.el) {
+                        if d.resize {
+                            el.cx = (d.cx + dx).max(20000);
+                            el.cy = (d.cy + dy).max(20000);
+                        } else {
+                            el.x = d.x + dx;
+                            el.y = d.y + dy;
+                        }
+                    }
+                }
+            }
+        }
+        if resp.drag_stopped() {
+            pe.drag = None;
+        }
+        if resp.clicked() {
+            if let Some(pos) = pointer {
+                let mut hit = None;
+                for (idx, el) in elems.iter().enumerate().rev() {
+                    if to_rect(el).contains(pos) {
+                        hit = Some(idx);
+                        break;
+                    }
+                }
+                pe.sel = hit;
+            }
+        }
     }
 
     fn folder_delete_window(&mut self, ui: &mut egui::Ui) {
@@ -9131,8 +10897,8 @@ impl App {
                     if self.content.folder_filter.as_deref() == Some(id.as_str()) {
                         self.content.folder_filter = None;
                     }
-                    if self.sr_folder.as_deref() == Some(id.as_str()) {
-                        self.sr_folder = None;
+                    if self.showroom.folder.as_deref() == Some(id.as_str()) {
+                        self.showroom.folder = None;
                     }
                     if self.index.overview_folder.as_deref() == Some(id.as_str()) {
                         self.index.overview_folder = None;
@@ -9252,13 +11018,27 @@ impl App {
                         .fill(ACCENT)
                         .corner_radius(10)
                         .min_size(egui::vec2(110.0, 36.0));
-                        if ui.add(login_btn).clicked() {
+                        if ui
+                            .add_enabled(
+                                !self.server.trim().is_empty()
+                                    && !self.username.trim().is_empty()
+                                    && !self.password.is_empty(),
+                                login_btn,
+                            )
+                            .clicked()
+                        {
                             self.do_login();
                         }
                         if ui.button(tr("取消")).clicked() {
                             cancel = true;
                         }
-                        if ui.button(tr("匿名进入")).clicked() {
+                        if ui
+                            .add_enabled(
+                                !self.server.trim().is_empty(),
+                                egui::Button::new(tr("匿名进入")),
+                            )
+                            .clicked()
+                        {
                             self.enter_anonymous();
                         }
                     });
@@ -9331,22 +11111,28 @@ impl App {
         if !self.need_identity("新建索引") {
             return;
         }
-        self.index.creating = true;
-        self.index.pick.clear();
+        let mut pick: Vec<(String, String, bool)> = Vec::new();
         for item in &self.units {
             let unit = item.get("unit").cloned().unwrap_or(json!({}));
             if let Some(rends) = item.get("renditions").and_then(|r| r.as_array()) {
                 for r in rends {
                     let rend = r.get("rendition").cloned().unwrap_or(json!({}));
-                    self.index.pick.push((s(&unit, "id"), s(&rend, "id"), false));
+                    pick.push((s(&unit, "id"), s(&rend, "id"), false));
                 }
             }
         }
-        if self.index.new_group.is_empty() {
-            if let Some(g) = self.groups.first() {
-                self.index.new_group = s(g, "id");
-            }
-        }
+        // The create form's group defaults to the first group (the
+        // old page-level new_group defaulting, now per-frame).
+        let new_group = self
+            .groups
+            .first()
+            .map(|g| s(g, "id"))
+            .unwrap_or_default();
+        self.index.stack.push(IndexFrame::Create(CreateState {
+            new_group,
+            pick,
+            ..Default::default()
+        }));
     }
 
     /// Index folder frame body: the folder tree with ＋ 新建索引
@@ -9366,25 +11152,30 @@ impl App {
             egui::ScrollArea::vertical()
                 .max_height((panel_h - 48.0).max(60.0))
                 .show(ui, |ui| {
-                    let detail_folder = if self.index.detail.is_some() {
-                        self.index
-                            .detail
-                            .as_ref()
-                            .map(|d| self.index_folder_of(&s(d, "id")))
-                            .filter(|x| !x.is_empty())
-                    } else {
-                        None
+                    let in_detail =
+                        matches!(self.index.stack.top(), IndexFrame::Detail(_));
+                    let detail_folder = match self.index.stack.top() {
+                        IndexFrame::Detail(d) => {
+                            let f = self.index_folder_of(&s(&d.detail, "id"));
+                            if f.is_empty() {
+                                None
+                            } else {
+                                Some(f)
+                            }
+                        }
+                        _ => None,
                     };
-                    let mut sel = if self.index.detail.is_some() {
+                    let mut sel = if in_detail {
                         detail_folder.clone()
                     } else {
                         self.index.overview_folder.clone()
                     };
                     self.folder_tree(ui, &mut sel);
-                    if self.index.detail.is_some() {
+                    if in_detail {
                         if sel != detail_folder {
-                            self.index.detail = None;
-                            self.index.selected = None;
+                            // picking another folder leaves the open
+                            // index: pop back to the overview frame
+                            self.index.stack.pop_to(0);
                             self.index.overview_folder = sel;
                         }
                     } else {
@@ -9413,31 +11204,56 @@ impl App {
     /// or — while creating — the create flow (which takes the whole
     /// body, as before).
     fn ix_main_body(&mut self, ui: &mut egui::Ui) {
-        if self.index.creating {
-            body_frame().show(ui, |ui| self.index_create(ui));
-            return;
-        }
-        body_frame().show(ui, |ui| {
-            if self.index.detail.is_none() {
-                self.index_overview(ui);
-                return;
+        // Frame-state take-out, same pattern as the content page:
+        // a placeholder overview frame sits in the taken frame's
+        // place meanwhile and is never rendered.
+        let mut frame = self
+            .index
+            .stack
+            .replace_top(IndexFrame::Overview(OverviewState::default()));
+        let mut outcome: Option<Option<String>> = None;
+        body_frame().show(ui, |ui| match &mut frame {
+            IndexFrame::Create(st) => {
+                self.index_create(ui, st);
+                if st.closed {
+                    outcome = Some(st.open_after.clone());
+                }
             }
-            // tight ghost row, like the board's plain text back-link
-            let back = ui.scope(|ui| {
-                ui.style_mut().spacing.button_padding = egui::vec2(6.0, 0.0);
-                text_action(ui, "‹ 返回总览", TEXT_WEAK, 13.0)
-            });
-            if back.inner {
-                self.index.detail = None;
-                self.index.selected = None;
+            IndexFrame::Detail(st) => {
+                let name = self
+                    .indexes
+                    .iter()
+                    .find(|x| s(x, "id") == st.index_id)
+                    .map(|x| s(x, "name"))
+                    .unwrap_or_default();
+                if crumb_bar(ui, &[tr("索引"), &name]) == Some(0) {
+                    st.closed = true;
+                }
+                self.index_detail(ui, st);
+                if st.closed {
+                    outcome = Some(None);
+                }
             }
-            self.index_detail(ui);
+            IndexFrame::Overview(ov) => {
+                self.index_overview(ui, ov);
+            }
         });
+        match outcome {
+            Some(open_after) => {
+                self.index.stack.pop();
+                if let Some(id) = open_after {
+                    self.open_index_detail(&id);
+                }
+            }
+            None => {
+                self.index.stack.replace_top(frame);
+            }
+        }
     }
 
     /// Index overview: standard cards for the indexes living in the
     /// selected folder. Single click selects, double click opens.
-    fn index_overview(&mut self, ui: &mut egui::Ui) {
+    fn index_overview(&mut self, ui: &mut egui::Ui, ov: &mut OverviewState) {
         let filter = self.index.overview_folder.clone();
         let title = match &filter {
             None => "全部索引".to_string(),
@@ -9449,6 +11265,15 @@ impl App {
                 .unwrap_or_else(|| "索引".into()),
         };
         ui.add_space(2.0);
+        if self.deep_source == Some(Page::Home) {
+            ui.horizontal(|ui| {
+                if text_action(ui, "‹ 返回主页", ACCENT, 13.0) {
+                    self.deep_source = None;
+                    self.page = Page::Home;
+                }
+            });
+            ui.add_space(6.0);
+        }
         ui.label(egui::RichText::new(title).size(18.0).strong());
         ui.add_space(14.0);
         let items: Vec<Value> = self
@@ -9462,7 +11287,7 @@ impl App {
             ui.horizontal_wrapped(|ui| {
                 for x in items {
                     let xid = s(&x, "id");
-                    let selected = self.index.overview_selected.as_deref() == Some(xid.as_str());
+                    let selected = ov.selected.as_deref() == Some(xid.as_str());
                     // Scope ring colors: the prototype's .std-card
                     // scope palette (company/ancestor/deptsub/dept/none).
                     let scope_color = match s(&x, "scope").as_str() {
@@ -9575,33 +11400,37 @@ impl App {
                     }
                     let click = ui.interact(rect, egui::Id::new(("idx_card", &xid)), egui::Sense::click());
                     if click.double_clicked() {
-                        self.index.branch = "main".into();
-                        self.open_index_detail(&xid);
+                        self.open_index_detail_as(&xid, "main".to_string());
                     } else if click.clicked() {
-                        self.index.overview_selected = Some(xid.clone());
+                        ov.selected = Some(xid.clone());
                     }
                 }
             });
         });
     }
 
-    fn index_create(&mut self, ui: &mut egui::Ui) {
+    fn index_create(&mut self, ui: &mut egui::Ui, st: &mut CreateState) {
         ui.heading("新建索引 · 选内容");
         ui.horizontal(|ui| {
             ui.label("名称");
-            ui.text_edit_singleline(&mut self.index.new_name);
+            ui.text_edit_singleline(&mut st.new_name);
             ui.label("内容组");
             egui::ComboBox::from_id_salt("new_index_group")
-                .selected_text(self.group_name(&self.index.new_group.clone()))
+                .selected_text(self.group_name(&st.new_group.clone()))
                 .show_ui(ui, |ui| {
                     for g in self.groups.clone() {
-                        ui.selectable_value(&mut self.index.new_group, s(&g, "id"), s(&g, "name"));
+                        ui.selectable_value(&mut st.new_group, s(&g, "id"), s(&g, "name"));
                     }
                 });
-            if ui.button("创建索引").clicked() {
-                let entries: Vec<Value> = self
-                    .index
-                    .pick
+            if ui
+                .add_enabled(
+                    st.pick.iter().any(|(_, _, on)| *on)
+                        && !st.new_name.trim().is_empty(),
+                    egui::Button::new("创建索引"),
+                )
+                .clicked()
+            {
+                let entries: Vec<Value> = st.pick
                     .iter()
                     .filter(|(_, _, on)| *on)
                     .map(|(u, r, _)| json!({ "unit_id": u, "rendition_id": r, "policy": "follow_latest", "locked_semver": Value::Null, "excerpt_slots": Value::Null }))
@@ -9613,28 +11442,28 @@ impl App {
                         "POST",
                         "/v1/indexes",
                         Some(json!({
-                            "name": self.index.new_name,
-                            "group_id": self.index.new_group,
+                            "name": st.new_name,
+                            "group_id": st.new_group,
                             "scope": "company",
                             "entries": entries,
                         })),
                     );
                     match r {
                         Ok(v) => {
-                            self.index.creating = false;
+                            st.open_after = Some(s(&v, "id"));
+                            st.closed = true;
                             self.refresh_all();
-                            self.open_index_detail(&s(&v, "id"));
                         }
                         Err(e) => self.msg = format!("创建失败：{e}"),
                     }
                 }
             }
             if ui.button("取消").clicked() {
-                self.index.creating = false;
+                st.closed = true;
             }
         });
         ui.separator();
-        let mut pick = self.index.pick.clone();
+        let mut pick = st.pick.clone();
         egui::ScrollArea::vertical().show(ui, |ui| {
             for item in self.units.clone() {
                 let unit = item.get("unit").cloned().unwrap_or(json!({}));
@@ -9654,11 +11483,11 @@ impl App {
                 }
             }
         });
-        self.index.pick = pick;
+        st.pick = pick;
     }
 
-    fn index_detail(&mut self, ui: &mut egui::Ui) {
-        let detail = self.index.detail.clone().unwrap();
+    fn index_detail(&mut self, ui: &mut egui::Ui, st: &mut IndexDetailState) {
+        let detail = st.detail.clone();
         let index = detail.get("index").cloned().unwrap_or(json!({}));
         let branches = detail.get("branches").and_then(|b| b.as_array()).cloned().unwrap_or_default();
         let tags = detail.get("tags").and_then(|t| t.as_array()).cloned().unwrap_or_default();
@@ -9676,10 +11505,10 @@ impl App {
         ui.add_space(2.0);
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("分支").size(11.5).color(TEXT_WEAK));
-            let mut branch = if self.index.branch.is_empty() {
+            let mut branch = if st.branch.is_empty() {
                 "main".to_string()
             } else {
-                self.index.branch.clone()
+                st.branch.clone()
             };
             egui::ComboBox::from_id_salt("branch")
                 .width(96.0)
@@ -9691,8 +11520,8 @@ impl App {
                         }
                     }
                 });
-            if branch != self.index.branch {
-                self.index.branch = branch;
+            if branch != st.branch {
+                st.branch = branch;
                 self.load_index_detail();
                 return;
             }
@@ -9705,12 +11534,13 @@ impl App {
                 );
             }
             ui.add(
-                egui::TextEdit::singleline(&mut self.index.tag_name)
+                egui::TextEdit::singleline(&mut st.tag_name)
                     .desired_width(176.0)
                     .margin(egui::vec2(10.0, 5.0)),
             );
             if ui
-                .add(
+                .add_enabled(
+                    !st.tag_name.is_empty(),
                     egui::Button::new(
                         egui::RichText::new("发布版本")
                             .size(13.0)
@@ -9721,16 +11551,15 @@ impl App {
                     .min_size(egui::vec2(88.0, 30.0)),
                 )
                 .clicked()
-                && !self.index.tag_name.is_empty()
             {
                 if !self.need_identity("发布版本") {
                     // Anonymous session: the login popup is open;
                     // the typed tag name stays for after the login.
-                } else if let Some(id) = self.index.selected.clone() {
+                } else if let Some(id) = st.index_id.clone() {
                     let r = self.call(
                         "POST",
                         &format!("/v1/indexes/{id}/tags"),
-                        Some(json!({ "branch": self.index.branch, "name": self.index.tag_name })),
+                        Some(json!({ "branch": st.branch, "name": st.tag_name })),
                     );
                     match r {
                         Ok(_) => {
@@ -9744,7 +11573,7 @@ impl App {
         });
         ui.add_space(2.0);
         ui.horizontal(|ui| {
-            ui.checkbox(&mut self.index.include_notes, "添加备注");
+            ui.checkbox(&mut st.include_notes, "添加备注");
             if text_action(ui, "导出（个人版）", TEXT_MAIN, 13.0) {
                 self.export_index_file(&index, "personal");
             }
@@ -9755,22 +11584,27 @@ impl App {
             if text_action(ui, "删除索引", BADGE_BAD_FG, 13.0) {
                 let iid = s(&index, "id");
                 self.trash_add("index", &iid);
-                self.index.detail = None;
-                self.index.selected = None;
+                st.closed = true;
             }
             ui.add_space(24.0);
             ui.add(
-                egui::TextEdit::singleline(&mut self.index.new_branch)
+                egui::TextEdit::singleline(&mut st.new_branch)
                     .hint_text("新分支名")
                     .desired_width(110.0)
                     .margin(egui::vec2(8.0, 2.0)),
             );
-            if text_action(ui, "拉分支", TEXT_MAIN, 13.0) && !self.index.new_branch.is_empty() {
-                if let Some(id) = self.index.selected.clone() {
+            if text_action_enabled(
+                ui,
+                !st.new_branch.is_empty(),
+                "拉分支",
+                TEXT_MAIN,
+                13.0,
+            ) {
+                if let Some(id) = st.index_id.clone() {
                     let r = self.call(
                         "POST",
                         &format!("/v1/indexes/{id}/branches"),
-                        Some(json!({ "name": self.index.new_branch, "from": self.index.branch })),
+                        Some(json!({ "name": st.new_branch, "from": st.branch })),
                     );
                     match r {
                         Ok(_) => {
@@ -9784,7 +11618,7 @@ impl App {
             if text_action(ui, "推送到演示厅", TEXT_MAIN, 13.0) {
                 if !self.need_identity("推送到演示厅") {
                     // Anonymous session: the login popup is open instead.
-                } else if let Some(id) = self.index.selected.clone() {
+                } else if let Some(id) = st.index_id.clone() {
                     let r = self.call(
                         "POST",
                         "/v1/showroom",
@@ -9826,8 +11660,7 @@ impl App {
                                 index_name: self.current_index_name(),
                                 at: pos,
                             });
-                            self.content.detail = None;
-                            self.content.selected_unit = None;
+                            self.close_unit_detail();
                             self.page = Page::Content;
                         }
                     });
@@ -9921,13 +11754,22 @@ impl App {
                                             self.commit_entries(es, "删除条目");
                                             return;
                                         }
-                                        if ui.button("↓").clicked() && pos + 1 < entries.len() {
+                                        if ui
+                                            .add_enabled(
+                                                pos + 1 < entries.len(),
+                                                egui::Button::new("↓"),
+                                            )
+                                            .clicked()
+                                        {
                                             let mut es = entries.clone();
                                             es.swap(pos, pos + 1);
                                             self.commit_entries(es, "调整顺序");
                                             return;
                                         }
-                                        if ui.button("↑").clicked() && pos > 0 {
+                                        if ui
+                                            .add_enabled(pos > 0, egui::Button::new("↑"))
+                                            .clicked()
+                                        {
                                             let mut es = entries.clone();
                                             es.swap(pos, pos - 1);
                                             self.commit_entries(es, "调整顺序");
@@ -9973,7 +11815,13 @@ impl App {
                                             }
                                             chip(ui, "版本锁定", CHIP_ORANGE_FG, CHIP_ORANGE_BG);
                                         } else {
-                                            if ui.button("锁定当前版本").clicked() {
+                                            if ui
+                                                .add_enabled(
+                                                    ver.is_object(),
+                                                    egui::Button::new("锁定当前版本"),
+                                                )
+                                                .clicked()
+                                            {
                                                 if ver.is_object() {
                                                     let mut es = entries.clone();
                                                     es[pos]["policy"] = json!({ "locked": { "version_id": s(&ver, "id") } });
@@ -10005,9 +11853,7 @@ impl App {
                             });
                             // quick-switch strip: history versions, newest
                             // first; last item opens the full-history popup
-                            if let Some(versions) = self
-                                .index
-                                .unit_versions
+                            if let Some(versions) = st.unit_versions
                                 .get(&s(&entry, "rendition_id"))
                                 .cloned()
                             {
@@ -10042,7 +11888,7 @@ impl App {
                                             });
                                         }
                                         if ui.button("更多").clicked() {
-                                            self.index.more_for = Some(pos);
+                                            self.overlays.push(Overlay::AllVersions { entry_pos: pos });
                                         }
                                     });
                                 }
@@ -10056,26 +11902,32 @@ impl App {
             ui.label(egui::RichText::new("分支合并").strong().size(16.0));
             ui.horizontal(|ui| {
                 ui.label("来源分支");
-                ui.text_edit_singleline(&mut self.index.merge_from);
-                if ui.button("预览合并").clicked() && !self.index.merge_from.is_empty() {
-                    if let Some(id) = self.index.selected.clone() {
-                        let into = self.index.branch.clone();
-                        let from = self.index.merge_from.clone();
+                ui.text_edit_singleline(&mut st.merge_from);
+                if ui
+                    .add_enabled(
+                        !st.merge_from.is_empty(),
+                        egui::Button::new("预览合并"),
+                    )
+                    .clicked()
+                {
+                    if let Some(id) = st.index_id.clone() {
+                        let into = st.branch.clone();
+                        let from = st.merge_from.clone();
                         match self.call(
                             "POST",
                             &format!("/v1/indexes/{id}/merge/preview"),
                             Some(json!({ "from": from, "into": into })),
                         ) {
                             Ok(v) => {
-                                self.index.merge_preview = Some(v);
-                                self.index.merge_resolutions.clear();
+                                st.merge_preview = Some(v);
+                                st.merge_resolutions.clear();
                             }
                             Err(e) => self.msg = format!("合并预览失败：{e}"),
                         }
                     }
                 }
             });
-            if let Some(preview) = self.index.merge_preview.clone() {
+            if let Some(preview) = st.merge_preview.clone() {
                 let conflicts = preview
                     .get("conflicts")
                     .and_then(|c| c.as_array())
@@ -10116,21 +11968,19 @@ impl App {
                                 entry_label(&ours),
                                 entry_label(&theirs)
                             ));
-                            let cur = self.index.merge_resolutions.get(&key).cloned();
+                            let cur = st.merge_resolutions.get(&key).cloned();
                             if ui
                                 .selectable_label(cur.as_deref() == Some("ours"), "用本分支")
                                 .clicked()
                             {
-                                self.index
-                                    .merge_resolutions
+                                st.merge_resolutions
                                     .insert(key.clone(), "ours".to_string());
                             }
                             if ui
                                 .selectable_label(cur.as_deref() == Some("theirs"), "用对方")
                                 .clicked()
                             {
-                                self.index
-                                    .merge_resolutions
+                                st.merge_resolutions
                                     .insert(key.clone(), "theirs".to_string());
                             }
                         });
@@ -10138,17 +11988,15 @@ impl App {
                 }
                 let unresolved = conflicts
                     .iter()
-                    .filter(|c| !self.index.merge_resolutions.contains_key(&s(c, "key")))
+                    .filter(|c| !st.merge_resolutions.contains_key(&s(c, "key")))
                     .count();
                 ui.horizontal(|ui| {
                     if ui
                         .add_enabled(unresolved == 0, egui::Button::new("执行合并"))
                         .clicked()
                     {
-                        if let Some(id) = self.index.selected.clone() {
-                            let resolutions: serde_json::Map<String, Value> = self
-                                .index
-                                .merge_resolutions
+                        if let Some(id) = st.index_id.clone() {
+                            let resolutions: serde_json::Map<String, Value> = st.merge_resolutions
                                 .iter()
                                 .map(|(k, v)| (k.clone(), json!(v)))
                                 .collect();
@@ -10156,15 +12004,15 @@ impl App {
                                 "POST",
                                 &format!("/v1/indexes/{id}/merge"),
                                 Some(json!({
-                                    "from": self.index.merge_from,
-                                    "into": self.index.branch,
+                                    "from": st.merge_from,
+                                    "into": st.branch,
                                     "resolutions": resolutions,
                                 })),
                             );
                             match r {
                                 Ok(_) => {
                                     self.msg = "合并完成".into();
-                                    self.index.merge_preview = None;
+                                    st.merge_preview = None;
                                     self.load_index_detail();
                                 }
                                 Err(e) => self.msg = format!("合并失败：{e}"),
@@ -10177,78 +12025,9 @@ impl App {
                 });
             }
             // full-history popup (opened from a strip's 「更多」)
-            if let Some(pos) = self.index.more_for {
-                let entries_now = self.current_entries();
-                let rid = entries_now
-                    .get(pos)
-                    .map(|e| s(e, "rendition_id"))
-                    .unwrap_or_default();
-                let versions = self
-                    .index
-                    .unit_versions
-                    .get(&rid)
-                    .cloned()
-                    .unwrap_or_default();
-                let cur_id = self
-                    .index
-                    .detail
-                    .as_ref()
-                    .and_then(|d| d.get("resolved_entries"))
-                    .and_then(|r| r.as_array())
-                    .and_then(|a| a.get(pos))
-                    .and_then(|re| re.get("resolved"))
-                    .map(|v| s(v, "id"))
-                    .unwrap_or_default();
-                let latest_id = versions.first().map(|v| s(v, "id")).unwrap_or_default();
-                let mut open = true;
-                let mut switch: Option<(String, String, bool)> = None;
-                egui::Window::new("全部历史版本")
-                    .open(&mut open)
-                    .collapsible(false)
-                    .resizable(false)
-                    .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-                    .show(ui.ctx(), |ui| {
-                        egui::ScrollArea::vertical()
-                            .max_height(430.0)
-                            .show(ui, |ui| {
-                                ui.horizontal_wrapped(|ui| {
-                                    for v in &versions {
-                                        let vid = s(v, "id");
-                                        let is_cur = vid == cur_id;
-                                        ui.vertical(|ui| {
-                                            if self.thumb_button(ui, &vid, 0, 110.0, is_cur) {
-                                                switch = Some((
-                                                    vid.clone(),
-                                                    s(v, "semver"),
-                                                    vid == latest_id,
-                                                ));
-                                            }
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "v{} · {} 页",
-                                                    s(v, "semver"),
-                                                    i(v, "page_count")
-                                                ))
-                                                .small()
-                                                .color(if is_cur { ACCENT } else { TEXT_WEAK }),
-                                            );
-                                        });
-                                    }
-                                });
-                            });
-                    });
-                if !open {
-                    self.index.more_for = None;
-                }
-                if let Some((vid, sv, is_latest)) = switch {
-                    self.switch_entry_version(pos, &vid, &sv, is_latest);
-                }
-            }
             ui.separator();
             ui.label(egui::RichText::new("提交历史").strong());
-            if let Some(commits) = self
-                .index
-                .commits
+            if let Some(commits) = st.commits
                 .clone()
                 .and_then(|c| c.get("commits").and_then(|x| x.as_array()).cloned())
             {
@@ -10262,9 +12041,7 @@ impl App {
                 }
             }
             ui.label(egui::RichText::new("导出记录").strong());
-            if let Some(exports) = self
-                .index
-                .exports
+            if let Some(exports) = st.exports
                 .clone()
                 .and_then(|c| c.get("exports").and_then(|x| x.as_array()).cloned())
             {
@@ -10441,7 +12218,8 @@ impl App {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             if ui
-                .add(
+                .add_enabled(
+                    !self.add_url.trim().is_empty(),
                     egui::Button::new(egui::RichText::new("登录并添加").color(egui::Color32::WHITE))
                         .fill(ACCENT)
                         .corner_radius(10)
@@ -10452,7 +12230,8 @@ impl App {
                 self.add_server_login();
             }
             if ui
-                .add(
+                .add_enabled(
+                    !self.add_url.trim().is_empty(),
                     egui::Button::new(egui::RichText::new("匿名添加"))
                         .corner_radius(10)
                         .min_size(egui::vec2(120.0, 30.0)),
@@ -10818,8 +12597,12 @@ impl App {
                                     [240.0, 26.0],
                                     egui::TextEdit::singleline(&mut self.settings.dept_name),
                                 );
-                                if ui.button("添加").clicked()
-                                    && !self.settings.dept_name.is_empty()
+                                if ui
+                                    .add_enabled(
+                                        !self.settings.dept_name.is_empty(),
+                                        egui::Button::new("添加"),
+                                    )
+                                    .clicked()
                                 {
                                     match self.call(
                                         "POST",
@@ -10870,7 +12653,15 @@ impl App {
                                     )
                                     .password(true),
                                 );
-                                if ui.button("创建账号").clicked() {
+                                if ui
+                                    .add_enabled(
+                                        !self.settings.user_name.trim().is_empty()
+                                            && !self.settings.user_display.trim().is_empty()
+                                            && !self.settings.user_password.is_empty(),
+                                        egui::Button::new("创建账号"),
+                                    )
+                                    .clicked()
+                                {
                                     match self.call(
                                         "POST",
                                         "/v1/org/users",
@@ -10900,8 +12691,12 @@ impl App {
                                     [240.0, 26.0],
                                     egui::TextEdit::singleline(&mut self.settings.group_name),
                                 );
-                                if ui.button("添加").clicked()
-                                    && !self.settings.group_name.is_empty()
+                                if ui
+                                    .add_enabled(
+                                        !self.settings.group_name.is_empty(),
+                                        egui::Button::new("添加"),
+                                    )
+                                    .clicked()
                                 {
                                     match self.call(
                                         "POST",
@@ -10983,7 +12778,14 @@ impl App {
                                             );
                                         }
                                     });
-                                if ui.button("添加授权").clicked() {
+                                if ui
+                                    .add_enabled(
+                                        !self.settings.grant_subject_id.trim().is_empty()
+                                            && !self.settings.grant_group.is_empty(),
+                                        egui::Button::new("添加授权"),
+                                    )
+                                    .clicked()
+                                {
                                     match self.call(
                                         "POST",
                                         "/v1/grants",
@@ -11096,8 +12898,8 @@ impl App {
                                             .map(|pr| {
                                                 format!(
                                                     "{}={}",
-                                                    s(pr, "source"),
-                                                    s(pr, "target")
+                                                    s(pr, "src"),
+                                                    s(pr, "dst")
                                                 )
                                             })
                                             .collect::<Vec<_>>()
@@ -11204,8 +13006,8 @@ impl App {
                                     .filter_map(|l| {
                                         let (a, b) = l.split_once('=')?;
                                         Some(json!({
-                                            "source": a.trim(),
-                                            "target": b.trim(),
+                                            "src": a.trim(),
+                                            "dst": b.trim(),
                                         }))
                                     })
                                     .collect();

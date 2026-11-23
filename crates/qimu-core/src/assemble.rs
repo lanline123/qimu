@@ -20,31 +20,20 @@
 //! the pre-integration behaviour: no sections written, block
 //! boundaries live in the manifest alone.
 
-use crate::pptx::{attr, parse_rels, resolve_target, scan_elements, slides, Package};
+use crate::pptx::{
+    described_part, parse_rels, parse_xml, rels_xml, resolve_target, serialize_xml, slides,
+    Package,
+};
+use craft_xml::{El, Local, Node};
 use std::collections::BTreeMap;
 
 const PRESENTATION: &str = "ppt/presentation.xml";
 const PRESENTATION_RELS: &str = "ppt/_rels/presentation.xml.rels";
 const CONTENT_TYPES: &str = "[Content_Types].xml";
-const RELS_HEADER: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">";
 const SLIDE_TYPE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide";
 const MASTER_TYPE: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster";
-
-fn dir_of(part: &str) -> &str {
-    match part.rfind('/') {
-        Some(i) => &part[..i],
-        None => "",
-    }
-}
-
-fn file_of(part: &str) -> &str {
-    match part.rfind('/') {
-        Some(i) => &part[i + 1..],
-        None => part,
-    }
-}
 
 fn is_shared(part: &str) -> bool {
     part == CONTENT_TYPES
@@ -59,122 +48,46 @@ fn is_shared(part: &str) -> bool {
 }
 
 fn renamed(part: &str, prefix: &str) -> String {
-    let dir = dir_of(part);
+    let dir = craft_opc::dir_of(part);
     if dir.is_empty() {
-        format!("{prefix}{}", file_of(part))
+        format!("{prefix}{}", craft_opc::file_of(part))
     } else {
-        format!("{dir}/{prefix}{}", file_of(part))
+        format!("{dir}/{prefix}{}", craft_opc::file_of(part))
     }
-}
-
-fn relativize(from_dir: &str, target: &str) -> String {
-    if from_dir.is_empty() {
-        return target.to_string();
-    }
-    let from: Vec<&str> = from_dir.split('/').collect();
-    let tgt: Vec<&str> = target.split('/').collect();
-    let mut common = 0;
-    while common < from.len() && common < tgt.len() && from[common] == tgt[common] {
-        common += 1;
-    }
-    let ups = from.len() - common;
-    let mut out = String::new();
-    for _ in 0..ups {
-        out.push_str("../");
-    }
-    out.push_str(&tgt[common..].join("/"));
-    out
-}
-
-fn rels_owner(rels_part: &str) -> String {
-    // "ppt/slides/_rels/slide1.xml.rels" -> "ppt/slides/slide1.xml"
-    let stripped = rels_part.replace("/_rels/", "/");
-    stripped
-        .strip_suffix(".rels")
-        .unwrap_or(&stripped)
-        .to_string()
-}
-
-fn replace_target(element: &str, new_target: &str) -> String {
-    if let Some(pos) = element.find("Target=\"") {
-        let start = pos + "Target=\"".len();
-        if let Some(endrel) = element[start..].find('"') {
-            let mut out = element.to_string();
-            out.replace_range(start..start + endrel, new_target);
-            return out;
-        }
-    }
-    element.to_string()
 }
 
 /// Rewrite one imported .rels part: targets are repointed at renamed
 /// parts; references to shared parts are dropped, except notes-master
 /// references which are repointed at the base deck's notes master.
+/// Relationships are parsed and re-serialized (craft-xml via
+/// `pptx::rels_xml`), ids preserved; only the target values change
+/// semantically.
 fn rewrite_rels(
     rels_xml: &str,
     owner_old: &str,
     rename_map: &BTreeMap<String, String>,
     base_notes_master: &Option<String>,
 ) -> String {
-    let owner_dir = dir_of(owner_old).to_string();
-    let mut out = String::from(RELS_HEADER);
-    for el in scan_elements(rels_xml, "<Relationship") {
-        let target = match attr(el, "Target") {
-            Some(t) => t,
-            None => continue,
-        };
-        if attr(el, "TargetMode") == Some("External") {
-            out.push_str(el);
-            continue;
-        }
-        let abs = resolve_target(owner_old, target);
-        let new_abs = if let Some(n) = rename_map.get(&abs) {
-            n.clone()
-        } else if abs.starts_with("ppt/notesMasters/") {
-            match base_notes_master {
-                Some(bnm) => bnm.clone(),
-                None => continue,
+    let items: Vec<(String, String, String, bool)> = parse_rels(rels_xml)
+        .into_iter()
+        .filter_map(|r| {
+            if r.external {
+                return Some((r.id, r.ty, r.target, true));
             }
-        } else if is_shared(&abs) {
-            continue;
-        } else {
-            continue;
-        };
-        let rel_target = relativize(&owner_dir, &new_abs);
-        out.push_str(&replace_target(el, &rel_target));
-    }
-    out.push_str("</Relationships>");
-    out
-}
-
-fn lst_inner(xml: &str, tag: &str) -> String {
-    let open = format!("<p:{tag}>");
-    let close = format!("</p:{tag}>");
-    if let Some(s) = xml.find(&open) {
-        if let Some(e) = xml[s..].find(&close) {
-            return xml[s + open.len()..s + e].to_string();
-        }
-    }
-    String::new()
-}
-
-fn replace_lst(xml: &str, tag: &str, new_inner: &str) -> String {
-    let open = format!("<p:{tag}>");
-    let close = format!("</p:{tag}>");
-    let self_closed = format!("<p:{tag}/>");
-    if let Some(s) = xml.find(&open) {
-        if let Some(e) = xml[s..].find(&close) {
-            let mut out = xml.to_string();
-            out.replace_range(s..s + e + close.len(), &format!("{open}{new_inner}{close}"));
-            return out;
-        }
-    }
-    if let Some(s) = xml.find(&self_closed) {
-        let mut out = xml.to_string();
-        out.replace_range(s..s + self_closed.len(), &format!("{open}{new_inner}{close}"));
-        return out;
-    }
-    xml.to_string()
+            let abs = resolve_target(owner_old, &r.target);
+            let new_abs = if let Some(n) = rename_map.get(&abs) {
+                n.clone()
+            } else if abs.starts_with("ppt/notesMasters/") {
+                base_notes_master.clone()?
+            } else {
+                // Shared scaffolding (is_shared) and anything not
+                // imported with this fragment: dropped, as before.
+                return None;
+            };
+            Some((r.id, r.ty, craft_opc::relative(owner_old, &new_abs), false))
+        })
+        .collect();
+    rels_xml(&items)
 }
 
 pub fn assemble(fragments: &[Package]) -> Result<Package, String> {
@@ -209,16 +122,29 @@ pub fn assemble(fragments: &[Package]) -> Result<Package, String> {
         id
     };
 
-    let mut new_pres_rels = String::new();
-    let mut new_master_entries = String::new();
-    let mut master_id: u64 = scan_elements(&lst_inner(&base.get_text(PRESENTATION)?, "sldMasterIdLst"), "<p:sldMasterId")
-        .iter()
-        .filter_map(|el| attr(el, "id").and_then(|v| v.parse::<u64>().ok()))
-        .max()
+    let mut new_pres_rel_items: Vec<(String, String, String, bool)> = Vec::new();
+    let mut new_master_items: Vec<El> = Vec::new();
+    // The base presentation tree, edited in place at the end (imports
+    // never touch the shared presentation part itself).
+    let mut pres_root = parse_xml(&base.get_text(PRESENTATION)?, PRESENTATION)?;
+    let mut master_id: u64 = pres_root
+        .find(Local("sldMasterIdLst"))
+        .and_then(|lst| {
+            lst.children(Local("sldMasterId"))
+                .filter_map(|el| el.attr("id").and_then(|v| v.parse::<u64>().ok()))
+                .max()
+        })
         .unwrap_or(2147483648)
         + 1;
 
-    let mut ct = out.get_text(CONTENT_TYPES)?.to_string();
+    // The base [Content_Types].xml tree; fragment overrides for
+    // imported parts are appended to it.
+    let mut ct_root = parse_xml(&out.get_text(CONTENT_TYPES)?, CONTENT_TYPES)?;
+    let mut ct_known: std::collections::BTreeSet<String> = ct_root
+        .elements()
+        .filter(|el| el.is(Local("Override")))
+        .filter_map(|el| el.attr("PartName").map(str::to_string))
+        .collect();
 
     for (i, frag) in fragments.iter().enumerate().skip(1) {
         let prefix = format!("q{i}_");
@@ -233,7 +159,7 @@ pub fn assemble(fragments: &[Package]) -> Result<Package, String> {
         for (old, new) in &map {
             let bytes = frag.get(old)?;
             if old.ends_with(".rels") {
-                let owner = rels_owner(old);
+                let owner = described_part(old);
                 let text = String::from_utf8(bytes.to_vec())
                     .map_err(|_| format!("{old} is not UTF-8"))?;
                 let rewritten = rewrite_rels(&text, &owner, &map, &base_notes_master);
@@ -244,39 +170,53 @@ pub fn assemble(fragments: &[Package]) -> Result<Package, String> {
         }
         // content types: adopt this fragment's overrides for imported parts
         if let Ok(frag_ct) = frag.get_text(CONTENT_TYPES) {
-            for el in scan_elements(&frag_ct, "<Override") {
-                if let (Some(pn), Some(_)) = (attr(el, "PartName"), attr(el, "ContentType")) {
+            if let Ok(frag_ct_root) = parse_xml(&frag_ct, CONTENT_TYPES) {
+                for el in frag_ct_root.elements() {
+                    if !el.is(Local("Override")) {
+                        continue;
+                    }
+                    let (Some(pn), Some(cty)) = (el.attr("PartName"), el.attr("ContentType"))
+                    else {
+                        continue;
+                    };
                     let part_name = pn.strip_prefix('/').unwrap_or(pn);
                     if let Some(new_name) = map.get(part_name) {
-                        let needle = format!("PartName=\"/{new_name}\"");
-                        if !ct.contains(&needle) {
-                            let new_el = manual_partname(el, &format!("/{new_name}"));
-                            if let Some(pos) = ct.rfind("</Types>") {
-                                ct.insert_str(pos, &new_el);
-                            }
+                        let new_pn = format!("/{new_name}");
+                        if ct_known.insert(new_pn.clone()) {
+                            let mut o = El::new("Override");
+                            o.set_attr("PartName", &new_pn);
+                            o.set_attr("ContentType", cty);
+                            ct_root.push(o);
                         }
                     }
                 }
             }
         }
         // masters of this fragment → presentation entries + rels
-        let frag_pres = frag.get_text(PRESENTATION)?;
+        let frag_pres_root = parse_xml(&frag.get_text(PRESENTATION)?, PRESENTATION)?;
         let frag_pres_rels = parse_rels(&frag.get_text(PRESENTATION_RELS)?);
         let rel_by_id: BTreeMap<&str, &crate::pptx::Rel> =
             frag_pres_rels.iter().map(|r| (r.id.as_str(), r)).collect();
-        for el in scan_elements(&lst_inner(&frag_pres, "sldMasterIdLst"), "<p:sldMasterId") {
-            if let Some(rid) = attr(el, "r:id") {
+        let master_items: Vec<El> = frag_pres_root
+            .find(Local("sldMasterIdLst"))
+            .map(|lst| lst.children(Local("sldMasterId")).cloned().collect())
+            .unwrap_or_default();
+        for el in &master_items {
+            if let Some(rid) = el.attr_local("r:id") {
                 if let Some(rel) = rel_by_id.get(rid) {
                     let abs = resolve_target(PRESENTATION, &rel.target);
                     if let Some(new_master) = map.get(&abs) {
                         let new_rid = fresh_rid();
-                        new_master_entries.push_str(&format!(
-                            "<p:sldMasterId id=\"{master_id}\" r:id=\"{new_rid}\"/>"
-                        ));
+                        let mut item = El::new("p:sldMasterId");
+                        item.set_attr("id", master_id.to_string());
+                        item.set_attr("r:id", &new_rid);
                         master_id += 1;
-                        new_pres_rels.push_str(&format!(
-                            "<Relationship Id=\"{new_rid}\" Type=\"{MASTER_TYPE}\" Target=\"{}\"/>",
-                            relativize("ppt", new_master)
+                        new_master_items.push(item);
+                        new_pres_rel_items.push((
+                            new_rid,
+                            MASTER_TYPE.to_string(),
+                            craft_opc::relative(PRESENTATION, new_master),
+                            false,
                         ));
                     }
                 }
@@ -286,9 +226,11 @@ pub fn assemble(fragments: &[Package]) -> Result<Package, String> {
         for s in slides(frag)? {
             if let Some(new_part) = map.get(&s.part) {
                 let new_rid = fresh_rid();
-                new_pres_rels.push_str(&format!(
-                    "<Relationship Id=\"{new_rid}\" Type=\"{SLIDE_TYPE}\" Target=\"{}\"/>",
-                    relativize("ppt", new_part)
+                new_pres_rel_items.push((
+                    new_rid.clone(),
+                    SLIDE_TYPE.to_string(),
+                    craft_opc::relative(PRESENTATION, new_part),
+                    false,
                 ));
                 final_slides.push((new_part.clone(), new_rid));
             }
@@ -296,42 +238,36 @@ pub fn assemble(fragments: &[Package]) -> Result<Package, String> {
     }
 
     // presentation.xml: masters = base + imported; slides = final order
-    let pres = out.get_text(PRESENTATION)?;
-    let masters_inner = format!(
-        "{}{}",
-        lst_inner(&pres, "sldMasterIdLst"),
-        new_master_entries
-    );
-    let pres = replace_lst(&pres, "sldMasterIdLst", &masters_inner);
-    let mut sld_inner = String::new();
-    for (idx, (_, rid)) in final_slides.iter().enumerate() {
-        sld_inner.push_str(&format!("<p:sldId id=\"{}\" r:id=\"{rid}\"/>", 256 + idx));
-    }
-    let pres = replace_lst(&pres, "sldIdLst", &sld_inner);
-    out.parts.insert(PRESENTATION.to_string(), pres.into_bytes());
-
-    // presentation rels: base rels + new entries
-    let mut pres_rels = out.get_text(PRESENTATION_RELS)?.to_string();
-    if let Some(pos) = pres_rels.rfind("</Relationships>") {
-        pres_rels.insert_str(pos, &new_pres_rels);
-    }
-    out.parts
-        .insert(PRESENTATION_RELS.to_string(), pres_rels.into_bytes());
-
-    out.parts.insert(CONTENT_TYPES.to_string(), ct.into_bytes());
-    Ok(out)
-}
-
-fn manual_partname(element: &str, new_partname: &str) -> String {
-    if let Some(pos) = element.find("PartName=\"") {
-        let start = pos + "PartName=\"".len();
-        if let Some(endrel) = element[start..].find('"') {
-            let mut out = element.to_string();
-            out.replace_range(start..start + endrel, new_partname);
-            return out;
+    if let Some(lst) = pres_root.child_mut(Local("sldMasterIdLst")) {
+        for item in new_master_items {
+            lst.push(item);
         }
     }
-    element.to_string()
+    if let Some(lst) = pres_root.child_mut(Local("sldIdLst")) {
+        lst.children = final_slides
+            .iter()
+            .enumerate()
+            .map(|(idx, (_, rid))| {
+                let mut el = El::new("p:sldId");
+                el.set_attr("id", (256 + idx).to_string());
+                el.set_attr("r:id", rid);
+                Node::El(el)
+            })
+            .collect();
+    }
+    out.parts.insert(PRESENTATION.to_string(), serialize_xml(&pres_root));
+
+    // presentation rels: base rels (document order) + new entries
+    let mut rel_items: Vec<(String, String, String, bool)> = parse_rels(&out.get_text(PRESENTATION_RELS)?)
+        .into_iter()
+        .map(|r| (r.id, r.ty, r.target, r.external))
+        .collect();
+    rel_items.extend(new_pres_rel_items);
+    out.parts
+        .insert(PRESENTATION_RELS.to_string(), rels_xml(&rel_items).into_bytes());
+
+    out.parts.insert(CONTENT_TYPES.to_string(), serialize_xml(&ct_root));
+    Ok(out)
 }
 
 #[cfg(test)]

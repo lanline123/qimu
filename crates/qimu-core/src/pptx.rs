@@ -1,6 +1,15 @@
-//! PPTX package surgery (Phase-0 POC, fragment Route B: direct OOXML
-//! package manipulation, using DeckCraft's code as the relationship-
-//! handling reference — spec §8.6).
+//! PPTX package surgery (fragment Route B: direct OOXML package
+//! manipulation, using DeckCraft's code as the relationship-handling
+//! reference — spec §8.6).
+//!
+//! Phase 3: the file layer under this module is craft-opc / craft-xml
+//! / craft-zip (storytold/craft-libs) — archive reads and writes go
+//! through craft-opc (bounded, preflighted), relationship and
+//! content-type semantics through craft-opc's parsers, and every XML
+//! part that is parsed or rewritten goes through craft-xml's owned
+//! tree and writer. Slide XML parts themselves are never
+//! reserialized: they move between packages as opaque bytes, which is
+//! what keeps the page fingerprints below meaningful.
 //!
 //! Imported decks are stored ONLY in split form (spec §3.1): each version
 //! is a small PPTX fragment, the deck is manifest + fragment references.
@@ -9,12 +18,18 @@
 //! (page count, per-page fingerprints, structural integrity). A failed
 //! check must roll back the whole import.
 
+use craft_xml::{El, Local, Node};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Cursor, Read, Write};
 
 pub type PptxResult<T> = Result<T, String>;
+
+/// Bounded reads for imported packages (craft-opc limits): a hostile
+/// or corrupt archive is refused, never partially trusted. Sized for
+/// real decks — tens of thousands of parts, video-sized single parts,
+/// a gigabyte inflated in total.
+const PACKAGE_LIMITS: craft_opc::Limits = craft_opc::Limits::new(50_000, 256 << 20, 1 << 30);
 
 const CONTENT_TYPES: &str = "[Content_Types].xml";
 const PRESENTATION: &str = "ppt/presentation.xml";
@@ -28,35 +43,35 @@ pub struct Package {
 
 impl Package {
     pub fn load(bytes: &[u8]) -> PptxResult<Package> {
-        let mut zip = zip::ZipArchive::new(Cursor::new(bytes))
+        let pkg = craft_opc::Package::open(bytes, &PACKAGE_LIMITS)
             .map_err(|e| format!("not a valid zip/pptx: {e}"))?;
+        // craft-opc leaves a damaged entry out with a warning and
+        // reads the rest; the import safety net keeps the old
+        // fail-closed behaviour — any unreadable entry refuses the
+        // whole package.
+        if !pkg.skipped().is_empty() {
+            return Err(format!("unreadable zip entries: {}", pkg.skipped().join(", ")));
+        }
         let mut parts = BTreeMap::new();
-        for i in 0..zip.len() {
-            let mut f = zip.by_index(i).map_err(|e| e.to_string())?;
-            if f.is_dir() {
-                continue;
+        for name in pkg.names() {
+            if let Some(bytes) = pkg.get(name) {
+                parts.insert(name.to_string(), bytes.to_vec());
             }
-            let name = f.name().to_string();
-            let mut buf = Vec::new();
-            f.read_to_end(&mut buf).map_err(|e| e.to_string())?;
-            parts.insert(name, buf);
         }
         Ok(Package { parts })
     }
 
     pub fn to_bytes(&self) -> PptxResult<Vec<u8>> {
-        let mut out = Cursor::new(Vec::new());
-        {
-            let mut zw = zip::ZipWriter::new(&mut out);
-            let opts = zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
-            for (name, bytes) in &self.parts {
-                zw.start_file(name, opts).map_err(|e| e.to_string())?;
-                zw.write_all(bytes).map_err(|e| e.to_string())?;
-            }
-            zw.finish().map_err(|e| e.to_string())?;
+        // The same observable shape as the old zip-crate writer —
+        // entries in name order, stored uncompressed — but written by
+        // craft-zip (through craft-opc's ZipOut): deterministic, with
+        // DOS-epoch timestamps on every entry.
+        let mut out = craft_opc::ZipOut::new();
+        for (name, bytes) in &self.parts {
+            out.add(name, bytes, craft_opc::Compression::Store)
+                .map_err(|e| e.to_string())?;
         }
-        Ok(out.into_inner())
+        out.finish().map_err(|e| e.to_string())
     }
 
     pub fn get(&self, name: &str) -> PptxResult<&[u8]> {
@@ -85,112 +100,113 @@ pub struct SlideRef {
     pub fingerprint: String,
 }
 
-/// Extract `<tag ... />` (or `<tag ...>...</tag>` start-tag) spans containing
-/// `marker`, returning each element's raw text. POC-grade string scanning;
-/// attribute order inside an element is not assumed.
-pub(crate) fn scan_elements<'a>(xml: &'a str, open: &str) -> Vec<&'a str> {
-    let mut out = Vec::new();
-    let mut rest = xml;
-    while let Some(pos) = rest.find(open) {
-        // Guard against prefix collisions: "<Relationship" must not match
-        // the "<Relationships" root, "<p:sldId" must not match
-        // "<p:sldIdLst". A tag name continuing with a letter/digit means
-        // this is a different, longer element — skip the occurrence.
-        let after_open = &rest[pos + open.len()..];
-        if after_open
-            .chars()
-            .next()
-            .map(|c| c.is_ascii_alphanumeric())
-            .unwrap_or(false)
-        {
-            rest = after_open;
-            continue;
-        }
-        let start = pos;
-        let after = &rest[start..];
-        // Element ends at "/>" for empty elements (Relationship, Override,
-        // sldId are all empty elements in the parts we scan).
-        if let Some(end) = after.find("/>") {
-            out.push(&after[..end + 2]);
-            rest = &after[end + 2..];
-        } else {
-            break;
-        }
-    }
-    out
+/// Parse an XML part into craft-xml's owned tree (names as written,
+/// namespace declarations kept as attributes). craft-xml's defaults
+/// are lenient (varied real-world generators parse), tightened here
+/// where leniency is a hazard: a DOCTYPE with an internal subset —
+/// where entity definitions live (XXE, expansion) — is refused, and
+/// an undefined entity is an error instead of silently dropped text.
+/// This is the single parse entry for the whole crate, so the posture
+/// cannot drift between call sites.
+pub(crate) fn parse_xml(xml: &str, part: &str) -> PptxResult<El> {
+    let mut options = craft_xml::Options::default();
+    options.doctype = craft_xml::Doctype::RejectInternalSubset;
+    options.unknown_entity = craft_xml::UnknownEntity::Error;
+    options
+        .parse(xml.as_bytes())
+        .map_err(|e| format!("part {part} is not readable XML: {e}"))
 }
 
-pub(crate) fn attr<'a>(element: &'a str, name: &str) -> Option<&'a str> {
-    let pat = format!("{name}=\"");
-    let start = element.find(&pat)? + pat.len();
-    let end = element[start..].find('"')? + start;
-    Some(&element[start..end])
+/// Serialize a parsed part back to bytes: the standalone declaration
+/// plus the root element, in craft-xml's writer form.
+pub(crate) fn serialize_xml(root: &El) -> Vec<u8> {
+    let mut out = craft_xml::DECL_STANDALONE.to_string();
+    out.push_str(&root.to_xml());
+    out.into_bytes()
 }
 
-/// Resolve a relationship target against the directory of its source part.
-pub(crate) fn resolve_target(source_part: &str, target: &str) -> String {
-    if let Some(stripped) = target.strip_prefix('/') {
-        return normalize_path(stripped);
-    }
-    let base = match source_part.rfind('/') {
-        Some(i) => &source_part[..i],
-        None => "",
-    };
-    // For a .rels file, the source part is the part it describes:
-    // "ppt/slides/_rels/slide1.xml.rels" describes "ppt/slides/slide1.xml".
-    let base = base.strip_suffix("_rels").map(|b| b.trim_end_matches('/')).unwrap_or(base);
-    if base.is_empty() {
-        normalize_path(target)
+/// The part a .rels part describes: "ppt/slides/_rels/slide1.xml.rels"
+/// describes "ppt/slides/slide1.xml", and "_rels/.rels" describes the
+/// package root (""). A plain part name describes itself.
+pub(crate) fn described_part(part: &str) -> String {
+    if let Some(pos) = part.rfind("/_rels/") {
+        let file = part[pos + "/_rels/".len()..].trim_end_matches(".rels");
+        format!("{}/{file}", &part[..pos])
+    } else if let Some(file) = part.strip_prefix("_rels/") {
+        file.trim_end_matches(".rels").to_string()
     } else {
-        normalize_path(&format!("{base}/{target}"))
+        part.to_string()
     }
 }
 
-fn normalize_path(p: &str) -> String {
-    let mut out: Vec<&str> = Vec::new();
-    for seg in p.split('/') {
-        match seg {
-            "" | "." => {}
-            ".." => {
-                out.pop();
-            }
-            s => out.push(s),
-        }
-    }
-    out.join("/")
+/// Resolve a relationship target against the directory of its source
+/// part (the source may be named by the part itself or by its .rels
+/// part). craft-opc name resolution: `..` cannot climb out of the
+/// package, a leading `/` is package-absolute, and a `#fragment`
+/// suffix is dropped.
+pub(crate) fn resolve_target(source_part: &str, target: &str) -> String {
+    let described = described_part(source_part);
+    craft_opc::resolve(craft_opc::dir_of(&described), target)
 }
 
+/// One relationship of a part, as parsed by craft-opc. `target` is the
+/// target as written in the .rels part (a relative reference or a
+/// URL); resolve it with [`resolve_target`] against the described
+/// part.
+#[derive(Debug, Clone)]
 pub(crate) struct Rel {
     pub id: String,
+    /// The full relationship type URI.
+    pub ty: String,
     pub target: String,
     pub external: bool,
-    pub raw: String,
 }
 
 pub(crate) fn parse_rels(xml: &str) -> Vec<Rel> {
-    scan_elements(xml, "<Relationship")
+    craft_opc::Rels::parse(xml.as_bytes(), "")
+        .list
         .into_iter()
-        .filter_map(|el| {
-            Some(Rel {
-                id: attr(el, "Id")?.to_string(),
-                target: attr(el, "Target")?.to_string(),
-                external: attr(el, "TargetMode") == Some("External"),
-                raw: el.to_string(),
-            })
-        })
+        .map(|r| Rel { id: r.id, ty: r.ty, target: r.target_raw, external: r.external })
         .collect()
+}
+
+/// Serialize relationships with their original ids, in the order
+/// given. craft-opc's RelsOut renumbers ids (rId1, rId2, ...), which
+/// package surgery cannot accept — sldId elements reference the
+/// existing ids — so the container is written with craft-xml
+/// directly. Items are (Id, Type, Target, external).
+pub(crate) fn rels_xml(items: &[(String, String, String, bool)]) -> String {
+    let mut w = craft_xml::Writer::document();
+    w.open(
+        "Relationships",
+        &[("xmlns", "http://schemas.openxmlformats.org/package/2006/relationships")],
+    );
+    for (id, ty, target, external) in items {
+        w.tag("Relationship")
+            .attr("Id", id)
+            .attr("Type", ty)
+            .attr("Target", target)
+            .attr_opt("TargetMode", external.then_some("External"))
+            .empty();
+    }
+    w.finish()
 }
 
 /// Slides of the deck in presentation order, with per-page fingerprints
 /// (identity by part + content, never by printed folio — spec §3.1).
 pub fn slides(pkg: &Package) -> PptxResult<Vec<SlideRef>> {
     let pres = pkg.get_text(PRESENTATION)?;
+    let root = parse_xml(&pres, PRESENTATION)?;
     let rels = parse_rels(&pkg.get_text(PRESENTATION_RELS)?);
     let by_id: BTreeMap<&str, &Rel> = rels.iter().map(|r| (r.id.as_str(), r)).collect();
 
     let mut out = Vec::new();
-    for el in scan_elements(&pres, "<p:sldId") {
-        let rid = attr(el, "r:id").ok_or("sldId without r:id")?;
+    let sld_ids: Vec<&El> = root
+        .find(Local("sldIdLst"))
+        .map(|lst| lst.children(Local("sldId")).collect())
+        .unwrap_or_default();
+    for el in sld_ids {
+        let rid = el.attr_local("r:id").ok_or("sldId without r:id")?;
         let rel = by_id.get(rid).ok_or_else(|| format!("sldId references unknown {rid}"))?;
         let part = resolve_target(PRESENTATION, &rel.target);
         let fp = page_fingerprint(pkg, &part);
@@ -218,7 +234,7 @@ pub fn page_fingerprint(pkg: &Package, slide_part: &str) -> String {
         let mut entries: Vec<String> = parse_rels(&text)
             .iter()
             .map(|r| {
-                let ty = attr(&r.raw, "Type").unwrap_or("");
+                let ty = r.ty.as_str();
                 if r.external {
                     format!("{ty}|ext|{}", r.target)
                 } else {
@@ -246,35 +262,7 @@ pub fn page_fingerprint(pkg: &Package, slide_part: &str) -> String {
 }
 
 fn rels_part_name(part: &str) -> String {
-    match part.rfind('/') {
-        Some(i) => format!("{}/_rels/{}.rels", &part[..i], &part[i + 1..]),
-        None => format!("_rels/{part}.rels"),
-    }
-}
-
-fn remove_elements_containing(xml: &str, open: &str, keep: impl Fn(&str) -> bool) -> String {
-    let mut out = String::with_capacity(xml.len());
-    let mut rest = xml;
-    while let Some(pos) = rest.find(open) {
-        out.push_str(&rest[..pos]);
-        let after = &rest[pos..];
-        match after.find("/>") {
-            Some(end) => {
-                let el = &after[..end + 2];
-                if keep(el) {
-                    out.push_str(el);
-                }
-                rest = &after[end + 2..];
-            }
-            None => {
-                out.push_str(after);
-                rest = "";
-                break;
-            }
-        }
-    }
-    out.push_str(rest);
-    out
+    craft_opc::rels_path(part)
 }
 
 /// Split a deck into one single-slide fragment per slide (Route B pruning:
@@ -284,10 +272,15 @@ fn remove_elements_containing(xml: &str, open: &str, keep: impl Fn(&str) -> bool
 pub fn split(pkg: &Package) -> PptxResult<Vec<Package>> {
     let deck_slides = slides(pkg)?;
     let pres_xml = pkg.get_text(PRESENTATION)?;
-    let sld_elements = scan_elements(&pres_xml, "<p:sldId");
+    let pres_root = parse_xml(&pres_xml, PRESENTATION)?;
+    let sld_elements: Vec<El> = pres_root
+        .find(Local("sldIdLst"))
+        .map(|lst| lst.children(Local("sldId")).cloned().collect())
+        .unwrap_or_default();
     if sld_elements.len() != deck_slides.len() {
         return Err("sldId count mismatch while parsing presentation.xml".into());
     }
+    let ct_root = parse_xml(&pkg.get_text(CONTENT_TYPES)?, CONTENT_TYPES)?;
 
     // Notes part owned by each slide (via its .rels), if any.
     let mut notes_of: BTreeMap<String, Option<String>> = BTreeMap::new();
@@ -369,35 +362,31 @@ pub fn split(pkg: &Package) -> PptxResult<Vec<Package>> {
         }
 
         // Prune presentation.xml: keep only this slide's sldId element.
-        let kept_el = sld_elements[i];
-        let pruned_pres = {
-            let begin = pres_xml.find("<p:sldIdLst").ok_or("no sldIdLst")?;
-            let open_end = pres_xml[begin..].find('>').ok_or("bad sldIdLst")? + begin + 1;
-            let close = pres_xml.find("</p:sldIdLst>").ok_or("no /sldIdLst")?;
-            format!("{}{}{}", &pres_xml[..open_end], kept_el, &pres_xml[close..])
-        };
-        parts.insert(PRESENTATION.to_string(), pruned_pres.into_bytes());
+        let mut frag_pres = pres_root.clone();
+        if let Some(lst) = frag_pres.child_mut(Local("sldIdLst")) {
+            lst.children = vec![Node::El(sld_elements[i].clone())];
+        }
+        parts.insert(PRESENTATION.to_string(), serialize_xml(&frag_pres));
 
         // Prune presentation rels: drop relationships to removed parts.
-        let pres_rels = pkg.get_text(PRESENTATION_RELS)?;
-        let removed_targets: BTreeSet<String> = removed.iter().cloned().collect();
-        let pruned_rels = remove_elements_containing(&pres_rels, "<Relationship", |el| {
-            match attr(el, "Target") {
-                Some(t) => !removed_targets.contains(&resolve_target(PRESENTATION, t)),
-                None => true,
-            }
-        });
-        parts.insert(PRESENTATION_RELS.to_string(), pruned_rels.into_bytes());
+        let pres_rels = parse_rels(&pkg.get_text(PRESENTATION_RELS)?);
+        let kept_rels: Vec<(String, String, String, bool)> = pres_rels
+            .iter()
+            .filter(|r| !removed.contains(&resolve_target(PRESENTATION, &r.target)))
+            .map(|r| (r.id.clone(), r.ty.clone(), r.target.clone(), r.external))
+            .collect();
+        parts.insert(PRESENTATION_RELS.to_string(), rels_xml(&kept_rels).into_bytes());
 
         // Prune [Content_Types].xml overrides for removed parts.
-        let ct = pkg.get_text(CONTENT_TYPES)?;
-        let pruned_ct = remove_elements_containing(&ct, "<Override", |el| {
-            match attr(el, "PartName") {
+        let mut frag_ct = ct_root.clone();
+        frag_ct.children.retain(|node| match node {
+            Node::El(el) if el.is(Local("Override")) => match el.attr("PartName") {
                 Some(p) => !removed.contains(p.trim_start_matches('/')),
                 None => true,
-            }
+            },
+            _ => true,
         });
-        parts.insert(CONTENT_TYPES.to_string(), pruned_ct.into_bytes());
+        parts.insert(CONTENT_TYPES.to_string(), serialize_xml(&frag_ct));
 
         fragments.push(Package { parts });
     }
@@ -412,39 +401,41 @@ pub fn reassemble(fragments: &[Package]) -> PptxResult<Package> {
         return Err("no fragments to reassemble".into());
     }
     let mut parts: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-    let mut sld_elements: Vec<String> = Vec::new();
-    let mut pres_rel_by_id: BTreeMap<String, String> = BTreeMap::new();
+    let mut sld_elements: Vec<El> = Vec::new();
+    let mut pres_rel_by_id: BTreeMap<String, (String, String, String, bool)> = BTreeMap::new();
     let mut overrides: BTreeMap<String, String> = BTreeMap::new();
     let mut defaults: BTreeMap<String, String> = BTreeMap::new();
-    let mut pres_template: Option<String> = None;
-    let mut rels_template: Option<String> = None;
-    let mut ct_template: Option<String> = None;
+    let mut pres_template: Option<El> = None;
 
     for frag in fragments {
         let fslides = slides(frag)?;
         if fslides.len() != 1 {
             return Err("fragment does not contain exactly one slide".into());
         }
-        let pres = frag.get_text(PRESENTATION)?;
-        let els = scan_elements(&pres, "<p:sldId");
-        sld_elements.push(els[0].to_string());
+        let pres_root = parse_xml(&frag.get_text(PRESENTATION)?, PRESENTATION)?;
+        let first_sld = pres_root
+            .find(Local("sldIdLst"))
+            .and_then(|lst| lst.children(Local("sldId")).next().cloned())
+            .ok_or("fragment presentation has no sldId")?;
+        sld_elements.push(first_sld);
         if pres_template.is_none() {
-            pres_template = Some(pres);
-            rels_template = Some(frag.get_text(PRESENTATION_RELS)?);
-            ct_template = Some(frag.get_text(CONTENT_TYPES)?);
+            pres_template = Some(pres_root);
         }
         for rel in parse_rels(&frag.get_text(PRESENTATION_RELS)?) {
-            pres_rel_by_id.entry(rel.id).or_insert(rel.raw);
+            pres_rel_by_id
+                .entry(rel.id.clone())
+                .or_insert((rel.id, rel.ty, rel.target, rel.external));
         }
-        let ct = frag.get_text(CONTENT_TYPES)?;
-        for el in scan_elements(&ct, "<Override") {
-            if let Some(p) = attr(el, "PartName") {
-                overrides.entry(p.to_string()).or_insert(el.to_string());
-            }
-        }
-        for el in scan_elements(&ct, "<Default") {
-            if let Some(e) = attr(el, "Extension") {
-                defaults.entry(e.to_string()).or_insert(el.to_string());
+        let ct_root = parse_xml(&frag.get_text(CONTENT_TYPES)?, CONTENT_TYPES)?;
+        for el in ct_root.elements() {
+            if el.is(Local("Override")) {
+                if let (Some(p), Some(c)) = (el.attr("PartName"), el.attr("ContentType")) {
+                    overrides.entry(p.to_string()).or_insert(c.to_string());
+                }
+            } else if el.is(Local("Default")) {
+                if let (Some(e), Some(c)) = (el.attr("Extension"), el.attr("ContentType")) {
+                    defaults.entry(e.to_string()).or_insert(c.to_string());
+                }
             }
         }
         for (name, bytes) in &frag.parts {
@@ -463,67 +454,50 @@ pub fn reassemble(fragments: &[Package]) -> PptxResult<Package> {
     }
 
     // presentation.xml: template with the full sldIdLst restored in order.
-    let pres = pres_template.unwrap();
-    let begin = pres.find("<p:sldIdLst").ok_or("no sldIdLst")?;
-    let open_end = pres[begin..].find('>').ok_or("bad sldIdLst")? + begin + 1;
-    let close = pres.find("</p:sldIdLst>").ok_or("no /sldIdLst")?;
-    let full_pres = format!("{}{}{}", &pres[..open_end], sld_elements.concat(), &pres[close..]);
-    parts.insert(PRESENTATION.to_string(), full_pres.into_bytes());
+    let mut pres_root = pres_template.unwrap();
+    if let Some(lst) = pres_root.child_mut(Local("sldIdLst")) {
+        lst.children = sld_elements.into_iter().map(Node::El).collect();
+    }
+    parts.insert(PRESENTATION.to_string(), serialize_xml(&pres_root));
 
-    // presentation rels: template shell with the union of relationships.
-    let rels_t = rels_template.unwrap();
-    let rels = rebuild_container(&rels_t, "<Relationships", "</Relationships>", &pres_rel_by_id.values().cloned().collect::<Vec<_>>().concat());
-    parts.insert(PRESENTATION_RELS.to_string(), rels.into_bytes());
+    // presentation rels: the union of the fragments' relationships,
+    // in relationship-id order (the old BTreeMap ordering).
+    let rel_items: Vec<(String, String, String, bool)> = pres_rel_by_id.into_values().collect();
+    parts.insert(PRESENTATION_RELS.to_string(), rels_xml(&rel_items).into_bytes());
 
     // [Content_Types].xml: defaults + union of overrides.
-    let ct_t = ct_template.unwrap();
-    let mut ct_body = String::new();
-    for d in defaults.values() {
-        ct_body.push_str(d);
+    let mut w = craft_xml::Writer::document();
+    w.open(
+        "Types",
+        &[("xmlns", "http://schemas.openxmlformats.org/package/2006/content-types")],
+    );
+    for (ext, ctype) in &defaults {
+        w.empty("Default", &[("Extension", ext), ("ContentType", ctype)]);
     }
-    for o in overrides.values() {
-        ct_body.push_str(o);
+    for (part, ctype) in &overrides {
+        w.empty("Override", &[("PartName", part), ("ContentType", ctype)]);
     }
-    let ct = rebuild_container(&ct_t, "<Types", "</Types>", &ct_body);
-    parts.insert(CONTENT_TYPES.to_string(), ct.into_bytes());
+    parts.insert(CONTENT_TYPES.to_string(), w.into_bytes());
 
     Ok(Package { parts })
-}
-
-fn rebuild_container(template: &str, open_marker: &str, close_marker: &str, inner: &str) -> String {
-    let Some(begin) = template.find(open_marker) else { return template.to_string() };
-    let Some(open_end) = template[begin..].find('>').map(|i| begin + i + 1) else {
-        return template.to_string();
-    };
-    let Some(close) = template.find(close_marker) else { return template.to_string() };
-    format!("{}{}{}", &template[..open_end], inner, &template[close..])
 }
 
 /// Structural integrity: every non-external relationship target exists,
 /// and every part is covered by [Content_Types].xml.
 pub fn structural_errors(pkg: &Package) -> Vec<String> {
     let mut errors = Vec::new();
-    // Content-type coverage.
-    let mut covered: BTreeSet<String> = BTreeSet::new();
-    let mut default_exts: BTreeSet<String> = BTreeSet::new();
-    if let Ok(ct) = pkg.get_text(CONTENT_TYPES) {
-        for el in scan_elements(&ct, "<Override") {
-            if let Some(p) = attr(el, "PartName") {
-                covered.insert(p.trim_start_matches('/').to_string());
-            }
-        }
-        for el in scan_elements(&ct, "<Default") {
-            if let Some(e) = attr(el, "Extension") {
-                default_exts.insert(e.to_lowercase());
-            }
-        }
-    }
+    // Content-type coverage (craft-opc: Override by part name, then
+    // Default by extension, both case-insensitive).
+    let content_types = pkg
+        .parts
+        .get(CONTENT_TYPES)
+        .map(|bytes| craft_opc::ContentTypes::parse(bytes))
+        .unwrap_or_default();
     for name in pkg.parts.keys() {
         if name == CONTENT_TYPES {
             continue;
         }
-        let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
-        if !covered.contains(name) && !default_exts.contains(&ext) {
+        if content_types.of(name).is_none() {
             errors.push(format!("part {name} not covered by [Content_Types].xml"));
         }
     }
@@ -532,11 +506,7 @@ pub fn structural_errors(pkg: &Package) -> Vec<String> {
         if !name.ends_with(".rels") {
             continue;
         }
-        // The described part: strip "_rels/" and ".rels".
-        let described = name
-            .replace("/_rels/", "/")
-            .trim_end_matches(".rels")
-            .to_string();
+        let described = described_part(name);
         let text = String::from_utf8_lossy(bytes);
         for rel in parse_rels(&text) {
             if rel.external {
@@ -600,10 +570,47 @@ pub fn package_fingerprint(pkg: &Package) -> String {
     format!("{:x}", h.finalize())
 }
 
-fn xml_escape_text(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+/// The `<p:txBody>` of the shape carrying the body placeholder
+/// (`<p:ph type="body"/>`), if the tree has one.
+fn body_txbody_mut(el: &mut El) -> Option<&mut El> {
+    if el.is(Local("sp")) {
+        let is_body = el
+            .descendants()
+            .any(|d| d.is(Local("ph")) && d.attr("type") == Some("body"));
+        if is_body {
+            return el.child_mut(Local("txBody"));
+        }
+    }
+    for child in el.elements_mut() {
+        if let Some(found) = body_txbody_mut(child) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// One notes paragraph in the form the old string writer emitted:
+/// a run with zh-CN run properties, or an empty `<a:p/>` for a blank
+/// line. Text escaping is the serializer's job (craft-xml).
+fn notes_paragraph(line: &str) -> El {
+    let mut p = El::new("a:p");
+    if line.is_empty() {
+        return p;
+    }
+    let mut rpr = El::new("a:rPr");
+    rpr.set_attr("lang", "zh-CN");
+    rpr.set_attr("dirty", "0");
+    let mut t = El::new("a:t");
+    t.push(line);
+    let mut r = El::new("a:r");
+    r.push(rpr);
+    r.push(t);
+    let mut end = El::new("a:endParaRPr");
+    end.set_attr("lang", "zh-CN");
+    end.set_attr("dirty", "0");
+    p.push(r);
+    p.push(end);
+    p
 }
 
 /// Write speaker notes (讲稿) into the notes page of the slide at
@@ -619,17 +626,13 @@ pub fn set_notes_text(pkg: &mut Package, slide_idx: usize, text: &str) -> bool {
         Some(s) => s.part.clone(),
         None => return false,
     };
-    let (dir, file) = match slide_part.rfind('/') {
-        Some(i) => (&slide_part[..i], &slide_part[i + 1..]),
-        None => return false,
-    };
-    let rels_part = format!("{dir}/_rels/{file}.rels");
+    let rels_part = rels_part_name(&slide_part);
     let rels_xml = match pkg.get_text(&rels_part) {
         Ok(x) => x,
         Err(_) => return false,
     };
     let rels = parse_rels(&rels_xml);
-    let notes_rel = match rels.iter().find(|r| r.raw.contains("/notesSlide")) {
+    let notes_rel = match rels.iter().find(|r| craft_opc::type_is(&r.ty, "notesSlide")) {
         Some(r) => r,
         None => return false,
     };
@@ -638,54 +641,25 @@ pub fn set_notes_text(pkg: &mut Package, slide_idx: usize, text: &str) -> bool {
         Ok(x) => x,
         Err(_) => return false,
     };
-    // locate the body placeholder's <p:sp> block
-    let mut search_from = 0;
-    let (sp_start, sp_end) = loop {
-        let Some(rel_s) = xml[search_from..].find("<p:sp>") else {
-            return false;
-        };
-        let s = search_from + rel_s;
-        let Some(rel_e) = xml[s..].find("</p:sp>") else {
-            return false;
-        };
-        let e = s + rel_e + "</p:sp>".len();
-        if xml[s..e].contains("type=\"body\"") {
-            break (s, e);
-        }
-        search_from = e;
+    let mut root = match parse_xml(&xml, &notes_part) {
+        Ok(r) => r,
+        Err(_) => return false,
     };
-    let block = &xml[sp_start..sp_end];
-    let Some(tb_rel) = block.find("<p:txBody>") else {
+    let Some(txbody) = body_txbody_mut(&mut root) else {
         return false;
     };
-    let tb_start = sp_start + tb_rel;
-    let Some(tb_close_rel) = xml[tb_start..].find("</p:txBody>") else {
-        return false;
-    };
-    let tb_close = tb_start + tb_close_rel;
-    // keep everything inside txBody before the first paragraph
-    // (a:bodyPr, a:lstStyle), replace the paragraphs
-    let inner = &xml[tb_start + "<p:txBody>".len()..tb_close];
-    let keep_len = inner
-        .find("<a:p>")
-        .or_else(|| inner.find("<a:p/>"))
-        .unwrap_or(inner.len());
-    let mut paras = String::new();
+    // Keep everything inside txBody before the first paragraph
+    // (a:bodyPr, a:lstStyle); replace the paragraphs.
+    let cut = txbody
+        .children
+        .iter()
+        .position(|n| matches!(n, Node::El(e) if e.is(Local("p"))))
+        .unwrap_or(txbody.children.len());
+    txbody.children.truncate(cut);
     for line in text.split('\n') {
-        if line.is_empty() {
-            paras.push_str("<a:p/>");
-        } else {
-            paras.push_str(&format!(
-                "<a:p><a:r><a:rPr lang=\"zh-CN\" dirty=\"0\"/><a:t>{}</a:t></a:r><a:endParaRPr lang=\"zh-CN\" dirty=\"0\"/></a:p>",
-                xml_escape_text(line)
-            ));
-        }
+        txbody.children.push(Node::El(notes_paragraph(line)));
     }
-    let mut out = String::with_capacity(xml.len() + paras.len());
-    out.push_str(&xml[..tb_start + "<p:txBody>".len() + keep_len]);
-    out.push_str(&paras);
-    out.push_str(&xml[tb_close..]);
-    pkg.parts.insert(notes_part, out.into_bytes());
+    pkg.parts.insert(notes_part, serialize_xml(&root));
     true
 }
 
@@ -694,17 +668,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalize_paths() {
-        assert_eq!(normalize_path("ppt/slides/../media/a.png"), "ppt/media/a.png");
+    fn resolve_targets() {
+        assert_eq!(
+            resolve_target("ppt/presentation.xml", "slides/slide1.xml"),
+            "ppt/slides/slide1.xml"
+        );
         assert_eq!(resolve_target("ppt/slides/slide1.xml", "../media/a.png"), "ppt/media/a.png");
         assert_eq!(
             resolve_target("ppt/slides/_rels/slide1.xml.rels", "../media/a.png"),
             "ppt/media/a.png"
         );
+        // `..` cannot climb out of the package.
+        assert_eq!(resolve_target("ppt/slides/slide1.xml", "../../../x.xml"), "x.xml");
+        assert_eq!(
+            rels_part_name("ppt/slides/slide1.xml"),
+            "ppt/slides/_rels/slide1.xml.rels"
+        );
+        assert_eq!(described_part("ppt/slides/_rels/slide1.xml.rels"), "ppt/slides/slide1.xml");
+        assert_eq!(described_part("_rels/.rels"), "");
     }
 }
 
 // ---------- page-level text-run access (visual page editor) ----------
+/// Text escaping for the run-surgery splice below (its replacements
+/// are written back into the slide XML byte stream, which is never
+/// reserialized). Backed by craft-xml's escaper — the same three
+/// replacements the old hand-written helper made.
+fn xml_escape_text(s: &str) -> String {
+    craft_xml::esc(s)
+}
+
 
 fn xml_unescape_text(s: &str) -> String {
     s.replace("&lt;", "<")
@@ -809,5 +802,837 @@ pub fn replace_slide_text_runs(
         }
     }
     pkg.parts.insert(part, out.into_bytes());
+    Ok(applied)
+}
+
+// ---------- slide element model (visual page editor v2) ----------
+//
+// The v1 editor treated a slide as a flat list of `<a:t>` runs. The v2
+// editor needs the slide's actual element tree: which shapes, pictures
+// and lines sit where, and how their text is styled. This section is
+// the read/write pair for that model, in the same string-scanning
+// style as the rest of this file (no XML DOM in the workspace).
+// Elements nested inside a group are not listed individually — the
+// group itself is one element (kind "group"), matching what the
+// editor can meaningfully move/resize as a unit.
+
+/// Direct formatting of one text run, as the editor exposes it: font
+/// size in points, bold, and an "RRGGBB" color. `None` = the run
+/// carries no explicit value (inherits from layout/master).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RunStyle {
+    pub sz: Option<f32>,
+    pub b: Option<bool>,
+    pub color: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ElRun {
+    pub text: String,
+    pub style: RunStyle,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ElPara {
+    pub runs: Vec<ElRun>,
+}
+
+/// One top-level element of a slide's `<p:spTree>`, in document order.
+/// Geometry is EMU (914400 per inch); `rot` is in 60000ths of a
+/// degree. `has_xfrm` is false when the element inherits its transform
+/// from the layout (no `<a:off>` of its own) — such elements can be
+/// restyled but not moved until they gain an explicit transform.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SlideElement {
+    pub kind: String, // text | shape | picture | line | graphic | group
+    pub name: String,
+    pub x: i64,
+    pub y: i64,
+    pub cx: i64,
+    pub cy: i64,
+    pub rot: i64,
+    pub has_xfrm: bool,
+    pub geom: Option<String>,
+    pub media: Option<String>,
+    pub paras: Vec<ElPara>,
+}
+
+/// Minimal tag tokenizer: returns (name, start, end, closing,
+/// self_closing) for the first tag at or after `from`. Comments and
+/// processing instructions are skipped; quoted attribute values may
+/// contain `>`.
+fn next_tag(xml: &str, from: usize) -> Option<(String, usize, usize, bool, bool)> {
+    let bytes = xml.as_bytes();
+    let mut i = from;
+    while i < bytes.len() {
+        if bytes[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        if xml[i..].starts_with("<!--") {
+            i = xml[i..].find("-->")? + i + 3;
+            continue;
+        }
+        if xml[i..].starts_with("<?") {
+            i = xml[i..].find("?>")? + i + 2;
+            continue;
+        }
+        if xml[i..].starts_with("<!") {
+            i = xml[i..].find('>')? + i + 1;
+            continue;
+        }
+        let closing = xml[i..].starts_with("</");
+        let name_start = if closing { i + 2 } else { i + 1 };
+        let mut j = name_start;
+        while j < bytes.len()
+            && (bytes[j].is_ascii_alphanumeric() || matches!(bytes[j], b':' | b'_' | b'-' | b'.'))
+        {
+            j += 1;
+        }
+        if j == name_start {
+            i += 1;
+            continue;
+        }
+        let name = xml[name_start..j].to_string();
+        let mut k = j;
+        let mut quote: Option<u8> = None;
+        while k < bytes.len() {
+            match quote {
+                Some(q) => {
+                    if bytes[k] == q {
+                        quote = None;
+                    }
+                }
+                None => match bytes[k] {
+                    b'"' | b'\'' => quote = Some(bytes[k]),
+                    b'>' => break,
+                    _ => {}
+                },
+            }
+            k += 1;
+        }
+        if k >= bytes.len() {
+            return None;
+        }
+        let self_closing = !closing && k > i && bytes[k - 1] == b'/';
+        return Some((name, i, k + 1, closing, self_closing));
+    }
+    None
+}
+
+/// Spans of the direct children of a fragment (whose own root tag has
+/// already been stripped) whose tag is in `names`. Returns (tag,
+/// start, end), end just past the matching close tag.
+fn child_spans(xml: &str, names: &[&str]) -> Vec<(String, usize, usize)> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut cur: Option<(String, usize, usize)> = None; // (tag, start, depth at open)
+    let mut pos = 0usize;
+    while let Some((name, s, e, closing, self_closing)) = next_tag(xml, pos) {
+        pos = e;
+        if closing {
+            depth = depth.saturating_sub(1);
+            if let Some((tag, start, d)) = &cur {
+                if *d == depth && *tag == name {
+                    out.push((tag.clone(), *start, e));
+                    cur = None;
+                }
+            }
+            continue;
+        }
+        if depth == 0 && cur.is_none() && names.contains(&name.as_str()) {
+            if self_closing {
+                out.push((name.clone(), s, e));
+                continue;
+            }
+            cur = Some((name.clone(), s, depth));
+        }
+        if !self_closing {
+            depth += 1;
+        }
+    }
+    out
+}
+
+/// The content between a block's first `>` and its final `<`.
+fn tag_inner(block: &str) -> &str {
+    let s = block.find('>').map(|i| i + 1).unwrap_or(0);
+    let e = block.rfind('<').unwrap_or(block.len());
+    if e >= s {
+        &block[s..e]
+    } else {
+        ""
+    }
+}
+
+/// The raw text of the first `<open...>` tag inside `block`.
+fn find_tag_text<'a>(block: &'a str, open: &str) -> Option<&'a str> {
+    let s = block.find(open)?;
+    // Guard against prefix collisions, same as scan_elements.
+    let after = &block[s + open.len()..];
+    if after
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_alphanumeric())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let (_, _, e, _, _) = next_tag(block, s)?;
+    Some(&block[s..e])
+}
+
+fn find_tag_attr(block: &str, open: &str, name: &str) -> Option<String> {
+    let tag = find_tag_text(block, open)?;
+    attr(tag, name).map(str::to_string)
+}
+
+fn parse_i64(s: Option<String>) -> i64 {
+    s.and_then(|v| v.parse().ok()).unwrap_or(0)
+}
+
+/// (x, y, cx, cy, has_xfrm) from an element block: the first
+/// `<a:off>` / `<a:ext>` in document order are the element's own
+/// transform (they precede any text body).
+fn geom_of(block: &str) -> (i64, i64, i64, i64, bool) {
+    let has = block.contains("<a:off");
+    (
+        parse_i64(find_tag_attr(block, "<a:off", "x")),
+        parse_i64(find_tag_attr(block, "<a:off", "y")),
+        parse_i64(find_tag_attr(block, "<a:ext", "cx")),
+        parse_i64(find_tag_attr(block, "<a:ext", "cy")),
+        has,
+    )
+}
+
+fn parse_run_style(rblock: &str) -> RunStyle {
+    let mut st = RunStyle { sz: None, b: None, color: None };
+    if let Some(rp) = find_tag_text(rblock, "<a:rPr") {
+        if let Some(v) = attr(rp, "sz") {
+            st.sz = v.parse::<f32>().ok().map(|h| h / 100.0);
+        }
+        if let Some(v) = attr(rp, "b") {
+            st.b = Some(v == "1" || v.eq_ignore_ascii_case("true"));
+        }
+    }
+    // The fill lives inside the (non-self-closing) rPr element.
+    if let Some(s) = rblock.find("<a:solidFill>") {
+        if let Some(v) = find_tag_attr(&rblock[s..], "<a:srgbClr", "val") {
+            st.color = Some(v.to_uppercase());
+        }
+    }
+    st
+}
+
+fn parse_paras(block: &str) -> Vec<ElPara> {
+    let Some(ts) = block.find("<p:txBody>") else {
+        return Vec::new();
+    };
+    let inner = tag_inner(&block[ts..]);
+    let mut paras = Vec::new();
+    for (_, ps, pe) in child_spans(inner, &["a:p"]) {
+        let pblock = &inner[ps..pe];
+        let pinner = tag_inner(pblock);
+        let mut runs = Vec::new();
+        for (_, rs, re) in child_spans(pinner, &["a:r", "a:fld"]) {
+            let rblock = &pinner[rs..re];
+            let text = match (rblock.find("<a:t>"), rblock.find("</a:t>")) {
+                (Some(a), Some(b)) if b > a => {
+                    xml_unescape_text(&rblock[a + "<a:t>".len()..b])
+                }
+                _ => String::new(),
+            };
+            runs.push(ElRun { text, style: parse_run_style(rblock) });
+        }
+        paras.push(ElPara { runs });
+    }
+    paras
+}
+
+fn picture_media(pkg: &Package, slide_part: &str, block: &str) -> Option<String> {
+    let s = block.find("r:embed=\"")? + "r:embed=\"".len();
+    let e = block[s..].find('"')? + s;
+    let rid = &block[s..e];
+    let (dir, file) = slide_part.rsplit_once('/')?;
+    let rels_part = format!("{dir}/_rels/{file}.rels");
+    let rels_xml = pkg.get_text(&rels_part).ok()?;
+    let rel = parse_rels(&rels_xml).into_iter().find(|r| r.id == rid)?;
+    if rel.external {
+        return None;
+    }
+    Some(resolve_target(slide_part, &rel.target))
+}
+
+fn parse_element(pkg: &Package, slide_part: &str, tag: &str, block: &str) -> SlideElement {
+    let paras = parse_paras(block);
+    let geom = find_tag_attr(block, "<a:prstGeom", "prst");
+    let kind = match tag {
+        "p:pic" => "picture",
+        "p:cxnSp" => "line",
+        "p:graphicFrame" => "graphic",
+        "p:grpSp" => "group",
+        _ => {
+            if paras.iter().any(|p| !p.runs.is_empty()) {
+                "text"
+            } else if geom.as_deref() == Some("line") {
+                "line"
+            } else {
+                "shape"
+            }
+        }
+    }
+    .to_string();
+    let (x, y, cx, cy, has_xfrm) = geom_of(block);
+    let rot = find_tag_text(block, "<a:xfrm")
+        .or_else(|| find_tag_text(block, "<p:xfrm"))
+        .and_then(|t| attr(t, "rot").map(str::to_string))
+        .map(|v| v.parse().unwrap_or(0))
+        .unwrap_or(0);
+    let media = if kind == "picture" {
+        picture_media(pkg, slide_part, block)
+    } else {
+        None
+    };
+    SlideElement {
+        kind,
+        name: find_tag_attr(block, "<p:cNvPr", "name").unwrap_or_default(),
+        x,
+        y,
+        cx,
+        cy,
+        rot,
+        has_xfrm,
+        geom,
+        media,
+        paras,
+    }
+}
+
+fn sp_tree_inner(xml: &str) -> Option<(usize, usize)> {
+    let s = xml.find("<p:spTree>")? + "<p:spTree>".len();
+    let e = xml[s..].find("</p:spTree>")? + s;
+    Some((s, e))
+}
+
+const EL_TAGS: [&str; 5] = ["p:sp", "p:pic", "p:cxnSp", "p:graphicFrame", "p:grpSp"];
+
+/// Slide size in EMU from `<p:sldSz>` (16:9 default when absent).
+pub fn slide_size(pkg: &Package) -> (i64, i64) {
+    let pres = pkg.get_text(PRESENTATION).unwrap_or_default();
+    for el in scan_elements(&pres, "<p:sldSz") {
+        let cx = attr(el, "cx").and_then(|v| v.parse().ok()).unwrap_or(12192000);
+        let cy = attr(el, "cy").and_then(|v| v.parse().ok()).unwrap_or(6858000);
+        return (cx, cy);
+    }
+    (12192000, 6858000)
+}
+
+/// The top-level elements of one slide, in document order — the v2
+/// editor's read side (companion to `slide_text_runs`).
+pub fn slide_elements(pkg: &Package, slide_idx: usize) -> PptxResult<Vec<SlideElement>> {
+    let refs = slides(pkg)?;
+    let sref = refs
+        .get(slide_idx)
+        .ok_or_else(|| format!("slide index {slide_idx} out of range"))?;
+    let xml = pkg.get_text(&sref.part)?;
+    let (ts, te) = sp_tree_inner(&xml).ok_or("slide has no spTree")?;
+    let inner = &xml[ts..te];
+    let mut out = Vec::new();
+    for (tag, s, e) in child_spans(inner, &EL_TAGS) {
+        out.push(parse_element(pkg, &sref.part, &tag, &inner[s..e]));
+    }
+    Ok(out)
+}
+
+// ---------- element write side ----------
+
+/// One edit operation against one slide, applied in list order.
+/// Indices address the document as it evolves: structural ops are
+/// emitted by the caller in an order that keeps indices valid
+/// (updates first, deletions descending, insertions ascending).
+pub enum SlideOp {
+    SetText { el: usize, para: usize, run: usize, text: String },
+    SetStyle {
+        el: usize,
+        para: usize,
+        run: usize,
+        sz: Option<f32>,
+        b: Option<bool>,
+        color: Option<String>,
+    },
+    AddPara { el: usize, after: Option<usize>, text: String },
+    DeletePara { el: usize, para: usize },
+    AddRun { el: usize, para: usize, text: String },
+    DeleteRun { el: usize, para: usize, run: usize },
+    Move { el: usize, x: i64, y: i64 },
+    Resize { el: usize, cx: i64, cy: i64 },
+    ReplacePic { el: usize, bytes: Vec<u8>, ext: String },
+}
+
+fn element_span(xml: &str, el: usize) -> Option<(usize, usize)> {
+    let (ts, te) = sp_tree_inner(xml)?;
+    let inner = &xml[ts..te];
+    child_spans(inner, &EL_TAGS)
+        .get(el)
+        .map(|(_, s, e)| (ts + s, ts + e))
+}
+
+/// Rewrite (or insert) attribute `name` on the tag starting at
+/// `tag_start` within `xml`.
+fn set_tag_attr(xml: &str, tag_start: usize, name: &str, value: &str) -> String {
+    let Some((_, _, tag_end, _, self_closing)) = next_tag(xml, tag_start) else {
+        return xml.to_string();
+    };
+    let tag = &xml[tag_start..tag_end];
+    let pat = format!(" {name}=\"");
+    let new_tag = if let Some(p) = tag.find(&pat) {
+        let vs = p + pat.len();
+        let ve = tag[vs..].find('"').map(|i| vs + i).unwrap_or(vs);
+        format!("{}{}{}", &tag[..vs], value, &tag[ve..])
+    } else if self_closing {
+        format!("{} {}=\"{}\"/>", &tag[..tag.len() - 2], name, value)
+    } else {
+        format!("{} {}=\"{}\">", &tag[..tag.len() - 1], name, value)
+    };
+    format!("{}{}{}", &xml[..tag_start], new_tag, &xml[tag_end..])
+}
+
+/// Paragraph spans (absolute, within the element block).
+fn para_spans(block: &str) -> Vec<(usize, usize)> {
+    let Some(ts) = block.find("<p:txBody>") else {
+        return Vec::new();
+    };
+    let tbody = &block[ts..];
+    let inner = tag_inner(tbody);
+    let inner_start = ts + tbody.find('>').map(|i| i + 1).unwrap_or(0);
+    child_spans(inner, &["a:p"])
+        .into_iter()
+        .map(|(_, s, e)| (inner_start + s, inner_start + e))
+        .collect()
+}
+
+/// Run spans (absolute, within the element block) of one paragraph.
+fn run_spans(block: &str, para: (usize, usize)) -> Vec<(usize, usize)> {
+    let pblock = &block[para.0..para.1];
+    let inner_start = para.0 + pblock.find('>').map(|i| i + 1).unwrap_or(0);
+    let inner = tag_inner(pblock);
+    child_spans(inner, &["a:r", "a:fld"])
+        .into_iter()
+        .map(|(_, s, e)| (inner_start + s, inner_start + e))
+        .collect()
+}
+
+/// The `<a:pPr.../>` / `<a:pPr>...</a:pPr>` text of a paragraph, if any.
+fn para_ppr(pblock: &str) -> String {
+    let Some(s) = pblock.find("<a:pPr") else {
+        return String::new();
+    };
+    let rest = &pblock[s..];
+    if let Some((_, _, e, _, sc)) = next_tag(rest, 0) {
+        if sc {
+            return rest[..e].to_string();
+        }
+        if let Some(c) = rest.find("</a:pPr>") {
+            return rest[..c + "</a:pPr>".len()].to_string();
+        }
+    }
+    String::new()
+}
+
+/// The first run's `<a:rPr...>` tag text within a block (style
+/// template for cloned runs/paragraphs).
+fn first_rpr(block: &str) -> String {
+    find_tag_text(block, "<a:rPr")
+        .map(str::to_string)
+        .unwrap_or_else(|| "<a:rPr lang=\"zh-CN\" dirty=\"0\"/>".to_string())
+}
+
+fn splice(xml: &str, span: (usize, usize), replacement: &str) -> String {
+    format!("{}{}{}", &xml[..span.0], replacement, &xml[span.1..])
+}
+
+/// Apply a style change to one run block (`<a:r>...</a:r>`).
+fn style_run_block(rb: &str, sz: Option<f32>, b: Option<bool>, color: Option<String>) -> String {
+    let mut out = rb.to_string();
+    let attrs: Vec<(&str, String)> = {
+        let mut v: Vec<(&str, String)> = Vec::new();
+        if let Some(s) = sz {
+            v.push(("sz", format!("{}", (s * 100.0).round() as i64)));
+        }
+        if let Some(bv) = b {
+            v.push(("b", if bv { "1" } else { "0" }.to_string()));
+        }
+        v
+    };
+    match out.find("<a:rPr") {
+        Some(rp_start) => {
+            for (name, value) in &attrs {
+                out = set_tag_attr(&out, rp_start, name, value);
+            }
+            if let Some(c) = &color {
+                let fill = format!("<a:solidFill><a:srgbClr val=\"{c}\"/></a:solidFill>");
+                // Re-locate rPr after the attribute edits.
+                let rp_start = out.find("<a:rPr").unwrap();
+                let (_, _, tag_end, _, sc) = next_tag(&out, rp_start).unwrap();
+                if sc {
+                    // Expand `<a:rPr .../>` into a paired element.
+                    let open = format!("{}>{}", &out[rp_start..tag_end - 2], fill);
+                    out = format!("{}{}</a:rPr>{}", &out[..rp_start], open, &out[tag_end..]);
+                } else if let Some(sf) = out[rp_start..].find("<a:srgbClr") {
+                    out = set_tag_attr(&out, rp_start + sf, "val", c);
+                } else {
+                    out = format!(
+                        "{}{}{}",
+                        &out[..tag_end],
+                        fill,
+                        &out[tag_end..]
+                    );
+                }
+            }
+        }
+        None => {
+            // No rPr: insert one right after the run's open tag.
+            let mut rpr = String::from("<a:rPr lang=\"zh-CN\" dirty=\"0\"");
+            for (name, value) in &attrs {
+                rpr.push_str(&format!(" {name}=\"{value}\""));
+            }
+            if let Some(c) = &color {
+                rpr.push_str(&format!(
+                    "><a:solidFill><a:srgbClr val=\"{c}\"/></a:solidFill></a:rPr>"
+                ));
+            } else {
+                rpr.push_str("/>");
+            }
+            let open_end = out.find('>').map(|i| i + 1).unwrap_or(0);
+            out = format!("{}{}{}", &out[..open_end], rpr, &out[open_end..]);
+        }
+    }
+    out
+}
+
+fn op_set_text(block: &str, para: usize, run: usize, text: &str) -> Option<String> {
+    let p = *para_spans(block).get(para)?;
+    let r = *run_spans(block, p).get(run)?;
+    let rb = &block[r.0..r.1];
+    let esc = xml_escape_text(text);
+    let new_rb = if let (Some(a), Some(b)) = (rb.find("<a:t>"), rb.find("</a:t>")) {
+        format!("{}{}{}", &rb[..a + 5], esc, &rb[b..])
+    } else if rb.contains("<a:t/>") {
+        rb.replace("<a:t/>", &format!("<a:t>{esc}</a:t>"))
+    } else {
+        // Append a text node before the run's close tag.
+        let close = rb.rfind("</a:")?;
+        format!("{}<a:t>{esc}</a:t>{}", &rb[..close], &rb[close..])
+    };
+    Some(splice(block, r, &new_rb))
+}
+
+fn op_set_style(
+    block: &str,
+    para: usize,
+    run: usize,
+    sz: Option<f32>,
+    b: Option<bool>,
+    color: Option<String>,
+) -> Option<String> {
+    let p = *para_spans(block).get(para)?;
+    let r = *run_spans(block, p).get(run)?;
+    let new_rb = style_run_block(&block[r.0..r.1], sz, b, color);
+    Some(splice(block, r, &new_rb))
+}
+
+fn op_add_para(block: &str, after: Option<usize>, text: &str) -> Option<String> {
+    let spans = para_spans(block);
+    let (insert_at, template) = match after {
+        Some(i) => {
+            let sp = *spans.get(i)?;
+            (sp.1, block[sp.0..sp.1].to_string())
+        }
+        None => match spans.last() {
+            Some(sp) => (sp.1, block[sp.0..sp.1].to_string()),
+            None => {
+                // No paragraphs yet: insert before </p:txBody>.
+                let te = block.find("</p:txBody>")?;
+                (te, String::new())
+            }
+        },
+    };
+    let ppr = para_ppr(&template);
+    let rpr = first_rpr(&template);
+    let new_para = format!(
+        "<a:p>{}<a:r>{}<a:t>{}</a:t></a:r></a:p>",
+        ppr,
+        rpr,
+        xml_escape_text(text)
+    );
+    Some(format!(
+        "{}{}{}",
+        &block[..insert_at],
+        new_para,
+        &block[insert_at..]
+    ))
+}
+
+fn op_delete_para(block: &str, para: usize) -> Option<String> {
+    let spans = para_spans(block);
+    if spans.len() <= 1 {
+        return None; // never leave a text body paragraph-less
+    }
+    let sp = *spans.get(para)?;
+    Some(splice(block, sp, ""))
+}
+
+fn op_add_run(block: &str, para: usize, text: &str) -> Option<String> {
+    let p = *para_spans(block).get(para)?;
+    let pblock = &block[p.0..p.1];
+    let rpr = first_rpr(pblock);
+    let new_run = format!("<a:r>{}<a:t>{}</a:t></a:r>", rpr, xml_escape_text(text));
+    if pblock.ends_with("/>") {
+        // A self-closing empty paragraph: expand it around the run.
+        return Some(splice(block, p, &format!("<a:p>{new_run}</a:p>")));
+    }
+    // Insert before <a:endParaRPr> when present, else before </a:p>.
+    let insert_at = match pblock.find("<a:endParaRPr") {
+        Some(i) => p.0 + i,
+        None => p.1 - "</a:p>".len(),
+    };
+    Some(format!(
+        "{}{}{}",
+        &block[..insert_at],
+        new_run,
+        &block[insert_at..]
+    ))
+}
+
+fn op_delete_run(block: &str, para: usize, run: usize) -> Option<String> {
+    let p = *para_spans(block).get(para)?;
+    let r = *run_spans(block, p).get(run)?;
+    Some(splice(block, r, ""))
+}
+
+fn op_move_resize(
+    block: &str,
+    new_off: Option<(i64, i64)>,
+    new_ext: Option<(i64, i64)>,
+) -> Option<String> {
+    let mut out = block.to_string();
+    if !out.contains("<a:off") {
+        // No explicit transform: insert one into the property bag so
+        // the element stops inheriting its position from the layout.
+        let (x, y) = new_off.unwrap_or((0, 0));
+        let (cx, cy) = new_ext.unwrap_or_else(|| {
+            let g = geom_of(&out);
+            (g.2, g.3)
+        });
+        let xfrm = format!(
+            "<a:xfrm><a:off x=\"{x}\" y=\"{y}\"/><a:ext cx=\"{cx}\" cy=\"{cy}\"/></a:xfrm>"
+        );
+        let anchor = ["<p:spPr>", "<p:spPr ", "<p:grpSpPr>"]
+            .iter()
+            .filter_map(|a| out.find(a).map(|i| (a, i)))
+            .next()?;
+        let tag_end = out[anchor.1..].find('>')? + anchor.1 + 1;
+        out = format!("{}{}{}", &out[..tag_end], xfrm, &out[tag_end..]);
+        return Some(out);
+    }
+    if let Some((x, y)) = new_off {
+        let s = out.find("<a:off")?;
+        out = set_tag_attr(&out, s, "x", &x.to_string());
+        let s = out.find("<a:off")?;
+        out = set_tag_attr(&out, s, "y", &y.to_string());
+    }
+    if let Some((cx, cy)) = new_ext {
+        match out.find("<a:ext") {
+            Some(s) => {
+                out = set_tag_attr(&out, s, "cx", &cx.to_string());
+                let s = out.find("<a:ext")?;
+                out = set_tag_attr(&out, s, "cy", &cy.to_string());
+            }
+            None => {
+                // off without ext: add the ext right after the off tag.
+                let s = out.find("<a:off")?;
+                let (_, _, e, _, _) = next_tag(&out, s)?;
+                out = format!(
+                    "{}<a:ext cx=\"{cx}\" cy=\"{cy}\"/>{}",
+                    &out[..e],
+                    &out[e..]
+                );
+            }
+        }
+    }
+    Some(out)
+}
+
+fn content_type_for(ext: &str) -> &'static str {
+    match ext {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        "emf" => "image/x-emf",
+        "wmf" => "image/x-wmf",
+        "tif" | "tiff" => "image/tiff",
+        _ => "application/octet-stream",
+    }
+}
+
+fn ensure_content_type(pkg: &mut Package, ext: &str) {
+    let Ok(ct) = pkg.get_text(CONTENT_TYPES) else {
+        return;
+    };
+    if ct.contains(&format!("Extension=\"{ext}\"")) {
+        return;
+    }
+    let Some(pos) = ct.find("</Types>") else {
+        return;
+    };
+    let add = format!(
+        "<Default Extension=\"{ext}\" ContentType=\"{}\"/>",
+        content_type_for(ext)
+    );
+    let out = format!("{}{}{}", &ct[..pos], add, &ct[pos..]);
+    pkg.parts.insert(CONTENT_TYPES.to_string(), out.into_bytes());
+}
+
+/// Repoint a picture element at a freshly stored media part. The new
+/// part is named by content hash, so identical replacements converge
+/// and no existing part is ever mutated in place. Returns false when
+/// the element has no resolvable image relationship.
+fn op_replace_pic(
+    pkg: &mut Package,
+    slide_part: &str,
+    xml: &str,
+    el: usize,
+    bytes: &[u8],
+    ext: &str,
+) -> bool {
+    let Some((s, e)) = element_span(xml, el) else {
+        return false;
+    };
+    let block = &xml[s..e];
+    let Some(rs) = block.find("r:embed=\"") else {
+        return false;
+    };
+    let rid_start = rs + "r:embed=\"".len();
+    let Some(re) = block[rid_start..].find('"') else {
+        return false;
+    };
+    let rid = block[rid_start..rid_start + re].to_string();
+    let (dir, file) = match slide_part.rsplit_once('/') {
+        Some(v) => v,
+        None => return false,
+    };
+    let rels_part = format!("{dir}/_rels/{file}.rels");
+    let Ok(rels_xml) = pkg.get_text(&rels_part) else {
+        return false;
+    };
+    if !parse_rels(&rels_xml).iter().any(|r| r.id == rid) {
+        return false;
+    }
+    let mut h = Sha256::new();
+    h.update(bytes);
+    let hex = format!("{:x}", h.finalize());
+    let part = format!("ppt/media/qimu_{}.{}", &hex[..16], ext);
+    if !pkg.parts.contains_key(&part) {
+        pkg.parts.insert(part.clone(), bytes.to_vec());
+    }
+    ensure_content_type(pkg, ext);
+    // Rewrite the relationship target to the new part.
+    let mut new_rels = rels_xml.clone();
+    let mut pos = 0usize;
+    while let Some((name, ts, te, _, _)) = next_tag(&new_rels, pos) {
+        pos = te;
+        if name == "Relationship"
+            && attr(&new_rels[ts..te], "Id") == Some(rid.as_str())
+        {
+            let file_name = part.rsplit('/').next().unwrap_or(&part);
+            new_rels = set_tag_attr(&new_rels, ts, "Target", &format!("../media/{file_name}"));
+            break;
+        }
+    }
+    if new_rels == rels_xml {
+        return false;
+    }
+    pkg.parts.insert(rels_part, new_rels.into_bytes());
+    true
+}
+
+/// Apply a batch of element operations to one slide of the package.
+/// Returns the number of operations that actually changed something.
+pub fn apply_slide_ops(
+    pkg: &mut Package,
+    slide_idx: usize,
+    ops: &[SlideOp],
+) -> PptxResult<usize> {
+    if ops.is_empty() {
+        return Ok(0);
+    }
+    let refs = slides(pkg)?;
+    let sref = refs
+        .get(slide_idx)
+        .ok_or_else(|| format!("slide index {slide_idx} out of range"))?;
+    let part = sref.part.clone();
+    let mut xml = pkg.get_text(&part)?;
+    let mut applied = 0usize;
+    for op in ops {
+        let next: Option<String> = match op {
+            SlideOp::ReplacePic { el, bytes, ext } => {
+                if op_replace_pic(pkg, &part, &xml, *el, bytes, ext) {
+                    applied += 1;
+                }
+                continue;
+            }
+            SlideOp::SetText { el, para, run, text } => {
+                element_span(&xml, *el).and_then(|(s, e)| {
+                    op_set_text(&xml[s..e], *para, *run, text)
+                        .map(|nb| splice(&xml, (s, e), &nb))
+                })
+            }
+            SlideOp::SetStyle { el, para, run, sz, b, color } => {
+                element_span(&xml, *el).and_then(|(s, e)| {
+                    op_set_style(&xml[s..e], *para, *run, *sz, *b, color.clone())
+                        .map(|nb| splice(&xml, (s, e), &nb))
+                })
+            }
+            SlideOp::AddPara { el, after, text } => {
+                element_span(&xml, *el).and_then(|(s, e)| {
+                    op_add_para(&xml[s..e], *after, text).map(|nb| splice(&xml, (s, e), &nb))
+                })
+            }
+            SlideOp::DeletePara { el, para } => {
+                element_span(&xml, *el).and_then(|(s, e)| {
+                    op_delete_para(&xml[s..e], *para).map(|nb| splice(&xml, (s, e), &nb))
+                })
+            }
+            SlideOp::AddRun { el, para, text } => {
+                element_span(&xml, *el).and_then(|(s, e)| {
+                    op_add_run(&xml[s..e], *para, text).map(|nb| splice(&xml, (s, e), &nb))
+                })
+            }
+            SlideOp::DeleteRun { el, para, run } => {
+                element_span(&xml, *el).and_then(|(s, e)| {
+                    op_delete_run(&xml[s..e], *para, *run).map(|nb| splice(&xml, (s, e), &nb))
+                })
+            }
+            SlideOp::Move { el, x, y } => element_span(&xml, *el).and_then(|(s, e)| {
+                op_move_resize(&xml[s..e], Some((*x, *y)), None)
+                    .map(|nb| splice(&xml, (s, e), &nb))
+            }),
+            SlideOp::Resize { el, cx, cy } => element_span(&xml, *el).and_then(|(s, e)| {
+                op_move_resize(&xml[s..e], None, Some((*cx, *cy)))
+                    .map(|nb| splice(&xml, (s, e), &nb))
+            }),
+        };
+        if let Some(nx) = next {
+            if nx != xml {
+                xml = nx;
+                applied += 1;
+            }
+        }
+    }
+    if applied > 0 {
+        pkg.parts.insert(part, xml.into_bytes());
+    }
     Ok(applied)
 }

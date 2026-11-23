@@ -14,20 +14,28 @@ license.workspace = true
 deckcraft-sections = []
 
 [dependencies]
-zip = "2"
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 argon2 = "0.5"
 rand = "0.8"
-# storytold/craft-libs (MIT OR Apache-2.0), pinned git rev — see design/组件接入台账.md
-# NOTE (P0, PLAN §7 risk 1 / §8 decision 2): craft-atomic has no
-# counterpart in DeckCraft's dependency graph, so it is NOT part of
-# the DeckCraft-baseline alignment and stays on 0c144b7. The aligned
-# crates (craft-ui / craft-update / craft-i18n -> 63196e6) are pinned
-# in qimu-client's manifest.
-craft-atomic = { git = "https://github.com/storytold/craft-libs", rev = "0c144b7d983899d4b5b281046dd03a8b1ab35fbb" }
+# craft-libs (upstream storytold/craft-libs, consumed from our fork
+# lanline123/craft-libs; MIT OR Apache-2.0), pinned git rev — see
+# design/组件接入台账.md. Phase 1 (route plan §5 stage 1): the root
+# [patch] tables redirect every craft-libs request in the graph to
+# the vendor/craft-libs submodule, so this pin documents the baseline
+# rev while the build compiles the submodule copy. The P0 note that
+# kept craft-atomic apart on 0c144b7 is retired: atomic converges
+# with the whole graph (route plan §6 item 2).
+craft-atomic = { git = "https://github.com/lanline123/craft-libs", rev = "b9c7b6970382acb1da090d83eb21e51f7006763a" }
+# Phase 3: the PPTX file layer (ZIP + XML + OPC) moves to craft-opc /
+# craft-xml (craft-zip is craft-opc's archive engine). Pinned at the
+# craft-libs rev the pending baseline convergence (fork-sync bump)
+# targets for every craft crate, so the convergence only has to
+# redirect the source to the lanline123 fork at this same rev.
+craft-opc = { git = "https://github.com/lanline123/craft-libs", rev = "b9c7b6970382acb1da090d83eb21e51f7006763a" }
+craft-xml = { git = "https://github.com/lanline123/craft-libs", rev = "b9c7b6970382acb1da090d83eb21e51f7006763a" }
 
 # DeckCraft (lanline123/deckcraft, MIT OR Apache-2.0) enters as a git
 # submodule at vendor/deckcraft (PLAN §4 form 1). P0 wires ONLY the
@@ -38,4 +46,7 @@ craft-atomic = { git = "https://github.com/storytold/craft-libs", rev = "0c144b7
 [dev-dependencies]
 deckcraft-model = { path = "../../vendor/deckcraft/crates/model" }
 deckcraft-pptx = { path = "../../vendor/deckcraft/crates/pptx" }
+# Tests only since Phase 3: the section probe reads parts with it, and
+# the file-layer regression tests build archives with it. Production
+# code reads/writes packages through craft-opc/craft-zip.
 zip = "2"

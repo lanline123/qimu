@@ -17,4 +17,4 @@ serde_json = "1"
 ureq = { version = "2", features = ["json"] }
 base64 = "0.22"
 # storytold/craft-libs (MIT OR Apache-2.0), pinned git rev — see design/组件接入台账.md
-craft-atomic = { git = "https://github.com/storytold/craft-libs", rev = "0c144b7d983899d4b5b281046dd03a8b1ab35fbb" }
+craft-atomic = { git = "https://github.com/lanline123/craft-libs", rev = "b9c7b6970382acb1da090d83eb21e51f7006763a" }

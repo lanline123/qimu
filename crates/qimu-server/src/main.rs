@@ -22,6 +22,9 @@ use std::sync::{Arc, Mutex};
 
 struct AppState {
     store: Mutex<Store>,
+    /// Background AI-translation jobs by id (long decks: clients start
+    /// a job and poll progress instead of blocking on one request).
+    translate_jobs: Mutex<HashMap<String, TranslateJobRec>>,
     data_dir: std::path::PathBuf,
     /// Standalone local-server mode (org-model standalone gap):
     /// tokenless loopback requests act as the seed owner. On only
@@ -468,7 +471,10 @@ async fn languages(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
     let langs: Value = raw
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| json!(["中文", "英语", "日语"]));
-    Ok(Json(json!({ "languages": langs })))
+    Ok(Json(json!({
+        "languages": langs,
+        "codes": load_language_codes(&store),
+    })))
 }
 
 #[derive(Deserialize)]
@@ -619,10 +625,12 @@ impl OpenAiCompat {
         let model_id = ModelId::new(self.model.clone()).map_err(|e| format!("模型名不合法：{e}"))?;
         let mut info = ModelInfo::new(model_id.clone(), self.model.clone());
         info.capabilities = vec![spec];
-        let config = craft_ai_openai::OpenAiConfig::new(format!(
-            "{}/v1",
-            self.endpoint.trim_end_matches('/')
-        ))
+        // The settings field holds the service base (e.g.
+        // https://api.openai.com); tolerate an admin pasting the
+        // /v1-suffixed form instead of failing with /v1/v1 requests.
+        let base = self.endpoint.trim().trim_end_matches('/');
+        let base = base.strip_suffix("/v1").unwrap_or(base);
+        let config = craft_ai_openai::OpenAiConfig::new(format!("{base}/v1"))
         .with_key(SecretString::new(self.api_key.clone()))
         .with_models(vec![info]);
         let provider = craft_ai_openai::OpenAiProvider::new(config)
@@ -713,26 +721,69 @@ struct TranslateReq {
     target_lang: String,
 }
 
-/// Translate one version into a target language: creates (or reuses) the
-/// target rendition and publishes a DRAFT 1.0.0 whose provenance is
-/// recorded in the note and in `ai` page bindings (§3.13/§3.15).
-async fn translate_unit(
-    State(st): State<St>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-    Json(req): Json<TranslateReq>,
-) -> Api<Value> {
-    let user = auth(&st, &headers)?;
+/// Map a `languages` setting entry to the rendition language code.
+/// The setting is edited as display names （中文 / 英语 / 日语）; entries
+/// that already are codes pass through unchanged.
+fn lang_code_of(raw: &str) -> String {
+    match raw.trim() {
+        "中文" | "简体中文" => "zh".to_string(),
+        "英语" | "英文" => "en".to_string(),
+        "日语" | "日文" => "ja".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// The server's configured content languages as rendition codes —
+/// the only legal translation targets.
+fn load_language_codes(store: &qimu_core::store::Store) -> Vec<String> {
+    let raw = store
+        .get_setting("languages")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .unwrap_or_else(|| vec!["中文".into(), "英语".into(), "日语".into()]);
+    let mut codes: Vec<String> = Vec::new();
+    for name in &raw {
+        let code = lang_code_of(name);
+        if !code.is_empty() && !codes.contains(&code) {
+            codes.push(code);
+        }
+    }
+    codes
+}
+
+/// Everything a translation run needs, loaded and validated up front
+/// (capability, language whitelist, provider construction), so the
+/// synchronous endpoint and the background job endpoint share one
+/// pipeline.
+struct TranslatePrep {
+    unit_id: String,
+    src_version: qimu_core::store::VersionRec,
+    src_rendition: qimu_core::store::RenditionRec,
+    frag_bytes: Vec<u8>,
+    glossary: Vec<GlossaryPair>,
+    translator: Box<dyn Translator + Send>,
+    provider_name: String,
+    target_lang: String,
+    author: String,
+}
+
+fn prepare_translate(
+    st: &St,
+    user: &UserRec,
+    unit_id: &str,
+    req: &TranslateReq,
+) -> Result<TranslatePrep, (StatusCode, Json<Value>)> {
     let unit = {
         let store = st.store.lock().unwrap();
-        store.get_unit(&id).map_err(|_| not_found())?
+        store.get_unit(unit_id).map_err(|_| not_found())?
     };
-    need_cap(&st, &user, &unit.group_id, "publish")?;
-    let (src_version, src_rendition, frag_bytes, glossary, provider_cfg) = {
+    need_cap(st, user, &unit.group_id, "publish")?;
+    let (src_version, src_rendition, frag_bytes, glossary, provider_cfg, codes) = {
         let store = st.store.lock().unwrap();
         let v = store.get_version(&req.version_id).map_err(|_| not_found())?;
         let r = store.get_rendition(&v.rendition_id).map_err(bad)?;
-        if r.unit_id != id {
+        if r.unit_id != unit_id {
             return Err(bad("版本不属于该内容块"));
         }
         let bytes = store.file_get(&v.fragment_hash).map_err(bad)?;
@@ -742,35 +793,103 @@ async fn translate_unit(
             r,
             bytes,
             load_glossary(&store),
-            (get("ai_provider"), get("ai_endpoint"), get("ai_model"), get("ai_api_key")),
+            (
+                get("ai_provider"),
+                get("ai_endpoint"),
+                get("ai_model"),
+                get("ai_api_key"),
+            ),
+            load_language_codes(&store),
         )
     };
-    let (provider_name, endpoint, model, api_key) = provider_cfg;
-    let translator: Box<dyn Translator> = match provider_name.as_str() {
+    let target_lang = lang_code_of(&req.target_lang);
+    if !codes.contains(&target_lang) {
+        return Err(bad(format!(
+            "目标语言「{}」不在内容语言清单中（当前清单：{}），请先在设置中维护内容语言",
+            req.target_lang,
+            codes.join("、")
+        )));
+    }
+    let (provider_raw, endpoint, model, api_key) = provider_cfg;
+    let translator: Box<dyn Translator + Send> = match provider_raw.as_str() {
         "openai-compat" => {
             if endpoint.is_empty() || api_key.is_empty() || model.is_empty() {
                 return Err(bad("AI 翻译未配置完整（endpoint / model / api_key），请先在设置中配置，或使用 stub 提供方"));
             }
-            Box::new(OpenAiCompat { endpoint, api_key, model })
+            Box::new(OpenAiCompat {
+                endpoint,
+                api_key,
+                model,
+            })
         }
-        _ => Box::new(qimu_core::translate::StubTranslator),
+        "" | "stub" => Box::new(qimu_core::translate::StubTranslator),
+        other => {
+            return Err(bad(format!(
+                "未知的 AI 提供方「{other}」，请在设置中选择 stub 或 openai-compat"
+            )))
+        }
     };
-    let pkg = Package::load(&frag_bytes).map_err(bad)?;
-    let (mut new_pkg, run_count) = qimu_core::translate::translate_package(
-        &pkg,
-        translator.as_ref(),
-        &req.target_lang,
-        &glossary,
-    )
-    .map_err(bad)?;
+    Ok(TranslatePrep {
+        unit_id: unit_id.to_string(),
+        src_version,
+        src_rendition,
+        frag_bytes,
+        glossary,
+        translator,
+        provider_name: if provider_raw.is_empty() {
+            "stub".to_string()
+        } else {
+            provider_raw
+        },
+        target_lang,
+        author: user.display_name.clone(),
+    })
+}
+
+/// Run a prepared translation: chunked slide-run translation with
+/// glossary enforcement, speaker scripts alongside, then the target
+/// rendition + DRAFT 1.0.0 + `ai` page bindings. Progress is reported
+/// as (done, total) over slide runs + non-empty scripts combined.
+fn run_translate(
+    st: &St,
+    prep: TranslatePrep,
+    on_progress: &mut dyn FnMut(usize, usize),
+) -> Result<Value, (StatusCode, Json<Value>)> {
+    let pkg = Package::load(&prep.frag_bytes).map_err(bad)?;
+    let src_scripts: Vec<String> = prep.src_version.scripts.clone();
+    let non_empty: Vec<String> = src_scripts
+        .iter()
+        .filter(|s| !s.trim().is_empty())
+        .cloned()
+        .collect();
+    let pkg_total = qimu_core::translate::count_translatable_runs(&pkg).map_err(bad)?;
+    let grand_total = pkg_total + non_empty.len();
+    let (mut new_pkg, run_count, mut gloss) = {
+        let mut cb = |d: usize, _t: usize| on_progress(d, grand_total);
+        qimu_core::translate::translate_package_chunked(
+            &pkg,
+            prep.translator.as_ref(),
+            &prep.target_lang,
+            &prep.glossary,
+            &mut cb,
+        )
+        .map_err(bad)?
+    };
     // translate the speaker scripts too, and write them into the notes
-    let src_scripts: Vec<String> = src_version.scripts.clone();
-    let non_empty: Vec<String> = src_scripts.iter().filter(|s| !s.trim().is_empty()).cloned().collect();
     let mut translated_scripts = src_scripts.clone();
     if !non_empty.is_empty() {
-        let out = translator
-            .translate(&non_empty, &req.target_lang, &glossary)
-            .map_err(bad)?;
+        let (out, rep) = {
+            let mut cb = |d: usize, _t: usize| on_progress(pkg_total + d, grand_total);
+            qimu_core::translate::translate_texts_chunked(
+                prep.translator.as_ref(),
+                &non_empty,
+                &prep.target_lang,
+                &prep.glossary,
+                &mut cb,
+            )
+            .map_err(bad)?
+        };
+        gloss.merge(rep);
         let mut it = out.into_iter();
         for s in translated_scripts.iter_mut() {
             if !s.trim().is_empty() {
@@ -786,38 +905,182 @@ async fn translate_unit(
     let new_bytes = new_pkg.to_bytes().map_err(bad)?;
     let store = st.store.lock().unwrap();
     let rend = store
-        .get_or_create_rendition(&id, &src_rendition.form, &req.target_lang)
+        .get_or_create_rendition(&prep.unit_id, &prep.src_rendition.form, &prep.target_lang)
         .map_err(bad)?;
     let version = store
         .insert_version(
             &rend.id,
             SemVer::new(1, 0, 0),
-            src_version.basis_revision,
-            &user.display_name,
+            prep.src_version.basis_revision,
+            &prep.author,
             &format!(
                 "AI 翻译草稿（待校对）· 源 {} v{} · {} 个文本run",
-                src_rendition.lang, src_version.semver, run_count
+                prep.src_rendition.lang, prep.src_version.semver, run_count
             ),
             &new_bytes,
             "draft",
         )
         .map_err(bad)?;
-    for i in 0..src_version.page_count {
+    for i in 0..prep.src_version.page_count {
         let _ = store.add_page_binding(
-            &id,
-            &src_version.id,
+            &prep.unit_id,
+            &prep.src_version.id,
             i,
             &version.id,
             i,
             "ai",
-            &user.display_name,
+            &prep.author,
         );
     }
-    Ok(Json(json!({
+    Ok(json!({
         "version": version,
         "rendition_id": rend.id,
-        "provider": if provider_name.is_empty() { "stub".to_string() } else { provider_name },
+        "provider": prep.provider_name,
         "translated_runs": run_count,
+        "glossary": {
+            "checked": gloss.checked,
+            "repaired": gloss.repaired,
+            "unresolved": gloss.unresolved,
+        },
+    }))
+}
+
+/// Translate one version into a target language: creates (or reuses)
+/// the target rendition and publishes a DRAFT 1.0.0 whose provenance
+/// is recorded in the note and in `ai` page bindings (§3.13/§3.15).
+async fn translate_unit(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<TranslateReq>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let prep = prepare_translate(&st, &user, &id, &req)?;
+    let result = run_translate(&st, prep, &mut |_, _| {})?;
+    Ok(Json(result))
+}
+
+/// One background translation job, polled by the client for progress.
+struct TranslateJobRec {
+    owner: String,
+    state: String, // running | succeeded | failed
+    done: usize,
+    total: usize,
+    error: Option<String>,
+    result: Option<Value>,
+}
+
+async fn start_translate_job(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<TranslateReq>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let prep = prepare_translate(&st, &user, &id, &req)?;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let job_id = format!("tj-{millis}-{seq}");
+    {
+        let mut jobs = st.translate_jobs.lock().unwrap();
+        // Keep only a bounded tail of finished jobs for polling clients.
+        if jobs.len() > 50 {
+            jobs.retain(|_, j| j.state == "running");
+        }
+        jobs.insert(
+            job_id.clone(),
+            TranslateJobRec {
+                owner: user.id.clone(),
+                state: "running".into(),
+                done: 0,
+                total: 0,
+                error: None,
+                result: None,
+            },
+        );
+    }
+    let st2 = st.clone();
+    let jid = job_id.clone();
+    tokio::task::spawn_blocking(move || {
+        let st3 = st2.clone();
+        let jid2 = jid.clone();
+        let mut cb = move |done: usize, total: usize| {
+            if let Ok(mut jobs) = st3.translate_jobs.lock() {
+                if let Some(j) = jobs.get_mut(&jid2) {
+                    j.done = done;
+                    j.total = total;
+                }
+            }
+        };
+        let outcome = run_translate(&st2, prep, &mut cb);
+        if let Ok(mut jobs) = st2.translate_jobs.lock() {
+            if let Some(j) = jobs.get_mut(&jid) {
+                match outcome {
+                    Ok(v) => {
+                        j.state = "succeeded".into();
+                        j.done = j.total;
+                        j.result = Some(v);
+                    }
+                    Err((_, body)) => {
+                        j.state = "failed".into();
+                        j.error = Some(
+                            body.0
+                                .get("error")
+                                .and_then(|e| e.as_str())
+                                .unwrap_or("翻译失败")
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+        }
+    });
+    Ok(Json(json!({ "job_id": job_id, "state": "running" })))
+}
+
+async fn get_translate_job(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let jobs = st.translate_jobs.lock().unwrap();
+    let j = jobs.get(&job_id).ok_or_else(not_found)?;
+    if j.owner != user.id && user.role != "super" {
+        return Err(forbidden());
+    }
+    Ok(Json(json!({
+        "job_id": job_id,
+        "state": j.state,
+        "done": j.done,
+        "total": j.total,
+        "error": j.error,
+        "result": j.result,
+    })))
+}
+
+/// Non-privileged AI configuration signal for clients: which provider
+/// is effective and whether a real one is fully configured. Never
+/// returns the endpoint or the key (those stay behind the super-only
+/// settings endpoint).
+async fn get_ai_status(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
+    let _ = auth(&st, &headers)?;
+    let store = st.store.lock().unwrap();
+    let get = |k: &str| store.get_setting(k).ok().flatten().unwrap_or_default();
+    let p = get("ai_provider");
+    let provider = if p.is_empty() { "stub".to_string() } else { p };
+    let configured = provider == "openai-compat"
+        && !get("ai_endpoint").is_empty()
+        && !get("ai_model").is_empty()
+        && !get("ai_api_key").is_empty();
+    Ok(Json(json!({
+        "provider": provider,
+        "configured": configured,
+        "model": get("ai_model"),
     })))
 }
 
@@ -1356,13 +1619,11 @@ fn render_thumbs(root: &std::path::Path, version_id: &str, frag: &[u8]) -> Resul
     render_thumbs_lo(root, version_id, frag)
 }
 
-/// Render a fragment PPTX to per-slide PNGs with the DeckCraft CLI
-/// (storytold/deckcraft, MIT OR Apache-2.0). Binary resolution:
-/// $QIMU_DECKCRAFT_CLI, then a deckcraft-cli sitting next to this server
-/// executable, then PATH. Scale 0.75 lands near the old pipeline's
-/// 55-DPI page size (733px wide for a 16:9 deck).
-fn render_thumbs_deckcraft(root: &std::path::Path, version_id: &str, frag: &[u8]) -> Result<Vec<Vec<u8>>, String> {
-    let bin = std::env::var("QIMU_DECKCRAFT_CLI")
+/// Resolve the deckcraft-cli binary: $QIMU_DECKCRAFT_CLI, then a
+/// deckcraft-cli sitting next to this server executable, then PATH.
+/// Shared by the thumbnail renderer and the PDF exporter (Q21).
+fn deckcraft_cli_bin() -> String {
+    std::env::var("QIMU_DECKCRAFT_CLI")
         .ok()
         .filter(|s| !s.is_empty())
         .or_else(|| {
@@ -1373,7 +1634,14 @@ fn render_thumbs_deckcraft(root: &std::path::Path, version_id: &str, frag: &[u8]
                 .filter(|p| p.exists())
                 .map(|p| p.display().to_string())
         })
-        .unwrap_or_else(|| "deckcraft-cli".to_string());
+        .unwrap_or_else(|| "deckcraft-cli".to_string())
+}
+
+/// Render a fragment PPTX to per-slide PNGs with the DeckCraft CLI
+/// (storytold/deckcraft, MIT OR Apache-2.0). Scale 0.75 lands near the
+/// old pipeline's 55-DPI page size (733px wide for a 16:9 deck).
+fn render_thumbs_deckcraft(root: &std::path::Path, version_id: &str, frag: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    let bin = deckcraft_cli_bin();
     let work = root.join("thumbs").join(format!(".work-dc-{version_id}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
@@ -2901,7 +3169,18 @@ async fn version_page_text(
         .unwrap_or(0);
     let pkg = Package::load(&bytes).map_err(bad)?;
     let runs = pptx::slide_text_runs(&pkg, page).map_err(bad)?;
-    Ok(Json(json!({ "page": page, "runs": runs })))
+    // v2 editor read side: the slide's element model. A parse failure
+    // degrades to an empty element list (the flat run list above keeps
+    // the v1 editing path alive), never to an error.
+    let (slide_cx, slide_cy) = pptx::slide_size(&pkg);
+    let elements = pptx::slide_elements(&pkg, page).unwrap_or_default();
+    Ok(Json(json!({
+        "page": page,
+        "runs": runs,
+        "slide_cx": slide_cx,
+        "slide_cy": slide_cy,
+        "elements": serde_json::to_value(&elements).unwrap_or(json!([])),
+    })))
 }
 
 #[derive(Deserialize)]
@@ -2914,9 +3193,53 @@ struct PageRunEdit {
 #[derive(Deserialize)]
 struct EditPagesReq {
     edits: Vec<PageRunEdit>,
+    /// v2 element operations (visual editor): text/style per run,
+    /// paragraph & run insertion/deletion, element move/resize and
+    /// picture replacement. Applied after the legacy run edits.
+    #[serde(default)]
+    ops: Vec<PageOpReq>,
     bump: Option<String>, // major | minor | patch (default minor)
     note: Option<String>,
     new_revision: Option<bool>,
+}
+
+/// One v2 element operation. `kind` selects the operation; the rest
+/// are its parameters (see pptx::SlideOp for semantics). Picture
+/// replacement carries the new image as base64 — the same upload
+/// shape as fragment publishing — and the server stores it through
+/// the content-addressed file layer before it enters the package.
+#[derive(Deserialize)]
+struct PageOpReq {
+    kind: String,
+    page: usize,
+    el: usize,
+    para: Option<usize>,
+    run: Option<usize>,
+    text: Option<String>,
+    sz: Option<f32>,
+    b: Option<bool>,
+    color: Option<String>,
+    x: Option<i64>,
+    y: Option<i64>,
+    cx: Option<i64>,
+    cy: Option<i64>,
+    data_base64: Option<String>,
+    ext: Option<String>,
+}
+
+/// Sniff an image format from magic bytes (None = unrecognized).
+fn sniff_image_ext(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
+        Some("png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("jpg")
+    } else if bytes.starts_with(b"GIF8") {
+        Some("gif")
+    } else if bytes.starts_with(b"BM") {
+        Some("bmp")
+    } else {
+        None
+    }
 }
 
 /// Save page-level text edits as a NEW version of the same rendition
@@ -2939,6 +3262,35 @@ async fn edit_version_pages(
         (ver, rend, unit, bytes)
     };
     need_cap(&st, &user, &unit.group_id, "publish")?;
+    // Picture replacements: decode and store the new images through
+    // the file layer first (content-addressed, like every other
+    // fragment), keeping the decoded bytes for the package surgery.
+    let mut pic_bytes: std::collections::HashMap<usize, (Vec<u8>, String)> =
+        std::collections::HashMap::new();
+    for (i, op) in req.ops.iter().enumerate() {
+        if op.kind != "replace_pic" {
+            continue;
+        }
+        let b64 = op
+            .data_base64
+            .as_deref()
+            .ok_or_else(|| bad("替换图片缺少图片数据"))?;
+        let bytes = b64d(b64)?;
+        let sniffed = sniff_image_ext(&bytes)
+            .ok_or_else(|| bad("只支持 PNG / JPEG / GIF / BMP 图片"))?;
+        let ext = match op.ext.as_deref().map(|e| e.to_ascii_lowercase()) {
+            Some(e) if e == sniffed || (e == "jpeg" && sniffed == "jpg") => {
+                sniffed.to_string()
+            }
+            Some(_) => return Err(bad("图片扩展名与实际格式不一致")),
+            None => sniffed.to_string(),
+        };
+        {
+            let store = st.store.lock().unwrap();
+            store.file_put(&bytes).map_err(bad)?;
+        }
+        pic_bytes.insert(i, (bytes, ext));
+    }
     let mut pkg = Package::load(&bytes).map_err(bad)?;
     // Group the flat edit list by page and apply run replacements.
     let mut by_page: std::collections::BTreeMap<usize, Vec<(usize, String)>> =
@@ -2953,8 +3305,71 @@ async fn edit_version_pages(
     for (page, edits) in &by_page {
         applied += pptx::replace_slide_text_runs(&mut pkg, *page, edits).map_err(bad)?;
     }
+    // v2 element operations, grouped by page, in request order (the
+    // client emits them in an index-safe order per element).
+    let mut ops_by_page: std::collections::BTreeMap<usize, Vec<pptx::SlideOp>> =
+        std::collections::BTreeMap::new();
+    for (i, op) in req.ops.iter().enumerate() {
+        let sop = match op.kind.as_str() {
+            "set_text" => pptx::SlideOp::SetText {
+                el: op.el,
+                para: op.para.unwrap_or(0),
+                run: op.run.unwrap_or(0),
+                text: op.text.clone().unwrap_or_default(),
+            },
+            "set_style" => pptx::SlideOp::SetStyle {
+                el: op.el,
+                para: op.para.unwrap_or(0),
+                run: op.run.unwrap_or(0),
+                sz: op.sz,
+                b: op.b,
+                color: op.color.clone(),
+            },
+            "add_para" => pptx::SlideOp::AddPara {
+                el: op.el,
+                after: op.para,
+                text: op.text.clone().unwrap_or_default(),
+            },
+            "del_para" => pptx::SlideOp::DeletePara {
+                el: op.el,
+                para: op.para.unwrap_or(0),
+            },
+            "add_run" => pptx::SlideOp::AddRun {
+                el: op.el,
+                para: op.para.unwrap_or(0),
+                text: op.text.clone().unwrap_or_default(),
+            },
+            "del_run" => pptx::SlideOp::DeleteRun {
+                el: op.el,
+                para: op.para.unwrap_or(0),
+                run: op.run.unwrap_or(0),
+            },
+            "move" => pptx::SlideOp::Move {
+                el: op.el,
+                x: op.x.unwrap_or(0),
+                y: op.y.unwrap_or(0),
+            },
+            "resize" => pptx::SlideOp::Resize {
+                el: op.el,
+                cx: op.cx.unwrap_or(0),
+                cy: op.cy.unwrap_or(0),
+            },
+            "replace_pic" => {
+                let (bytes, ext) = pic_bytes
+                    .get(&i)
+                    .ok_or_else(|| bad("替换图片数据丢失"))?
+                    .clone();
+                pptx::SlideOp::ReplacePic { el: op.el, bytes, ext }
+            }
+            other => return Err(bad(format!("未知编辑操作 {other}"))),
+        };
+        ops_by_page.entry(op.page).or_default().push(sop);
+    }
+    for (page, ops) in &ops_by_page {
+        applied += pptx::apply_slide_ops(&mut pkg, *page, ops).map_err(bad)?;
+    }
     if applied == 0 {
-        return Err(bad("没有可应用的文字修改"));
+        return Err(bad("没有可应用的修改"));
     }
     let frag = pkg.to_bytes().map_err(bad)?;
     let store = st.store.lock().unwrap();
@@ -3321,6 +3736,171 @@ async fn export_showroom(
     })))
 }
 
+/// Convert an assembled deck PPTX to PDF with the DeckCraft CLI
+/// (file.export via `run --export`): the same subprocess pattern as
+/// the thumbnail renderer. `form` picks the file.export layout —
+/// "slides" (one slide per page), "handout" (6 slides per sheet),
+/// "notes" (slide + speaker notes per page); `page` restricts the
+/// export to one 0-based deck page. textLayer is pinned on: the PDF
+/// carries a real (invisible) text layer over the rasterised slide
+/// artwork, so text stays selectable/searchable — the artwork itself
+/// is raster at file.export's default 200 dpi, not vector paths
+/// (deckcraft-pdf's own model; tools/verify_pdf_export.py is the
+/// CI-side evidence gate for exactly this distinction).
+fn deck_to_pdf(
+    root: &std::path::Path,
+    tag: &str,
+    deck: &[u8],
+    form: &str,
+    page: Option<usize>,
+) -> Result<Vec<u8>, String> {
+    let bin = deckcraft_cli_bin();
+    let work = root.join("pdf").join(format!(".work-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+    let cleanup = |work: &std::path::Path| {
+        let _ = std::fs::remove_dir_all(work);
+    };
+    let pptx = work.join("deck.pptx");
+    std::fs::write(&pptx, deck).map_err(|e| e.to_string())?;
+    let out_pdf = work.join("out.pdf");
+    let mut params = json!({ "textLayer": true });
+    match form {
+        "handout" => {
+            params["layout"] = json!("handouts");
+            params["perPage"] = json!(6);
+        }
+        "notes" => {
+            params["layout"] = json!("notes");
+        }
+        _ => {
+            params["layout"] = json!("slides");
+        }
+    }
+    if let Some(p) = page {
+        params["slides"] = json!([p]);
+    }
+    let out = std::process::Command::new(&bin)
+        .arg("run")
+        .arg("--in")
+        .arg(&pptx)
+        .arg("--export")
+        .arg(&out_pdf)
+        .arg("--export-params")
+        .arg(params.to_string())
+        .output()
+        .map_err(|e| format!("启动 deckcraft-cli 失败（{bin}）: {e}"))?;
+    if !out.status.success() || !out_pdf.exists() {
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        cleanup(&work);
+        return Err(format!("deckcraft-cli 导出 PDF 失败: {stderr}"));
+    }
+    let bytes = std::fs::read(&out_pdf).map_err(|e| e.to_string())?;
+    cleanup(&work);
+    if bytes.is_empty() {
+        return Err("DeckCraft 导出未产出 PDF".into());
+    }
+    Ok(bytes)
+}
+
+#[derive(Deserialize)]
+struct PdfExportReq {
+    kind: Option<String>,
+    form: Option<String>,
+    page: Option<usize>,
+    include_notes: Option<bool>,
+}
+
+/// Export a showroom item's deck as PDF (Q21): the same access funnel
+/// as export_showroom (named users by item access; a guest session
+/// only for a live org_public item, always the company edition), then
+/// the assembled deck goes through DeckCraft file.export. `form`:
+/// "slides" (default) | "handout" | "notes"; `page`: one 0-based
+/// deck-global page instead of the whole deck. Coexists with the
+/// PPTX export — build_export is shared, neither path touches the
+/// other's output.
+async fn export_showroom_pdf(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<PdfExportReq>,
+) -> Api<Value> {
+    let form = match req.form.as_deref().unwrap_or("slides") {
+        f @ ("slides" | "handout" | "notes") => f.to_string(),
+        other => return Err(bad(format!("未知 PDF 版式：{other}"))),
+    };
+    let auth_res = auth(&st, &headers);
+    let guest = has_guest_session(&st, &headers);
+    let (entries, source, exporter, kind) = {
+        let store = st.store.lock().unwrap();
+        let item = store
+            .get_showroom(&id)
+            .map_err(bad)?
+            .ok_or_else(|| not_found())?;
+        let exporter: Option<UserRec> = match auth_res {
+            Ok(user) => {
+                if !store.showroom_item_access(&user, &item).map_err(bad)? {
+                    return Err(not_found());
+                }
+                Some(user)
+            }
+            Err(e) => {
+                if !guest || !store.guest_item_visible(&item) {
+                    return Err(e);
+                }
+                None
+            }
+        };
+        let idx_id = item.source_index_id.clone().ok_or_else(|| bad("该条目没有来源索引"))?;
+        let commit = match &item.commit_id {
+            Some(cid) => store.get_commit(cid).map_err(bad)?,
+            None => {
+                let head = store
+                    .branch_head(&idx_id, "main")
+                    .map_err(bad)?
+                    .ok_or_else(|| bad("来源索引尚无提交"))?;
+                store.get_commit(&head).map_err(bad)?
+            }
+        };
+        let source = SourceRef {
+            index_id: idx_id,
+            branch: "main".to_string(),
+            commit_id: commit.id.clone(),
+            tag: None,
+        };
+        // Guests always receive the company edition; named
+        // exporters keep their choice of kind.
+        let kind = if exporter.is_some() {
+            req.kind.as_deref().unwrap_or("personal")
+        } else {
+            "company"
+        };
+        (commit.entries.clone(), source, exporter, kind)
+    };
+    // The notes form is pointless without the speaker scripts written
+    // back into the deck's notes pages, so it implies include_notes.
+    let include_notes = req.include_notes.unwrap_or(form == "notes");
+    let (deck, _manifest, page_count) = build_export(
+        &st,
+        exporter.as_ref(),
+        &entries,
+        Some(source),
+        kind,
+        include_notes,
+    )?;
+    if let Some(p) = req.page {
+        if (p as i64) >= page_count {
+            return Err(bad("页码超出成品页数"));
+        }
+    }
+    let pdf = deck_to_pdf(&st.data_dir, &id, &deck, &form, req.page).map_err(bad)?;
+    Ok(Json(json!({
+        "page_count": if req.page.is_some() { 1 } else { page_count },
+        "form": form,
+        "data_base64": b64e(&pdf),
+    })))
+}
+
 #[derive(Deserialize)]
 struct AssemblyReq {
     name: String,
@@ -3564,6 +4144,7 @@ async fn main() {
     }
     let state: St = Arc::new(AppState {
         store: Mutex::new(store),
+        translate_jobs: Mutex::new(HashMap::new()),
         data_dir: data_dir.clone(),
         standalone,
     });
@@ -3588,6 +4169,9 @@ async fn main() {
         .route("/v1/settings/cache-policy", get(get_cache_policy).put(put_cache_policy))
         .route("/v1/settings/ai", get(get_ai_settings).put(put_ai_settings))
         .route("/v1/units/:id/translate", post(translate_unit))
+        .route("/v1/units/:id/translate-jobs", post(start_translate_job))
+        .route("/v1/translate-jobs/:job_id", get(get_translate_job))
+        .route("/v1/ai/status", get(get_ai_status))
         .route("/v1/folders", get(folders).post(create_folder))
         .route("/v1/folders/:id/rename", post(rename_folder))
         .route("/v1/folders/:id", delete(delete_folder))
@@ -3644,6 +4228,7 @@ async fn main() {
         .route("/v1/versions/:id/page-text", get(version_page_text))
         .route("/v1/versions/:id/edit-pages", post(edit_version_pages))
         .route("/v1/showroom/:id/export", post(export_showroom))
+        .route("/v1/showroom/:id/export-pdf", post(export_showroom_pdf))
         .route("/v1/custom-groups", get(list_custom_groups).post(create_custom_group))
         .route("/v1/custom-groups/:id/members", post(add_custom_group_member))
         .route("/v1/custom-groups/:id/members/remove", post(remove_custom_group_member))

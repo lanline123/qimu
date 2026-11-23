@@ -53,3 +53,45 @@ egui_glow = { git = "https://github.com/storytold/egui.git", rev = "6d518fc79968
 egui_extras = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
 eframe = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
 winit = { git = "https://github.com/storytold/winit.git", rev = "a517b3846ee8457d84ee4975110bfda6797c44dc" }
+
+# ---------------------------------------------------------------------------
+# craft-libs single-baseline convergence (phase 1, route plan §5
+# stage 1). craft-libs is requested by three parties in this graph:
+# qimu itself (member pins name our fork lanline123/craft-libs @
+# b9c7b69), DeckCraft (vendor submodule; its workspace pins
+# storytold/craft-libs at five different revs) and PdfCraft (git
+# dependency; its chain pins storytold/craft-libs @ e2dc681).
+# Same-name/same-version packages from different revs are different
+# crates to rustc, so the graph only converges if every request is
+# redirected to one copy. [patch] applies from the build's root
+# workspace only, hence this restatement here (same pattern as the
+# pdfcraft hayro mirror above). Both source spellings are covered.
+# Crates reached only as workspace-internal path deps inside
+# craft-libs (craft-fonts-build via craft-ui, craft-stream-codecs
+# via craft-pdf, craft-zip via craft-opc/craft-pptx) converge
+# through the submodule workspace itself and need no entry here.
+# Bumps: move the vendor/craft-libs submodule pointer and the
+# member pins together, CI-gated.
+[patch."https://github.com/storytold/craft-libs"]
+craft-atomic = { path = "vendor/craft-libs/crates/atomic" }
+craft-i18n = { path = "vendor/craft-libs/crates/i18n" }
+craft-ui = { path = "vendor/craft-libs/crates/ui" }
+craft-update = { path = "vendor/craft-libs/crates/update" }
+craft-drawingml = { path = "vendor/craft-libs/crates/drawingml" }
+craft-opc = { path = "vendor/craft-libs/crates/opc" }
+craft-xml = { path = "vendor/craft-libs/crates/xml" }
+craft-cfb = { path = "vendor/craft-libs/crates/cfb" }
+craft-pptx = { path = "vendor/craft-libs/crates/pptx" }
+craft-pdf = { path = "vendor/craft-libs/crates/pdf" }
+
+[patch."https://github.com/lanline123/craft-libs"]
+craft-atomic = { path = "vendor/craft-libs/crates/atomic" }
+craft-i18n = { path = "vendor/craft-libs/crates/i18n" }
+craft-ui = { path = "vendor/craft-libs/crates/ui" }
+craft-update = { path = "vendor/craft-libs/crates/update" }
+craft-drawingml = { path = "vendor/craft-libs/crates/drawingml" }
+craft-opc = { path = "vendor/craft-libs/crates/opc" }
+craft-xml = { path = "vendor/craft-libs/crates/xml" }
+craft-cfb = { path = "vendor/craft-libs/crates/cfb" }
+craft-pptx = { path = "vendor/craft-libs/crates/pptx" }
+craft-pdf = { path = "vendor/craft-libs/crates/pdf" }

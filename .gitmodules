@@ -1,3 +1,6 @@
 [submodule "vendor/deckcraft"]
 	path = vendor/deckcraft
 	url = https://github.com/lanline123/deckcraft.git
+[submodule "vendor/craft-libs"]
+	path = vendor/craft-libs
+	url = https://github.com/lanline123/craft-libs.git

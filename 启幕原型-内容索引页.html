@@ -3522,7 +3522,7 @@ function syncBarState(){
  if(sh){
   var st=barSelectedId();
   var shared=st?!!MY_SHARES[curView==='index'?('idx:'+st):st]:false;
-  sh.disabled=!st;
+  sh.disabled=false; /* 状态规则修正：与自身 handler 的 barTargetOrToast 点击提示口径一致，不再以禁用代替目标提示 */
   sh.querySelector('.ic-a').hidden=shared;
   sh.querySelector('.ic-b').hidden=!shared;
   sh.title=shared?'取消分享':'分享给…';
@@ -3535,9 +3535,9 @@ function syncBarState(){
   (INSERT_LINE&&INSERT_LINE.scope==='wall'&&!drillActive())||   /* 长卷竖线锁定＝插入点即锚点 */
   (INSERT_LINE&&INSERT_LINE.scope==='kids'&&drillActive())||    /* 子块卡竖线锁定 */
   (!drillActive()&&!!selectedBlockId()));
- ['sdInfo','sdPull'].forEach(function(id){var b=document.getElementById(id);if(b)b.disabled=wallCtx});
+ var _bi=document.getElementById('sdInfo');if(_bi)_bi.disabled=!(inLight||deckDetailOpen()||deckSelectedId()||(typeof idxSelId!=='undefined'&&idxSelId));var _bp=document.getElementById('sdPull');if(_bp)_bp.disabled=wallCtx; /* 状态规则修正：sdInfo 改按目标判定（有可查看对象即亮），不再按 wall 上下文整组置灰；sdPull 在内容页无可收目标，保留禁用 */
  /* #406 大图预览：预览/放映/演示者/导出这组对「这一页」生效，重新点亮 */
- ['sdPreview','sdExport','sdExportPdf','sdPresent','sdPresenterView'].forEach(function(id){var b=document.getElementById(id);if(b)b.disabled=wallCtx&&!inLight});
+ var _noDeckTarget=!(inLight||deckDetailOpen()||deckSelectedId()||(wallCtx&&typeof drillActive==='function'&&drillActive()&&!!selectedBlockId())||(typeof idxSelId!=='undefined'&&idxSelId));['sdPreview','sdExport','sdExportPdf','sdPresent','sdPresenterView'].forEach(function(id){var b=document.getElementById(id);if(b)b.disabled=_noDeckTarget}); /* 状态规则修正：整组置灰（wallCtx&&!inLight）改为按目标判定——灯箱/详情/选中稿/下钻选中块/索引选中任一存在即整组可点，与各 handler 的 barTargetOrToast 口径一致 */
  var ps=document.getElementById('sdPasteSplit'),pg=document.getElementById('sdPasteGroup');
  if(ps)ps.disabled=!pasteOk;
  if(pg)pg.disabled=!pasteOk;
@@ -3573,7 +3573,7 @@ function syncBarState(){
   dl2.classList.toggle('ready',!dl2.disabled);
   dl2.title=inLight?'删除这一页（以内容块新版本提交，历史保留）':(showSel?'删除选中的演示厅条目':(idxSel?'删除选中的索引（软删除）':'删除选中的内容块'));
  }
- if(!wallCtx){['sdPresent','sdPresenterView','sdInfo'].forEach(function(id){var b=document.getElementById(id);if(b)b.disabled=idxCtx})}
+ if(!wallCtx&&curView==='index'){var _noIdxDeck=!(typeof idxSelId!=='undefined'&&idxSelId);['sdPresent','sdPresenterView','sdInfo'].forEach(function(id){var b=document.getElementById(id);if(b)b.disabled=_noIdxDeck})} /* 状态规则修正：索引页不再整页禁用——索引本身即组装好的稿，选中索引即可演示/查看；仅未选中时禁用（无作用目标） */
  var pl=document.getElementById('sdPull');
  if(pl&&!wallCtx){
   pl.disabled=idxCtx;
@@ -5856,7 +5856,7 @@ document.addEventListener('click',function(ev){
     返回箭头在没有上一层时也变灰 */
  function updateBarAvail(){
   var acts=document.getElementById('deckBarActs');
-  if(acts)acts.classList.toggle('off',!((curView==='show')||deckDetailOpen()||(curView==='index'&&typeof idxSelId!=='undefined'&&!!idxSelId)||(curView==='wall'&&typeof drillActive==='function'&&!drillActive())||(typeof lightCtx==='function'&&lightCtx())));
+  if(acts)acts.classList.toggle('off',!((curView==='show')||deckDetailOpen()||(curView==='index'&&typeof idxSelId!=='undefined'&&!!idxSelId)||(curView==='wall')||(typeof lightCtx==='function'&&lightCtx()))); /* 状态规则修正：内容页下钻中不再整排熄灭——下钻选中态下 syncBarState 已按目标点亮复制/剪切/组合/删除，原 !drillActive 条件与之矛盾（亮着却点不动） */
   var bc=document.getElementById('sdClose');
   if(bc){
    bc.disabled=!(deckDetailOpen()||(pageStack&&pageStack.length)||(typeof drillActive==='function'&&drillActive())||curView!=='home');

@@ -3,5 +3,8 @@ vendor/*
 # DeckCraft is a git submodule (pointer tracked in this repo, PLAN §4
 # form 1); its contents belong to the submodule's own repository.
 !vendor/deckcraft
+# craft-libs is likewise a git submodule (phase 1 single-baseline
+# convergence); its contents belong to the submodule's repository.
+!vendor/craft-libs
 *.pptx
 !docs/*.md

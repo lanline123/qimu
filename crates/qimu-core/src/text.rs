@@ -1,21 +1,20 @@
 //! Text extraction from slide XML: all <a:t> runs, plus a best-effort title
 //! (the text of the first shape). Used for search and card labels.
+//!
+//! Phase 3: extraction parses with craft-xml instead of scanning for
+//! `<a:t>` substrings — text inside comments or CDATA is no longer
+//! picked up, entity and numeric character references are decoded by
+//! the parser, and malformed XML yields no text instead of partial
+//! matches.
 
 pub fn extract_texts(slide_xml: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut rest = slide_xml;
-    while let Some(start) = rest.find("<a:t>") {
-        let after = &rest[start + 5..];
-        match after.find("</a:t>") {
-            Some(end) => {
-                let raw = &after[..end];
-                out.push(unescape(raw));
-                rest = &after[end + 6..];
-            }
-            None => break,
-        }
-    }
-    out
+    let Ok(root) = crate::pptx::parse_xml(slide_xml, "slide part") else {
+        return Vec::new();
+    };
+    root.find_all(craft_xml::Local("t"))
+        .map(|el| el.text().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 pub fn slide_title(slide_xml: &str) -> String {
@@ -36,19 +35,13 @@ pub fn slide_full_text(slide_xml: &str) -> String {
 /// page's body placeholder, paragraphs joined by newlines. Empty when the
 /// slide has no notes or the body is empty.
 pub fn notes_text(pkg: &crate::pptx::Package, slide_part: &str) -> String {
-    let rels_part = {
-        let (dir, file) = match slide_part.rfind('/') {
-            Some(i) => (&slide_part[..i], &slide_part[i + 1..]),
-            None => ("", slide_part),
-        };
-        format!("{dir}/_rels/{file}.rels")
-    };
+    let rels_part = craft_opc::rels_path(slide_part);
     let rels_xml = match pkg.get_text(&rels_part) {
         Ok(x) => x,
         Err(_) => return String::new(),
     };
     let rels = crate::pptx::parse_rels(&rels_xml);
-    let notes_rel = match rels.iter().find(|r| r.raw.contains("/notesSlide")) {
+    let notes_rel = match rels.iter().find(|r| craft_opc::type_is(&r.ty, "notesSlide")) {
         Some(r) => r,
         None => return String::new(),
     };
@@ -57,61 +50,33 @@ pub fn notes_text(pkg: &crate::pptx::Package, slide_part: &str) -> String {
         Ok(x) => x,
         Err(_) => return String::new(),
     };
-    // find the <p:sp> block carrying the body placeholder
-    for block in split_sp_blocks(&xml) {
-        if block.contains("type=\"body\"") {
-            let mut paras = Vec::new();
-            for p in split_paragraphs(block) {
-                let runs = extract_texts(p);
-                if !runs.is_empty() {
-                    paras.push(runs.join(""));
-                }
-            }
-            return paras.join("\n");
+    let Ok(root) = crate::pptx::parse_xml(&xml, &notes_part) else {
+        return String::new();
+    };
+    // The notes page's body placeholder: a shape whose placeholder is
+    // type="body"; its paragraphs' runs, paragraphs joined by newlines.
+    for sp in root.find_all(craft_xml::Local("sp")) {
+        let is_body = sp
+            .descendants()
+            .any(|d| d.is(craft_xml::Local("ph")) && d.attr("type") == Some("body"));
+        if !is_body {
+            continue;
         }
+        let Some(txbody) = sp.find(craft_xml::Local("txBody")) else {
+            continue;
+        };
+        let mut paras = Vec::new();
+        for p in txbody.children(craft_xml::Local("p")) {
+            let runs: Vec<String> = p
+                .find_all(craft_xml::Local("t"))
+                .map(|t| t.text().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !runs.is_empty() {
+                paras.push(runs.join(""));
+            }
+        }
+        return paras.join("\n");
     }
     String::new()
-}
-
-fn split_sp_blocks(xml: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut rest = xml;
-    while let Some(s) = rest.find("<p:sp>") {
-        let after = &rest[s..];
-        match after.find("</p:sp>") {
-            Some(e) => {
-                out.push(&after[..e + 7]);
-                rest = &after[e + 7..];
-            }
-            None => break,
-        }
-    }
-    out
-}
-
-fn split_paragraphs(block: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut rest = block;
-    while let Some(s) = rest.find("<a:p>") {
-        let after = &rest[s..];
-        match after.find("</a:p>") {
-            Some(e) => {
-                out.push(&after[..e + 6]);
-                rest = &after[e + 6..];
-            }
-            None => break,
-        }
-    }
-    if out.is_empty() && block.contains("<a:p/>") {
-        // single empty paragraph — no text
-    }
-    out
-}
-
-fn unescape(s: &str) -> String {
-    s.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&")
 }
