@@ -63,12 +63,12 @@ fn renamed(part: &str, prefix: &str) -> String {
 /// `pptx::rels_xml`), ids preserved; only the target values change
 /// semantically.
 fn rewrite_rels(
-    rels_xml: &str,
+    rels_src: &str,
     owner_old: &str,
     rename_map: &BTreeMap<String, String>,
     base_notes_master: &Option<String>,
 ) -> String {
-    let items: Vec<(String, String, String, bool)> = parse_rels(rels_xml)
+    let items: Vec<(String, String, String, bool)> = parse_rels(rels_src)
         .into_iter()
         .filter_map(|r| {
             if r.external {

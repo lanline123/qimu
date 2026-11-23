@@ -162,6 +162,53 @@ pub(crate) struct Rel {
     pub external: bool,
 }
 
+// NOTE (merge repair): the two string-scanning helpers below are the
+// element-model section's own tools (slide XML is edited as text by
+// slide_elements / apply_slide_ops). They were lost when the phase-3
+// craft-xml rewrite of this file's parsing half replaced the file the
+// editor package was based on; restored verbatim from that package.
+/// Extract `<tag ... />` (or `<tag ...>...</tag>` start-tag) spans containing
+/// `marker`, returning each element's raw text. POC-grade string scanning;
+/// attribute order inside an element is not assumed.
+pub(crate) fn scan_elements<'a>(xml: &'a str, open: &str) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(pos) = rest.find(open) {
+        // Guard against prefix collisions: "<Relationship" must not match
+        // the "<Relationships" root, "<p:sldId" must not match
+        // "<p:sldIdLst". A tag name continuing with a letter/digit means
+        // this is a different, longer element — skip the occurrence.
+        let after_open = &rest[pos + open.len()..];
+        if after_open
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphanumeric())
+            .unwrap_or(false)
+        {
+            rest = after_open;
+            continue;
+        }
+        let start = pos;
+        let after = &rest[start..];
+        // Element ends at "/>" for empty elements (Relationship, Override,
+        // sldId are all empty elements in the parts we scan).
+        if let Some(end) = after.find("/>") {
+            out.push(&after[..end + 2]);
+            rest = &after[end + 2..];
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+pub(crate) fn attr<'a>(element: &'a str, name: &str) -> Option<&'a str> {
+    let pat = format!("{name}=\"");
+    let start = element.find(&pat)? + pat.len();
+    let end = element[start..].find('"')? + start;
+    Some(&element[start..end])
+}
+
 pub(crate) fn parse_rels(xml: &str) -> Vec<Rel> {
     craft_opc::Rels::parse(xml.as_bytes(), "")
         .list
