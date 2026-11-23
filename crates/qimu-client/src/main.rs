@@ -89,7 +89,7 @@ pub const TEXT_MAIN: egui::Color32 = egui::Color32::from_rgb(0xE9, 0xE9, 0xEF);
 pub const TEXT_WEAK: egui::Color32 = egui::Color32::from_rgb(0x8B, 0x8B, 0x97);
 /// Third text tier — derived: --muted at 62% alpha (the prototype
 /// defines only --ink and --muted).
-pub const TEXT_FAINT: egui::Color32 = egui::Color32::from_rgba_unmultiplied(0x8B, 0x8B, 0x97, 158);
+pub const TEXT_FAINT: egui::Color32 = egui::Color32::from_rgba_unmultiplied_const(0x8B, 0x8B, 0x97, 158);
 /// Row/ghost hover fill — the prototype's --panel2 (.tree button:hover).
 pub const HOVER_BG: egui::Color32 = egui::Color32::from_rgb(0x1D, 0x1D, 0x23);
 /// Button hover / pressed / open fill — the prototype's --panel3
@@ -127,7 +127,7 @@ pub const BTN_BG: egui::Color32 = egui::Color32::from_rgb(0x15, 0x15, 0x19);
 /// Selected list-row fill — the prototype's --accent-soft
 /// (rgba(47,107,245,.16); .tree button.active pairs it with accent
 /// text).
-pub const SEL_BG: egui::Color32 = egui::Color32::from_rgba_unmultiplied(0x2F, 0x6B, 0xF5, 41);
+pub const SEL_BG: egui::Color32 = egui::Color32::from_rgba_unmultiplied_const(0x2F, 0x6B, 0xF5, 41);
 /// Layout tokens: page content inset inside a dock frame (the dock
 /// frames carry the panel widths now — 300 left frames, 240 for the
 /// settings nav, per the framework's Default workspace).
@@ -307,23 +307,23 @@ fn chip(ui: &mut egui::Ui, text: &str, fg: egui::Color32, bg: egui::Color32) {
 /// Status chips: the prototype's semantic pairs (fg over its *-soft
 /// bg; gray = --muted on --panel2).
 pub const CHIP_GREEN_FG: egui::Color32 = egui::Color32::from_rgb(0x3F, 0xAE, 0x74);
-pub const CHIP_GREEN_BG: egui::Color32 = egui::Color32::from_rgba_unmultiplied(0x3F, 0xAE, 0x74, 38);
+pub const CHIP_GREEN_BG: egui::Color32 = egui::Color32::from_rgba_unmultiplied_const(0x3F, 0xAE, 0x74, 38);
 pub const CHIP_ORANGE_FG: egui::Color32 = egui::Color32::from_rgb(0xE0, 0x91, 0x3A);
-pub const CHIP_ORANGE_BG: egui::Color32 = egui::Color32::from_rgba_unmultiplied(0xE0, 0x91, 0x3A, 36);
-pub const CHIP_BLUE_BG: egui::Color32 = egui::Color32::from_rgba_unmultiplied(0x5B, 0x8C, 0xFF, 41);
+pub const CHIP_ORANGE_BG: egui::Color32 = egui::Color32::from_rgba_unmultiplied_const(0xE0, 0x91, 0x3A, 36);
+pub const CHIP_BLUE_BG: egui::Color32 = egui::Color32::from_rgba_unmultiplied_const(0x5B, 0x8C, 0xFF, 41);
 pub const CHIP_GRAY_FG: egui::Color32 = egui::Color32::from_rgb(0x8B, 0x8B, 0x97);
 pub const CHIP_GRAY_BG: egui::Color32 = egui::Color32::from_rgb(0x1D, 0x1D, 0x23);
 /// Danger pair — the prototype's --rose / --rose-soft.
 pub const ROSE: egui::Color32 = egui::Color32::from_rgb(0xF2, 0x55, 0x5A);
-pub const ROSE_SOFT_BG: egui::Color32 = egui::Color32::from_rgba_unmultiplied(0xF2, 0x55, 0x5A, 36);
+pub const ROSE_SOFT_BG: egui::Color32 = egui::Color32::from_rgba_unmultiplied_const(0xF2, 0x55, 0x5A, 36);
 /// Accent-soft fill (prototype accent-soft — the same value as
 /// SEL_BG): the Soft segmented selected state and accent-tinted
 /// fills introduced by the five-features line.
-pub const ACCENT_SOFT: egui::Color32 = egui::Color32::from_rgba_unmultiplied(0x2F, 0x6B, 0xF5, 41);
+pub const ACCENT_SOFT: egui::Color32 = egui::Color32::from_rgba_unmultiplied_const(0x2F, 0x6B, 0xF5, 41);
 /// Badge Bad tone: the prototype's --rose over its soft pair
 /// (identical values to ROSE / ROSE_SOFT_BG above).
 pub const BADGE_BAD_FG: egui::Color32 = egui::Color32::from_rgb(0xF2, 0x55, 0x5A);
-pub const BADGE_BAD_BG: egui::Color32 = egui::Color32::from_rgba_unmultiplied(0xF2, 0x55, 0x5A, 36);
+pub const BADGE_BAD_BG: egui::Color32 = egui::Color32::from_rgba_unmultiplied_const(0xF2, 0x55, 0x5A, 36);
 /// Danger button fill (prototype --rose, solid).
 pub const DANGER_BG: egui::Color32 = egui::Color32::from_rgb(0xF2, 0x55, 0x5A);
 
@@ -8328,6 +8328,7 @@ impl App {
     fn confirm_ui(&mut self, ui: &mut egui::Ui, c: ConfirmState) -> Option<Overlay> {
         let mut open = true;
         let mut confirmed = false;
+        let mut cancelled = false;
         egui::Window::new(&c.title)
             .open(&mut open)
             .collapsible(false)
@@ -8348,12 +8349,12 @@ impl App {
                             confirmed = true;
                         }
                         if btn_ghost(ui, tr("取消")).clicked() {
-                            open = false;
+                            cancelled = true;
                         }
                     });
                 });
             });
-        if !open {
+        if !open || cancelled {
             return None;
         }
         if confirmed {
@@ -8418,6 +8419,7 @@ impl App {
     ) -> Option<Overlay> {
         let mut open = true;
         let mut create = false;
+        let mut cancelled = false;
         egui::Window::new(tr("从模板新建"))
             .open(&mut open)
             .collapsible(false)
@@ -8469,12 +8471,12 @@ impl App {
                             create = true;
                         }
                         if btn_ghost(ui, tr("取消")).clicked() {
-                            open = false;
+                            cancelled = true;
                         }
                     });
                 });
             });
-        if !open {
+        if !open || cancelled {
             return None;
         }
         if create {
@@ -8740,7 +8742,7 @@ impl App {
                     y += 22.0;
                     if p.cur + 1 < p.pages.len() {
                         let (nvid, npage) = &p.pages[p.cur + 1];
-                        if let Some(tex) = self.thumb(nvid, *np) {
+                        if let Some(tex) = self.thumb(nvid, *npage) {
                             let w = rail.width() - 28.0;
                             let h = w * tex.size_vec2().y / tex.size_vec2().x.max(1.0);
                             let r = egui::Rect::from_min_size(
@@ -8795,15 +8797,15 @@ impl App {
                 resp.context_menu(|ui| {
                     if ui.button(tr("黑屏")).clicked() {
                         toggle_black = true;
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button(tr("演讲者视图")).clicked() {
                         toggle_speaker = true;
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button(tr("结束放映")).clicked() {
                         exit = true;
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
             });
