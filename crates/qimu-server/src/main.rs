@@ -2930,13 +2930,33 @@ fn resolve_data_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(home).join(".qimu").join("server-data")
 }
 
+/// Startup failures of a double-clicked console app vanish together
+/// with the console window ("闪一下就没"), leaving the user nothing to
+/// report. Print the reason and wait for Enter so it can be read, then
+/// exit non-zero.
+fn fatal_startup(msg: &str) -> ! {
+    eprintln!("启幕服务器启动失败：{msg}");
+    eprintln!("按回车键关闭此窗口。");
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+    std::process::exit(1)
+}
+
 #[tokio::main]
 async fn main() {
     let data_dir = resolve_data_dir();
-    let store = Store::open(&data_dir).expect("open data dir");
+    let store = match Store::open(&data_dir) {
+        Ok(s) => s,
+        Err(e) => fatal_startup(&format!(
+            "无法打开数据目录 {}：{e}（数据库可能被占用，或目录不可写）",
+            data_dir.display()
+        )),
+    };
     if store.user_count().map(|c| c == 0).unwrap_or(false) {
         let pw = std::env::var("QIMU_ADMIN_PASSWORD").unwrap_or_else(|_| "admin12345".to_string());
-        store.ensure_seed(&pw).expect("seed");
+        if let Err(e) = store.ensure_seed(&pw) {
+            fatal_startup(&format!("初始化管理员账号失败：{e}"));
+        }
         println!("首次启动：已创建超级管理员 admin / {pw}（请登录后修改；可用环境变量 QIMU_ADMIN_PASSWORD 指定）");
     }
     let state: St = Arc::new(AppState {
@@ -3031,11 +3051,29 @@ async fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(8730);
     let addr = format!("0.0.0.0:{port}");
-    let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            // Most common cause: another qimu-server is already
+            // running (the installer registers a logon autostart
+            // entry), so a double-clicked second instance has nothing
+            // to do. Say so instead of dying on an expect() panic.
+            let probe = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+            if std::net::TcpStream::connect(probe).is_ok() {
+                fatal_startup(&format!(
+                    "端口 {port} 上已有一个启幕服务器在运行，无需重复启动。\
+                     直接打开客户端连接它即可；若要重启，先关掉已运行的实例。"
+                ));
+            }
+            fatal_startup(&format!("无法监听 {addr}：{e}"))
+        }
+    };
     println!(
         "qimu-server listening on http://{addr} (data dir: {})",
         data_dir.display()
     );
     tokio::spawn(discovery_task(port));
-    axum::serve(listener, app).await.expect("serve");
+    if let Err(e) = axum::serve(listener, app).await {
+        fatal_startup(&format!("服务器运行中断：{e}"));
+    }
 }

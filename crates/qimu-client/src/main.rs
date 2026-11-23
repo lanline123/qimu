@@ -1358,7 +1358,16 @@ fn spawn_local_server(exe: &std::path::Path) -> bool {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        install_cjk_font(&cc.egui_ctx);
+        // A pathological system font must never kill startup: if font
+        // installation panics, continue with egui's bundled fonts.
+        let font_ctx = cc.egui_ctx.clone();
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            install_cjk_font(&font_ctx);
+        }))
+        .is_err()
+        {
+            startup_log("install_cjk_font panicked; continuing with bundled fonts");
+        }
         init_i18n();
         apply_modern_style(&cc.egui_ctx);
         migrate_cache_dir_once();
@@ -2821,7 +2830,7 @@ fn q_seg_pills(ui: &mut egui::Ui, labels: &[&str], selected: usize) -> Option<us
                     .color(if active { egui::Color32::WHITE } else { TEXT_WEAK }),
             )
             .fill(if active { ACCENT } else { BTN_BG })
-            .corner_radius(255)
+            .corner_radius(999)
             .min_size(egui::vec2(0.0, 26.0));
             if ui.add(btn).clicked() && !active {
                 changed = Some(i);
@@ -8219,7 +8228,38 @@ impl App {
     }
 }
 
-fn main() -> eframe::Result<()> {
+/// Append one line to the startup log under ~/.qimu (best effort: a
+/// logging failure must never take the app down with it). The GUI
+/// subsystem has no console, so without this file a startup failure is
+/// a silent vanish ("闪一下就没") with zero evidence left behind.
+fn startup_log(msg: &str) {
+    let dir = qimu_home();
+    let _ = std::fs::create_dir_all(&dir);
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let line = format!("[{secs}] {msg}\n");
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("client-startup.log"))
+        .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+}
+
+/// Route panics into the startup log before the default hook runs, so
+/// a startup panic leaves a diagnosable trace instead of just a flash.
+fn install_panic_logger() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        startup_log(&format!("PANIC: {info}"));
+        default_hook(info);
+    }));
+}
+
+fn main() {
+    install_panic_logger();
+    startup_log("qimu-client starting");
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 900.0])
@@ -8227,11 +8267,28 @@ fn main() -> eframe::Result<()> {
             .with_title("启幕 · PPT 管理器"),
         ..Default::default()
     };
-    eframe::run_native(
+    match eframe::run_native(
         "启幕",
         options,
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
-    )
+    ) {
+        Ok(()) => startup_log("qimu-client exited normally"),
+        Err(e) => {
+            // Previously main returned this Err and the process died
+            // silently (no console under the Windows GUI subsystem).
+            // Leave a log line and tell the user what happened.
+            startup_log(&format!("run_native error: {e:?}"));
+            let log_path = qimu_home().join("client-startup.log");
+            let _ = rfd::MessageDialog::new()
+                .set_level(rfd::MessageLevel::Error)
+                .set_title("启幕启动失败")
+                .set_description(format!(
+                    "图形界面初始化失败：{e}\n\n详细信息已写入日志：{}",
+                    log_path.display()
+                ))
+                .show();
+        }
+    }
 }
 
 #[cfg(test)]
