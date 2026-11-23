@@ -1,0 +1,76 @@
+; 启幕服务器 · 独立 Windows 安装包 (NSIS) —— 第一期分开打包 (2026-11-23)
+; 与客户端安装包 (启幕-客户端.nsi) 完全独立: 服务器装在一台常开的电脑上即可,
+; 客户端不在这台机器上也能用 (从各自的客户端包安装后填本机地址连接)。
+; 服务器只含 qimu-server.exe 一个二进制 + 数据目录 qimu-data (exe 同目录优先)。
+; 构建 (Linux): cp 启幕-服务器.nsi qimu-server-setup.nsi && LC_ALL=C.UTF-8 makensis qimu-server-setup.nsi
+; 产物: 启幕服务器-Setup.exe
+; 二进制来源: win\ 子目录 (windows-gnu release 构建的 qimu-server.exe)
+
+Unicode true
+SetCompressor lzma
+
+!include "MUI2.nsh"
+!include "LogicLib.nsh"
+
+Name "启幕服务器"
+OutFile "启幕服务器-Setup.exe"
+InstallDir "$PROGRAMFILES64\启幕服务器"
+InstallDirRegKey HKLM "Software\QimuServer" "InstallDir"
+RequestExecutionLevel admin
+
+!define PRODUCT "启幕服务器"
+!define VERSION "0.1.0"
+!define PUBLISHER "启幕"
+
+!insertmacro MUI_PAGE_WELCOME
+!insertmacro MUI_PAGE_DIRECTORY
+!insertmacro MUI_PAGE_INSTFILES
+!insertmacro MUI_PAGE_FINISH
+!insertmacro MUI_UNPAGE_CONFIRM
+!insertmacro MUI_UNPAGE_INSTFILES
+!insertmacro MUI_LANGUAGE "SimpChinese"
+
+Function .onInit
+  ${If} ${FileExists} "D:\*.*"
+    StrCpy $INSTDIR "D:\Program Files\启幕服务器"
+  ${EndIf}
+FunctionEnd
+
+Section "启幕服务器" SEC_SERVER
+  SectionIn RO
+  SetOutPath "$INSTDIR"
+  File "win/qimu-server.exe"
+  ; 数据目录预建: 服务器 exe 同目录有 qimu-data 时优先用它
+  CreateDirectory "$INSTDIR\qimu-data"
+  CreateDirectory "$SMPROGRAMS\启幕"
+  CreateShortcut "$SMPROGRAMS\启幕\启幕服务器.lnk" "$INSTDIR\qimu-server.exe"
+  ; 开机自启 (当前用户 Run 项)
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "QimuServer" "$INSTDIR\qimu-server.exe"
+  ; 卸载登记 (独立于客户端包的 QimuClient 项)
+  WriteUninstaller "$INSTDIR\uninstall.exe"
+  WriteRegStr HKLM "Software\QimuServer" "InstallDir" "$INSTDIR"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\QimuServer" "DisplayName" "${PRODUCT}"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\QimuServer" "Publisher" "${PUBLISHER}"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\QimuServer" "DisplayVersion" "${VERSION}"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\QimuServer" "InstallLocation" "$INSTDIR"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\QimuServer" "UninstallString" "$INSTDIR\uninstall.exe"
+  WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\QimuServer" "NoModify" 1
+  WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\QimuServer" "NoRepair" 1
+SectionEnd
+
+Section "Uninstall"
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "QimuServer"
+  Delete "$SMPROGRAMS\启幕\启幕服务器.lnk"
+  RMDir "$SMPROGRAMS\启幕"
+  Delete "$INSTDIR\qimu-server.exe"
+  Delete "$INSTDIR\uninstall.exe"
+  ; 服务器数据默认保留, 询问后才删
+  ${If} ${FileExists} "$INSTDIR\qimu-data\*.*"
+    MessageBox MB_YESNO|MB_DEFBUTTON1 "保留服务器数据 (qimu-data) 吗?$\n$\n选「是」: 保留内容库数据 (推荐, 以后重装还能用)。$\n选「否」: 连同数据一起删除, 不可恢复。" IDYES keep_data
+      RMDir /r "$INSTDIR\qimu-data"
+    keep_data:
+  ${EndIf}
+  RMDir "$INSTDIR"
+  DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\QimuServer"
+  DeleteRegKey HKLM "Software\QimuServer"
+SectionEnd

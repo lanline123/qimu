@@ -66,7 +66,11 @@ fn install_cjk_font(ctx: &egui::Context) {
 /// selection marks, key values and focus; selection is gray, never an
 /// accent flood. State ladder, one step per state (§5): secondary button
 /// #26262B → hover #2C2C2C → pressed #36363C.
-pub const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x2D, 0x8C, 0xEB);
+/// Phase-1 UI alignment (2026-11-23): accent follows the HTML
+/// prototype's --accent #2f6bf5 (user ruling: prototype is the UI
+/// authority). Was design-spec #2D8CEB; deviation logged in the
+/// phase-1 report.
+pub const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x2F, 0x6B, 0xF5);
 pub const ACCENT_DEEP: egui::Color32 = egui::Color32::from_rgb(0x6C, 0xB2, 0xF5);
 /// Side panel fill (#1A1B1F).
 pub const CHROME: egui::Color32 = egui::Color32::from_rgb(0x1A, 0x1B, 0x1F);
@@ -93,7 +97,9 @@ pub const TAB_TEXT: egui::Color32 = egui::Color32::from_rgb(0x9A, 0x9A, 0x9A);
 pub const TAB_TEXT_ACTIVE: egui::Color32 = egui::Color32::from_rgb(0xE3, 0xE3, 0xE3);
 /// Workspace-tab active blue — EffectCraft hot_text #3D8FF5; used
 /// ONLY on the tool row's workspace tabs (text + 2px underline).
-pub const HOT: egui::Color32 = egui::Color32::from_rgb(0x3D, 0x8F, 0xF5);
+/// Aligned to the prototype accent #2f6bf5 in phase 1 (was
+/// EffectCraft's #3D8FF5) so tabs and accents speak one blue.
+pub const HOT: egui::Color32 = egui::Color32::from_rgb(0x2F, 0x6B, 0xF5);
 /// Field border #3A3A3A (toast outline, per the framework's toast).
 pub const FIELD_BORDER: egui::Color32 = egui::Color32::from_rgb(0x3A, 0x3A, 0x3A);
 /// Tool-row vertical separator — EffectCraft separator #343434.
@@ -678,9 +684,11 @@ fn b64d(s: &str) -> Result<Vec<u8>, String> {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Page {
+    Home,
     Showroom,
     Content,
     Index,
+    Trash,
     Settings,
 }
 
@@ -796,6 +804,7 @@ struct App {
     sr_deck: Option<Value>,
     sr_preview: Option<(String, usize)>,
     page: Page,
+    trash_filter: usize, // 0 all | 1 index | 2 content | 3 showroom
     msg: String,
     folders: Vec<Value>,
     groups: Vec<Value>,
@@ -1379,11 +1388,14 @@ impl App {
             sr_deck: None,
             sr_preview: None,
             page: match std::env::var("QIMU_PAGE").as_deref() {
+                Ok("home") => Page::Home,
                 Ok("content") => Page::Content,
                 Ok("index") => Page::Index,
+                Ok("trash") => Page::Trash,
                 Ok("settings") => Page::Settings,
                 _ => Page::Showroom,
             },
+            trash_filter: 0,
             msg: String::new(),
             folders: vec![],
             groups: vec![],
@@ -2773,6 +2785,214 @@ fn workspace_tab(ui: &mut egui::Ui, active: bool, label: &str) -> egui::Response
     resp
 }
 
+/// === Phase-1 unified components (2026-11-23) ===
+/// The HTML prototype grew five button flavours and four segmented
+/// controls; the client standardises on ONE primary button, ONE
+/// ghost button and ONE segmented-pills control. New surfaces (Home,
+/// Trash) are built only from these plus `card_frame()`; the four
+/// legacy pages migrate onto them page by page (see phase-1 report).
+fn q_primary_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(egui::RichText::new(label).size(12.5).color(egui::Color32::WHITE))
+            .fill(ACCENT)
+            .corner_radius(6)
+            .min_size(egui::vec2(0.0, 30.0)),
+    )
+}
+
+fn q_ghost_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(egui::RichText::new(label).size(12.5).color(TEXT_MAIN))
+            .fill(BTN_BG)
+            .corner_radius(6)
+            .min_size(egui::vec2(0.0, 30.0)),
+    )
+}
+
+/// Segmented pills: returns the newly selected index when changed.
+fn q_seg_pills(ui: &mut egui::Ui, labels: &[&str], selected: usize) -> Option<usize> {
+    let mut changed = None;
+    ui.horizontal(|ui| {
+        for (i, label) in labels.iter().enumerate() {
+            let active = i == selected;
+            let btn = egui::Button::new(
+                egui::RichText::new(tr(*label))
+                    .size(12.0)
+                    .color(if active { egui::Color32::WHITE } else { TEXT_WEAK }),
+            )
+            .fill(if active { ACCENT } else { BTN_BG })
+            .corner_radius(999)
+            .min_size(egui::vec2(0.0, 26.0));
+            if ui.add(btn).clicked() && !active {
+                changed = Some(i);
+            }
+        }
+    });
+    changed
+}
+
+impl App {
+    /// Home / launchpad (prototype #homeView): welcome line, the
+    /// four quick-action cards, an at-a-glance count strip and the
+    /// recent-index list. Plain page (no dock workspace): the
+    /// prototype's home is a single scrolling surface, and keeping
+    /// it out of the dock framework keeps the four docked pages'
+    /// layouts untouched. Data comes from the already-loaded app
+    /// state (indexes / units / showroom), so no new requests.
+    fn page_home(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.add_space(18.0);
+            ui.label(
+                egui::RichText::new(tr("欢迎使用启幕"))
+                    .size(22.0)
+                    .color(TEXT_MAIN),
+            );
+            ui.label(
+                egui::RichText::new(tr("PPT 内容管理与原地更新 · 局域网版"))
+                    .size(12.5)
+                    .color(TEXT_WEAK),
+            );
+            ui.add_space(16.0);
+            // Quick actions — the prototype's four launch cards.
+            ui.horizontal_wrapped(|ui| {
+                card_frame().show(ui, |ui| {
+                    ui.set_min_width(180.0);
+                    ui.label(egui::RichText::new(tr("新建索引")).size(14.0).color(TEXT_MAIN));
+                    ui.label(
+                        egui::RichText::new(tr("把内容块编成一份可发布的索引"))
+                            .size(11.5)
+                            .color(TEXT_WEAK),
+                    );
+                    ui.add_space(8.0);
+                    if q_primary_button(ui, tr("去新建")).clicked() {
+                        self.act_new_index();
+                    }
+                });
+                card_frame().show(ui, |ui| {
+                    ui.set_min_width(180.0);
+                    ui.label(egui::RichText::new(tr("导入整稿")).size(14.0).color(TEXT_MAIN));
+                    ui.label(
+                        egui::RichText::new(tr("把一份 PPT 拆成内容块入库"))
+                            .size(11.5)
+                            .color(TEXT_WEAK),
+                    );
+                    ui.add_space(8.0);
+                    if q_primary_button(ui, tr("去导入")).clicked() {
+                        self.page = Page::Content;
+                        self.act_import_ppt();
+                    }
+                });
+                card_frame().show(ui, |ui| {
+                    ui.set_min_width(180.0);
+                    ui.label(egui::RichText::new(tr("打开演示厅")).size(14.0).color(TEXT_MAIN));
+                    ui.label(
+                        egui::RichText::new(tr("浏览已发布的成品与分享"))
+                            .size(11.5)
+                            .color(TEXT_WEAK),
+                    );
+                    ui.add_space(8.0);
+                    if q_primary_button(ui, tr("去演示厅")).clicked() {
+                        self.page = Page::Showroom;
+                    }
+                });
+                card_frame().show(ui, |ui| {
+                    ui.set_min_width(180.0);
+                    ui.label(egui::RichText::new(tr("连接服务器")).size(14.0).color(TEXT_MAIN));
+                    ui.label(
+                        egui::RichText::new(tr("添加或切换启幕服务器地址"))
+                            .size(11.5)
+                            .color(TEXT_WEAK),
+                    );
+                    ui.add_space(8.0);
+                    if q_primary_button(ui, tr("去设置")).clicked() {
+                        self.page = Page::Settings;
+                        self.settings.section = 0;
+                    }
+                });
+            });
+            ui.add_space(16.0);
+            // At-a-glance counts from loaded state.
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} · {} {} · {} {} · {} {}",
+                    tr("当前内容"),
+                    self.indexes.len(),
+                    tr("个索引"),
+                    self.units.len(),
+                    tr("个内容块"),
+                    self.showroom_live.len(),
+                    tr("个演示成品"),
+                ))
+                .size(12.0)
+                .color(TEXT_WEAK),
+            );
+            ui.add_space(14.0);
+            ui.label(egui::RichText::new(tr("最近的索引")).size(14.0).color(TEXT_MAIN));
+            ui.add_space(6.0);
+            if self.indexes.is_empty() {
+                ui.label(
+                    egui::RichText::new(tr("暂无索引。点上方「新建索引」创建第一个。"))
+                        .size(12.0)
+                        .color(TEXT_WEAK),
+                );
+            } else {
+                for idx in self.indexes.iter().take(8) {
+                    let name = s(idx, "name");
+                    if q_ghost_button(ui, &name).clicked() {
+                        self.page = Page::Index;
+                    }
+                    ui.add_space(4.0);
+                }
+            }
+            ui.add_space(18.0);
+        });
+    }
+
+    /// Trash (prototype #trashView): standalone view shell with the
+    /// prototype's three-kind filter. DATA WIRING IS PENDING: the
+    /// server has per-object lifecycle/delete actions but no
+    /// "list deleted items" endpoint yet, so this page renders its
+    /// frame and an honest empty state instead of fabricating rows.
+    /// Tracked in the phase-1 report.
+    fn page_trash(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(tr("回收站")).size(18.0).color(TEXT_MAIN));
+                ui.add_space(12.0);
+                if let Some(i) = q_seg_pills(
+                    ui,
+                    &["全部", "索引", "内容块", "演示成品"],
+                    self.trash_filter,
+                ) {
+                    self.trash_filter = i;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if q_ghost_button(ui, tr("清空回收站")).clicked() {
+                        self.msg = tr("回收站数据接口尚未接通，暂不能清空").into();
+                    }
+                });
+            });
+            ui.add_space(16.0);
+            card_frame().show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(tr("回收站暂无可显示的已删条目"))
+                        .size(13.0)
+                        .color(TEXT_MAIN),
+                );
+                ui.label(
+                    egui::RichText::new(tr(
+                        "说明：已删条目清单接口（服务端）尚未提供，本页先落界面壳；接口到位后此处将列出可恢复 / 可彻底删除的条目。",
+                    ))
+                    .size(11.5)
+                    .color(TEXT_WEAK),
+                );
+            });
+            ui.add_space(14.0);
+        });
+    }
+}
+
 /// Panel permissions inside Qimu workspaces: LOCKED (James
 /// 2026-11-16 — the framework's homepage is a fixed layout, and so
 /// is Qimu's). craft-ui's `Permissions::locked()` clears movable /
@@ -3001,6 +3221,8 @@ impl App {
             Page::Content => self.ws_ct.take(),
             Page::Index => self.ws_ix.take(),
             Page::Settings => self.ws_st.take(),
+            // Home / Trash are plain pages and never reach dock_show.
+            Page::Home | Page::Trash => None,
         }
         .expect("workspace built by the dock_<page> caller");
         let area_id = match page {
@@ -3008,6 +3230,7 @@ impl App {
             Page::Content => "qimu-dock-content",
             Page::Index => "qimu-dock-index",
             Page::Settings => "qimu-dock-settings",
+            Page::Home | Page::Trash => "qimu-dock-plain",
         };
         let body = ui.max_rect();
         let style = qimu_dock_style(ui);
@@ -3039,6 +3262,7 @@ impl App {
             Page::Content => self.ws_ct = Some(ws),
             Page::Index => self.ws_ix = Some(ws),
             Page::Settings => self.ws_st = Some(ws),
+            Page::Home | Page::Trash => {}
         }
     }
 
@@ -3387,9 +3611,11 @@ impl eframe::App for App {
                     ui.menu_button(egui::RichText::new(tr("视图")).size(12.0), |ui| {
                         ui.set_min_width(160.0);
                         for (page, label) in [
+                            (Page::Home, "主页"),
                             (Page::Showroom, "演示厅"),
                             (Page::Content, "内容页"),
                             (Page::Index, "索引页"),
+                            (Page::Trash, "回收站"),
                             (Page::Settings, "设置"),
                         ] {
                             if ui.button(tr(label)).clicked() {
@@ -3490,6 +3716,7 @@ impl eframe::App for App {
                                 self.act_new_index();
                             }
                         }
+                        Page::Home | Page::Trash => {}
                         Page::Settings => {}
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3547,6 +3774,8 @@ impl eframe::App for App {
                             (Page::Index, "索引页"),
                             (Page::Content, "内容页"),
                             (Page::Showroom, "演示厅"),
+                            (Page::Trash, "回收站"),
+                            (Page::Home, "主页"),
                         ] {
                             if workspace_tab(ui, self.page == page, tr(label)).clicked() {
                                 self.page = page;
@@ -3575,9 +3804,11 @@ impl eframe::App for App {
                 }),
             )
             .show(ui, |ui| match self.page {
+                Page::Home => self.page_home(ui),
                 Page::Showroom => self.dock_showroom(ui),
                 Page::Content => self.dock_content(ui),
                 Page::Index => self.dock_index(ui),
+                Page::Trash => self.page_trash(ui),
                 Page::Settings => self.dock_settings(ui),
             });
         self.toast(ui, screen);

@@ -1,3 +1,7 @@
+; 【已停用 · 2026-11-23 第一期分开打包】本脚本是客户端+服务器合一的旧包,
+; 已被同目录的「启幕-客户端.nsi」与「启幕-服务器.nsi」两个独立安装包取代
+; (服务器一个程序、客户端一个程序, 各自安装/卸载)。保留仅备查, 勿再用它出包。
+;
 ; 启幕 Windows 安装包 (NSIS)
 ; 构建 (Linux): cp 启幕.nsi qimu-setup.nsi && LC_ALL=C.UTF-8 makensis qimu-setup.nsi
 ;   - 中文脚本文件名会让 makensis 的 argv 转换失败, 故先拷成 ASCII 名再构建;
