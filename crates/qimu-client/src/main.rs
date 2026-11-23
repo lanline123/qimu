@@ -257,20 +257,21 @@ pub const LINE_34: egui::Color32 = egui::Color32::from_rgb(0x28, 0x28, 0x30);
 pub const ICON_TINT: egui::Color32 = egui::Color32::from_rgb(0x8B, 0x8B, 0x97);
 /// Icon-slot hover fill — the prototype's --panel3 (.icon-btn:hover).
 pub const ICON_HOVER: egui::Color32 = egui::Color32::from_rgb(0x26, 0x26, 0x2E);
-/// Text-field fill — the prototype's --panel (.search input), with
-/// the 1px --line border the prototype draws on inputs.
-pub const FIELD_BG: egui::Color32 = egui::Color32::from_rgb(0x15, 0x15, 0x19);
-/// Secondary button fill — the prototype's --panel (.btn), finished
-/// with the 1px --line border the prototype draws on buttons.
-pub const BTN_BG: egui::Color32 = egui::Color32::from_rgb(0x15, 0x15, 0x19);
+/// Text-field fill — the prototype's --panel2 (skin layer §5:
+/// inputs sit on --panel2 with a 1px --line2 border).
+pub const FIELD_BG: egui::Color32 = egui::Color32::from_rgb(0x1D, 0x1D, 0x23);
+/// Secondary button fill — the prototype's --panel2 (skin layer
+/// §5: .btn rests on --panel2 with a 1px --line2 border, hover
+/// steps to --panel3).
+pub const BTN_BG: egui::Color32 = egui::Color32::from_rgb(0x1D, 0x1D, 0x23);
 /// Selected list-row fill — the prototype's --accent-soft
 /// (rgba(47,107,245,.16); .tree button.active pairs it with accent
 /// text).
 pub const SEL_BG: egui::Color32 = egui::Color32::from_rgba_unmultiplied_const(0x2F, 0x6B, 0xF5, 41);
-/// Layout tokens: page content inset inside a dock frame (the dock
-/// frames carry the panel widths now — 300 left frames, 240 for the
-/// settings nav, per the framework's Default workspace).
-pub const PAGE_PAD_L: f32 = 16.0;
+/// Layout tokens: page content inset inside a dock frame — the
+/// prototype's main padding (20px top / 22px sides); the sidebar
+/// column is 268px on every page (.appbody grid).
+pub const PAGE_PAD_L: f32 = 22.0;
 
 fn apply_modern_style(ctx: &egui::Context) {
     let mut style = (*ctx.global_style()).clone();
@@ -296,8 +297,9 @@ fn apply_modern_style(ctx: &egui::Context) {
     // Windows/dialogs: the prototype's dialog cascade resolves to
     // 10px (18px → 14px → 10px rules of equal specificity, last wins).
     v.window_corner_radius = egui::CornerRadius::same(10);
-    // Menus/popovers take the same 10px tier.
-    v.menu_corner_radius = egui::CornerRadius::same(10);
+    // Menus/popovers take the prototype's menu tier: .ctx-menu /
+    // .edit-menu are 8px.
+    v.menu_corner_radius = egui::CornerRadius::same(8);
     // Shadows live only on windows/popups: the prototype's single
     // --shadow token (0 14px 34px rgba(0,0,0,.5)); cards and chrome
     // layer by brightness + border alone.
@@ -313,11 +315,12 @@ fn apply_modern_style(ctx: &egui::Context) {
         spread: 0,
         color: egui::Color32::from_black_alpha(128),
     };
-    // Widget-level corner radius 10 across the board: the prototype's
-    // control tier (.btn / .search input / .tree button are all 10px).
-    // egui has a single widget radius, so the prototype's 8px
-    // small-control tier (stat chips, seg pills) lives at call sites.
-    let r = egui::CornerRadius::same(10);
+    // Widget-level corner radius 6 across the board: the prototype's
+    // final tightening layer puts every control (.btn, inputs, .tree
+    // button, seg containers, chips) at 6px. egui has a single widget
+    // radius, so the remaining tiers (dialog 10, toast 8, badge 4,
+    // slide 4, pills 999) live at call sites.
+    let r = egui::CornerRadius::same(6);
     for w in [
         &mut v.widgets.noninteractive,
         &mut v.widgets.inactive,
@@ -328,34 +331,35 @@ fn apply_modern_style(ctx: &egui::Context) {
         w.corner_radius = r;
     }
     v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, SEPARATOR);
-    // State ladder (prototype): buttons/fields rest on --panel with
-    // the 1px --line border the prototype draws on .btn and inputs;
-    // button hover steps to --panel3 (.btn:hover), weak/ghost hover
-    // to --panel2 (.tree button:hover); pressed/open sit on --panel3.
-    // State colors apply instantly — no color tweening anywhere.
+    // State ladder (prototype, skin layer §5): buttons/fields rest
+    // on --panel2 with a 1px --line2 border; button hover steps to
+    // --panel3 (.btn:hover), weak/ghost hover to --panel2 (.tree
+    // button:hover); pressed/open sit on --panel3. State colors
+    // apply instantly — no color tweening anywhere.
     v.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
     v.widgets.inactive.bg_fill = BTN_BG;
-    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, SEPARATOR);
+    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, FIELD_BORDER);
     v.widgets.hovered.weak_bg_fill = HOVER_BG;
     v.widgets.hovered.bg_fill = PRESSED_BG;
-    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, SEPARATOR);
+    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, FIELD_BORDER);
     v.widgets.active.weak_bg_fill = PRESSED_BG;
     v.widgets.active.bg_fill = PRESSED_BG;
-    v.widgets.active.bg_stroke = egui::Stroke::new(1.0, SEPARATOR);
+    v.widgets.active.bg_stroke = egui::Stroke::new(1.0, FIELD_BORDER);
     v.widgets.open.weak_bg_fill = HOVER_BG;
     v.widgets.open.bg_fill = PRESSED_BG;
-    v.widgets.open.bg_stroke = egui::Stroke::new(1.0, SEPARATOR);
+    v.widgets.open.bg_stroke = egui::Stroke::new(1.0, FIELD_BORDER);
     style.visuals = v;
     use egui::{FontFamily, FontId, TextStyle};
-    // Type ladder (prototype): ambient text 12.5–13px (.btn 12.5,
-    // body copy 12.5/13), small 11, page titles 17–19 (crumb 18).
+    // Type ladder (prototype): body copy 13.5px (the skin layer's
+    // body rule), controls 12.5 (.btn), small 11, page titles
+    // 17–19 (crumb 18).
     style.text_styles.insert(
         TextStyle::Heading,
         FontId::new(18.0, FontFamily::Proportional),
     );
     style
         .text_styles
-        .insert(TextStyle::Body, FontId::new(12.5, FontFamily::Proportional));
+        .insert(TextStyle::Body, FontId::new(13.5, FontFamily::Proportional));
     style.text_styles.insert(
         TextStyle::Button,
         FontId::new(12.5, FontFamily::Proportional),
@@ -382,7 +386,9 @@ fn apply_modern_style(ctx: &egui::Context) {
     style.spacing.scroll = egui::style::ScrollStyle {
         floating: true,
         bar_width: 10.0,
-        floating_width: 5.0,
+        // The prototype's scrollbar: 10px bar, --panel3 thumb with a
+        // 3px transparent border — a ≈4px visible core, 99px radius.
+        floating_width: 4.0,
         foreground_color: false,
         dormant_background_opacity: 0.0,
         dormant_handle_opacity: 0.5,
@@ -390,21 +396,28 @@ fn apply_modern_style(ctx: &egui::Context) {
         ..Default::default()
     };
     style.spacing.indent = 10.0;
-    style.spacing.window_margin = egui::Margin::same(12);
+    // Dialog bodies take the prototype's .modal-body padding (20px).
+    style.spacing.window_margin = egui::Margin::same(20);
     ctx.set_global_style(style);
 }
 
 /// The one standard card: the prototype's --panel surface over the
-/// --bg canvas, 1px --line hairline as the only finish, 12px radius
-/// (--radius; the final .std-card cascade), 12px inner margin, NO
-/// shadow (the final .std-card rule sets box-shadow:none) —
-/// cover-first layout.
+/// --bg canvas, 1px --line hairline as the only finish, 6px radius
+/// (the final tightening layer puts .std-card and every panel-class
+/// surface at 6px), NO shadow (the final .std-card rule sets
+/// box-shadow:none) — cover-first layout. Inner margin follows the
+/// final .card-body padding (10px top / 12px sides / 11px bottom).
 fn card_frame() -> egui::Frame {
     egui::Frame::NONE
         .fill(CARD_BG)
         .stroke(egui::Stroke::new(1.0, CARD_BORDER))
-        .corner_radius(egui::CornerRadius::same(12))
-        .inner_margin(egui::Margin::same(12))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin {
+            left: 12,
+            right: 12,
+            top: 10,
+            bottom: 11,
+        })
         .shadow(egui::epaint::Shadow {
             offset: [0, 0],
             blur: 0,
@@ -413,11 +426,11 @@ fn card_frame() -> egui::Frame {
         })
 }
 
-/// Index entry (PPT) card variant: the same 12px card tier as every
-/// other card under the prototype (its square corners were a
-/// spec-era deviation); kept as a named variant for its call site.
+/// Index entry (PPT) card variant: the same 6px card tier as every
+/// other card under the prototype's tightening layer; kept as a
+/// named variant for its call site.
 fn card_frame_square() -> egui::Frame {
-    card_frame().corner_radius(egui::CornerRadius::same(12))
+    card_frame().corner_radius(egui::CornerRadius::same(6))
 }
 
 /// Flush variant (no inner margin) for cover-first cards: the cover
@@ -430,14 +443,16 @@ fn card_frame_flush() -> egui::Frame {
 /// Painted manually with an exact-size allocation: a Frame here inherits
 /// whatever layout surrounds it and stretches/wraps unpredictably.
 fn chip(ui: &mut egui::Ui, text: &str, fg: egui::Color32, bg: egui::Color32) {
+    // Badge geometry (prototype .badge, final cascade): 11px text,
+    // 2px/7px padding, 4px radius (tightening layer).
     let font = egui::FontId::new(11.0, egui::FontFamily::Proportional);
     let galley = ui.painter().layout_no_wrap(text.to_string(), font, fg);
-    let size = egui::vec2(galley.size().x + 16.0, 18.0);
+    let size = egui::vec2(galley.size().x + 14.0, 20.0);
     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
     let painter = ui.painter();
-    painter.rect_filled(rect, 9.0, bg);
+    painter.rect_filled(rect, 4.0, bg);
     painter.galley(
-        egui::pos2(rect.min.x + 8.0, rect.center().y - galley.size().y / 2.0),
+        egui::pos2(rect.min.x + 7.0, rect.center().y - galley.size().y / 2.0),
         galley,
         fg,
     );
@@ -455,9 +470,8 @@ pub const CHIP_GRAY_BG: egui::Color32 = egui::Color32::from_rgb(0x1D, 0x1D, 0x23
 /// Danger pair — the prototype's --rose / --rose-soft.
 pub const ROSE: egui::Color32 = egui::Color32::from_rgb(0xF2, 0x55, 0x5A);
 pub const ROSE_SOFT_BG: egui::Color32 = egui::Color32::from_rgba_unmultiplied_const(0xF2, 0x55, 0x5A, 36);
-/// Accent-soft fill (prototype accent-soft — the same value as
-/// SEL_BG): the Soft segmented selected state and accent-tinted
-/// fills introduced by the five-features line.
+/// Accent-soft fill (prototype --accent-soft — the same value as
+/// SEL_BG): the .show-seg selected state and accent-tinted fills.
 pub const ACCENT_SOFT: egui::Color32 = egui::Color32::from_rgba_unmultiplied_const(0x2F, 0x6B, 0xF5, 41);
 /// Badge Bad tone: the prototype's --rose over its soft pair
 /// (identical values to ROSE / ROSE_SOFT_BG above).
@@ -473,7 +487,7 @@ fn text_action(ui: &mut egui::Ui, label: &str, color: egui::Color32, size: f32) 
         egui::Button::new(egui::RichText::new(label).size(size).color(color))
             .fill(egui::Color32::TRANSPARENT)
             .stroke(egui::Stroke::NONE)
-            .corner_radius(egui::CornerRadius::same(10)),
+            .corner_radius(egui::CornerRadius::same(6)),
     )
     .clicked()
 }
@@ -490,31 +504,32 @@ fn text_action_enabled(
         egui::Button::new(egui::RichText::new(label).size(size).color(color))
             .fill(egui::Color32::TRANSPARENT)
             .stroke(egui::Stroke::NONE)
-            .corner_radius(egui::CornerRadius::same(10)),
+            .corner_radius(egui::CornerRadius::same(6)),
     )
     .clicked()
 }
 
 /// Split a nav-panel body rect into (content, footer strip): the
-/// footer is the bottom 30px (EffectCraft's panel footer); content
-/// keeps the panel inner margins — 6px sides, 8px top, 4px above the
-/// footer.
+/// prototype's sidepanel rhythm — .sp-body padding 12px (14px at
+/// the bottom) over a .sp-foot strip (10px top / 14px sides / 12px
+/// bottom around a 28px action row ≈ 42px) with its 1px --line
+/// top border.
 fn nav_split(rect: egui::Rect) -> (egui::Rect, egui::Rect) {
-    let footer = egui::Rect::from_min_max(egui::pos2(rect.min.x, rect.max.y - 30.0), rect.max);
+    let footer = egui::Rect::from_min_max(egui::pos2(rect.min.x, rect.max.y - 42.0), rect.max);
     let content = egui::Rect::from_min_max(
-        egui::pos2(rect.min.x + 6.0, rect.min.y + 8.0),
-        egui::pos2(rect.max.x - 6.0, rect.max.y - 34.0),
+        egui::pos2(rect.min.x + 12.0, rect.min.y + 12.0),
+        egui::pos2(rect.max.x - 12.0, rect.max.y - 42.0),
     );
     (content, footer)
 }
 
-/// Full-width panel row (folder tree / zone list / settings nav):
-/// 24 high — the framework's list density (EffectCraft's project
-/// panel rows are 19; Qimu's rows carry a 14px icon, so 24) —
-/// selected = #2E2F36 gray rounded-4 fill across the whole panel
-/// width (never blue, spec §5). An optional IconPark glyph (14px,
-/// icon tint #B4B4B4) leads the label. Returns the row's response
-/// (click + right-click context menu both hang off it).
+/// Full-width panel row (folder tree / settings nav): the
+/// prototype's .tree button — 28px min height (final compact
+/// layer), 6px radius (tightening layer), ink text at rest, hover
+/// --panel2, selected = --accent-soft fill with accent text. An
+/// optional IconPark glyph (15px, the tree's mask-icon size) leads
+/// the label. Returns the row's response (click + right-click
+/// context menu both hang off it).
 fn tree_row(
     ui: &mut egui::Ui,
     selected: bool,
@@ -525,18 +540,18 @@ fn tree_row(
 ) -> egui::Response {
     let width = ui.available_width();
     let (rect, resp) =
-        ui.allocate_exact_size(egui::vec2(width, 24.0), egui::Sense::click());
+        ui.allocate_exact_size(egui::vec2(width, 28.0), egui::Sense::click());
     let painter = ui.painter();
     if selected {
-        painter.rect_filled(rect, 10.0, SEL_BG);
+        painter.rect_filled(rect, 6.0, SEL_BG);
     } else if resp.hovered() {
-        painter.rect_filled(rect, 10.0, HOVER_BG);
+        painter.rect_filled(rect, 6.0, HOVER_BG);
     }
     let mut tx = rect.min.x + 10.0 + indent;
     if let Some(tex) = icon {
         let ir = egui::Rect::from_min_size(
-            egui::pos2(tx, rect.center().y - 7.0),
-            egui::vec2(14.0, 14.0),
+            egui::pos2(tx, rect.center().y - 7.5),
+            egui::vec2(15.0, 15.0),
         );
         painter.image(
             tex,
@@ -544,27 +559,28 @@ fn tree_row(
             egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
             ICON_TINT,
         );
-        tx += 14.0 + 6.0;
+        tx += 15.0 + 6.0;
     }
     let font = egui::FontId::new(size, egui::FontFamily::Proportional);
-    let color = if selected { ACCENT } else { TEXT_WEAK };
+    let color = if selected { ACCENT } else { TEXT_MAIN };
     let galley = painter.layout_no_wrap(label.to_string(), font, color);
     let ty = rect.center().y - galley.size().y / 2.0;
     painter.galley(egui::pos2(tx, ty), galley, color);
     resp
 }
 
-/// Page body padding inside a dock frame, tightened one step with
-/// the frame2 density pass: 16 left/right, 8 top. The fill is the
-/// app canvas: inside a dock frame the panel_bg would otherwise
-/// show through, and the page content is unchanged from the
-/// pre-framework shell, where it sat directly on the canvas.
+/// Page body padding inside a dock frame: the prototype's main
+/// padding — 22px sides, 20px top — with 46px at the bottom, the
+/// --bottombar-h the prototype's content column reserves. The fill
+/// is the app canvas: inside a dock frame the panel_bg would
+/// otherwise show through, and the page content sits directly on
+/// the canvas, as the prototype's content column does.
 fn body_frame() -> egui::Frame {
     egui::Frame::NONE.fill(APP_BG).inner_margin(egui::Margin {
         left: PAGE_PAD_L as i8,
-        right: 16,
-        top: 8,
-        bottom: 12,
+        right: 22,
+        top: 20,
+        bottom: 46,
     })
 }
 
@@ -4263,7 +4279,7 @@ impl App {
                                             .color(egui::Color32::WHITE),
                                     )
                                     .fill(ACCENT)
-                                    .corner_radius(10),
+                                    .corner_radius(6),
                                 )
                                 .clicked()
                         {
@@ -4360,9 +4376,9 @@ impl App {
 
     /// Grid-end add card on the content page: blank block, or a block
     /// whose first version is pasted in from PowerPoint.
-    fn content_add_card(&mut self, ui: &mut egui::Ui) {
+    fn content_add_card(&mut self, ui: &mut egui::Ui, card_w: f32, card_h: f32) {
         let (rect, resp) = ui.allocate_exact_size(
-            egui::vec2(300.0, 258.0),
+            egui::vec2(card_w, card_h),
             egui::Sense::click(),
         );
         ui.painter().rect_stroke(
@@ -4387,7 +4403,7 @@ impl App {
                             [92.0, 28.0],
                             egui::Button::new(egui::RichText::new("新建空白块").size(11.5))
                                 .fill(BTN_BG)
-                                .corner_radius(10),
+                                .corner_radius(6),
                         )
                         .clicked()
                     {
@@ -4398,7 +4414,7 @@ impl App {
                             [104.0, 28.0],
                             egui::Button::new(egui::RichText::new("粘贴 PPT 页新建").size(11.5))
                                 .fill(BTN_BG)
-                                .corner_radius(10),
+                                .corner_radius(6),
                         )
                         .clicked()
                     {
@@ -4530,36 +4546,40 @@ fn i(v: &Value, key: &str) -> i64 {
 
 /// The tool row's vertical separator: 20 high, #343434, with the
 /// framework's 6px breathing room on each side.
+/// Toolbar separator: the prototype's .tool-sep — 1×18px --line
+/// with 5px side margins.
 fn tool_vsep(ui: &mut egui::Ui) {
-    ui.add_space(6.0);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(1.0, 20.0), egui::Sense::hover());
+    ui.add_space(5.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(1.0, 18.0), egui::Sense::hover());
     ui.painter().vline(rect.center().x, rect.y_range(), egui::Stroke::new(1.0, LINE_34));
-    ui.add_space(6.0);
+    ui.add_space(5.0);
 }
 
-/// Workspace tab (tool row, right side): 12.5px text, 26 high;
-/// active = accent text + a 2px underline in the same accent;
-/// inactive = dim text, no fill anywhere.
-fn workspace_tab(ui: &mut egui::Ui, active: bool, label: &str) -> egui::Response {
-    let color = if active { HOT } else { TAB_TEXT };
-    let btn = egui::Button::new(egui::RichText::new(label).size(12.5).color(color))
-        .fill(egui::Color32::TRANSPARENT)
-        .stroke(egui::Stroke::NONE)
-        .corner_radius(egui::CornerRadius::ZERO)
-        .min_size(egui::vec2(0.0, 26.0));
-    let resp = ui.add(btn);
-    if active {
-        let r = resp.rect;
-        ui.painter().rect_filled(
-            egui::Rect::from_min_max(
-                egui::pos2(r.min.x + 8.0, r.max.y - 2.0),
-                egui::pos2(r.max.x - 8.0, r.max.y),
-            ),
-            0.0,
-            HOT,
-        );
-    }
-    resp
+/// Page tab (tool row, right side): the prototype's .pagetabs
+/// form — 28px tall, 6px radius, active = accent fill with white
+/// text, inactive = transparent with muted text. The prototype's
+/// tabs are icon-only; the client's icon set has no glyphs for
+/// 索引 / 回收站 / 设置, so the tabs carry text labels instead
+/// (declared approximation in the alignment report).
+fn page_tab(ui: &mut egui::Ui, active: bool, label: &str) -> egui::Response {
+    let btn = egui::Button::new(
+        egui::RichText::new(label)
+            .size(12.5)
+            .color(if active {
+                egui::Color32::WHITE
+            } else {
+                TAB_TEXT
+            }),
+    )
+    .fill(if active {
+        ACCENT
+    } else {
+        egui::Color32::TRANSPARENT
+    })
+    .stroke(egui::Stroke::NONE)
+    .corner_radius(egui::CornerRadius::same(6))
+    .min_size(egui::vec2(0.0, 28.0));
+    ui.add(btn)
 }
 
 
@@ -4603,7 +4623,7 @@ fn btn_ghost(ui: &mut egui::Ui, label: &str) -> egui::Response {
             .fill(egui::Color32::TRANSPARENT)
             .stroke(egui::Stroke::new(1.0, FIELD_BORDER))
             .corner_radius(6)
-            .min_size(egui::vec2(0.0, 30.0)),
+            .min_size(egui::vec2(0.0, 28.0)),
     )
 }
 
@@ -4614,7 +4634,7 @@ fn btn_ghost_enabled(ui: &mut egui::Ui, enabled: bool, label: &str) -> egui::Res
             .fill(egui::Color32::TRANSPARENT)
             .stroke(egui::Stroke::new(1.0, FIELD_BORDER))
             .corner_radius(6)
-            .min_size(egui::vec2(0.0, 30.0)),
+            .min_size(egui::vec2(0.0, 28.0)),
     )
 }
 
@@ -4623,15 +4643,17 @@ fn btn_danger(ui: &mut egui::Ui, label: &str) -> egui::Response {
         egui::Button::new(egui::RichText::new(label).size(12.5).color(egui::Color32::WHITE))
             .fill(DANGER_BG)
             .corner_radius(6)
-            .min_size(egui::vec2(0.0, 30.0)),
+            .min_size(egui::vec2(0.0, 28.0)),
     )
 }
 
-/// Segmented selected-state styles (A6). The prototype carries
-/// three paradigms whose division of labour is not yet ruled
-/// （未清账清单 #1): pending that rule, NEW surfaces use Soft
-/// （主色软底） and legacy call sites keep Solid through
-/// q_seg_pills. Do not spread a third paradigm.
+/// Segmented selected-state styles (A6), following the
+/// prototype's own division of labour: Soft is the segctl form
+/// （视图/页签切换 — a --panel2 container, neutral --panel3
+/// selected fill); Solid is the accent-filled pill （筛选激活，
+/// the .idx-toolbar filter form) through q_seg_pills. The third
+/// paradigm (accent-soft) belongs to .show-seg, which the
+/// showroom sidebar draws directly.
 #[derive(Clone, Copy, PartialEq)]
 enum SegStyle {
     Solid,
@@ -4647,23 +4669,40 @@ fn segmented(
     match style {
         SegStyle::Solid => q_seg_pills(ui, labels, selected),
         SegStyle::Soft => {
+            // The prototype's segctl: a --panel2 container with a
+            // 1px --line border and a 2px inset; buttons at 6px
+            // radius / 26px min height, selected = --panel3 fill
+            // with ink text, resting = transparent with muted text.
             let mut changed = None;
-            ui.horizontal(|ui| {
-                for (i, label) in labels.iter().enumerate() {
-                    let active = i == selected;
-                    let btn = egui::Button::new(
-                        egui::RichText::new(tr(*label))
-                            .size(12.0)
-                            .color(if active { ACCENT } else { TEXT_WEAK }),
-                    )
-                    .fill(if active { ACCENT_SOFT } else { BTN_BG })
-                    .corner_radius(255)
-                    .min_size(egui::vec2(0.0, 26.0));
-                    if ui.add(btn).clicked() && !active {
-                        changed = Some(i);
-                    }
-                }
-            });
+            egui::Frame::NONE
+                .fill(HOVER_BG)
+                .stroke(egui::Stroke::new(1.0, SEPARATOR))
+                .corner_radius(egui::CornerRadius::same(6))
+                .inner_margin(egui::Margin::same(2))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        for (i, label) in labels.iter().enumerate() {
+                            let active = i == selected;
+                            let btn = egui::Button::new(
+                                egui::RichText::new(tr(*label))
+                                    .size(12.5)
+                                    .color(if active { TEXT_MAIN } else { TEXT_WEAK }),
+                            )
+                            .fill(if active {
+                                PRESSED_BG
+                            } else {
+                                egui::Color32::TRANSPARENT
+                            })
+                            .stroke(egui::Stroke::NONE)
+                            .corner_radius(egui::CornerRadius::same(6))
+                            .min_size(egui::vec2(0.0, 26.0));
+                            if ui.add(btn).clicked() && !active {
+                                changed = Some(i);
+                            }
+                        }
+                    });
+                });
             changed
         }
     }
@@ -4786,8 +4825,8 @@ fn q_primary_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     ui.add(
         egui::Button::new(egui::RichText::new(label).size(12.5).color(egui::Color32::WHITE))
             .fill(ACCENT)
-            .corner_radius(10)
-            .min_size(egui::vec2(0.0, 30.0)),
+            .corner_radius(6)
+            .min_size(egui::vec2(0.0, 28.0)),
     )
 }
 
@@ -4795,8 +4834,8 @@ fn q_ghost_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     ui.add(
         egui::Button::new(egui::RichText::new(label).size(12.5).color(TEXT_MAIN))
             .fill(BTN_BG)
-            .corner_radius(10)
-            .min_size(egui::vec2(0.0, 30.0)),
+            .corner_radius(6)
+            .min_size(egui::vec2(0.0, 28.0)),
     )
 }
 
@@ -4831,20 +4870,30 @@ impl App {
     /// use is recorded on this device (client settings), so the
     /// launcher is fully useful with no server at all.
     fn page_home(&mut self, ui: &mut egui::Ui) {
+        // The prototype's home wrap (.home-wrap, final cascade):
+        // 52px top / 40px sides / 64px bottom, full width.
+        egui::Frame::NONE
+            .inner_margin(egui::Margin {
+                left: 40,
+                right: 40,
+                top: 52,
+                bottom: 64,
+            })
+            .show(ui, |ui| {
         egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.add_space(18.0);
             ui.label(
                 egui::RichText::new(tr("欢迎使用启幕"))
-                    .size(22.0)
+                    .size(30.0)
                     .color(TEXT_MAIN),
             );
+            ui.add_space(4.0);
             ui.label(
                 egui::RichText::new(format!(
                     "{} · 版本 {}",
                     tr("PPT 内容管理与索引系统"),
                     env!("CARGO_PKG_VERSION")
                 ))
-                .size(12.5)
+                .size(13.0)
                 .color(TEXT_WEAK),
             );
             ui.add_space(6.0);
@@ -4897,19 +4946,22 @@ impl App {
                 });
                 ui.add_space(12.0);
             }
-            // The prototype's four launch cards.
+            // The prototype's four launch cards: one row of four
+            // with 12px gaps, the row capped at 980px (.home-actions).
             let mut act: Option<&'static str> = None;
+            let card_w = (ui.available_width().min(980.0) - 36.0) / 4.0;
+            ui.spacing_mut().item_spacing.x = 12.0;
             ui.horizontal_wrapped(|ui| {
-                if self.home_action_card(ui, "icon-doc-add", *ICON_DOC_ADD, tr("新建索引")) {
+                if self.home_action_card(ui, card_w, "icon-doc-add", *ICON_DOC_ADD, tr("新建索引")) {
                     act = Some("new");
                 }
-                if self.home_action_card(ui, "icon-play", *ICON_PLAY, tr("打开示例项目")) {
+                if self.home_action_card(ui, card_w, "icon-play", *ICON_PLAY, tr("打开示例项目")) {
                     act = Some("sample");
                 }
-                if self.home_action_card(ui, "icon-upload", *ICON_UPLOAD, tr("导入素材…")) {
+                if self.home_action_card(ui, card_w, "icon-upload", *ICON_UPLOAD, tr("导入素材…")) {
                     act = Some("import");
                 }
-                if self.home_action_card(ui, "icon-all-apps", *ICON_ALL_APPS, tr("从模板新建")) {
+                if self.home_action_card(ui, card_w, "icon-all-apps", *ICON_ALL_APPS, tr("从模板新建")) {
                     act = Some("template");
                 }
             });
@@ -4949,21 +5001,64 @@ impl App {
                 .size(12.0)
                 .color(TEXT_WEAK),
             );
-            ui.add_space(14.0);
-            ui.label(egui::RichText::new(tr("最近使用")).size(14.0).color(TEXT_MAIN));
+            ui.add_space(38.0);
+            ui.label(egui::RichText::new(tr("最近使用")).size(13.0).color(TEXT_MAIN));
             ui.add_space(6.0);
             let recents = recent_items();
             if recents.is_empty() {
-                ui.label(
-                    egui::RichText::new(tr(
-                        "暂无最近使用。打开过的索引、内容块和演示成品会出现在这里。",
-                    ))
-                    .size(12.0)
-                    .color(TEXT_WEAK),
-                );
+                // The prototype's .hr-empty: centered title + sub
+                // copy with generous vertical padding.
+                ui.add_space(48.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        egui::RichText::new(tr("暂无最近使用"))
+                            .size(13.0)
+                            .color(TEXT_MAIN),
+                    );
+                    ui.add_space(7.0);
+                    ui.label(
+                        egui::RichText::new(tr(
+                            "打开过的索引、内容块和演示成品会出现在这里。",
+                        ))
+                        .size(12.0)
+                        .color(TEXT_WEAK),
+                    );
+                });
+                ui.add_space(48.0);
             } else {
                 // Borderless table (A27): name / kind / version /
-                // last opened; a row click reopens the item.
+                // last opened; a row click reopens the item. The
+                // header row is the prototype's .hr-head: muted
+                // 11.5px labels on the 2.2/1.1/1/1 column grid with
+                // a 1px --line under it.
+                {
+                    let w = ui.available_width();
+                    let (hrect, _) =
+                        ui.allocate_exact_size(egui::vec2(w, 26.0), egui::Sense::hover());
+                    let painter = ui.painter();
+                    let font = egui::FontId::new(11.5, egui::FontFamily::Proportional);
+                    for (text, fx) in [
+                        (tr("名称"), 0.0f32),
+                        (tr("类型"), 2.2 / 5.3),
+                        (tr("版本"), 3.3 / 5.3),
+                        (tr("最近打开"), 4.3 / 5.3),
+                    ] {
+                        let g = painter.layout_no_wrap(text.to_string(), font, TEXT_WEAK);
+                        painter.galley(
+                            egui::pos2(
+                                hrect.min.x + 2.0 + w * fx,
+                                hrect.center().y - g.size().y / 2.0,
+                            ),
+                            g,
+                            TEXT_WEAK,
+                        );
+                    }
+                    painter.hline(
+                        hrect.x_range(),
+                        hrect.max.y - 0.5,
+                        egui::Stroke::new(1.0, SEPARATOR),
+                    );
+                }
                 let mut open: Option<Value> = None;
                 for r in &recents {
                     let (rect, resp) = ui.allocate_exact_size(
@@ -4980,17 +5075,18 @@ impl App {
                         "showroom" => tr("演示成品"),
                         _ => "",
                     };
+                    let w = rect.width();
                     let cols: [(String, f32); 4] = [
-                        (s(r, "title"), 0.0),
-                        (kind_label.to_string(), rect.max.x - 330.0),
-                        (s(r, "ver"), rect.max.x - 240.0),
-                        (fmt_time(i(r, "ms")), rect.max.x - 150.0),
+                        (s(r, "title"), rect.min.x + 2.0),
+                        (kind_label.to_string(), rect.min.x + w * (2.2 / 5.3)),
+                        (s(r, "ver"), rect.min.x + w * (3.3 / 5.3)),
+                        (fmt_time(i(r, "ms")), rect.min.x + w * (4.3 / 5.3)),
                     ];
                     for (j, (text, x)) in cols.iter().enumerate() {
                         let font = egui::FontId::new(12.0, egui::FontFamily::Proportional);
                         let color = if j == 0 { TEXT_MAIN } else { TEXT_WEAK };
                         let g = painter.layout_no_wrap(text.clone(), font, color);
-                        let gx = if j == 0 { rect.min.x + 8.0 } else { *x };
+                        let gx = *x;
                         painter.galley(
                             egui::pos2(gx, rect.center().y - g.size().y / 2.0),
                             g,
@@ -5020,8 +5116,8 @@ impl App {
                     }
                 }
             }
-            ui.add_space(18.0);
         });
+            });
     }
 
     /// One launcher action card (A27): 22px icon + label on a
@@ -5029,19 +5125,20 @@ impl App {
     fn home_action_card(
         &mut self,
         ui: &mut egui::Ui,
+        width: f32,
         name: &'static str,
         bytes: &'static [u8],
         label: &str,
     ) -> bool {
         let tex = self.tex_icon(ui, name, bytes);
         let (rect, resp) =
-            ui.allocate_exact_size(egui::vec2(216.0, 66.0), egui::Sense::click());
+            ui.allocate_exact_size(egui::vec2(width, 66.0), egui::Sense::click());
         let painter = ui.painter();
         let fill = if resp.hovered() { HOVER_BG } else { CARD_BG };
-        painter.rect_filled(rect, 10.0, fill);
+        painter.rect_filled(rect, 6.0, fill);
         painter.rect_stroke(
             rect,
-            10.0,
+            6.0,
             egui::Stroke::new(1.0, CARD_BORDER),
             egui::StrokeKind::Inside,
         );
@@ -5053,7 +5150,7 @@ impl App {
             tex,
             ir,
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-            ICON_TINT,
+            TEXT_MAIN,
         );
         let font = egui::FontId::new(13.5, egui::FontFamily::Proportional);
         let g = painter.layout_no_wrap(label.to_string(), font, TEXT_MAIN);
@@ -5128,11 +5225,11 @@ impl App {
     /// lossless; purge is the only destructive step and always goes
     /// through the Confirm overlay.
     fn page_trash(&mut self, ui: &mut egui::Ui) {
+        body_frame().show(ui, |ui| {
         if self.token.is_none() {
             // Explicit not-connected state (not an error): the trash
             // lives on the server. Local work is unaffected, and the
             // page says exactly what connecting unlocks.
-            ui.add_space(14.0);
             ui.label(egui::RichText::new(tr("回收站")).size(18.0).color(TEXT_MAIN));
             ui.add_space(16.0);
             card_frame().show(ui, |ui| {
@@ -5164,6 +5261,7 @@ impl App {
         } else {
             self.trash_list_ui(ui);
         }
+        });
     }
 
     fn trash_load(&mut self) {
@@ -5263,7 +5361,6 @@ impl App {
         let mut retry = false;
 
         egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.add_space(14.0);
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(tr("回收站")).size(18.0).color(TEXT_MAIN));
                 ui.add_space(12.0);
@@ -5644,7 +5741,15 @@ impl App {
 /// workspace apply keeps resizing working under lock — width
 /// adjustment is not panel movement.
 fn qpanel_permissions(_p: &QPanel) -> craft_ui::docking::Permissions {
-    craft_ui::docking::Permissions::default().locked()
+    // accepts_tabs is cleared on top of locked(): craft-ui draws
+    // NO tab strip for a lone panel whose permissions are
+    // "protected" (!movable && !closable && !accepts_tabs) — and
+    // the prototype's panes have no tab strips: the sidepanel and
+    // the content column are plain bordered surfaces. Drop targets
+    // stay rejected by the workspace lock, as before.
+    let mut p = craft_ui::docking::Permissions::default().locked();
+    p.accepts_tabs = false;
+    p
 }
 
 /// Build a page workspace with its layout root and lock it: the
@@ -5657,21 +5762,23 @@ fn q_workspace(root: craft_ui::docking::Node<QPanel>) -> craft_ui::docking::Work
     ws
 }
 
-/// DockStyle from the framework tokens — the same assignments
-/// EffectCraft's dock_style() makes from its theme: strips and bodies
-/// panel_bg, text #E3E3E3 / inactive #9A9A9A, accent = the focus blue,
-/// floating frames panel_bg, 12px font, 30px tabs, 4px gaps.
-/// Border: from_ui takes egui's noninteractive bg_stroke (#26262B),
-/// which the component then draws around the dock area, every group
-/// and every column — a wireframe the framework's homepage does not
-/// have (its groups are separated only by the 4px app_bg gap), so
+/// DockStyle from the prototype tokens: pane bodies paint their
+/// own surfaces (sidepanel --panel, content --bg), so the area
+/// behind the panes is the canvas itself and the split seam is a
+/// 1px canvas hairline — the closest read of the sidepanel's 1px
+/// --line right border the framework's gap painting can give.
+/// Tab-strip fields stay set but unused: every group is stripless
+/// (see qpanel_permissions), exactly like the prototype's panes.
+/// Border: from_ui takes egui's noninteractive bg_stroke, which
+/// the component then draws around the dock area, every group and
+/// every column — a wireframe the prototype does not have — so
 /// the border is switched off entirely.
 fn qimu_dock_style(ui: &egui::Ui) -> craft_ui::docking::DockStyle {
     let mut style = craft_ui::docking::DockStyle::from_ui(ui);
     style.border = egui::Stroke::NONE;
     style.tab_height = 30.0;
-    style.gap = 4.0;
-    style.background = PANEL_BG;
+    style.gap = 1.0;
+    style.background = APP_BG;
     style.tab_background = PANEL_BG;
     style.active_background = PANEL_BG;
     style.text = TAB_TEXT_ACTIVE;
@@ -5918,7 +6025,7 @@ impl App {
         }
     }
 
-    /// Showroom workspace: left frame 300 fixed (navigation), main
+    /// Showroom workspace: left frame 268 fixed (navigation), main
     /// frame (the wall / deck view); for a super admin with a
     /// non-empty review queue, a bottom frame at ratio 0.72 carries
     /// the queue — the framework Default tree's bottom-frame slot.
@@ -5926,7 +6033,7 @@ impl App {
         let review = self.role() == "super" && !self.showroom_pending.is_empty();
         if self.ws_sr.is_none() || self.ws_sr_review != review {
             let main = q_hsplit(
-                craft_ui::layout::SplitSize::FixedFirst(300.0),
+                craft_ui::layout::SplitSize::FixedFirst(268.0),
                 q_tabs(&[QPanel::SrNav]),
                 q_tabs(&[QPanel::SrMain]),
             );
@@ -5945,7 +6052,7 @@ impl App {
         self.dock_show(ui, Page::Showroom);
     }
 
-    /// Content workspace: folder frame 300 fixed + main frame; with
+    /// Content workspace: folder frame 268 fixed + main frame; with
     /// a block open for maintenance the split gives way to the single
     /// main frame, exactly as the page behaved before the framework.
     fn dock_content(&mut self, ui: &mut egui::Ui) {
@@ -5955,7 +6062,7 @@ impl App {
                 q_tabs(&[QPanel::CtMain])
             } else {
                 q_hsplit(
-                    craft_ui::layout::SplitSize::FixedFirst(300.0),
+                    craft_ui::layout::SplitSize::FixedFirst(268.0),
                     q_tabs(&[QPanel::CtNav]),
                     q_tabs(&[QPanel::CtMain]),
                 )
@@ -5966,7 +6073,7 @@ impl App {
         self.dock_show(ui, Page::Content);
     }
 
-    /// Index workspace: folder frame 300 fixed + main frame; the
+    /// Index workspace: folder frame 268 fixed + main frame; the
     /// create flow takes the whole body, as before.
     fn dock_index(&mut self, ui: &mut egui::Ui) {
         let creating = matches!(self.index.stack.top(), IndexFrame::Create(_));
@@ -5975,7 +6082,7 @@ impl App {
                 q_tabs(&[QPanel::IxMain])
             } else {
                 q_hsplit(
-                    craft_ui::layout::SplitSize::FixedFirst(300.0),
+                    craft_ui::layout::SplitSize::FixedFirst(268.0),
                     q_tabs(&[QPanel::IxNav]),
                     q_tabs(&[QPanel::IxMain]),
                 )
@@ -5986,11 +6093,12 @@ impl App {
         self.dock_show(ui, Page::Index);
     }
 
-    /// Settings workspace: section nav frame 240 fixed + section frame.
+    /// Settings workspace: section nav frame 268 fixed (the
+    /// prototype's one sidepanel width) + section frame.
     fn dock_settings(&mut self, ui: &mut egui::Ui) {
         if self.ws_st.is_none() {
             let root = q_hsplit(
-                craft_ui::layout::SplitSize::FixedFirst(240.0),
+                craft_ui::layout::SplitSize::FixedFirst(268.0),
                 q_tabs(&[QPanel::StNav]),
                 q_tabs(&[QPanel::StMain]),
             );
@@ -5999,22 +6107,23 @@ impl App {
         self.dock_show(ui, Page::Settings);
     }
 
-    /// The framework's status surface: no status bar — a floating
-    /// toast at the screen's bottom-left (16 in, 44 up), panel_bg
-    /// with a field_border outline, radius 6, 12px text, gone after
-    /// 5 seconds. `msg` remains the client's only message channel;
+    /// The status surface: no status bar — a floating toast where
+    /// the prototype puts it: top-right, 14px below the 100px
+    /// chrome (top = --chrome-h + 14 = 114), --panel3 fill with a
+    /// --line2 outline, 8px radius, 13px text, gone after 3.4
+    /// seconds. `msg` remains the client's only message channel;
     /// the toast stamps it when it changes.
-    fn toast(&mut self, ui: &mut egui::Ui, screen: egui::Rect) {
+    fn toast(&mut self, ui: &mut egui::Ui, _screen: egui::Rect) {
         let now = ui.ctx().input(|i| i.time);
         if self.msg != self.toast_msg {
             self.toast_msg = self.msg.clone();
             self.toast_since = now;
         }
-        if self.toast_msg.is_empty() || now - self.toast_since > 5.0 {
+        if self.toast_msg.is_empty() || now - self.toast_since > 3.4 {
             return;
         }
         egui::Area::new(egui::Id::new("qimu_toast"))
-            .fixed_pos(egui::pos2(screen.min.x + 16.0, screen.max.y - 44.0))
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 114.0))
             .order(egui::Order::Foreground)
             .show(ui.ctx(), |ui| {
                 egui::Frame::NONE
@@ -6036,7 +6145,7 @@ impl App {
                     .show(ui, |ui| {
                         ui.label(
                             egui::RichText::new(&self.toast_msg)
-                                .size(12.0)
+                                .size(13.0)
                                 .color(TEXT_MAIN),
                         );
                     });
@@ -6195,19 +6304,66 @@ impl eframe::App for App {
         }
 
 
-        // ==== Main-window framework, replicated from the EffectCraft
-        // source (design/EffectCraft主页布局拆解.md): menu row 24 +
-        // tool row 40 over a craft-ui dock body; no status bar — the
-        // message channel floats as a toast. ====
+        // ==== Main-window chrome, following the HTML prototype's
+        // shell: title bar 32 + menu bar 32 + toolbar 36 = the
+        // prototype's --chrome-h 100px, over a stripless dock body;
+        // no status bar — the message channel floats as a toast.
+        // The title and menu bars sit on --panel, the toolbar on
+        // --bg, each closed by a 1px --line (drawn by hand — the
+        // panels' own separator lines stay off).
+        // ====
         let screen = ui.max_rect();
-        // Row 1 — menu row: pure text menus (File/Edit/... in the
-        // original; Qimu's own commands in the same slots).
+        // Row 1 — title bar (.titlebar): 18px logo, the brand, and
+        // the current page as the dim document label. The window
+        // controls on the prototype's right side are the OS
+        // window's own in the client.
+        egui::Panel::top("title_row")
+            .exact_size(32.0)
+            .frame(egui::Frame::NONE.fill(PANEL_BG))
+            .show_separator_line(false)
+            .show(ui, |ui| {
+                ui.horizontal_centered(|ui| {
+                    self.logo_ui(ui, 18.0);
+                    ui.add_space(7.0);
+                    ui.label(
+                        egui::RichText::new("启幕")
+                            .size(12.0)
+                            .strong()
+                            .color(TEXT_MAIN),
+                    );
+                    ui.add_space(8.0);
+                    let page_name = match self.page {
+                        Page::Home => tr("主页"),
+                        Page::Showroom => tr("演示厅"),
+                        Page::Content => tr("内容页"),
+                        Page::Index => tr("索引页"),
+                        Page::Trash => tr("回收站"),
+                        Page::Settings => tr("设置"),
+                    };
+                    ui.label(egui::RichText::new(page_name).size(12.0).color(TEXT_WEAK));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                                .size(11.5)
+                                .color(TEXT_FAINT),
+                        );
+                    });
+                });
+                let r = ui.max_rect();
+                ui.painter().hline(
+                    r.x_range(),
+                    r.max.y - 0.5,
+                    egui::Stroke::new(1.0, SEPARATOR),
+                );
+            });
+        // Row 2 — menu bar (.menubar-row): the text menus on the
+        // left; on the right, the session cluster in the
+        // prototype's slots — the server and the user as quiet
+        // icon-btn text, sign-in as the .pill-primary, sign-out as
+        // an icon tool.
         egui::Panel::top("menu_row")
-            .exact_size(24.0)
-            .frame(egui::Frame::NONE.fill(HEADER_BG))
-            // No separator line: egui panels draw one by default from
-            // the noninteractive stroke — the framework's menu row
-            // sits directly on the tool row with no line between.
+            .exact_size(32.0)
+            .frame(egui::Frame::NONE.fill(PANEL_BG))
             .show_separator_line(false)
             .show(ui, |ui| {
                 egui::MenuBar::new().ui(ui, |ui| {
@@ -6256,16 +6412,92 @@ impl eframe::App for App {
                             ui.close();
                         }
                     });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if self.user.is_some() {
+                            if self.tool_slot(ui, false, tr("退出"), "power", *ICON_POWER) {
+                                self.logout();
+                            }
+                        } else if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(tr("登录"))
+                                        .size(12.5)
+                                        .color(egui::Color32::WHITE),
+                                )
+                                .fill(ACCENT)
+                                .stroke(egui::Stroke::NONE)
+                                .corner_radius(255)
+                                .min_size(egui::vec2(0.0, 26.0)),
+                            )
+                            .clicked()
+                        {
+                            self.login_open = true;
+                        }
+                        ui.add_space(6.0);
+                        let user_text = if self.user.is_some() {
+                            let name = self
+                                .user
+                                .as_ref()
+                                .map(|u| s(u, "display_name"))
+                                .unwrap_or_default();
+                            format!("{name} · {}", self.role())
+                        } else if self.anon_active() {
+                            format!("匿名 · 已连接 {}", self.active_server_label())
+                        } else {
+                            tr("未登录").to_string()
+                        };
+                        ui.label(
+                            egui::RichText::new(user_text)
+                                .size(12.0)
+                                .color(TEXT_WEAK),
+                        );
+                        ui.add_space(6.0);
+                        // Current server: click cycles through the other
+                        // connected servers, or opens 服务器 settings.
+                        let srv_label = craft_i18n::fmt(
+                            tr("服务器：{name}"),
+                            &[("name", &self.active_server_label())],
+                        );
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(srv_label)
+                                        .size(12.0)
+                                        .color(TEXT_WEAK),
+                                )
+                                .fill(egui::Color32::TRANSPARENT)
+                                .stroke(egui::Stroke::NONE)
+                                .corner_radius(6),
+                            )
+                            .clicked()
+                        {
+                            let connected: Vec<usize> = (0..self.conns.len())
+                                .filter(|&i| self.conns[i].status == ConnStatus::Connected)
+                                .collect();
+                            if connected.len() > 1 {
+                                let cur = self.active.unwrap_or(usize::MAX);
+                                let pos = connected.iter().position(|&i| i == cur).unwrap_or(0);
+                                let next = connected[(pos + 1) % connected.len()];
+                                self.activate(next);
+                            } else {
+                                self.page = Page::Settings;
+                                self.settings.section = 0;
+                            }
+                        }
+                    });
                 });
+                let r = ui.max_rect();
+                ui.painter().hline(
+                    r.x_range(),
+                    r.max.y - 0.5,
+                    egui::Stroke::new(1.0, SEPARATOR),
+                );
             });
-        // Row 2 — tool row: logo, Home slot, separator, the current
-        // page's tool slots (IconPark glyphs); right side: workspace
-        // tabs (the four pages, in the framework's workspace-switch
-        // form), separator, then the server / user / exit cluster.
-        // A 1px app_bg line closes it (drawn by hand below — the
-        // panel's own separator line stays off).
+        // Row 3 — toolbar (.toolbar, on --bg): the current page's
+        // tool slots on the left; on the right, the page tabs in
+        // .pagetabs form, split off by a .tool-sep.
         egui::Panel::top("tool_row")
-            .exact_size(40.0)
+            .exact_size(36.0)
             .show_separator_line(false)
             .frame(
                 egui::Frame::NONE.fill(HEADER_BG).inner_margin(egui::Margin {
@@ -6277,19 +6509,6 @@ impl eframe::App for App {
             )
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
-                    self.logo_ui(ui, 24.0);
-                    ui.add_space(8.0);
-                    if self.tool_slot(
-                        ui,
-                        self.page == Page::Showroom,
-                        tr("演示厅"),
-                        "home",
-                        *ICON_HOME,
-                    ) {
-                        self.page = Page::Showroom;
-                    }
-                    ui.add_space(2.0);
-                    tool_vsep(ui);
                     // Page tool slots: only actions the page already
                     // has (the pages keep their in-body buttons; these
                     // call the same methods) — showroom refreshes,
@@ -6345,74 +6564,7 @@ impl eframe::App for App {
                         Page::Settings => {}
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if self.user.is_some() {
-                            if self.tool_slot(ui, false, tr("退出"), "power", *ICON_POWER) {
-                                self.logout();
-                            }
-                        } else if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new(tr("登录")).size(11.5).color(ACCENT),
-                                )
-                                .fill(BTN_BG)
-                                .corner_radius(10),
-                            )
-                            .clicked()
-                        {
-                            self.login_open = true;
-                        }
-                        ui.add_space(6.0);
-                        let user_text = if self.user.is_some() {
-                            let name = self
-                                .user
-                                .as_ref()
-                                .map(|u| s(u, "display_name"))
-                                .unwrap_or_default();
-                            format!("{name} · {}", self.role())
-                        } else if self.anon_active() {
-                            format!("匿名 · 已连接 {}", self.active_server_label())
-                        } else {
-                            tr("未登录").to_string()
-                        };
-                        ui.label(
-                            egui::RichText::new(user_text)
-                                .size(11.5)
-                                .color(TEXT_WEAK),
-                        );
-                        ui.add_space(6.0);
-                        // Current server: click cycles through the other
-                        // connected servers, or opens 服务器 settings.
-                        let srv_label = craft_i18n::fmt(
-                            tr("服务器：{name}"),
-                            &[("name", &self.active_server_label())],
-                        );
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new(srv_label).size(11.5).color(TEXT_WEAK),
-                                )
-                                .fill(BTN_BG)
-                                .corner_radius(10),
-                            )
-                            .clicked()
-                        {
-                            let connected: Vec<usize> = (0..self.conns.len())
-                                .filter(|&i| self.conns[i].status == ConnStatus::Connected)
-                                .collect();
-                            if connected.len() > 1 {
-                                let cur = self.active.unwrap_or(usize::MAX);
-                                let pos = connected.iter().position(|&i| i == cur).unwrap_or(0);
-                                let next = connected[(pos + 1) % connected.len()];
-                                self.activate(next);
-                            } else {
-                                self.page = Page::Settings;
-                                self.settings.section = 0;
-                            }
-                        }
-                        ui.add_space(10.0);
-                        tool_vsep(ui);
-                        ui.add_space(10.0);
-                        // Workspace tabs, rightmost first (rtl layout):
+                        // Page tabs, rightmost first (rtl layout):
                         // they read 演示厅 → 内容页 → 索引页 → 设置.
                         for (page, label) in [
                             (Page::Settings, "设置"),
@@ -6422,34 +6574,82 @@ impl eframe::App for App {
                             (Page::Trash, "回收站"),
                             (Page::Home, "主页"),
                         ] {
-                            if workspace_tab(ui, self.page == page, tr(label)).clicked() {
+                            if page_tab(ui, self.page == page, tr(label)).clicked() {
                                 self.page = page;
                                 self.deep_source = None;
                                 self.review.jump_source = None;
                             }
                         }
+                        ui.add_space(4.0);
+                        tool_vsep(ui);
                     });
                 });
-                // 1px app_bg line under the tool row (frame.rs paints
-                // the row's bottom edge with app_bg, not a hairline).
                 let r = ui.max_rect();
                 ui.painter().hline(
                     r.x_range(),
                     r.max.y - 0.5,
-                    egui::Stroke::new(1.0, APP_BG),
+                    egui::Stroke::new(1.0, SEPARATOR),
                 );
             });
-        // Body: the dock area, inset 4 left/right, +2 top, −4 bottom
-        // from the window edges (frame.rs), on the app canvas.
+        // Bottom bar (#deckBar): 46px (--bottombar-h) on --panel
+        // with a 1px --line on top, spanning the full width (the
+        // prototype offsets it past the sidebar; egui panels span
+        // the window — declared approximation). The left slot
+        // carries the prototype's page-id chip: the top-level page
+        // number (showroom zones take #2–#5 positionally). The
+        // deck actions the prototype parks on the right live in
+        // the deck view's own bar in the client.
+        egui::Panel::bottom("deck_bar")
+            .exact_size(46.0)
+            .frame(egui::Frame::NONE.fill(PANEL_BG))
+            .show_separator_line(false)
+            .show(ui, |ui| {
+                let r = ui.max_rect();
+                ui.painter().hline(
+                    r.x_range(),
+                    r.min.y + 0.5,
+                    egui::Stroke::new(1.0, SEPARATOR),
+                );
+                ui.horizontal_centered(|ui| {
+                    ui.add_space(22.0);
+                    let pid = match self.page {
+                        Page::Home => "#1",
+                        Page::Showroom => match self.showroom.zone.as_str() {
+                            "library" => "#3",
+                            "inbox" => "#4",
+                            "groups" => "#5",
+                            _ => "#2",
+                        },
+                        Page::Content => "#6",
+                        Page::Index => "#7",
+                        Page::Settings => "#8",
+                        Page::Trash => "#9",
+                    };
+                    egui::Frame::NONE
+                        .fill(HOVER_BG)
+                        .stroke(egui::Stroke::new(1.0, FIELD_BORDER))
+                        .corner_radius(egui::CornerRadius::same(6))
+                        .inner_margin(egui::Margin {
+                            left: 9,
+                            right: 9,
+                            top: 6,
+                            bottom: 6,
+                        })
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(pid)
+                                    .size(11.5)
+                                    .strong()
+                                    .color(TEXT_WEAK),
+                            );
+                        });
+                });
+            });
+        // Body: the dock area, flush with the window edges — the
+        // prototype's .appbody has no outer inset; the panes carry
+        // their own padding.
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::NONE.fill(APP_BG).inner_margin(egui::Margin {
-                    left: 4,
-                    right: 4,
-                    top: 2,
-                    bottom: 4,
-                }),
-            )
+            .frame(egui::Frame::NONE.fill(APP_BG))
             .show(ui, |ui| match self.page {
                 Page::Home => self.page_home(ui),
                 Page::Showroom => self.dock_showroom(ui),
@@ -6901,7 +7101,7 @@ impl App {
             hovered: visuals(ICON_HOVER),
             pressed: None,
             selected: visuals(ICON_HOVER),
-            corner_radius: egui::CornerRadius::same(7),
+            corner_radius: egui::CornerRadius::same(6),
             focus_stroke: egui::Stroke::new(1.0, ACCENT),
         };
         let resp = craft_ui::buttons::IconButton::new(label, egui::vec2(30.0, 30.0), &style)
@@ -6918,11 +7118,12 @@ impl App {
         resp.on_hover_text(label).clicked()
     }
 
-    /// Toolbar slot (framework geometry, decomposition §2): a 26×26
-    /// craft-ui IconButton carrying an IconPark glyph at ≈15px —
-    /// icon tint #B4B4B4 at rest, and the framework's one accent-filled
-    /// state (white glyph on accent) when the slot is the active one.
-    /// The label doubles as tooltip and accessibility name.
+    /// Toolbar slot: a 28×26 craft-ui IconButton carrying an
+    /// IconPark glyph at 15px — the prototype's .tool geometry
+    /// (28×26, 6px radius, muted glyph at rest, --panel3 hover;
+    /// the accent-filled selected state matches .ticon.on /
+    /// .pagetabs.on). The label doubles as tooltip and
+    /// accessibility name.
     fn tool_slot(
         &mut self,
         ui: &mut egui::Ui,
@@ -6944,10 +7145,10 @@ impl App {
             hovered: visuals(ICON_HOVER, ICON_TINT),
             pressed: None,
             selected: visuals(ACCENT, egui::Color32::WHITE),
-            corner_radius: egui::CornerRadius::same(7),
+            corner_radius: egui::CornerRadius::same(6),
             focus_stroke: egui::Stroke::new(1.0, ACCENT),
         };
-        let resp = craft_ui::buttons::IconButton::new(label, egui::vec2(26.0, 26.0), &style)
+        let resp = craft_ui::buttons::IconButton::new(label, egui::vec2(28.0, 26.0), &style)
             .selected(active)
             .show(ui, |ui, rect, icon_tint| {
                 let icon_rect =
@@ -6962,9 +7163,9 @@ impl App {
         resp.on_hover_text(label).clicked()
     }
 
-    /// Panel-footer icon button: 22×22 craft-ui IconButton with a
-    /// 14px glyph — the footer scale of EffectCraft's project panel
-    /// (28px strip, 22px buttons).
+    /// Panel-footer icon button: 28×28 craft-ui IconButton with a
+    /// 15px glyph — the prototype's .sp-foot action scale (28px
+    /// rows, 15px glyphs, 6px radius).
     fn small_icon_button(
         &mut self,
         ui: &mut egui::Ui,
@@ -6983,13 +7184,13 @@ impl App {
             hovered: visuals(ICON_HOVER),
             pressed: None,
             selected: visuals(ICON_HOVER),
-            corner_radius: egui::CornerRadius::same(7),
+            corner_radius: egui::CornerRadius::same(6),
             focus_stroke: egui::Stroke::new(1.0, ACCENT),
         };
-        let resp = craft_ui::buttons::IconButton::new(label, egui::vec2(22.0, 22.0), &style)
+        let resp = craft_ui::buttons::IconButton::new(label, egui::vec2(28.0, 28.0), &style)
             .show(ui, |ui, rect, icon_tint| {
                 let icon_rect =
-                    egui::Rect::from_center_size(rect.center(), egui::vec2(14.0, 14.0));
+                    egui::Rect::from_center_size(rect.center(), egui::vec2(15.0, 15.0));
                 ui.painter().image(
                     tex_id,
                     icon_rect,
@@ -7011,8 +7212,8 @@ impl App {
             egui::Stroke::new(1.0, SEPARATOR),
         );
         let inner = egui::Rect::from_min_max(
-            egui::pos2(rect.min.x + 6.0, rect.min.y + 4.0),
-            egui::pos2(rect.max.x - 6.0, rect.max.y - 2.0),
+            egui::pos2(rect.min.x + 14.0, rect.min.y + 10.0),
+            egui::pos2(rect.max.x - 14.0, rect.max.y - 12.0),
         );
         let mut fui = ui.new_child(egui::UiBuilder::new().max_rect(inner));
         fui.set_clip_rect(inner.intersect(ui.clip_rect()));
@@ -7250,14 +7451,18 @@ impl App {
                         pages.push((vid.clone(), p as usize, pages.len() + 1));
                     }
                 }
-                let per_row = ((ui.available_width() + 12.0) / 228.0).floor().max(1.0) as usize;
+                // Page grid (prototype .deck-pages): fluid
+                // columns, min 212px wide, 12px gaps.
+                let avail = ui.available_width();
+                let per_row = ((avail + 12.0) / 224.0).floor().max(1.0) as usize;
+                let page_w = (avail + 12.0) / per_row as f32 - 12.0;
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
                     for row in pages.chunks(per_row) {
                         ui.horizontal(|ui| {
                             for (vid, p, n) in row {
                                 ui.vertical(|ui| {
-                                    if self.thumb_button(ui, vid, *p, 216.0, false) {
+                                    if self.thumb_button(ui, vid, *p, page_w, false) {
                                         self.overlays.push(Overlay::PagePreview { version_id: vid.clone(), page: *p, global: *n - 1, item: item.clone() });
                                     }
                                     ui.label(
@@ -7605,28 +7810,52 @@ impl App {
     /// drawn on its chrome fill inside the dock frame.
     fn sr_nav_body(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
-        ui.painter().rect_filled(rect, 0.0, CHROME);
+        ui.painter().rect_filled(rect, 0.0, PANEL_BG);
         let (content_rect, footer_rect) = nav_split(rect);
         let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(content_rect));
         cui.set_clip_rect(content_rect.intersect(ui.clip_rect()));
         {
             let ui = &mut cui;
-            // the four zones live at the top of the left column
-            // (James 2026-11-15), each with its IconPark glyph; the
-            // folder tree sits below them
-            for (zone, label, icon) in [
-                ("plaza", "广场", self.tex_icon(ui, "globe", *ICON_GLOBE)),
-                ("library", "我的库", self.tex_icon(ui, "bookshelf", *ICON_BOOKSHELF)),
-                ("inbox", "收到的分享", self.tex_icon(ui, "inbox", *ICON_INBOX)),
-                ("groups", "群组空间", self.tex_icon(ui, "peoples-two", *ICON_PEOPLES2)),
-            ] {
-                if tree_row(ui, self.showroom.zone == zone, 0.0, Some(icon), label, 12.0).clicked() {
-                    self.showroom.zone = zone.to_string();
-                    // switching zones leaves any open deck
-                    self.showroom.stack.pop_to(0);
-                }
+            // The four zones live at the top of the left column as
+            // the prototype's .show-seg: a 2x2 grid of segment
+            // buttons (--panel2 fill, 1px --line border, 6px
+            // radius, 26px min height, 5px gaps); the selected
+            // zone takes the accent-soft fill + accent border +
+            // accent text. The folder tree sits below them.
+            let zones: &[(&str, &str)] = &[
+                ("plaza", "广场"),
+                ("library", "我的库"),
+                ("inbox", "收到的分享"),
+                ("groups", "群组空间"),
+            ];
+            let seg_w = (ui.available_width() - 5.0) / 2.0;
+            for pair in zones.chunks(2) {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 5.0;
+                    for (zone, label) in pair {
+                        let active = self.showroom.zone == *zone;
+                        let btn = egui::Button::new(
+                            egui::RichText::new(*label)
+                                .size(12.5)
+                                .color(if active { ACCENT } else { TEXT_WEAK }),
+                        )
+                        .fill(if active { ACCENT_SOFT } else { BTN_BG })
+                        .stroke(egui::Stroke::new(
+                            1.0,
+                            if active { ACCENT } else { SEPARATOR },
+                        ))
+                        .corner_radius(egui::CornerRadius::same(6))
+                        .min_size(egui::vec2(seg_w, 26.0));
+                        if ui.add(btn).clicked() && !active {
+                            self.showroom.zone = zone.to_string();
+                            // switching zones leaves any open deck
+                            self.showroom.stack.pop_to(0);
+                        }
+                    }
+                });
+                ui.add_space(5.0);
             }
-            ui.add_space(6.0);
+            ui.add_space(9.0);
             ui.separator();
             ui.add_space(6.0);
             let mut sel = self.showroom.folder.clone();
@@ -7643,20 +7872,28 @@ impl App {
 
     /// Review queue frame body (super admins): the queue that used
     /// to sit under the showroom wall, now in the framework's bottom
-    /// frame — its tab strip carries the title, so the in-body
-    /// heading is gone; rows and actions are the same.
+    /// frame. Panes are stripless (prototype form), so the frame
+    /// carries its own in-body heading; rows and actions are the
+    /// same.
     fn sr_review_body(&mut self, ui: &mut egui::Ui) {
         egui::Frame::NONE
             .fill(APP_BG)
             .inner_margin(egui::Margin {
-                left: 16,
-                right: 16,
-                top: 8,
-                bottom: 12,
+                left: 22,
+                right: 22,
+                top: 20,
+                bottom: 16,
             })
             .show(ui, |ui| {
                 ui.set_min_size(ui.available_size());
                 egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(tr("待审队列"))
+                            .size(15.0)
+                            .strong()
+                            .color(TEXT_MAIN),
+                    );
+                    ui.add_space(10.0);
                     for item in self.showroom_pending.clone() {
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new(s(&item, "title")).strong());
@@ -8209,6 +8446,13 @@ impl App {
         ui.add_space(6.0);
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
+            // Card grid (prototype .show-grid): fluid columns,
+            // min 216px wide, 12px gaps — no oversized fixed cards.
+            let avail = ui.available_width();
+            let per_row = ((avail + 12.0) / 228.0).floor().max(1.0);
+            let card_w = (avail + 12.0) / per_row - 12.0;
+            let cover_h = card_w * 9.0 / 16.0;
+            let card_h = cover_h + 118.0;
             ui.horizontal_wrapped(|ui| {
                 for item in self.showroom_live.clone() {
                     if !self.folder_filter_ok(
@@ -8217,12 +8461,12 @@ impl App {
                     ) {
                         continue;
                     }
-                    let outer = ui.allocate_ui(egui::vec2(340.0, 300.0), |ui| {
+                    let outer = ui.allocate_ui(egui::vec2(card_w, card_h), |ui| {
                         // allocate_ui inherits the wrapped horizontal layout;
                         // card content must flow top-down
                         ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
                         card_frame_flush().show(ui, |ui| {
-                            ui.set_min_size(egui::vec2(340.0, 300.0));
+                            ui.set_min_size(egui::vec2(card_w, card_h));
                             let src0 = s(&item, "source_index_id");
                             let cover = self
                                 .index_covers
@@ -8230,22 +8474,22 @@ impl App {
                                 .cloned()
                                 .unwrap_or_default();
                             if !cover.is_empty() {
-                                self.thumb_ui(ui, &cover, 0, 340.0);
+                                self.thumb_ui(ui, &cover, 0, card_w);
                             } else {
-                                ui.allocate_space(egui::vec2(340.0, 191.0));
+                                ui.allocate_space(egui::vec2(card_w, cover_h));
                             }
                             egui::Frame::NONE
                                 .inner_margin(egui::Margin {
-                                    left: 16,
-                                    right: 16,
-                                    top: 12,
-                                    bottom: 12,
+                                    left: 12,
+                                    right: 12,
+                                    top: 10,
+                                    bottom: 11,
                                 })
                                 .show(ui, |ui| {
                             // the grid's 16px spacing must not leak in here
                             ui.spacing_mut().item_spacing = egui::vec2(8.0, 5.0);
                             ui.label(
-                                egui::RichText::new(s(&item, "title")).strong().size(13.5).color(TEXT_MAIN),
+                                egui::RichText::new(s(&item, "title")).strong().size(13.0).color(TEXT_MAIN),
                             );
                             ui.add_space(3.0);
                             let intro = s(&item, "intro");
@@ -8317,7 +8561,7 @@ impl App {
                     // clicks (the interact only covers the cover area)
                     let cover_rect = egui::Rect::from_min_size(
                         outer.response.rect.min,
-                        egui::vec2(340.0, 191.0),
+                        egui::vec2(card_w, cover_h),
                     );
                     let click = ui.interact(
                         cover_rect,
@@ -8350,7 +8594,7 @@ impl App {
     /// footer strip.
     fn ct_nav_body(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
-        ui.painter().rect_filled(rect, 0.0, CHROME);
+        ui.painter().rect_filled(rect, 0.0, PANEL_BG);
         let (content_rect, footer_rect) = nav_split(rect);
         let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(content_rect));
         cui.set_clip_rect(content_rect.intersect(ui.clip_rect()));
@@ -8564,6 +8808,13 @@ impl App {
         }
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
+            // Card grid (prototype .grid): fluid columns, min
+            // 220px wide, 12px gaps.
+            let avail = ui.available_width();
+            let per_row = ((avail + 12.0) / 232.0).floor().max(1.0);
+            let card_w = (avail + 12.0) / per_row - 12.0;
+            let cover_h = card_w * 9.0 / 16.0;
+            let card_h = cover_h + 89.0;
             ui.horizontal_wrapped(|ui| {
                 for item in self.units.clone() {
                     let unit = item.get("unit").cloned().unwrap_or(json!({}));
@@ -8579,30 +8830,30 @@ impl App {
                         .and_then(|r| r.get("latest"))
                         .cloned()
                         .unwrap_or(Value::Null);
-                    let outer = ui.allocate_ui(egui::vec2(300.0, 258.0), |ui| {
+                    let outer = ui.allocate_ui(egui::vec2(card_w, card_h), |ui| {
                         let _resp = ui
                             .with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
                                 card_frame_flush().show(ui, |ui| {
-                            ui.set_min_size(egui::vec2(300.0, 258.0));
+                            ui.set_min_size(egui::vec2(card_w, card_h));
                             if latest.is_object() {
                                 let vid = s(&latest, "id");
-                                self.thumb_ui(ui, &vid, 0, 300.0);
+                                self.thumb_ui(ui, &vid, 0, card_w);
                             } else {
-                                ui.allocate_space(egui::vec2(300.0, 169.0));
+                                ui.allocate_space(egui::vec2(card_w, cover_h));
                             }
                             egui::Frame::NONE
                                 .inner_margin(egui::Margin {
-                                    left: 14,
-                                    right: 14,
+                                    left: 12,
+                                    right: 12,
                                     top: 10,
-                                    bottom: 12,
+                                    bottom: 11,
                                 })
                                 .show(ui, |ui| {
                                     ui.spacing_mut().item_spacing = egui::vec2(8.0, 5.0);
                                     ui.label(
                                         egui::RichText::new(s(&unit, "name"))
                                             .strong()
-                                            .size(13.5)
+                                            .size(13.0)
                                             .color(TEXT_MAIN),
                                     );
                                     ui.add_space(5.0);
@@ -8659,7 +8910,7 @@ impl App {
                                                         .color(egui::Color32::WHITE),
                                                 )
                                                 .fill(ACCENT)
-                                                .corner_radius(10),
+                                                .corner_radius(6),
                                             )
                                             .clicked()
                                         {
@@ -8701,7 +8952,7 @@ impl App {
                 // grid-end add card (I): same footprint as a content
                 // card; two entries — blank block / paste PPT pages
                 if self.pick.is_none() {
-                    self.content_add_card(ui);
+                    self.content_add_card(ui, card_w, card_h);
                 }
             });
         });
@@ -9290,7 +9541,7 @@ impl App {
                                                     .color(CHIP_GREEN_FG),
                                             )
                                             .fill(CHIP_GREEN_BG)
-                                            .corner_radius(10),
+                                            .corner_radius(6),
                                         )
                                         .clicked()
                                     {
@@ -9357,6 +9608,7 @@ impl App {
     /// carry a right-click menu （新建子文件夹 / 新建文件夹 / 重命名 / 删除）;
     /// right-clicking the blank area below the tree offers 新建文件夹.
     fn folder_tree(&mut self, ui: &mut egui::Ui, selected: &mut Option<String>) {
+        ui.spacing_mut().item_spacing.y = 2.0;
         enum Act {
             NewChild(String),
             NewSibling(Option<String>),
@@ -9365,7 +9617,7 @@ impl App {
         }
         let mut action: Option<Act> = None;
         let all_icon = self.tex_icon(ui, "all-application", *ICON_ALL_APPS);
-        if tree_row(ui, selected.is_none(), 0.0, Some(all_icon), "全部", 12.0).clicked() {
+        if tree_row(ui, selected.is_none(), 0.0, Some(all_icon), "全部", 12.5).clicked() {
             *selected = None;
         }
         // an inline editor for a NEW root folder sits right under 全部
@@ -9423,10 +9675,10 @@ impl App {
                 let resp = tree_row(
                     ui,
                     is_sel,
-                    d as f32 * 14.0,
+                    d as f32 * 15.0,
                     Some(ficon),
                     &fname,
-                    12.0,
+                    12.5,
                 );
                 if resp.clicked() {
                     *selected = Some(fid.clone());
@@ -10199,7 +10451,7 @@ impl App {
                     painter.rect_filled(
                         rail,
                         0.0,
-                        egui::Color32::from_rgb(0x14, 0x17, 0x15),
+                        egui::Color32::from_rgb(0x14, 0x17, 0x16),
                     );
                     let mut y = rail.min.y + 14.0;
                     let small = egui::FontId::new(11.5, egui::FontFamily::Proportional);
@@ -11016,7 +11268,7 @@ impl App {
                                 .color(egui::Color32::WHITE),
                         )
                         .fill(ACCENT)
-                        .corner_radius(10)
+                        .corner_radius(6)
                         .min_size(egui::vec2(110.0, 36.0));
                         if ui
                             .add_enabled(
@@ -11140,7 +11392,7 @@ impl App {
     /// furniture: content / action / footer strip).
     fn ix_nav_body(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
-        ui.painter().rect_filled(rect, 0.0, CHROME);
+        ui.painter().rect_filled(rect, 0.0, PANEL_BG);
         let (content_rect, footer_rect) = nav_split(rect);
         let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(content_rect));
         cui.set_clip_rect(content_rect.intersect(ui.clip_rect()));
@@ -11185,12 +11437,12 @@ impl App {
             ui.add_space(8.0);
             if ui
                 .add_sized(
-                    [ui.available_width(), 34.0],
+                    [ui.available_width(), 32.0],
                     egui::Button::new(
                         egui::RichText::new("＋ 新建索引").color(egui::Color32::WHITE),
                     )
                     .fill(ACCENT)
-                    .corner_radius(255),
+                    .corner_radius(6),
                 )
                 .clicked()
             {
@@ -11284,6 +11536,13 @@ impl App {
             .collect();
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
+            // Card grid (prototype .idx-grid): fluid columns,
+            // min 236px wide, 12px gaps.
+            let avail = ui.available_width();
+            let per_row = ((avail + 12.0) / 248.0).floor().max(1.0);
+            let card_w = (avail + 12.0) / per_row - 12.0;
+            let cover_h = card_w * 9.0 / 16.0;
+            let card_h = cover_h + 115.0;
             ui.horizontal_wrapped(|ui| {
                 for x in items {
                     let xid = s(&x, "id");
@@ -11297,30 +11556,30 @@ impl App {
                         "dept" => egui::Color32::from_rgb(0xD0, 0x8A, 0x3E),
                         _ => egui::Color32::from_rgb(0x9A, 0xA3, 0x9C),
                     };
-                    let resp = ui.allocate_ui(egui::vec2(300.0, 284.0), |ui| {
+                    let resp = ui.allocate_ui(egui::vec2(card_w, card_h), |ui| {
                         ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
                             egui::Frame::NONE
                                 .fill(CARD_BG)
-                                .corner_radius(12)
+                                .corner_radius(6)
                                 .stroke(egui::Stroke::new(1.0, scope_color))
                                 .show(ui, |ui| {
-                                    ui.set_min_size(egui::vec2(300.0, 284.0));
+                                    ui.set_min_size(egui::vec2(card_w, card_h));
                                     let cover = self
                                         .index_covers
                                         .get(&xid)
                                         .cloned()
                                         .unwrap_or_default();
                                     if !cover.is_empty() {
-                                        self.thumb_ui(ui, &cover, 0, 300.0);
+                                        self.thumb_ui(ui, &cover, 0, card_w);
                                     } else {
-                                        ui.allocate_space(egui::vec2(300.0, 169.0));
+                                        ui.allocate_space(egui::vec2(card_w, cover_h));
                                     }
                                     egui::Frame::NONE
                                         .inner_margin(egui::Margin {
-                                            left: 14,
-                                            right: 14,
-                                            top: 13,
-                                            bottom: 12,
+                                            left: 12,
+                                            right: 12,
+                                            top: 10,
+                                            bottom: 11,
                                         })
                                         .show(ui, |ui| {
                                             ui.spacing_mut().item_spacing =
@@ -11328,7 +11587,7 @@ impl App {
                                             ui.label(
                                                 egui::RichText::new(s(&x, "name"))
                                                     .strong()
-                                                    .size(13.5),
+                                                    .size(13.0),
                                             );
                                             ui.add_space(7.0);
                                             ui.horizontal(|ui| {
@@ -11547,7 +11806,7 @@ impl App {
                             .color(egui::Color32::WHITE),
                     )
                     .fill(ACCENT)
-                    .corner_radius(10)
+                    .corner_radius(6)
                     .min_size(egui::vec2(88.0, 30.0)),
                 )
                 .clicked()
@@ -12222,7 +12481,7 @@ impl App {
                     !self.add_url.trim().is_empty(),
                     egui::Button::new(egui::RichText::new("登录并添加").color(egui::Color32::WHITE))
                         .fill(ACCENT)
-                        .corner_radius(10)
+                        .corner_radius(6)
                         .min_size(egui::vec2(120.0, 30.0)),
                 )
                 .clicked()
@@ -12233,7 +12492,7 @@ impl App {
                 .add_enabled(
                     !self.add_url.trim().is_empty(),
                     egui::Button::new(egui::RichText::new("匿名添加"))
-                        .corner_radius(10)
+                        .corner_radius(6)
                         .min_size(egui::vec2(120.0, 30.0)),
                 )
                 .clicked()
@@ -12393,17 +12652,18 @@ impl App {
             self.settings.section = 0;
         }
         egui::Frame::NONE
-            .fill(CHROME)
+            .fill(PANEL_BG)
             .inner_margin(egui::Margin {
-                left: 6,
-                right: 6,
-                top: 8,
-                bottom: 6,
+                left: 12,
+                right: 12,
+                top: 12,
+                bottom: 14,
             })
             .show(ui, |ui| {
                 ui.set_min_size(ui.available_size());
+                ui.spacing_mut().item_spacing.y = 2.0;
                 for (i, name) in sections.iter().enumerate() {
-                    if tree_row(ui, self.settings.section == i, 0.0, None, tr(name), 12.0)
+                    if tree_row(ui, self.settings.section == i, 0.0, None, tr(name), 12.5)
                         .clicked()
                     {
                         self.settings.section = i;
@@ -12426,9 +12686,9 @@ impl App {
         egui::Frame::NONE
             .fill(APP_BG)
             .inner_margin(egui::Margin {
-                left: 16,
-                right: 16,
-                top: 12,
+                left: 22,
+                right: 22,
+                top: 20,
                 bottom: 16,
             })
             .show(ui, |ui| {
@@ -12490,7 +12750,7 @@ impl App {
                                                         .color(egui::Color32::WHITE),
                                                 )
                                                 .fill(ACCENT)
-                                                .corner_radius(10)
+                                                .corner_radius(6)
                                                 .min_size(egui::vec2(120.0, 38.0)),
                                             )
                                             .clicked()
@@ -12834,7 +13094,7 @@ impl App {
                                             .color(egui::Color32::WHITE),
                                     )
                                     .fill(ACCENT)
-                                    .corner_radius(10),
+                                    .corner_radius(6),
                                 )
                                 .clicked()
                             {
@@ -12968,7 +13228,7 @@ impl App {
                                             .color(egui::Color32::WHITE),
                                     )
                                     .fill(ACCENT)
-                                    .corner_radius(10),
+                                    .corner_radius(6),
                                 )
                                 .clicked()
                             {
