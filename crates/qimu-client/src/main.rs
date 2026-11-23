@@ -2969,14 +2969,15 @@ impl App {
                     app.open_index_detail(idx_id);
                     if mode == "pages" {
                         if let Ok(pos) = n.parse::<usize>() {
-                            let resolved = app
-                                .index
-                                .detail
-                                .as_ref()
-                                .and_then(|d| d.get("resolved_entries"))
-                                .and_then(|r| r.as_array())
-                                .cloned()
-                                .unwrap_or_default();
+                            let resolved = match app.index.stack.top() {
+                                IndexFrame::Detail(d) => d
+                                    .detail
+                                    .get("resolved_entries")
+                                    .and_then(|r| r.as_array())
+                                    .cloned()
+                                    .unwrap_or_default(),
+                                _ => Vec::new(),
+                            };
                             if let Some(re) = resolved.get(pos).cloned() {
                                 let total = re
                                     .get("resolved")
@@ -2992,7 +2993,7 @@ impl App {
                                 index_name: app.current_index_name(),
                                 at,
                             });
-                            app.content.detail = None;
+                            app.content.stack.pop_to(0);
                             app.page = Page::Content;
                         }
                     }
@@ -5043,7 +5044,7 @@ impl App {
                         (tr("版本"), 3.3 / 5.3),
                         (tr("最近打开"), 4.3 / 5.3),
                     ] {
-                        let g = painter.layout_no_wrap(text.to_string(), font, TEXT_WEAK);
+                        let g = painter.layout_no_wrap(text.to_string(), font.clone(), TEXT_WEAK);
                         painter.galley(
                             egui::pos2(
                                 hrect.min.x + 2.0 + w * fx,
@@ -9123,9 +9124,7 @@ impl App {
                                         &format!("/v1/versions/{}/recall", s(v, "id")),
                                         None,
                                     );
-                                    if let Some(uid) = st.unit_id.clone() {
-                                        self.open_unit_detail(&uid);
-                                    }
+                                    self.open_unit_detail(&st.unit_id.clone());
                                 }
                                 if s(v, "status") != "recalled" && ui.button("编辑页面").clicked() {
                                     // Page-level visual editing (overlay):
@@ -9241,20 +9240,15 @@ impl App {
                         }
                     });
                 let busy = self.translating.is_some();
-                let translate_ready = st.unit_id.is_some()
-                    && st
-                        .detail
-                        .as_ref()
-                        .map(|d| {
-                            d.get("renditions")
-                                .and_then(|r| r.as_array())
-                                .and_then(|arr| arr.first())
-                                .and_then(|r| r.get("versions"))
-                                .and_then(|v| v.as_array())
-                                .map(|arr| !arr.is_empty())
-                                .unwrap_or(false)
-                        })
-                        .unwrap_or(false);
+                let translate_ready = st
+                    .detail
+                    .get("renditions")
+                    .and_then(|r| r.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|r| r.get("versions"))
+                    .and_then(|v| v.as_array())
+                    .map(|arr| !arr.is_empty())
+                    .unwrap_or(false);
                 let btn_text = match &self.translating {
                     Some((_, d, t)) if *t > 0 => format!("翻译中… {d}/{t}"),
                     Some(_) => "翻译中…".to_string(),
@@ -9262,17 +9256,18 @@ impl App {
                 };
                 if ui.add_enabled(!busy && translate_ready, egui::Button::new(btn_text)).clicked() {
                     // latest version of the first rendition in the detail
-                    let first_version = st.detail.as_ref().and_then(|d| {
-                        d.get("renditions")
-                            .and_then(|r| r.as_array())
-                            .and_then(|arr| arr.first())
-                            .and_then(|r| r.get("versions"))
-                            .and_then(|v| v.as_array())
-                            .and_then(|arr| arr.first())
-                            .map(|v| s(v, "id"))
-                    });
-                    match (st.unit_id.clone(), first_version) {
-                        (Some(uid), Some(vid)) => {
+                    let first_version = st
+                        .detail
+                        .get("renditions")
+                        .and_then(|r| r.as_array())
+                        .and_then(|arr| arr.first())
+                        .and_then(|r| r.get("versions"))
+                        .and_then(|v| v.as_array())
+                        .and_then(|arr| arr.first())
+                        .map(|v| s(v, "id"));
+                    match first_version {
+                        Some(vid) => {
+                            let uid = st.unit_id.clone();
                             let to = if st.translate_to.is_empty() {
                                 "zh".to_string()
                             } else {
@@ -9350,9 +9345,7 @@ impl App {
                         ) {
                             Ok(_) => {
                                 self.msg = "讲稿已保存".into();
-                                if let Some(uid) = st.unit_id.clone() {
-                                    self.open_unit_detail(&uid);
-                                }
+                                self.open_unit_detail(&st.unit_id.clone());
                             }
                             Err(e) => self.msg = format!("保存讲稿失败：{e}"),
                         }
@@ -9399,15 +9392,13 @@ impl App {
             });
             if ui
                 .add_enabled(
-                    st.publish_file.is_some()
-                        && st.unit_id.is_some(),
+                    st.publish_file.is_some(),
                     egui::Button::new("发布"),
                 )
                 .clicked()
             {
-                if let (Some(path), Some(uid)) =
-                    (st.publish_file.clone(), st.unit_id.clone())
-                {
+                if let Some(path) = st.publish_file.clone() {
+                    let uid = st.unit_id.clone();
                     if let Ok(bytes) = std::fs::read(&path) {
                         let bump = ["major", "minor", "patch"][st.publish_bump];
                         let r = self.call(
@@ -9545,19 +9536,18 @@ impl App {
                                         )
                                         .clicked()
                                     {
-                                        if let Some(uid) = st.unit_id.clone() {
+                                        let uid = st.unit_id.clone();
                                             let _ = self.call(
                                                 "POST",
                                                 &format!("/v1/units/{uid}/page-bindings/{bid}/delete"),
                                                 None,
                                             );
                                             self.open_unit_detail(&uid);
-                                        }
                                     }
                                 }
                                 (Some(fs), None) => {
                                     if ui.button("绑定").clicked() {
-                                        if let Some(uid) = st.unit_id.clone() {
+                                        let uid = st.unit_id.clone();
                                             let r = self.call(
                                                 "POST",
                                                 &format!("/v1/units/{uid}/page-bindings"),
@@ -9574,7 +9564,6 @@ impl App {
                                                     self.msg = format!("绑定失败：{e}")
                                                 }
                                             }
-                                        }
                                     }
                                 }
                                 _ => {
@@ -9595,9 +9584,7 @@ impl App {
                 ui.label(egui::RichText::new("至少两个版本后可做逐页绑定").weak());
             }
         });
-        if let Some(unit_id) = st.unit_id.clone() {
-            self.attachments_ui(ui, "unit", &unit_id);
-        }
+        self.attachments_ui(ui, "unit", &st.unit_id.clone());
     }
 }
 
@@ -9891,7 +9878,7 @@ impl App {
                 Some(Overlay::PickTemplate(_)) => {
                     self.overlays.pop();
                 }
-                Some(Overlay::AllVersions(_)) => {
+                Some(Overlay::AllVersions { entry_pos: _ }) => {
                     self.overlays.pop();
                 }
                 Some(Overlay::PagePreview { .. }) => {
@@ -11814,7 +11801,7 @@ impl App {
                 if !self.need_identity("发布版本") {
                     // Anonymous session: the login popup is open;
                     // the typed tag name stays for after the login.
-                } else if let Some(id) = st.index_id.clone() {
+                } else { let id = st.index_id.clone();
                     let r = self.call(
                         "POST",
                         &format!("/v1/indexes/{id}/tags"),
@@ -11859,7 +11846,7 @@ impl App {
                 TEXT_MAIN,
                 13.0,
             ) {
-                if let Some(id) = st.index_id.clone() {
+                let id = st.index_id.clone();
                     let r = self.call(
                         "POST",
                         &format!("/v1/indexes/{id}/branches"),
@@ -11872,12 +11859,11 @@ impl App {
                         }
                         Err(e) => self.msg = e,
                     }
-                }
             }
             if text_action(ui, "推送到演示厅", TEXT_MAIN, 13.0) {
                 if !self.need_identity("推送到演示厅") {
                     // Anonymous session: the login popup is open instead.
-                } else if let Some(id) = st.index_id.clone() {
+                } else { let id = st.index_id.clone();
                     let r = self.call(
                         "POST",
                         "/v1/showroom",
@@ -12169,7 +12155,7 @@ impl App {
                     )
                     .clicked()
                 {
-                    if let Some(id) = st.index_id.clone() {
+                    let id = st.index_id.clone();
                         let into = st.branch.clone();
                         let from = st.merge_from.clone();
                         match self.call(
@@ -12183,7 +12169,6 @@ impl App {
                             }
                             Err(e) => self.msg = format!("合并预览失败：{e}"),
                         }
-                    }
                 }
             });
             if let Some(preview) = st.merge_preview.clone() {
@@ -12254,7 +12239,7 @@ impl App {
                         .add_enabled(unresolved == 0, egui::Button::new("执行合并"))
                         .clicked()
                     {
-                        if let Some(id) = st.index_id.clone() {
+                        let id = st.index_id.clone();
                             let resolutions: serde_json::Map<String, Value> = st.merge_resolutions
                                 .iter()
                                 .map(|(k, v)| (k.clone(), json!(v)))
@@ -12276,7 +12261,6 @@ impl App {
                                 }
                                 Err(e) => self.msg = format!("合并失败：{e}"),
                             }
-                        }
                     }
                     if unresolved > 0 {
                         ui.label(format!("还剩 {unresolved} 条未裁决"));
