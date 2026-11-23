@@ -1033,6 +1033,9 @@ fn icon_png(b64: &str) -> &'static [u8] {
 
 static ICON_PLAY: std::sync::LazyLock<&'static [u8]> =
     std::sync::LazyLock::new(|| icon_png(include_str!("../assets/icons/play.png.b64")));
+// Retained for the organization phase: the share entries that used
+// this glyph are offline at the export-only sharing stage.
+#[allow(dead_code)]
 static ICON_SHARE: std::sync::LazyLock<&'static [u8]> =
     std::sync::LazyLock::new(|| icon_png(include_str!("../assets/icons/share.png.b64")));
 static ICON_EXPORT: std::sync::LazyLock<&'static [u8]> =
@@ -1126,11 +1129,17 @@ enum ConnStatus {
     Connected,
     Failed,
     LoggedOut,
+    /// Anonymous (guest) session: connected for reading the
+    /// server's public content, no identity attached.
+    Anonymous,
 }
 
 /// One saved server connection, persisted in ~/.qimu/servers.json as
-/// {name, url, username, token}. The client holds several at once; one
-/// is "active" and feeds every API call (pages show the active server).
+/// {name, url, username, token, anon}. The client holds several at
+/// once; one is "active" and feeds every API call (pages show the
+/// active server). An anonymous connection (anon = true) is a guest
+/// session on its server — it never carries a token and lives next
+/// to, never instead of, a named connection for the same address.
 #[derive(Clone)]
 struct Conn {
     name: String,
@@ -1138,6 +1147,7 @@ struct Conn {
     username: String,
     token: Option<String>,
     status: ConnStatus,
+    anon: bool,
 }
 
 fn normalize_url(u: &str) -> String {
@@ -1175,6 +1185,7 @@ fn load_conns() -> Vec<Conn> {
                 .and_then(|t| t.as_str())
                 .filter(|t| !t.is_empty())
                 .map(|t| t.to_string());
+            let anon = v.get("anon").and_then(|a| a.as_bool()).unwrap_or(false);
             Some(Conn {
                 name: v
                     .get("name")
@@ -1184,12 +1195,15 @@ fn load_conns() -> Vec<Conn> {
                     .unwrap_or_else(|| conn_display_name(&url)),
                 url,
                 username: v.get("username").and_then(|u| u.as_str()).unwrap_or("").to_string(),
-                status: if token.is_some() {
+                status: if anon {
+                    ConnStatus::Anonymous // probed at startup like the rest
+                } else if token.is_some() {
                     ConnStatus::Failed // until validated at startup
                 } else {
                     ConnStatus::LoggedOut
                 },
                 token,
+                anon,
             })
         })
         .collect()
@@ -1204,6 +1218,7 @@ fn save_conns(conns: &[Conn]) {
                 "url": c.url,
                 "username": c.username,
                 "token": c.token,
+                "anon": c.anon,
             })
         })
         .collect();
@@ -1649,6 +1664,7 @@ impl App {
                             username: self.username.clone(),
                             token: self.token.clone(),
                             status: ConnStatus::Connected,
+                            anon: false,
                         });
                         self.conns.len() - 1
                     }
@@ -1709,6 +1725,17 @@ impl App {
             let c = self.conns.get(i)?;
             (c.url.clone(), c.token.clone())
         };
+        if self.conns[i].anon {
+            // Anonymous connection: no session to validate — probe
+            // the guest surface instead; reachable means connected.
+            let ok = raw_call(&url, None, "GET", "/v1/showroom?state=live", None, true).is_ok();
+            self.conns[i].status = if ok {
+                ConnStatus::Anonymous
+            } else {
+                ConnStatus::Failed
+            };
+            return None;
+        }
         match token {
             None => {
                 self.conns[i].status = ConnStatus::LoggedOut;
@@ -1741,6 +1768,12 @@ impl App {
         if self.token.is_some() {
             self.msg = format!("已切换到服务器 {}", self.conns[i].name);
             self.refresh_all();
+        } else if self.conns[i].status == ConnStatus::Anonymous {
+            self.msg = format!(
+                "已匿名连接 {}：可浏览公开内容，发布与审批需实名登录",
+                self.conns[i].name
+            );
+            self.refresh_guest();
         }
     }
 
@@ -1767,7 +1800,11 @@ impl App {
             .and_then(|u| {
                 self.conns
                     .iter()
-                    .position(|c| c.url == u && c.status == ConnStatus::Connected)
+                    .position(|c| {
+                        c.url == u
+                            && (c.status == ConnStatus::Connected
+                                || c.status == ConnStatus::Anonymous)
+                    })
             })
             .or_else(|| {
                 self.conns
@@ -1853,6 +1890,7 @@ impl App {
                             username,
                             token,
                             status: ConnStatus::Connected,
+                            anon: false,
                         });
                         self.conns.len() - 1
                     }
@@ -1863,6 +1901,80 @@ impl App {
             }
             Err(e) => self.msg = format!("添加服务器失败：{e}"),
         }
+    }
+
+    /// Enter a server anonymously (user ruling 2026-11-23): the
+    /// address alone makes the connection — a guest session that
+    /// can browse the server's public content and nothing more.
+    /// The anonymous connection is a separate saved entry from any
+    /// named one for the same address, so entering anonymously
+    /// never touches a saved named session. The guest surface is
+    /// probed first: an unreachable (or pre-guest-surface) server
+    /// is reported, not silently "connected".
+    fn activate_anonymous(&mut self, url: &str) -> bool {
+        let url = normalize_url(url);
+        if url.is_empty() {
+            self.msg = "请先填写服务器地址".into();
+            return false;
+        }
+        if raw_call(&url, None, "GET", "/v1/showroom?state=live", None, true).is_err() {
+            self.msg = format!("无法匿名连接 {url}：服务器不可达，或版本过旧不支持匿名浏览");
+            return false;
+        }
+        let idx = match self.conns.iter().position(|c| c.url == url && c.anon) {
+            Some(i) => {
+                self.conns[i].status = ConnStatus::Anonymous;
+                i
+            }
+            None => {
+                self.conns.push(Conn {
+                    name: conn_display_name(&url),
+                    url: url.clone(),
+                    username: String::new(),
+                    token: None,
+                    status: ConnStatus::Anonymous,
+                    anon: true,
+                });
+                self.conns.len() - 1
+            }
+        };
+        self.active = Some(idx);
+        self.server = url;
+        self.token = None;
+        self.user = None;
+        self.persist_conns();
+        // A different identity context than whatever was on screen:
+        // drop the previous context's server data, then load the
+        // guest one. Local data (offline cache) is untouched.
+        self.clear_account_state();
+        self.refresh_guest();
+        self.msg = format!(
+            "已匿名连接 {}：可浏览公开内容，发布与审批需实名登录",
+            self.conns[idx].name
+        );
+        true
+    }
+
+    /// The login popup's 「匿名进入」: connect to the typed server
+    /// address as a guest. Success closes the popup (as a named
+    /// login does); failure keeps it open with the reason inside.
+    fn enter_anonymous(&mut self) {
+        let url = self.server.clone();
+        if self.activate_anonymous(&url) {
+            self.login_open = false;
+        }
+    }
+
+    /// Settings → 添加服务器, the anonymous counterpart of
+    /// add_server_login: save + activate a guest connection for
+    /// the typed address, no account involved.
+    fn add_server_anon(&mut self) {
+        let url = normalize_url(&self.add_url);
+        if url.is_empty() {
+            self.msg = "请填写服务器地址".into();
+            return;
+        }
+        self.activate_anonymous(&url);
     }
 
     fn start_discovery(&mut self) {
@@ -1907,25 +2019,45 @@ impl App {
         self.refresh_guest();
     }
 
-    /// Gate for actions that need a server identity (user ruling
-    /// 2026-11-23: login must not gate *entering* the app, only the
-    /// actions that genuinely need an identity). When logged out:
-    /// explain, open the login popup, and report false so the
-    /// caller returns without touching the network. Closing the
-    /// popup leaves the user's page and context exactly as they
-    /// were; nothing is retried automatically after login.
-    fn need_login(&mut self, action: &str) -> bool {
-        if self.token.is_some() {
+    /// Identity gate — anonymous connections only (user rulings
+    /// 2026-11-23). Standalone/local use never trips it: with a
+    /// named session, or with no anonymous connection active (the
+    /// local standalone form, where the bundled server is the
+    /// user's own data plane), every action proceeds ungated —
+    /// local functions need no account, full stop. An anonymous
+    /// (guest) session on an organization server is read-only by
+    /// design, so write-class actions there — import, create,
+    /// publish, review — explain and open the login popup for a
+    /// named login instead of dying at the server with a bare 401.
+    /// Closing the popup leaves page and context untouched;
+    /// nothing is retried automatically after login.
+    fn need_identity(&mut self, action: &str) -> bool {
+        if !self.anon_active() {
             return true;
         }
-        self.msg = format!("「{action}」需要登录后使用，请先登录");
+        self.msg = format!("「{action}」需要实名登录：匿名连接只能浏览公开内容，请先登录");
         self.login_open = true;
         false
     }
 
-    /// What a logged-out client may load: the published showroom
-    /// (the server serves live items anonymously) plus the local
-    /// offline cache index. Everything else stays empty until login.
+    /// True when the active connection is an anonymous (guest)
+    /// session: connected for reading, carrying no named identity.
+    /// Keyed on the connection's anon flag rather than on token
+    /// presence, so the mode survives the planned move to
+    /// server-issued guest tokens (org-model G1) unchanged.
+    fn anon_active(&self) -> bool {
+        self.active
+            .and_then(|i| self.conns.get(i))
+            .map(|c| c.anon && c.status == ConnStatus::Anonymous)
+            .unwrap_or(false)
+    }
+
+    /// What a client without a named session may load: the
+    /// showroom's public items (the server serves live items
+    /// anonymously — this is both the standalone local server's
+    /// own plaza and an organization server's public surface)
+    /// plus the local offline cache index. Named-session data
+    /// loads through refresh_all instead.
     fn refresh_guest(&mut self) {
         if let Ok(v) = self.call("GET", "/v1/showroom?state=live", None) {
             self.showroom_live = v
@@ -1933,8 +2065,38 @@ impl App {
                 .and_then(|f| f.as_array())
                 .cloned()
                 .unwrap_or_default();
+            self.resolve_showroom_covers();
         }
         self.cache_entries = load_cache_index();
+    }
+
+    /// Plaza card covers: resolve each live item's source index to
+    /// its first resolved version id (the thumb source). Shared by
+    /// the named and guest refresh paths — what a guest actually
+    /// receives is bounded by the server's guest read surface, so
+    /// on a server that does not (yet) serve index reads
+    /// anonymously the lookups fail soft and covers stay blank
+    /// until it does; no client change is needed when it expands.
+    fn resolve_showroom_covers(&mut self) {
+        for item in self.showroom_live.clone() {
+            let src = s(&item, "source_index_id");
+            if src.is_empty() || self.index_covers.contains_key(&src) {
+                continue;
+            }
+            self.index_covers.insert(src.clone(), String::new());
+            if let Ok(d) = self.call("GET", &format!("/v1/indexes/{src}"), None) {
+                if let Some(vid) = d
+                    .get("resolved_entries")
+                    .and_then(|r| r.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|e| e.get("resolved"))
+                    .and_then(|r| r.get("id"))
+                    .and_then(|x| x.as_str())
+                {
+                    self.index_covers.insert(src, vid.to_string());
+                }
+            }
+        }
     }
 
     /// Drop every server-scoped list tied to the previous identity.
@@ -1977,26 +2139,12 @@ impl App {
         }
         if let Ok(v) = self.call("GET", "/v1/showroom?state=live", None) {
             self.showroom_live = v.get("items").and_then(|f| f.as_array()).cloned().unwrap_or_default();
-            // plaza card covers: first resolved version of the source index
-            for item in self.showroom_live.clone() {
-                let src = s(&item, "source_index_id");
-                if src.is_empty() || self.index_covers.contains_key(&src) {
-                    continue;
-                }
-                self.index_covers.insert(src.clone(), String::new());
-                if let Ok(d) = self.call("GET", &format!("/v1/indexes/{src}"), None) {
-                    if let Some(vid) = d
-                        .get("resolved_entries")
-                        .and_then(|r| r.as_array())
-                        .and_then(|a| a.first())
-                        .and_then(|e| e.get("resolved"))
-                        .and_then(|r| r.get("id"))
-                        .and_then(|x| x.as_str())
-                    {
-                        self.index_covers.insert(src, vid.to_string());
-                    }
-                }
-            }
+            // A guest pass earlier in this session may have parked
+            // empty placeholders for covers it could not resolve;
+            // a named session re-resolves instead of inheriting
+            // the blanks.
+            self.index_covers.retain(|_, v| !v.is_empty());
+            self.resolve_showroom_covers();
         }
         for x in self.indexes.clone() {
             let xid = s(&x, "id");
@@ -2713,6 +2861,9 @@ impl App {
     }
 
     fn create_blank_unit(&mut self) {
+        if !self.need_identity("新建内容块") {
+            return;
+        }
         let r = self.call(
             "POST",
             "/v1/units",
@@ -2743,7 +2894,7 @@ impl App {
     /// version. QIMU_PASTE_FRAGMENT points at a prepared fragment file
     /// and stands in for the bridge capture in headless verification.
     fn create_unit_from_paste(&mut self) {
-        if !self.need_login("粘贴新建") {
+        if !self.need_identity("粘贴新建") {
             return;
         }
         let frag: Option<std::path::PathBuf> = std::env::var("QIMU_PASTE_FRAGMENT")
@@ -2927,15 +3078,28 @@ impl App {
             ui.add_space(16.0);
             if self.token.is_none() {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(tr(
-                            "当前未登录：可浏览演示厅与本地缓存，登录后可使用全部功能。",
-                        ))
-                        .size(12.5)
-                        .color(TEXT_WEAK),
-                    );
-                    if q_primary_button(ui, tr("登录")).clicked() {
-                        self.login_open = true;
+                    if self.anon_active() {
+                        ui.label(
+                            egui::RichText::new(tr(
+                                "匿名连接：可浏览组织公开内容；发布、审批需实名登录。",
+                            ))
+                            .size(12.5)
+                            .color(TEXT_WEAK),
+                        );
+                        if q_primary_button(ui, tr("实名登录")).clicked() {
+                            self.login_open = true;
+                        }
+                    } else {
+                        ui.label(
+                            egui::RichText::new(tr(
+                                "本机功能无需登录即可完整使用；连接组织服务器可浏览公开内容。",
+                            ))
+                            .size(12.5)
+                            .color(TEXT_WEAK),
+                        );
+                        if q_primary_button(ui, tr("连接服务器")).clicked() {
+                            self.login_open = true;
+                        }
                     }
                 });
                 ui.add_space(12.0);
@@ -3688,7 +3852,11 @@ impl eframe::App for App {
                     match self.page {
                         Page::Showroom => {
                             if self.tool_slot(ui, false, tr("刷新"), "refresh", *ICON_REFRESH) {
-                                self.refresh_all();
+                                if self.token.is_some() {
+                                    self.refresh_all();
+                                } else {
+                                    self.refresh_guest();
+                                }
                             }
                         }
                         Page::Content => {
@@ -3756,6 +3924,8 @@ impl eframe::App for App {
                                 .map(|u| s(u, "display_name"))
                                 .unwrap_or_default();
                             format!("{name} · {}", self.role())
+                        } else if self.anon_active() {
+                            format!("匿名 · 已连接 {}", self.active_server_label())
                         } else {
                             tr("未登录").to_string()
                         };
@@ -4192,9 +4362,6 @@ impl App {
     /// Open a showroom entry's whole-deck view (H): fetch the source
     /// index so its resolved entries can be paged through.
     fn open_showroom_deck(&mut self, item: &Value) {
-        if !self.need_login("查看演示内容") {
-            return;
-        }
         self.sr_detail = Some(item.clone());
         self.sr_deck = None;
         self.sr_preview = None;
@@ -4410,11 +4577,13 @@ impl App {
         let Some(item) = self.sr_detail.clone() else {
             return;
         };
-        // Header (James 2026-11-15): deck title on the left; the five
-        // actions as IconPark icons at the top-right — 开始演示 / 分享 /
+        // Header (James 2026-11-15): deck title on the left; the
+        // actions as IconPark icons at the top-right — 开始演示 /
         // 导出 / 缓存到本地 in light gray, 返回 in red. No text buttons
         // here, and the old top-left "‹ 返回" text entry is gone (back
-        // is the red icon).
+        // is the red icon). The 分享 icon is gone (2026-11-23 ruling:
+        // sharing is export-only at this stage; the permissioned
+        // in-server share flow returns with the organization phase).
         let mut go_back = false;
         let mut act: Option<&'static str> = None;
         let cache_key = format!("sr_{}", s(&item, "id"));
@@ -4455,9 +4624,6 @@ impl App {
                 if self.icon_button(ui, "icon-export", *ICON_EXPORT, "导出") {
                     act = Some("export");
                 }
-                if self.icon_button(ui, "icon-share", *ICON_SHARE, "分享") {
-                    act = Some("share");
-                }
                 if self.icon_button(ui, "icon-play", *ICON_PLAY, "开始演示") {
                     act = Some("play");
                 }
@@ -4492,10 +4658,6 @@ impl App {
         match act {
             Some("play") => {
                 self.present_showroom(&s(&item, "id"), &s(&item, "title"));
-            }
-            Some("share") => {
-                self.share_for = Some(s(&item, "id"));
-                self.share_target.clear();
             }
             Some("export") => {
                 match self.call(
@@ -4740,6 +4902,14 @@ impl App {
         }
     }
 
+    /// Permissioned in-server sharing (send to a user / dept /
+    /// group via /v1/shares). OFFLINE at this stage (user ruling
+    /// 2026-11-23: sharing is export-only for now; publish-style
+    /// sharing returns with the organization phase). The panel and
+    /// its server calls are retained untouched for that phase —
+    /// every entry point that opened it has been removed, so this
+    /// is currently unreachable.
+    #[allow(dead_code)]
     fn share_panel(&mut self, ui: &mut egui::Ui) {
         let item_id = self.share_for.clone().unwrap_or_default();
         let title = self
@@ -5073,7 +5243,7 @@ impl App {
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new(s(&item, "title")).strong());
                             ui.label(format!("提交人 {}", s(&item, "submitted_by")));
-                            if ui.button("通过").clicked() {
+                            if ui.button("通过").clicked() && self.need_identity("审批演示厅投稿") {
                                 let _ = self.call(
                                     "POST",
                                     &format!("/v1/showroom/{}/review", s(&item, "id")),
@@ -5081,7 +5251,7 @@ impl App {
                                 );
                                 self.refresh_all();
                             }
-                            if ui.button("驳回").clicked() {
+                            if ui.button("驳回").clicked() && self.need_identity("审批演示厅投稿") {
                                 let _ = self.call(
                                     "POST",
                                     &format!("/v1/showroom/{}/review", s(&item, "id")),
@@ -5109,9 +5279,9 @@ impl App {
                 .color(TEXT_MAIN),
         );
         ui.add_space(6.0);
-        if self.token.is_none() && self.sr_zone == "plaza" {
+        if self.anon_active() && self.sr_zone == "plaza" {
             ui.label(
-                egui::RichText::new(tr("未登录：仅显示已发布内容，封面与逐页查看需登录"))
+                egui::RichText::new(tr("匿名连接：仅显示公开内容，发布与审批需实名登录"))
                     .size(12.0)
                     .color(TEXT_WEAK),
             );
@@ -5128,9 +5298,6 @@ impl App {
         if self.sr_zone == "groups" {
             self.groups_view(ui);
             return;
-        }
-        if self.share_for.is_some() {
-            self.share_panel(ui);
         }
         ui.add_space(6.0);
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -5194,10 +5361,6 @@ impl App {
                             ui.horizontal(|ui| {
                                 if text_action(ui, "开始演示", ACCENT, 13.0) {
                                     self.present_showroom(&s(&item, "id"), &s(&item, "title"));
-                                }
-                                if text_action(ui, "分享", TEXT_MAIN, 13.0) {
-                                    self.share_for = Some(s(&item, "id"));
-                                    self.share_target.clear();
                                 }
                             let src = s(&item, "source_index_id");
                             if !src.is_empty() {
@@ -5283,7 +5446,7 @@ impl App {
     /// toolbar slot): pick a deck, let the server propose blocks,
     /// then import with the proposal confirmed as-is.
     fn act_import_split(&mut self) {
-        if !self.need_login("智能分块导入") {
+        if !self.need_identity("智能分块导入") {
             return;
         }
         if let Some(path) = rfd::FileDialog::new()
@@ -5338,7 +5501,7 @@ impl App {
     /// 导入 PPT (content page action, also its toolbar slot): import
     /// a whole deck into the current folder/group.
     fn act_import_ppt(&mut self) {
-        if !self.need_login("导入 PPT") {
+        if !self.need_identity("导入 PPT") {
             return;
         }
         if let Some(path) = rfd::FileDialog::new()
@@ -6247,6 +6410,9 @@ impl App {
     }
 
     fn folder_edit_commit(&mut self) {
+        if !self.need_identity("编辑文件夹") {
+            return;
+        }
         let Some(edit) = self.folder_edit.take() else {
             return;
         };
@@ -6362,10 +6528,15 @@ impl App {
 
     /// The login popup (user rulings 2026-11-23): login is a modal
     /// dialog over the main window — never a page, never an entry
-    /// gate. It reuses the pre-existing login form state (server /
-    /// username / password live on App and feed do_login), so the
-    /// connection restore and local-server autostart logic are
-    /// untouched, and closing + reopening keeps whatever was typed.
+    /// gate. The server address is the primary field: with an
+    /// address alone, 「匿名进入」 connects a guest session that can
+    /// browse the server's public content; the account fields are
+    /// for a named login, which publishing / review / signed
+    /// actions require. It reuses the pre-existing login form state
+    /// (server / username / password live on App and feed do_login),
+    /// so the connection restore and local-server autostart logic
+    /// are untouched, and closing + reopening keeps whatever was
+    /// typed.
     ///
     /// Close behavior (each path only flips `login_open` — nothing
     /// is submitted, cleared or rolled back on close, at any stage,
@@ -6441,6 +6612,14 @@ impl App {
                             .color(TEXT_WEAK),
                     );
                 }
+                ui.add_space(10.0);
+                ui.label(
+                    egui::RichText::new(tr(
+                        "只填服务器地址可「匿名进入」：浏览公开内容；发布、审批需实名登录。",
+                    ))
+                    .size(11.5)
+                    .color(TEXT_WEAK),
+                );
                 ui.add_space(16.0);
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -6457,6 +6636,9 @@ impl App {
                         }
                         if ui.button(tr("取消")).clicked() {
                             cancel = true;
+                        }
+                        if ui.button(tr("匿名进入")).clicked() {
+                            self.enter_anonymous();
                         }
                     });
                 });
@@ -6525,7 +6707,7 @@ impl App {
     /// slot): enter the create flow with the pick list primed from
     /// every unit's renditions.
     fn act_new_index(&mut self) {
-        if !self.need_login("新建索引") {
+        if !self.need_identity("新建索引") {
             return;
         }
         self.index.creating = true;
@@ -6917,7 +7099,10 @@ impl App {
                 .clicked()
                 && !self.index.tag_name.is_empty()
             {
-                if let Some(id) = self.index.selected.clone() {
+                if !self.need_identity("发布版本") {
+                    // Anonymous session: the login popup is open;
+                    // the typed tag name stays for after the login.
+                } else if let Some(id) = self.index.selected.clone() {
                     let r = self.call(
                         "POST",
                         &format!("/v1/indexes/{id}/tags"),
@@ -6966,7 +7151,9 @@ impl App {
                 }
             }
             if text_action(ui, "推送到演示厅", TEXT_MAIN, 13.0) {
-                if let Some(id) = self.index.selected.clone() {
+                if !self.need_identity("推送到演示厅") {
+                    // Anonymous session: the login popup is open instead.
+                } else if let Some(id) = self.index.selected.clone() {
                     let r = self.call(
                         "POST",
                         "/v1/showroom",
@@ -7523,10 +7710,15 @@ impl App {
                         ConnStatus::Connected => ("已连接", egui::Color32::from_rgb(0x35, 0xB2, 0x6B)),
                         ConnStatus::Failed => ("连接失败", egui::Color32::from_rgb(0xE5, 0x53, 0x4B)),
                         ConnStatus::LoggedOut => ("未登录", TEXT_WEAK),
+                        ConnStatus::Anonymous => ("匿名连接", egui::Color32::from_rgb(0x2F, 0x6B, 0xF5)),
                     };
                     ui.horizontal(|ui| {
                         ui.label(
-                            egui::RichText::new(format!("{} · {}", c.url, c.username))
+                            egui::RichText::new(if c.anon {
+                                format!("{} · 匿名", c.url)
+                            } else {
+                                format!("{} · {}", c.url, c.username)
+                            })
                                 .size(11.5)
                                 .color(TEXT_WEAK),
                         );
@@ -7606,17 +7798,29 @@ impl App {
                 ui.end_row();
             });
         ui.add_space(8.0);
-        if ui
-            .add(
-                egui::Button::new(egui::RichText::new("登录并添加").color(egui::Color32::WHITE))
-                    .fill(ACCENT)
-                    .corner_radius(15)
-                    .min_size(egui::vec2(120.0, 30.0)),
-            )
-            .clicked()
-        {
-            self.add_server_login();
-        }
+        ui.horizontal(|ui| {
+            if ui
+                .add(
+                    egui::Button::new(egui::RichText::new("登录并添加").color(egui::Color32::WHITE))
+                        .fill(ACCENT)
+                        .corner_radius(15)
+                        .min_size(egui::vec2(120.0, 30.0)),
+                )
+                .clicked()
+            {
+                self.add_server_login();
+            }
+            if ui
+                .add(
+                    egui::Button::new(egui::RichText::new("匿名添加"))
+                        .corner_radius(15)
+                        .min_size(egui::vec2(120.0, 30.0)),
+                )
+                .clicked()
+            {
+                self.add_server_anon();
+            }
+        });
         ui.add_space(14.0);
         ui.separator();
         ui.add_space(10.0);
@@ -7674,7 +7878,7 @@ impl App {
         }
         if let Some(u) = use_url {
             self.add_url = u;
-            self.msg = "地址已填入上方表单，输入账号密码后点「登录并添加」".into();
+            self.msg = "地址已填入上方表单：输入账号密码点「登录并添加」，或点「匿名添加」浏览公开内容".into();
         }
         ui.add_space(14.0);
         ui.label(
