@@ -4,6 +4,7 @@
 //! exactly like the CLI (spec §4.4 parity).
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+mod index_history;
 mod shell;
 
 use base64::Engine;
@@ -983,6 +984,7 @@ enum IndexFrame {
 enum IndexDetailAction {
     Reload,
     ChangeBranch(String),
+    FocusCommit { branch: String, id: String },
     Export(&'static str),
     Commit(Vec<Value>, &'static str),
     Insert(usize),
@@ -996,6 +998,14 @@ struct OverviewState {
     selected: Option<String>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IndexDetailView {
+    Wall,
+    Commits,
+    Versions,
+    Exports,
+}
+
 /// 索引详情帧状态：一个打开的索引的全部工作状态，随帧销毁。
 struct IndexDetailState {
     index_id: String,
@@ -1003,6 +1013,8 @@ struct IndexDetailState {
     branch: String,
     commits: Option<Value>,
     exports: Option<Value>,
+    view: IndexDetailView,
+    selected_commit: Option<String>,
     /// rendition_id -> versions, semver desc（打开时预取）。
     unit_versions: std::collections::HashMap<String, Vec<Value>>,
     tag_name: String,
@@ -1023,6 +1035,8 @@ impl IndexDetailState {
             branch,
             commits: None,
             exports: None,
+            view: IndexDetailView::Wall,
+            selected_commit: None,
             unit_versions: Default::default(),
             tag_name: String::new(),
             new_branch: String::new(),
@@ -4109,6 +4123,7 @@ impl App {
                 if let IndexFrame::Detail(st) = self.index.stack.top_mut() {
                     st.branch = branch;
                     st.detail = detail;
+                    st.selected_commit = None;
                     st.merge_preview = None;
                     st.merge_resolutions.clear();
                 }
@@ -4144,16 +4159,12 @@ impl App {
                 }
             }
         }
-        let mut unit_versions: std::collections::HashMap<String, Vec<Value>> =
-            Default::default();
+        let mut unit_versions: std::collections::HashMap<String, Vec<Value>> = Default::default();
         for uid in seen_units {
             if let Ok(u) = self.call("GET", &format!("/v1/units/{uid}"), None) {
                 if let Some(rends) = u.get("renditions").and_then(|r| r.as_array()) {
                     for r in rends {
-                        let rid = r
-                            .get("rendition")
-                            .map(|x| s(x, "id"))
-                            .unwrap_or_default();
+                        let rid = r.get("rendition").map(|x| s(x, "id")).unwrap_or_default();
                         let mut vs: Vec<Value> = r
                             .get("versions")
                             .and_then(|v| v.as_array())
@@ -4176,15 +4187,19 @@ impl App {
         if let IndexFrame::Detail(d) = self.index.stack.top_mut() {
             d.unit_versions = unit_versions;
         }
-        if let Ok(v) = self.call("GET", &format!("/v1/indexes/{id}/commits?branch={branch}"), None) {
-            if let IndexFrame::Detail(d) = self.index.stack.top_mut() {
-                d.commits = Some(v);
-            }
-        }
-        if let Ok(v) = self.call("GET", &format!("/v1/exports?index_id={id}"), None) {
-            if let IndexFrame::Detail(d) = self.index.stack.top_mut() {
-                d.exports = Some(v);
-            }
+        let commits = self
+            .call(
+                "GET",
+                &format!("/v1/indexes/{id}/commits?branch={branch}"),
+                None,
+            )
+            .ok();
+        let exports = self
+            .call("GET", &format!("/v1/exports?index_id={id}"), None)
+            .ok();
+        if let IndexFrame::Detail(d) = self.index.stack.top_mut() {
+            d.commits = commits;
+            d.exports = exports;
         }
     }
 
@@ -10893,6 +10908,21 @@ impl App {
             None => match action {
                 Some(IndexDetailAction::Reload) => self.load_index_detail(),
                 Some(IndexDetailAction::ChangeBranch(branch)) => self.change_index_branch(branch),
+                Some(IndexDetailAction::FocusCommit { branch, id }) => {
+                    let branch_changed = matches!(
+                        self.index.stack.top(),
+                        IndexFrame::Detail(st) if st.branch != branch
+                    );
+                    if branch_changed {
+                        self.change_index_branch(branch.clone());
+                    }
+                    if let IndexFrame::Detail(st) = self.index.stack.top_mut() {
+                        if st.branch == branch {
+                            st.view = IndexDetailView::Commits;
+                            st.selected_commit = Some(id);
+                        }
+                    }
+                }
                 Some(IndexDetailAction::Export(kind)) => {
                     if let IndexFrame::Detail(st) = self.index.stack.top() {
                         let index = st.detail.get("index").cloned().unwrap_or_default();
@@ -11191,11 +11221,6 @@ impl App {
             .and_then(|b| b.as_array())
             .cloned()
             .unwrap_or_default();
-        let tags = detail
-            .get("tags")
-            .and_then(|t| t.as_array())
-            .cloned()
-            .unwrap_or_default();
         ui.horizontal(|ui| {
             ui.heading(s(&index, "name"));
             ui.label(
@@ -11227,16 +11252,9 @@ impl App {
                 *action = Some(IndexDetailAction::ChangeBranch(branch));
                 return;
             }
-            ui.label(egui::RichText::new("版本").size(11.5).color(TEXT_WEAK));
-            for t in &tags {
-                ui.label(
-                    egui::RichText::new(format!("V{}", s(t, "name")))
-                        .size(11.5)
-                        .color(TEXT_MAIN),
-                );
-            }
             ui.add(
                 egui::TextEdit::singleline(&mut st.tag_name)
+                    .hint_text("新版本号")
                     .desired_width(176.0)
                     .margin(egui::vec2(10.0, 5.0)),
             );
@@ -11332,7 +11350,13 @@ impl App {
                 }
             }
         });
-        ui.add_space(6.0);
+        ui.add_space(8.0);
+        self.index_detail_tabs(ui, st);
+        ui.add_space(10.0);
+        if st.view != IndexDetailView::Wall {
+            self.index_history_view(ui, st, action);
+            return;
+        }
         // entry tile wall: horizontal cards, one per row
         let entries: Vec<Value> = detail
             .get("resolved_entries")
@@ -11576,164 +11600,140 @@ impl App {
                 });
                 ui.add_space(8.0);
             }
-            ui.add_space(6.0);
-            ui.label(egui::RichText::new("分支合并").strong().size(16.0));
-            ui.horizontal(|ui| {
-                ui.label("来源分支");
-                ui.text_edit_singleline(&mut st.merge_from);
-                if ui
-                    .add_enabled(
-                        !st.merge_from.is_empty(),
-                        egui::Button::new("预览合并"),
-                    )
-                    .clicked()
-                {
-                    let id = st.index_id.clone();
-                        let into = st.branch.clone();
-                        let from = st.merge_from.clone();
-                        match self.call(
-                            "POST",
-                            &format!("/v1/indexes/{id}/merge/preview"),
-                            Some(json!({ "from": from, "into": into })),
-                        ) {
-                            Ok(v) => {
-                                st.merge_preview = Some(v);
-                                st.merge_resolutions.clear();
-                            }
-                            Err(e) => self.msg = format!("合并预览失败：{e}"),
-                        }
-                }
-            });
-            if let Some(preview) = st.merge_preview.clone() {
-                let conflicts = preview
-                    .get("conflicts")
-                    .and_then(|c| c.as_array())
-                    .cloned()
-                    .unwrap_or_default();
-                let mut names: std::collections::HashMap<String, String> =
-                    std::collections::HashMap::new();
-                for re in &resolved {
-                    if let Some(en) = re.get("entry") {
-                        names.insert(
-                            s(en, "unit_id"),
-                            re.get("unit_name")
-                                .and_then(|x| x.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                        );
-                    }
-                }
-                if conflicts.is_empty() {
-                    ui.label(
-                        egui::RichText::new("无冲突，可自动合并")
-                            .color(CHIP_GREEN_FG),
-                    );
-                } else {
-                    ui.label(format!("{} 个条目冲突，逐条裁决：", conflicts.len()));
-                    for c in &conflicts {
-                        let key = s(c, "key");
-                        let uname = names
-                            .get(&s(c, "unit_id"))
-                            .cloned()
-                            .unwrap_or_else(|| "条目".to_string());
-                        let ours = c.get("ours").cloned().unwrap_or(Value::Null);
-                        let theirs = c.get("theirs").cloned().unwrap_or(Value::Null);
-                        ui.horizontal(|ui| {
-                            ui.label(format!(
-                                "{}：本分支「{}」 / 对方「{}」",
-                                uname,
-                                entry_label(&ours),
-                                entry_label(&theirs)
-                            ));
-                            let cur = st.merge_resolutions.get(&key).cloned();
-                            if ui
-                                .selectable_label(cur.as_deref() == Some("ours"), "用本分支")
-                                .clicked()
-                            {
-                                st.merge_resolutions
-                                    .insert(key.clone(), "ours".to_string());
-                            }
-                            if ui
-                                .selectable_label(cur.as_deref() == Some("theirs"), "用对方")
-                                .clicked()
-                            {
-                                st.merge_resolutions
-                                    .insert(key.clone(), "theirs".to_string());
-                            }
-                        });
-                    }
-                }
-                let unresolved = conflicts
-                    .iter()
-                    .filter(|c| !st.merge_resolutions.contains_key(&s(c, "key")))
-                    .count();
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(unresolved == 0, egui::Button::new("执行合并"))
-                        .clicked()
-                    {
-                        let id = st.index_id.clone();
-                            let resolutions: serde_json::Map<String, Value> = st.merge_resolutions
-                                .iter()
-                                .map(|(k, v)| (k.clone(), json!(v)))
-                                .collect();
-                            let r = self.call(
-                                "POST",
-                                &format!("/v1/indexes/{id}/merge"),
-                                Some(json!({
-                                    "from": st.merge_from,
-                                    "into": st.branch,
-                                    "resolutions": resolutions,
-                                })),
-                            );
-                            match r {
-                                Ok(_) => {
-                                    self.msg = "合并完成".into();
-                                    st.merge_preview = None;
-                                    *action = Some(IndexDetailAction::Reload);
-                                }
-                                Err(e) => self.msg = format!("合并失败：{e}"),
-                            }
-                    }
-                    if unresolved > 0 {
-                        ui.label(format!("还剩 {unresolved} 条未裁决"));
-                    }
-                });
+            let index_id = s(&index, "id");
+            if !index_id.is_empty() {
+                self.attachments_ui(ui, "index", &index_id);
             }
-            // full-history popup (opened from a strip's 「更多」)
-            ui.separator();
-            ui.label(egui::RichText::new("提交历史").strong());
-            if let Some(commits) = st.commits
-                .clone()
-                .and_then(|c| c.get("commits").and_then(|x| x.as_array()).cloned())
+        });
+    }
+
+    fn index_merge_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        st: &mut IndexDetailState,
+        action: &mut Option<IndexDetailAction>,
+    ) {
+        let resolved = st.detail["resolved_entries"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("分支合并").strong().size(16.0));
+        ui.horizontal(|ui| {
+            ui.label("来源分支");
+            ui.text_edit_singleline(&mut st.merge_from);
+            if ui
+                .add_enabled(!st.merge_from.is_empty(), egui::Button::new("预览合并"))
+                .clicked()
             {
-                for c in commits {
-                    ui.label(format!(
-                        "{} · {} · {}",
-                        s(&c, "message"),
-                        s(&c, "author"),
-                        fmt_time(i(&c, "created_ms"))
-                    ));
-                }
-            }
-            ui.label(egui::RichText::new("导出记录").strong());
-            if let Some(exports) = st.exports
-                .clone()
-                .and_then(|c| c.get("exports").and_then(|x| x.as_array()).cloned())
-            {
-                for e in exports {
-                    ui.label(format!(
-                        "{} 页 · {} · {}",
-                        i(&e, "page_count"),
-                        fmt_time(i(&e, "created_ms")),
-                        s(&e, "id")
-                    ));
+                let id = st.index_id.clone();
+                let into = st.branch.clone();
+                let from = st.merge_from.clone();
+                match self.call(
+                    "POST",
+                    &format!("/v1/indexes/{id}/merge/preview"),
+                    Some(json!({ "from": from, "into": into })),
+                ) {
+                    Ok(v) => {
+                        st.merge_preview = Some(v);
+                        st.merge_resolutions.clear();
+                    }
+                    Err(e) => self.msg = format!("合并预览失败：{e}"),
                 }
             }
         });
-        let index_id = s(&index, "id");
-        if !index_id.is_empty() {
-            self.attachments_ui(ui, "index", &index_id);
+        if let Some(preview) = st.merge_preview.clone() {
+            let conflicts = preview
+                .get("conflicts")
+                .and_then(|c| c.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let mut names: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            for re in &resolved {
+                if let Some(en) = re.get("entry") {
+                    names.insert(
+                        s(en, "unit_id"),
+                        re.get("unit_name")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    );
+                }
+            }
+            if conflicts.is_empty() {
+                ui.label(egui::RichText::new("无冲突，可自动合并").color(CHIP_GREEN_FG));
+            } else {
+                ui.label(format!("{} 个条目冲突，逐条裁决：", conflicts.len()));
+                for c in &conflicts {
+                    let key = s(c, "key");
+                    let uname = names
+                        .get(&s(c, "unit_id"))
+                        .cloned()
+                        .unwrap_or_else(|| "条目".to_string());
+                    let ours = c.get("ours").cloned().unwrap_or(Value::Null);
+                    let theirs = c.get("theirs").cloned().unwrap_or(Value::Null);
+                    ui.horizontal(|ui| {
+                        ui.label(format!(
+                            "{}：本分支「{}」 / 对方「{}」",
+                            uname,
+                            entry_label(&ours),
+                            entry_label(&theirs)
+                        ));
+                        let cur = st.merge_resolutions.get(&key).cloned();
+                        if ui
+                            .selectable_label(cur.as_deref() == Some("ours"), "用本分支")
+                            .clicked()
+                        {
+                            st.merge_resolutions.insert(key.clone(), "ours".to_string());
+                        }
+                        if ui
+                            .selectable_label(cur.as_deref() == Some("theirs"), "用对方")
+                            .clicked()
+                        {
+                            st.merge_resolutions
+                                .insert(key.clone(), "theirs".to_string());
+                        }
+                    });
+                }
+            }
+            let unresolved = conflicts
+                .iter()
+                .filter(|c| !st.merge_resolutions.contains_key(&s(c, "key")))
+                .count();
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(unresolved == 0, egui::Button::new("执行合并"))
+                    .clicked()
+                {
+                    let id = st.index_id.clone();
+                    let resolutions: serde_json::Map<String, Value> = st
+                        .merge_resolutions
+                        .iter()
+                        .map(|(k, v)| (k.clone(), json!(v)))
+                        .collect();
+                    let r = self.call(
+                        "POST",
+                        &format!("/v1/indexes/{id}/merge"),
+                        Some(json!({
+                            "from": st.merge_from,
+                            "into": st.branch,
+                            "resolutions": resolutions,
+                        })),
+                    );
+                    match r {
+                        Ok(_) => {
+                            self.msg = "合并完成".into();
+                            st.merge_preview = None;
+                            *action = Some(IndexDetailAction::Reload);
+                        }
+                        Err(e) => self.msg = format!("合并失败：{e}"),
+                    }
+                }
+                if unresolved > 0 {
+                    ui.label(format!("还剩 {unresolved} 条未裁决"));
+                }
+            });
         }
     }
 
