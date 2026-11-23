@@ -2128,6 +2128,7 @@ struct App {
     trash: TrashState,
     review: ReviewState,
     nav_home: NavStack<HomeFrame>,
+    home_recent_query: String,
     overlays: Vec<Overlay>,
     msg: String,
     folders: Vec<Value>,
@@ -2813,6 +2814,7 @@ impl App {
             trash: TrashState::new(),
             review: ReviewState::new(),
             nav_home: NavStack::new(HomeFrame::Root),
+            home_recent_query: String::new(),
             overlays: vec![],
             msg: String::new(),
             folders: vec![],
@@ -4595,6 +4597,50 @@ fn tool_vsep(ui: &mut egui::Ui) {
     ui.add_space(5.0);
 }
 
+fn home_recent_row(ui: &mut egui::Ui, columns: [&str; 4], interactive: bool) -> egui::Response {
+    let sense = if interactive {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), sense);
+    let painter = ui.painter();
+    if interactive && response.hovered() {
+        painter.rect_filled(rect, 6.0, HOVER_BG);
+    }
+    let mut x = rect.min.x + 2.0;
+    for (index, (text, fraction)) in columns.into_iter().zip([2.2, 1.1, 1.0, 1.0]).enumerate() {
+        let width = rect.width() * fraction / 5.3;
+        let color = if interactive && index == 0 {
+            TEXT_MAIN
+        } else {
+            TEXT_WEAK
+        };
+        let column = egui::Rect::from_min_size(
+            egui::pos2(x, rect.min.y),
+            egui::vec2((width - 10.0).max(0.0), rect.height()),
+        );
+        painter
+            .with_clip_rect(painter.clip_rect().intersect(column))
+            .text(
+                column.left_center(),
+                egui::Align2::LEFT_CENTER,
+                text,
+                egui::FontId::proportional(12.0),
+                color,
+            );
+        x += width;
+    }
+    if !interactive {
+        painter.hline(
+            rect.x_range(),
+            rect.max.y - 0.5,
+            egui::Stroke::new(1.0, SEPARATOR),
+        );
+    }
+    response
+}
+
 fn client_now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -4881,255 +4927,201 @@ impl App {
     /// navigate to the other pages instead of drilling in. Recent
     /// use is recorded on this device (client settings), so the
     /// launcher is fully useful with no server at all.
+    fn home_sidebar(&mut self, ui: &mut egui::Ui) {
+        let mut action = None;
+        egui::Panel::left("home_sidebar")
+            .exact_size(268.0)
+            .frame(egui::Frame::NONE.fill(PANEL_BG).inner_margin(12))
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 6.0;
+                for (page, label, name, icon) in [
+                    (Page::Showroom, "演示厅", "nav-show", *ICON_NAV_SHOW),
+                    (Page::Index, "索引页", "nav-index", *ICON_NAV_INDEX),
+                    (Page::Content, "内容页", "nav-content", *ICON_NAV_CONTENT),
+                ] {
+                    let texture = self.tex_icon(ui, name, icon);
+                    let image = egui::Image::new((texture, egui::vec2(16.0, 16.0))).tint(ACCENT);
+                    let button = egui::Button::image_and_text(image, tr(label))
+                        .fill(HOVER_BG)
+                        .stroke(egui::Stroke::new(1.0, FIELD_BORDER));
+                    if ui.add_sized([ui.available_width(), 34.0], button).clicked() {
+                        self.page = page;
+                        self.deep_source = None;
+                    }
+                }
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                    for (key, label) in [
+                        ("template", "从模板新建"),
+                        ("import", "导入素材…"),
+                        ("sample", "打开示例项目"),
+                        ("new", "新建索引"),
+                    ] {
+                        let button = egui::Button::new(tr(label))
+                            .fill(if key == "new" { ACCENT } else { HOVER_BG })
+                            .corner_radius(6);
+                        if ui.add_sized([ui.available_width(), 32.0], button).clicked() {
+                            action = Some(key);
+                        }
+                    }
+                });
+            });
+        self.run_home_action(action);
+    }
+
     fn page_home(&mut self, ui: &mut egui::Ui) {
-        // The prototype's home wrap (.home-wrap, final cascade):
-        // 52px top / 40px sides / 64px bottom, full width.
+        let viewport_width = ui.ctx().viewport_rect().width();
         egui::Frame::NONE
             .inner_margin(egui::Margin {
                 left: 40,
                 right: 40,
                 top: 52,
-                bottom: 64,
+                bottom: 18,
             })
             .show(ui, |ui| {
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(tr("欢迎使用启幕"))
-                    .size(30.0)
-                    .color(TEXT_MAIN),
-            );
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new(format!(
-                    "{} · 版本 {}",
-                    tr("PPT 内容管理与索引系统"),
-                    env!("CARGO_PKG_VERSION")
-                ))
-                .size(13.0)
-                .color(TEXT_WEAK),
-            );
-            ui.add_space(6.0);
-            // Connection state, stated neutrally: the launcher and
-            // every local feature work the same with no server; the
-            // line only says what this device can currently reach.
-            // Identity keys on the connection's anon flag, never on
-            // token presence: an anonymous connection mirrors a
-            // server-issued guest token into self.token (G1), so a
-            // token-first check would mislabel it as a named session.
-            let conn_line = if self.anon_active() {
-                format!("{} · {}", tr("已连接服务器（匿名）"), self.active_server_label())
-            } else if self.token.is_some()
-                || self
-                    .conns
-                    .iter()
-                    .any(|c| c.status == ConnStatus::Connected)
-            {
-                format!("{} · {}", tr("已连接服务器"), self.active_server_label())
-            } else {
-                tr("单机模式：未连接服务器，本地功能完整可用").to_string()
-            };
-            ui.label(egui::RichText::new(conn_line).size(12.0).color(TEXT_FAINT));
-            ui.add_space(16.0);
-            if self.user.is_none() {
-                ui.horizontal(|ui| {
-                    if self.anon_active() {
-                        ui.label(
-                            egui::RichText::new(tr(
-                                "匿名连接：可浏览组织公开内容；发布、审批需实名登录。",
-                            ))
-                            .size(12.5)
-                            .color(TEXT_WEAK),
-                        );
-                        if q_primary_button(ui, tr("实名登录")).clicked() {
-                            self.login_open = true;
-                        }
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.label(egui::RichText::new(tr("欢迎使用启幕")).size(30.0).strong());
+                    ui.add_space(5.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} · 版本 {}",
+                            tr("PPT 内容管理与索引系统"),
+                            env!("CARGO_PKG_VERSION")
+                        ))
+                        .size(13.0)
+                        .color(TEXT_WEAK),
+                    );
+                    ui.add_space(28.0);
+                    let mut action = None;
+                    let columns = if viewport_width <= 1000.0 { 2 } else { 4 };
+                    let width = if viewport_width > 1200.0 {
+                        ui.available_width().min(980.0)
                     } else {
-                        ui.label(
-                            egui::RichText::new(tr(
-                                "本机功能无需登录即可完整使用；连接组织服务器可浏览公开内容。",
-                            ))
-                            .size(12.5)
-                            .color(TEXT_WEAK),
-                        );
-                        if q_primary_button(ui, tr("连接服务器")).clicked() {
-                            self.login_open = true;
-                        }
+                        ui.available_width()
+                    };
+                    let card_width = ((width + 12.0) / columns as f32 - 12.0).floor();
+                    let actions = [
+                        ("new", "新建索引", "icon-doc-add", *ICON_DOC_ADD),
+                        ("sample", "打开示例项目", "nav-show", *ICON_NAV_SHOW),
+                        ("import", "导入素材…", "icon-upload", *ICON_UPLOAD),
+                        ("template", "从模板新建", "icon-all-apps", *ICON_ALL_APPS),
+                    ];
+                    ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
+                    for row in actions.chunks(columns) {
+                        ui.horizontal(|ui| {
+                            for &(key, label, name, icon) in row {
+                                if self.home_action_card(ui, card_width, name, icon, tr(label)) {
+                                    action = Some(key);
+                                }
+                            }
+                        });
                     }
+                    self.run_home_action(action);
+                    ui.add_space(40.0);
+                    self.home_recent_ui(ui);
                 });
-                ui.add_space(12.0);
+            });
+    }
+
+    fn run_home_action(&mut self, action: Option<&str>) {
+        match action {
+            Some("new") => self.act_new_index(),
+            Some("sample") => self.open_sample_project(),
+            Some("import") => {
+                self.page = Page::Content;
+                self.act_import_ppt();
             }
-            // The prototype's four launch cards: one row of four
-            // with 12px gaps, the row capped at 980px (.home-actions).
-            let mut act: Option<&'static str> = None;
-            let card_w = (ui.available_width().min(980.0) - 36.0) / 4.0;
-            ui.spacing_mut().item_spacing.x = 12.0;
-            ui.horizontal_wrapped(|ui| {
-                if self.home_action_card(ui, card_w, "icon-doc-add", *ICON_DOC_ADD, tr("新建索引")) {
-                    act = Some("new");
-                }
-                if self.home_action_card(ui, card_w, "icon-play", *ICON_PLAY, tr("打开示例项目")) {
-                    act = Some("sample");
-                }
-                if self.home_action_card(ui, card_w, "icon-upload", *ICON_UPLOAD, tr("导入素材…")) {
-                    act = Some("import");
-                }
-                if self.home_action_card(ui, card_w, "icon-all-apps", *ICON_ALL_APPS, tr("从模板新建")) {
-                    act = Some("template");
+            Some("template") => {
+                let first = self.indexes.first().map(|x| s(x, "id")).unwrap_or_default();
+                self.overlays.push(Overlay::PickTemplate(PickTemplateState {
+                    new_name: String::new(),
+                    template_id: first,
+                }));
+            }
+            _ => {}
+        }
+    }
+
+    fn home_recent_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(tr("最近使用")).size(13.0).strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.home_recent_query)
+                        .hint_text(tr("搜索最近文件"))
+                        .desired_width(170.0)
+                        .margin(egui::vec2(9.0, 6.0)),
+                );
+            });
+        });
+        ui.spacing_mut().item_spacing.y = 0.0;
+        home_recent_row(
+            ui,
+            [tr("名称"), tr("打开时间"), tr("大小"), tr("类型")],
+            false,
+        );
+
+        let query = self.home_recent_query.trim().to_lowercase();
+        let mut open = None;
+        let mut found = false;
+        for r in recent_items() {
+            let kind = match s(&r, "kind").as_str() {
+                "index" => tr("索引"),
+                "unit" => tr("内容块"),
+                "showroom" => tr("演示成品"),
+                _ => "",
+            };
+            let title = s(&r, "title");
+            let version = s(&r, "ver");
+            if ![title.as_str(), kind, version.as_str()]
+                .iter()
+                .any(|value| value.to_lowercase().contains(&query))
+            {
+                continue;
+            }
+            found = true;
+            let time = fmt_time(i(&r, "ms"));
+            let response = home_recent_row(ui, [&title, &time, "—", kind], true);
+            if !version.is_empty() {
+                response.clone().on_hover_text(version);
+            }
+            if response.clicked() {
+                open = Some(r);
+            }
+        }
+        if !found {
+            ui.add_space(56.0);
+            ui.vertical_centered(|ui| {
+                if query.is_empty() {
+                    ui.label(tr("你最近使用的文件会显示在这里"));
+                    ui.add_space(7.0);
+                    ui.label(
+                        egui::RichText::new(tr("新建一个索引，或打开示例项目先熟悉一下界面。"))
+                            .size(12.0)
+                            .color(TEXT_WEAK),
+                    );
+                } else {
+                    ui.label(tr("没有匹配的最近文件"));
                 }
             });
-            match act {
-                Some("new") => self.act_new_index(),
-                Some("sample") => self.open_sample_project(),
-                Some("import") => {
-                    self.page = Page::Content;
-                    self.act_import_ppt();
+        }
+        if let Some(r) = open {
+            self.deep_source = Some(Page::Home);
+            match s(&r, "kind").as_str() {
+                "index" => {
+                    self.page = Page::Index;
+                    self.open_index_detail(&s(&r, "id"));
                 }
-                Some("template") => {
-                    let first = self
-                        .indexes
-                        .first()
-                        .map(|x| s(x, "id"))
-                        .unwrap_or_default();
-                    self.overlays.push(Overlay::PickTemplate(PickTemplateState {
-                        new_name: String::new(),
-                        template_id: first,
-                    }));
+                "unit" => {
+                    self.page = Page::Content;
+                    self.open_unit_detail(&s(&r, "id"));
+                }
+                "showroom" => {
+                    self.page = Page::Showroom;
+                    self.open_deck_for_ref("showroom", &s(&r, "id"), &s(&r, "title"));
                 }
                 _ => {}
             }
-            ui.add_space(16.0);
-            // At-a-glance counts from loaded state.
-            ui.label(
-                egui::RichText::new(format!(
-                    "{} · {} {} · {} {} · {} {}",
-                    tr("当前内容"),
-                    self.indexes.len(),
-                    tr("个索引"),
-                    self.units.len(),
-                    tr("个内容块"),
-                    self.showroom_live.len(),
-                    tr("个演示成品"),
-                ))
-                .size(12.0)
-                .color(TEXT_WEAK),
-            );
-            ui.add_space(38.0);
-            ui.label(egui::RichText::new(tr("最近使用")).size(13.0).color(TEXT_MAIN));
-            ui.add_space(6.0);
-            let recents = recent_items();
-            if recents.is_empty() {
-                // The prototype's .hr-empty: centered title + sub
-                // copy with generous vertical padding.
-                ui.add_space(48.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(
-                        egui::RichText::new(tr("暂无最近使用"))
-                            .size(13.0)
-                            .color(TEXT_MAIN),
-                    );
-                    ui.add_space(7.0);
-                    ui.label(
-                        egui::RichText::new(tr(
-                            "打开过的索引、内容块和演示成品会出现在这里。",
-                        ))
-                        .size(12.0)
-                        .color(TEXT_WEAK),
-                    );
-                });
-                ui.add_space(48.0);
-            } else {
-                // Borderless table (A27): name / kind / version /
-                // last opened; a row click reopens the item. The
-                // header row is the prototype's .hr-head: muted
-                // 11.5px labels on the 2.2/1.1/1/1 column grid with
-                // a 1px --line under it.
-                {
-                    let w = ui.available_width();
-                    let (hrect, _) =
-                        ui.allocate_exact_size(egui::vec2(w, 26.0), egui::Sense::hover());
-                    let painter = ui.painter();
-                    let font = egui::FontId::new(11.5, egui::FontFamily::Proportional);
-                    for (text, fx) in [
-                        (tr("名称"), 0.0f32),
-                        (tr("类型"), 2.2 / 5.3),
-                        (tr("版本"), 3.3 / 5.3),
-                        (tr("最近打开"), 4.3 / 5.3),
-                    ] {
-                        let g = painter.layout_no_wrap(text.to_string(), font.clone(), TEXT_WEAK);
-                        painter.galley(
-                            egui::pos2(
-                                hrect.min.x + 2.0 + w * fx,
-                                hrect.center().y - g.size().y / 2.0,
-                            ),
-                            g,
-                            TEXT_WEAK,
-                        );
-                    }
-                    painter.hline(
-                        hrect.x_range(),
-                        hrect.max.y - 0.5,
-                        egui::Stroke::new(1.0, SEPARATOR),
-                    );
-                }
-                let mut open: Option<Value> = None;
-                for r in &recents {
-                    let (rect, resp) = ui.allocate_exact_size(
-                        egui::vec2(ui.available_width(), 30.0),
-                        egui::Sense::click(),
-                    );
-                    let painter = ui.painter();
-                    if resp.hovered() {
-                        painter.rect_filled(rect, 6.0, HOVER_BG);
-                    }
-                    let kind_label = match s(r, "kind").as_str() {
-                        "index" => tr("索引"),
-                        "unit" => tr("内容块"),
-                        "showroom" => tr("演示成品"),
-                        _ => "",
-                    };
-                    let w = rect.width();
-                    let cols: [(String, f32); 4] = [
-                        (s(r, "title"), rect.min.x + 2.0),
-                        (kind_label.to_string(), rect.min.x + w * (2.2 / 5.3)),
-                        (s(r, "ver"), rect.min.x + w * (3.3 / 5.3)),
-                        (fmt_time(i(r, "ms")), rect.min.x + w * (4.3 / 5.3)),
-                    ];
-                    for (j, (text, x)) in cols.iter().enumerate() {
-                        let font = egui::FontId::new(12.0, egui::FontFamily::Proportional);
-                        let color = if j == 0 { TEXT_MAIN } else { TEXT_WEAK };
-                        let g = painter.layout_no_wrap(text.clone(), font, color);
-                        let gx = *x;
-                        painter.galley(
-                            egui::pos2(gx, rect.center().y - g.size().y / 2.0),
-                            g,
-                            color,
-                        );
-                    }
-                    if resp.clicked() {
-                        open = Some(r.clone());
-                    }
-                }
-                if let Some(r) = open {
-                    self.deep_source = Some(Page::Home);
-                    match s(&r, "kind").as_str() {
-                        "index" => {
-                            self.page = Page::Index;
-                            self.open_index_detail(&s(&r, "id"));
-                        }
-                        "unit" => {
-                            self.page = Page::Content;
-                            self.open_unit_detail(&s(&r, "id"));
-                        }
-                        "showroom" => {
-                            self.page = Page::Showroom;
-                            self.open_deck_for_ref("showroom", &s(&r, "id"), &s(&r, "title"));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        });
-            });
+        }
     }
 
     /// One launcher action card (A27): 22px icon + label on a
@@ -6604,6 +6596,9 @@ impl eframe::App for App {
                     egui::Stroke::new(1.0, SEPARATOR),
                 );
             });
+        if self.page == Page::Home {
+            self.home_sidebar(ui);
+        }
         if self.page != Page::Index {
             self.page_footer(ui);
         }
