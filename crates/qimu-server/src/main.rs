@@ -56,6 +56,29 @@ fn auth(st: &St, headers: &HeaderMap) -> Result<UserRec, (StatusCode, Json<Value
         .map_err(|e| err(StatusCode::UNAUTHORIZED, e))
 }
 
+/// Optional auth for the anonymous guest read surface (user ruling
+/// 2026-11-23: the client opens without login). Returns the user
+/// when a valid session token is present, None when the header is
+/// absent — and rejects a *present but invalid* token, so a stale
+/// session still surfaces as 401 instead of silently downgrading.
+fn auth_opt(st: &St, headers: &HeaderMap) -> Result<Option<UserRec>, (StatusCode, Json<Value>)> {
+    let token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|v| v.trim().to_string());
+    match token {
+        None => Ok(None),
+        Some(t) => {
+            let store = st.store.lock().unwrap();
+            store
+                .user_by_token(&t)
+                .map(Some)
+                .map_err(|e| err(StatusCode::UNAUTHORIZED, e))
+        }
+    }
+}
+
 fn need_cap(
     st: &St,
     user: &UserRec,
@@ -671,8 +694,11 @@ async fn translate_unit(
     })))
 }
 
-async fn get_cache_policy(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
-    let _ = auth(&st, &headers)?;
+async fn get_cache_policy(State(st): State<St>) -> Api<Value> {
+    // Anonymous-readable (user ruling 2026-11-23): the value is a
+    // device policy (allowed / max_mb) the client applies to its
+    // local offline cache; it carries no user data. Writing it
+    // stays super-only (put_cache_policy below).
     let store = st.store.lock().unwrap();
     let raw = store.get_setting("cache_policy").map_err(bad)?;
     let policy: Value = raw
@@ -2397,12 +2423,19 @@ async fn list_showroom(
     headers: HeaderMap,
     Query(q): Query<HashMap<String, String>>,
 ) -> Api<Value> {
-    let user = auth(&st, &headers)?;
+    // Anonymous-readable (user ruling 2026-11-23): guests only
+    // ever see published (live) items; the own-submissions widening
+    // for non-super users applies to authenticated users only.
+    let user = auth_opt(&st, &headers)?;
     let store = st.store.lock().unwrap();
     let state = q.get("state").map(|s| s.as_str());
     let mut items = store.list_showroom(state).map_err(bad)?;
-    if user.role != "super" {
-        items.retain(|i| i.state == "live" || i.submitted_by == user.display_name);
+    match &user {
+        None => items.retain(|i| i.state == "live"),
+        Some(u) if u.role != "super" => {
+            items.retain(|i| i.state == "live" || i.submitted_by == u.display_name)
+        }
+        _ => {}
     }
     Ok(Json(json!({ "items": items })))
 }

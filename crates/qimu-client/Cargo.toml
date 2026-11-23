@@ -21,6 +21,10 @@ serde_json = "1"
 ureq = { version = "2", features = ["json"] }
 base64 = "0.22"
 rfd = "0.15"
+
+# build.rs embeds the brand logo as the Windows executable icon.
+[build-dependencies]
+winresource = "0.1"
 # craft-i18n (storytold/craft-libs@63196e6, MIT OR Apache-2.0): the
 # source-keyed localization runtime; catalogs live in locales/*.tsv in
 # the storytold/craft-i18n TSV format.

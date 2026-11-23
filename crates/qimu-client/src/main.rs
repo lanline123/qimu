@@ -358,24 +358,6 @@ fn tree_row(
     resp
 }
 
-/// The blue brand tile with the white 启 glyph (top bar 24px, login 64px).
-fn logo_tile(ui: &mut egui::Ui, size: f32, glyph: f32, radius: f32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
-    let painter = ui.painter();
-    painter.rect_filled(rect, radius, ACCENT);
-    let font = egui::FontId::new(glyph, egui::FontFamily::Proportional);
-    let galley = painter.layout_no_wrap(
-        "启".to_string(),
-        font,
-        egui::Color32::WHITE,
-    );
-    let pos = egui::pos2(
-        rect.center().x - galley.size().x / 2.0,
-        rect.center().y - galley.size().y / 2.0,
-    );
-    painter.galley(pos, galley, egui::Color32::WHITE);
-}
-
 /// Page body padding inside a dock frame, tightened one step with
 /// the frame2 density pass: 16 left/right, 8 top. The fill is the
 /// app canvas: inside a dock frame the panel_bg would otherwise
@@ -879,6 +861,11 @@ struct App {
     /// currently floating and when it appeared, in egui time.
     toast_msg: String,
     toast_since: f64,
+    /// Login popup visibility (login is a closable dialog over the
+    /// main window, never an entry gate — see login_window).
+    login_open: bool,
+    /// About dialog visibility.
+    about_open: bool,
 }
 
 enum ThumbState {
@@ -1094,6 +1081,14 @@ static ICON_CLIPBOARD: std::sync::LazyLock<&'static [u8]> = std::sync::LazyLock:
 });
 static ICON_DOC_ADD: std::sync::LazyLock<&'static [u8]> =
     std::sync::LazyLock::new(|| icon_png(include_str!("../assets/icons/doc-add.png.b64")));
+
+/// The brand logo (blue Q ribbon), extracted from the product
+/// prototype's top bar and stored as base64 text like the icons
+/// (assets/logo.png.b64). Drives the shell / login / about image,
+/// the runtime window icon (app_icon) and — via build.rs — the
+/// executable's embedded icon.
+static LOGO_PNG: std::sync::LazyLock<&'static [u8]> =
+    std::sync::LazyLock::new(|| icon_png(include_str!("../assets/logo.png.b64")));
 
 /// Temporary index-initiated modes hosted on the content page (§3.10):
 /// picking an entry's pages, or inserting a new entry, both start from
@@ -1466,6 +1461,8 @@ impl App {
             ws_st: None,
             toast_msg: String::new(),
             toast_since: 0.0,
+            login_open: false,
+            about_open: false,
         };
         if std::env::var("QIMU_AUTOLOGIN").is_ok() && !app.password.is_empty() {
             app.do_login();
@@ -1631,6 +1628,7 @@ impl App {
                 self.token = v.get("token").and_then(|t| t.as_str()).map(|s| s.to_string());
                 self.user = v.get("user").cloned();
                 self.msg = "登录成功".into();
+                self.login_open = false;
                 // Persist this server as a saved connection so the next
                 // start goes straight in.
                 let url = self.server.clone();
@@ -1754,6 +1752,7 @@ impl App {
         self.conns = load_conns();
         if self.conns.is_empty() {
             self.autostart_local_server();
+            self.refresh_guest();
             return;
         }
         for i in 0..self.conns.len() {
@@ -1788,6 +1787,9 @@ impl App {
             if self.token.is_some() {
                 self.refresh_all();
             }
+        }
+        if self.token.is_none() {
+            self.refresh_guest();
         }
     }
 
@@ -1897,6 +1899,64 @@ impl App {
             }
             self.persist_conns();
         }
+        // The shell stays usable logged out: drop the previous
+        // identity's server data (it must not linger on screen) and
+        // fall back to the guest surface (published showroom + the
+        // local offline cache).
+        self.clear_account_state();
+        self.refresh_guest();
+    }
+
+    /// Gate for actions that need a server identity (user ruling
+    /// 2026-11-23: login must not gate *entering* the app, only the
+    /// actions that genuinely need an identity). When logged out:
+    /// explain, open the login popup, and report false so the
+    /// caller returns without touching the network. Closing the
+    /// popup leaves the user's page and context exactly as they
+    /// were; nothing is retried automatically after login.
+    fn need_login(&mut self, action: &str) -> bool {
+        if self.token.is_some() {
+            return true;
+        }
+        self.msg = format!("「{action}」需要登录后使用，请先登录");
+        self.login_open = true;
+        false
+    }
+
+    /// What a logged-out client may load: the published showroom
+    /// (the server serves live items anonymously) plus the local
+    /// offline cache index. Everything else stays empty until login.
+    fn refresh_guest(&mut self) {
+        if let Ok(v) = self.call("GET", "/v1/showroom?state=live", None) {
+            self.showroom_live = v
+                .get("items")
+                .and_then(|f| f.as_array())
+                .cloned()
+                .unwrap_or_default();
+        }
+        self.cache_entries = load_cache_index();
+    }
+
+    /// Drop every server-scoped list tied to the previous identity.
+    fn clear_account_state(&mut self) {
+        self.folders.clear();
+        self.groups.clear();
+        self.units.clear();
+        self.indexes.clear();
+        self.org = json!({});
+        self.showroom_live.clear();
+        self.showroom_pending.clear();
+        self.my_assemblies.clear();
+        self.inbox.clear();
+        self.group_spaces.clear();
+        self.my_teams.clear();
+        self.library_refs.clear();
+        self.index_covers.clear();
+        self.index_tags.clear();
+        self.sr_detail = None;
+        self.sr_deck = None;
+        self.sr_preview = None;
+        self.my_id.clear();
     }
 
     fn refresh_all(&mut self) {
@@ -2683,6 +2743,9 @@ impl App {
     /// version. QIMU_PASTE_FRAGMENT points at a prepared fragment file
     /// and stands in for the bridge capture in headless verification.
     fn create_unit_from_paste(&mut self) {
+        if !self.need_login("粘贴新建") {
+            return;
+        }
         let frag: Option<std::path::PathBuf> = std::env::var("QIMU_PASTE_FRAGMENT")
             .ok()
             .map(std::path::PathBuf::from)
@@ -2862,6 +2925,21 @@ impl App {
                     .color(TEXT_WEAK),
             );
             ui.add_space(16.0);
+            if self.token.is_none() {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(tr(
+                            "当前未登录：可浏览演示厅与本地缓存，登录后可使用全部功能。",
+                        ))
+                        .size(12.5)
+                        .color(TEXT_WEAK),
+                    );
+                    if q_primary_button(ui, tr("登录")).clicked() {
+                        self.login_open = true;
+                    }
+                });
+                ui.add_space(12.0);
+            }
             // Quick actions — the prototype's four launch cards.
             ui.horizontal_wrapped(|ui| {
                 card_frame().show(ui, |ui| {
@@ -3189,6 +3267,13 @@ impl App {
     /// Settings sections visible to the current role — sections a
     /// role may not see are not rendered at all (§7.9).
     fn settings_sections(&self) -> Vec<&'static str> {
+        if self.token.is_none() {
+            // Logged out: only the local sections — connecting a
+            // server (and logging in there) plus the on-device
+            // offline cache. Identity-bound sections appear after
+            // login, per role, as before.
+            return vec!["服务器", "离线缓存"];
+        }
         let role = self.role();
         let mut sections: Vec<&str> = vec!["服务器", "个人资料"];
         if role != "member" {
@@ -3502,93 +3587,6 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
 
-        if self.token.is_none() {
-            egui::CentralPanel::default()
-                .frame(egui::Frame::NONE.fill(APP_BG))
-                .show(ui, |ui| {
-                    // Board: a 500×400 card (r6, standard card radius)
-                    // centered on the canvas — blue logo tile, white
-                    // title, gray labels, 330×34 fields on a 52 pitch,
-                    // blue pill aligned with the field column.
-                    ui.add_space(((ui.available_height() - 400.0).max(0.0)) / 2.0 - 25.0);
-                    ui.vertical_centered(|ui| {
-                        egui::Frame::NONE
-                            .fill(CARD_BG)
-                            .stroke(egui::Stroke::new(1.0, CARD_BORDER))
-                            .corner_radius(egui::CornerRadius::same(6))
-                            .inner_margin(egui::Margin {
-                                left: 40,
-                                right: 40,
-                                top: 36,
-                                bottom: 28,
-                            })
-                            .show(ui, |ui| {
-                                ui.set_width(420.0);
-                                ui.vertical_centered(|ui| {
-                                    logo_tile(ui, 64.0, 30.0, 14.0);
-                                    ui.add_space(12.0);
-                                    ui.label(
-                                        egui::RichText::new("启幕")
-                                            .strong()
-                                            .size(26.0)
-                                            .color(TEXT_MAIN),
-                                    );
-                                    ui.add_space(4.0);
-                                    ui.label(
-                                        egui::RichText::new(tr("PPT 内容管理与更新系统"))
-                                            .size(13.0)
-                                            .color(TEXT_WEAK),
-                                    );
-                                });
-                                ui.add_space(22.0);
-                                egui::Grid::new("login_grid")
-                                    .num_columns(2)
-                                    .spacing([10.0, 18.0])
-                                    .show(ui, |ui| {
-                                        for (label, val, pw) in [
-                                            ("服务器", &mut self.server, false),
-                                            ("账号", &mut self.username, false),
-                                            ("密码", &mut self.password, true),
-                                        ] {
-                                            ui.label(
-                                                egui::RichText::new(tr(label))
-                                                    .size(13.0)
-                                                    .color(TEXT_WEAK),
-                                            );
-                                            ui.add_sized(
-                                                [330.0, 34.0],
-                                                egui::TextEdit::singleline(val)
-                                                    .password(pw)
-                                                    .margin(egui::vec2(10.0, 8.0)),
-                                            );
-                                            ui.end_row();
-                                        }
-                                    });
-                                ui.add_space(18.0);
-                                ui.horizontal(|ui| {
-                                    // align with the field column
-                                    ui.add_space(52.0);
-                                    let login_btn = egui::Button::new(
-                                        egui::RichText::new(tr("登录"))
-                                            .size(14.0)
-                                            .color(egui::Color32::WHITE),
-                                    )
-                                    .fill(ACCENT)
-                                    .corner_radius(20)
-                                    .min_size(egui::vec2(330.0, 40.0));
-                                    if ui.add(login_btn).clicked() {
-                                        self.do_login();
-                                    }
-                                });
-                            });
-                        if !self.msg.is_empty() {
-                            ui.add_space(12.0);
-                            ui.label(egui::RichText::new(&self.msg).color(TEXT_WEAK));
-                        }
-                    });
-                });
-            return;
-        }
 
         // ==== Main-window framework, replicated from the EffectCraft
         // source (design/EffectCraft主页布局拆解.md): menu row 24 +
@@ -3608,8 +3606,13 @@ impl eframe::App for App {
                 egui::MenuBar::new().ui(ui, |ui| {
                     ui.menu_button(egui::RichText::new(tr("文件")).size(12.0), |ui| {
                         ui.set_min_width(160.0);
-                        if ui.button(tr("退出登录")).clicked() {
-                            self.logout();
+                        if self.token.is_some() {
+                            if ui.button(tr("退出登录")).clicked() {
+                                self.logout();
+                                ui.close();
+                            }
+                        } else if ui.button(tr("登录")).clicked() {
+                            self.login_open = true;
                             ui.close();
                         }
                         if ui.button(tr("退出")).clicked() {
@@ -3640,7 +3643,7 @@ impl eframe::App for App {
                             ui.close();
                         }
                         if ui.button(tr("关于启幕")).clicked() {
-                            self.msg = "启幕 · PPT 内容管理与更新系统".into();
+                            self.about_open = true;
                             ui.close();
                         }
                     });
@@ -3665,7 +3668,7 @@ impl eframe::App for App {
             )
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
-                    logo_tile(ui, 24.0, 13.0, 6.0);
+                    self.logo_ui(ui, 24.0);
                     ui.add_space(8.0);
                     if self.tool_slot(
                         ui,
@@ -3729,17 +3732,35 @@ impl eframe::App for App {
                         Page::Settings => {}
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if self.tool_slot(ui, false, tr("退出"), "power", *ICON_POWER) {
-                            self.logout();
+                        if self.token.is_some() {
+                            if self.tool_slot(ui, false, tr("退出"), "power", *ICON_POWER) {
+                                self.logout();
+                            }
+                        } else if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(tr("登录")).size(11.5).color(ACCENT),
+                                )
+                                .fill(BTN_BG)
+                                .corner_radius(6),
+                            )
+                            .clicked()
+                        {
+                            self.login_open = true;
                         }
                         ui.add_space(6.0);
-                        let name = self
-                            .user
-                            .as_ref()
-                            .map(|u| s(u, "display_name"))
-                            .unwrap_or_default();
+                        let user_text = if self.token.is_some() {
+                            let name = self
+                                .user
+                                .as_ref()
+                                .map(|u| s(u, "display_name"))
+                                .unwrap_or_default();
+                            format!("{name} · {}", self.role())
+                        } else {
+                            tr("未登录").to_string()
+                        };
                         ui.label(
-                            egui::RichText::new(format!("{name} · {}", self.role()))
+                            egui::RichText::new(user_text)
                                 .size(11.5)
                                 .color(TEXT_WEAK),
                         );
@@ -3821,6 +3842,8 @@ impl eframe::App for App {
                 Page::Settings => self.dock_settings(ui),
             });
         self.toast(ui, screen);
+        self.login_window(ui);
+        self.about_window(ui);
     }
 }
 
@@ -4169,6 +4192,9 @@ impl App {
     /// Open a showroom entry's whole-deck view (H): fetch the source
     /// index so its resolved entries can be paged through.
     fn open_showroom_deck(&mut self, item: &Value) {
+        if !self.need_login("查看演示内容") {
+            return;
+        }
         self.sr_detail = Some(item.clone());
         self.sr_deck = None;
         self.sr_preview = None;
@@ -4191,6 +4217,13 @@ impl App {
         label: &str,
     ) -> bool {
         self.icon_button_tinted(ui, name, bytes, label, egui::Color32::WHITE)
+    }
+
+    /// The brand logo at `size` px (shell tool row, login popup,
+    /// about dialog) — the real Q-ribbon image, not a drawn tile.
+    fn logo_ui(&mut self, ui: &mut egui::Ui, size: f32) {
+        let id = self.tex_icon(ui, "logo", *LOGO_PNG);
+        ui.image((id, egui::vec2(size, size)));
     }
 
     /// Load an embedded IconPark PNG into the texture cache (once)
@@ -5076,6 +5109,14 @@ impl App {
                 .color(TEXT_MAIN),
         );
         ui.add_space(6.0);
+        if self.token.is_none() && self.sr_zone == "plaza" {
+            ui.label(
+                egui::RichText::new(tr("未登录：仅显示已发布内容，封面与逐页查看需登录"))
+                    .size(12.0)
+                    .color(TEXT_WEAK),
+            );
+            ui.add_space(4.0);
+        }
         if self.sr_zone == "library" {
             self.library_view(ui);
             return;
@@ -5242,6 +5283,9 @@ impl App {
     /// toolbar slot): pick a deck, let the server propose blocks,
     /// then import with the proposal confirmed as-is.
     fn act_import_split(&mut self) {
+        if !self.need_login("智能分块导入") {
+            return;
+        }
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("PowerPoint", &["pptx"])
             .pick_file()
@@ -5294,6 +5338,9 @@ impl App {
     /// 导入 PPT (content page action, also its toolbar slot): import
     /// a whole deck into the current folder/group.
     fn act_import_ppt(&mut self) {
+        if !self.need_login("导入 PPT") {
+            return;
+        }
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("PowerPoint", &["pptx"])
             .pick_file()
@@ -6313,6 +6360,151 @@ impl App {
         }
     }
 
+    /// The login popup (user rulings 2026-11-23): login is a modal
+    /// dialog over the main window — never a page, never an entry
+    /// gate. It reuses the pre-existing login form state (server /
+    /// username / password live on App and feed do_login), so the
+    /// connection restore and local-server autostart logic are
+    /// untouched, and closing + reopening keeps whatever was typed.
+    ///
+    /// Close behavior (each path only flips `login_open` — nothing
+    /// is submitted, cleared or rolled back on close, at any stage,
+    /// including mid-typing and after a failed submit):
+    /// - the title-bar X (egui's .open binding);
+    /// - the 「取消」 button;
+    /// - the Esc key.
+    /// There is no mask layer (the codebase's other dialogs have
+    /// none either); the window itself is the modal surface. A
+    /// failed login keeps the popup open with the error shown
+    /// inside; a successful one closes it via do_login.
+    fn login_window(&mut self, ui: &mut egui::Ui) {
+        if !self.login_open {
+            return;
+        }
+        if ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.login_open = false;
+            return;
+        }
+        let mut open = true;
+        let mut cancel = false;
+        egui::Window::new("登录")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ui.ctx(), |ui| {
+                ui.vertical_centered(|ui| {
+                    self.logo_ui(ui, 56.0);
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new("启幕")
+                            .strong()
+                            .size(24.0)
+                            .color(TEXT_MAIN),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(tr("PPT 内容管理与更新系统"))
+                            .size(13.0)
+                            .color(TEXT_WEAK),
+                    );
+                });
+                ui.add_space(18.0);
+                egui::Grid::new("login_grid")
+                    .num_columns(2)
+                    .spacing([10.0, 14.0])
+                    .show(ui, |ui| {
+                        for (label, val, pw) in [
+                            ("服务器", &mut self.server, false),
+                            ("账号", &mut self.username, false),
+                            ("密码", &mut self.password, true),
+                        ] {
+                            ui.label(
+                                egui::RichText::new(tr(label))
+                                    .size(13.0)
+                                    .color(TEXT_WEAK),
+                            );
+                            ui.add_sized(
+                                [300.0, 34.0],
+                                egui::TextEdit::singleline(val)
+                                    .password(pw)
+                                    .margin(egui::vec2(10.0, 8.0)),
+                            );
+                            ui.end_row();
+                        }
+                    });
+                if !self.msg.is_empty() {
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new(&self.msg)
+                            .size(12.0)
+                            .color(TEXT_WEAK),
+                    );
+                }
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let login_btn = egui::Button::new(
+                            egui::RichText::new(tr("登录"))
+                                .size(14.0)
+                                .color(egui::Color32::WHITE),
+                        )
+                        .fill(ACCENT)
+                        .corner_radius(6)
+                        .min_size(egui::vec2(110.0, 36.0));
+                        if ui.add(login_btn).clicked() {
+                            self.do_login();
+                        }
+                        if ui.button(tr("取消")).clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            });
+        if cancel || !open {
+            self.login_open = false;
+        }
+    }
+
+    /// About dialog: brand logo + name + version (the 帮助 menu's
+    /// 关于启幕 used to only flash a toast line).
+    fn about_window(&mut self, ui: &mut egui::Ui) {
+        if !self.about_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("关于启幕")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ui.ctx(), |ui| {
+                ui.vertical_centered(|ui| {
+                    self.logo_ui(ui, 64.0);
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new("启幕")
+                            .strong()
+                            .size(22.0)
+                            .color(TEXT_MAIN),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} · v{}",
+                            tr("PPT 内容管理与更新系统"),
+                            env!("CARGO_PKG_VERSION")
+                        ))
+                        .size(12.5)
+                        .color(TEXT_WEAK),
+                    );
+                });
+            });
+        if !open {
+            self.about_open = false;
+        }
+    }
+
     fn index_folder_of(&self, index_id: &str) -> String {
         self.indexes
             .iter()
@@ -6333,6 +6525,9 @@ impl App {
     /// slot): enter the create flow with the pick list primed from
     /// every unit's renditions.
     fn act_new_index(&mut self) {
+        if !self.need_login("新建索引") {
+            return;
+        }
         self.index.creating = true;
         self.index.pick.clear();
         for item in &self.units {
@@ -8257,14 +8452,31 @@ fn install_panic_logger() {
     }));
 }
 
+/// The brand logo as the OS window / taskbar icon, decoded from
+/// the same embedded asset the shell renders (assets/logo.png.b64).
+fn app_icon() -> Option<egui::IconData> {
+    let img = image::load_from_memory(*LOGO_PNG).ok()?;
+    let rgba = img.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    Some(egui::IconData {
+        rgba: rgba.into_raw(),
+        width,
+        height,
+    })
+}
+
 fn main() {
     install_panic_logger();
     startup_log("qimu-client starting");
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1440.0, 900.0])
+        .with_min_inner_size([960.0, 600.0])
+        .with_title("启幕 · PPT 管理器");
+    if let Some(icon) = app_icon() {
+        viewport = viewport.with_icon(icon);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1440.0, 900.0])
-            .with_min_inner_size([960.0, 600.0])
-            .with_title("启幕 · PPT 管理器"),
+        viewport,
         ..Default::default()
     };
     match eframe::run_native(
