@@ -126,7 +126,9 @@ impl App {
                 self.run_home_action(Some(key));
             }
         }
-        if matches!(page, Page::Showroom | Page::Content | Page::Index)
+        let can_add_folder = matches!(page, Page::Content | Page::Index)
+            || (page == Page::Showroom && self.showroom.zone == "plaza");
+        if can_add_folder
             && self.small_icon_button(ui, "folder-plus", *ICON_FOLDER_PLUS, tr("新建文件夹"))
         {
             self.folder_edit = Some(FolderEdit {

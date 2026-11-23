@@ -2027,6 +2027,10 @@ enum ConfirmAction {
 struct ShowroomState {
     zone: String, // plaza | library | inbox | groups
     folder: Option<String>,
+    library_view: usize,
+    share_source: usize,
+    group_id: Option<String>,
+    selected_card: Option<String>,
     stack: NavStack<SrFrame>,
 }
 
@@ -2035,6 +2039,10 @@ impl Default for ShowroomState {
         Self {
             zone: std::env::var("QIMU_ZONE").unwrap_or_else(|_| "plaza".into()),
             folder: None,
+            library_view: 0,
+            share_source: 0,
+            group_id: None,
+            selected_card: None,
             stack: NavStack::new(SrFrame::Wall),
         }
     }
@@ -2051,6 +2059,7 @@ enum SrFrame {
 struct DeckState {
     item: Value,
     deck: Option<Value>,
+    notes_view: bool,
     /// Set by the header 返回 action; the dispatcher pops.
     closed: bool,
 }
@@ -4589,6 +4598,13 @@ fn home_recent_row(ui: &mut egui::Ui, columns: [&str; 4], interactive: bool) -> 
     response
 }
 
+fn showroom_columns(ui: &egui::Ui, minimum_width: f32) -> (usize, f32) {
+    let available = ui.available_width();
+    let columns = ((available + 12.0) / (minimum_width + 12.0)).floor().max(1.0) as usize;
+    let width = ((available + 12.0) / columns as f32 - 12.0).floor();
+    (columns, width.max(1.0))
+}
+
 fn client_now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -4883,53 +4899,112 @@ impl App {
     }
 
     fn sr_nav_body(&mut self, ui: &mut egui::Ui) {
-        // The four zones live at the top of the left column as
-        // the prototype's .show-seg: a 2x2 grid of segment
-        // buttons (--panel2 fill, 1px --line border, 6px
-        // radius, 26px min height, 5px gaps); the selected
-        // zone takes the accent-soft fill + accent border +
-        // accent text. The folder tree sits below them.
-        let zones: &[(&str, &str)] = &[
-            ("plaza", "广场"),
-            ("library", "我的库"),
-            ("inbox", "收到的分享"),
-            ("groups", "群组空间"),
-        ];
-        let seg_w = (ui.available_width() - 5.0) / 2.0;
-        for pair in zones.chunks(2) {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 5.0;
-                for (zone, label) in pair {
-                    let active = self.showroom.zone == *zone;
-                    let btn = egui::Button::new(
-                        egui::RichText::new(*label).size(12.5).color(if active {
-                            ACCENT
-                        } else {
-                            TEXT_WEAK
-                        }),
+        let zones = ["plaza", "library", "inbox", "groups"];
+        let active = zones
+            .iter()
+            .position(|id| *id == self.showroom.zone)
+            .unwrap_or(0);
+        let labels = ["公共", "我的", "分享", "群组"];
+        ui.horizontal(|ui| {
+            if let Some(next) = segmented(ui, &labels, active, SegStyle::Soft) {
+                self.showroom.zone = zones[next].to_string();
+                self.showroom.selected_card = None;
+                self.showroom.stack.pop_to(0);
+            }
+        });
+        ui.add_space(8.0);
+        match self.showroom.zone.as_str() {
+            "library" => {
+                ui.label(egui::RichText::new("我的目录").size(12.0).color(TEXT_WEAK));
+                for (idx, label) in ["全部", "收藏", "本地缓存", "我的组装"]
+                    .into_iter()
+                    .enumerate()
+                {
+                    if tree_row(
+                        ui,
+                        self.showroom.library_view == idx,
+                        0.0,
+                        None,
+                        label,
+                        12.5,
                     )
-                    .fill(if active { ACCENT_SOFT } else { BTN_BG })
-                    .stroke(egui::Stroke::new(
-                        1.0,
-                        if active { ACCENT } else { SEPARATOR },
-                    ))
-                    .corner_radius(egui::CornerRadius::same(6))
-                    .min_size(egui::vec2(seg_w, 26.0));
-                    if ui.add(btn).clicked() && !active {
-                        self.showroom.zone = zone.to_string();
-                        // switching zones leaves any open deck
+                    .clicked()
+                    {
+                        self.showroom.library_view = idx;
                         self.showroom.stack.pop_to(0);
                     }
                 }
-            });
-            ui.add_space(5.0);
+            }
+            "inbox" => {
+                ui.label(egui::RichText::new("分享来源").size(12.0).color(TEXT_WEAK));
+                for (idx, label) in ["全部", "个人分享", "部门分享"].into_iter().enumerate()
+                {
+                    let count = self
+                        .inbox
+                        .iter()
+                        .filter(|item| Self::share_matches_source(item, idx))
+                        .count();
+                    if tree_row(
+                        ui,
+                        self.showroom.share_source == idx,
+                        0.0,
+                        None,
+                        &format!("{label} · {count}"),
+                        12.5,
+                    )
+                    .clicked()
+                    {
+                        self.showroom.share_source = idx;
+                        self.showroom.stack.pop_to(0);
+                    }
+                }
+            }
+            "groups" => {
+                ui.label(egui::RichText::new("群组").size(12.0).color(TEXT_WEAK));
+                let active = self
+                    .active_showroom_group()
+                    .map(|space| s(&space["group"], "id"));
+                for space in &self.group_spaces {
+                    let group = &space["group"];
+                    let id = s(group, "id");
+                    let label = format!(
+                        "{} · {} 人",
+                        s(group, "name"),
+                        group["members"].as_array().map_or(0, Vec::len),
+                    );
+                    if tree_row(ui, active.as_ref() == Some(&id), 0.0, None, &label, 12.5).clicked()
+                    {
+                        self.showroom.group_id = Some(id);
+                        self.showroom.stack.pop_to(0);
+                    }
+                }
+            }
+            _ => {
+                ui.label(egui::RichText::new("公共目录").size(12.0).color(TEXT_WEAK));
+                let mut selected = self.showroom.folder.clone();
+                self.folder_tree(ui, &mut selected);
+                if selected != self.showroom.folder {
+                    self.showroom.stack.pop_to(0);
+                    self.showroom.selected_card = None;
+                    self.showroom.folder = selected;
+                }
+            }
         }
-        ui.add_space(9.0);
-        ui.separator();
-        ui.add_space(6.0);
-        let mut sel = self.showroom.folder.clone();
-        self.folder_tree(ui, &mut sel);
-        self.showroom.folder = sel;
+    }
+
+    fn active_showroom_group(&self) -> Option<&Value> {
+        self.group_spaces
+            .iter()
+            .find(|space| space["group"]["id"].as_str() == self.showroom.group_id.as_deref())
+            .or_else(|| self.group_spaces.first())
+    }
+
+    fn share_matches_source(item: &Value, source: usize) -> bool {
+        match source {
+            1 => item["target_kind"] == "user",
+            2 => item["target_kind"] == "dept",
+            _ => true,
+        }
     }
 
     fn ct_nav_body(&mut self, ui: &mut egui::Ui) {
@@ -6335,6 +6410,7 @@ impl App {
                     "source_index_id": "", "submitted_by": "",
                 }),
                 deck: None,
+                notes_view: false,
                 closed: false,
             }));
         }
@@ -6348,6 +6424,7 @@ impl App {
         self.showroom.stack.push(SrFrame::Deck(DeckState {
             item: item.clone(),
             deck: None,
+            notes_view: false,
             closed: false,
         }));
         let src = s(item, "source_index_id");
@@ -6597,10 +6674,7 @@ impl App {
         let mut act: Option<&'static str> = None;
         let mut pdf_act: Option<(&'static str, Option<usize>)> = None;
         let cache_key = format!("sr_{}", s(&item, "id"));
-        let already_cached = self
-            .cache_entries
-            .iter()
-            .any(|e| s(e, "key") == cache_key);
+        let already_cached = self.cache_entries.iter().any(|e| s(e, "key") == cache_key);
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new(s(&item, "title"))
@@ -6652,8 +6726,10 @@ impl App {
         ui.label(
             egui::RichText::new(format!(
                 "{} · {}",
-                if src_name.is_empty() {
+                if s(&item, "source_index_id").is_empty() {
                     "个人组装".to_string()
+                } else if src_name.is_empty() {
+                    "来源索引".to_string()
                 } else {
                     format!("来源索引 {src_name}")
                 },
@@ -6684,7 +6760,7 @@ impl App {
         ui.add_space(8.0);
         match act {
             Some("play") => {
-                self.start_present_from_deck(ui);
+                self.start_presentation(ui, &item, st.deck.as_ref());
             }
             Some("export") => {
                 match self.call(
@@ -6708,39 +6784,20 @@ impl App {
                     Err(e) => self.msg = format!("导出失败：{e}"),
                 }
             }
-            Some("cache") => {
-                // Identical flow to the showroom card's 缓存到本地 text
-                // action: export the source index (personal) and hand
-                // the bytes to cache_deck, which enforces the server
-                // cache policy (allowed / capacity) before writing.
-                let src = s(&item, "source_index_id");
-                if src.is_empty() {
-                    self.msg = "该条目暂不支持缓存到本地".into();
-                } else {
-                    let title = s(&item, "title");
-                    match self.call(
-                        "POST",
-                        &format!("/v1/indexes/{src}/export"),
-                        Some(json!({ "branch": "main", "kind": "personal" })),
-                    ) {
-                        Ok(v) => {
-                            if let Some(data) =
-                                v.get("data_base64").and_then(|x| x.as_str())
-                            {
-                                if let Ok(bytes) = b64d(data) {
-                                    let pages = i(&v, "page_count");
-                                    self.cache_deck(&cache_key, &title, &bytes, pages);
-                                }
-                            }
-                        }
-                        Err(e) => self.msg = format!("缓存失败：{e}"),
-                    }
-                }
-            }
+            Some("cache") => self.cache_showroom_deck(&item),
             _ => {}
         }
         if let Some((form, page)) = pdf_act {
             self.export_showroom_pdf(&item, form, page);
+        }
+        ui.add_space(8.0);
+        if let Some(view) = segmented(
+            ui,
+            &["逐页缩略图", "讲稿"],
+            usize::from(st.notes_view),
+            SegStyle::Soft,
+        ) {
+            st.notes_view = view == 1;
         }
         ui.add_space(10.0);
         match &st.deck {
@@ -6753,7 +6810,7 @@ impl App {
                 // Flatten to a page list, then lay out in explicit rows:
                 // horizontal_wrapped proved unreliable inside this
                 // nested scroll area (pages ran off the right edge).
-                let mut pages: Vec<(String, usize, usize)> = Vec::new();
+                let mut pages: Vec<(String, usize, String)> = Vec::new();
                 for re in &resolved {
                     let ver = re.get("resolved").cloned().unwrap_or(Value::Null);
                     if !ver.is_object() {
@@ -6762,34 +6819,62 @@ impl App {
                     let vid = s(&ver, "id");
                     let total = i(&ver, "page_count");
                     for p in 0..total {
-                        pages.push((vid.clone(), p as usize, pages.len() + 1));
+                        let note = ver["scripts"]
+                            .get(p as usize)
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        pages.push((vid.clone(), p as usize, note.to_owned()));
                     }
                 }
-                // Page grid (prototype .deck-pages): fluid
-                // columns, min 212px wide, 12px gaps.
-                let avail = ui.available_width();
-                let per_row = ((avail + 12.0) / 224.0).floor().max(1.0) as usize;
-                let page_w = (avail + 12.0) / per_row as f32 - 12.0;
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
-                    for row in pages.chunks(per_row) {
-                        ui.horizontal(|ui| {
-                            for (vid, p, n) in row {
-                                ui.vertical(|ui| {
-                                    if self.thumb_button(ui, vid, *p, page_w, false) {
-                                        self.overlays.push(Overlay::PagePreview { version_id: vid.clone(), page: *p, global: *n - 1, item: item.clone() });
-                                    }
-                                    ui.label(
-                                        egui::RichText::new(format!("第 {n} 页"))
-                                            .size(11.0)
-                                            .color(TEXT_FAINT),
-                                    );
+                egui::ScrollArea::vertical()
+                    .id_salt(st.notes_view)
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
+                        if st.notes_view {
+                            for (index, (vid, page, note)) in pages.iter().enumerate() {
+                                card_frame().show(ui, |ui| {
+                                    ui.horizontal_top(|ui| {
+                                        self.thumb_ui(ui, vid, *page, 180.0);
+                                        ui.vertical(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(format!("第 {} 页", index + 1))
+                                                    .strong(),
+                                            );
+                                            ui.label(if note.is_empty() {
+                                                "暂无讲稿"
+                                            } else {
+                                                note
+                                            });
+                                        });
+                                    });
                                 });
                             }
-                        });
-                        ui.add_space(8.0);
-                    }
-                });
+                            return;
+                        }
+                        let (columns, width) = showroom_columns(ui, 212.0);
+                        for (row_index, row) in pages.chunks(columns).enumerate() {
+                            ui.horizontal_top(|ui| {
+                                for (column, (vid, page, _)) in row.iter().enumerate() {
+                                    let global = row_index * columns + column;
+                                    ui.vertical(|ui| {
+                                        if self.thumb_button(ui, vid, *page, width, false) {
+                                            self.overlays.push(Overlay::PagePreview {
+                                                version_id: vid.clone(),
+                                                page: *page,
+                                                global,
+                                                item: item.clone(),
+                                            });
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(format!("第 {} 页", global + 1))
+                                                .size(11.0)
+                                                .color(TEXT_FAINT),
+                                        );
+                                    });
+                                }
+                            });
+                        }
+                    });
             }
             None => {
                 ui.add_space(60.0);
@@ -6804,174 +6889,231 @@ impl App {
         }
     }
 
-    fn library_view(&mut self, ui: &mut egui::Ui) {
-        ui.label(egui::RichText::new("我的收藏").strong());
-        if self.library_refs.is_empty() {
-            ui.label(egui::RichText::new("暂无收藏。从收到的分享里保存进来。").weak());
+    fn cache_showroom_deck(&mut self, item: &Value) {
+        let source = s(item, "source_index_id");
+        if source.is_empty() {
+            self.msg = "该条目暂不支持缓存到本地".into();
+            return;
         }
-        for e in self.library_refs.clone() {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(s(&e, "title")).strong());
-                let folder = s(&e, "folder");
-                if !folder.is_empty() {
-                    ui.label(egui::RichText::new(folder).small().weak());
+        match self.call(
+            "POST",
+            &format!("/v1/indexes/{source}/export"),
+            Some(json!({ "branch": "main", "kind": "personal" })),
+        ) {
+            Ok(data) => {
+                if let Ok(bytes) = b64d(&s(&data, "data_base64")) {
+                    self.cache_deck(
+                        &format!("sr_{}", s(item, "id")),
+                        &s(item, "title"),
+                        &bytes,
+                        i(&data, "page_count"),
+                    );
                 }
-                if s(&e, "item_kind") == "showroom" {
-                    if ui.small_button("看整稿").clicked() {
-                        self.open_deck_for_ref("showroom", &s(&e, "item_id"), &s(&e, "title"));
-                    }
-                    if ui.small_button("导出 PPT").clicked() {
-                        let item_id = s(&e, "item_id");
-                        let title = s(&e, "title");
-                        if let Some(path) = rfd::FileDialog::new()
-                            .set_file_name(format!("{title}.pptx"))
-                            .save_file()
-                        {
-                            match self.call(
-                                "POST",
-                                &format!("/v1/showroom/{item_id}/export"),
-                                Some(json!({ "kind": "personal" })),
-                            ) {
-                                Ok(v) => {
-                                    if let Some(data) =
-                                        v.get("data_base64").and_then(|x| x.as_str())
-                                    {
-                                        if let Ok(bytes) = b64d(data) {
-                                            let _ = std::fs::write(&path, bytes);
-                                            self.msg = "已导出".into();
-                                        }
-                                    }
-                                }
-                                Err(e2) => self.msg = format!("导出失败：{e2}"),
-                            }
-                        }
-                    }
-                }
-                if ui.small_button("移除").clicked() {
-                    let lid = s(&e, "id");
-                    match self.call(
-                        "POST",
-                        &format!("/v1/library/{lid}/delete"),
-                        Some(json!({})),
-                    ) {
-                        Ok(_) => {
-                            self.msg = "已移除".into();
-                            self.refresh_all();
-                        }
-                        Err(e2) => self.msg = format!("移除失败：{e2}"),
-                    }
-                }
-            });
-        }
-        ui.separator();
-        ui.label(egui::RichText::new("本地缓存（离线可用）").strong());
-        if self.cache_entries.is_empty() {
-            ui.label(egui::RichText::new("暂无缓存。在广场或我的组装里点「缓存到本地」。").weak());
-        }
-        for e in self.cache_entries.clone() {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(s(&e, "title")).strong());
-                ui.label(format!(
-                    "{} 页 · {}",
-                    i(&e, "page_count"),
-                    fmt_time(i(&e, "cached_ms"))
-                ));
-                let key = s(&e, "key");
-                if ui.button("打开").clicked() {
-                    self.open_cache(&key);
-                }
-                if ui.button("移除缓存").clicked() {
-                    self.remove_cache(&key);
-                }
-            });
-        }
-        ui.separator();
-        ui.label(egui::RichText::new("我的组装").strong());
-        if self.my_assemblies.is_empty() {
-            ui.label(egui::RichText::new("暂无组装").weak());
-        }
-        for a in self.my_assemblies.clone() {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(s(&a, "name")).strong());
-                ui.label(format!(
-                    "{} 个条目 · {}",
-                    i(&a, "entry_count"),
-                    fmt_time(i(&a, "created_ms"))
-                ));
-                if ui.button("缓存到本地").clicked() {
-                    let aid = s(&a, "id");
-                    let name = s(&a, "name");
-                    match self.call(
-                        "POST",
-                        &format!("/v1/assemblies/{aid}/export"),
-                        Some(json!({ "kind": "personal" })),
-                    ) {
-                        Ok(v) => {
-                            if let Some(data) = v.get("data_base64").and_then(|x| x.as_str()) {
-                                if let Ok(bytes) = b64d(data) {
-                                    let pages = i(&v, "page_count");
-                                    self.cache_deck(&aid, &name, &bytes, pages);
-                                }
-                            }
-                        }
-                        Err(e) => self.msg = format!("缓存失败：{e}"),
-                    }
-                }
-            });
+            }
+            Err(e) => self.msg = format!("缓存失败：{e}"),
         }
     }
 
-    /// Permissioned in-server sharing (send to a user / dept /
-    /// group via /v1/shares). OFFLINE at this stage (user ruling
-    /// 2026-11-23: sharing is export-only for now; publish-style
-    /// sharing returns with the organization phase). The panel and
-    /// its server calls are retained untouched for that phase —
-    /// every entry point that opened it has been removed, so this
-    /// is currently unreachable.
-    #[allow(dead_code)]
-    fn inbox_view(&mut self, ui: &mut egui::Ui) {
-        if self.inbox.is_empty() {
-            ui.label(egui::RichText::new("暂无收到的分享").weak());
-            return;
-        }
-        for sh in self.inbox.clone() {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(s(&sh, "title")).strong());
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{} · {}",
-                        s(&sh, "from_name"),
-                        fmt_time(i(&sh, "created_ms"))
-                    ))
-                    .small()
-                    .weak(),
-                );
-                if s(&sh, "item_kind") == "showroom" {
-                    if ui.small_button("看整稿").clicked() {
-                        self.open_deck_for_ref(
-                            "showroom",
-                            &s(&sh, "item_id"),
-                            &s(&sh, "title"),
-                        );
-                    }
+    fn library_view(&mut self, ui: &mut egui::Ui) {
+        let section = self.showroom.library_view;
+        egui::ScrollArea::vertical()
+            .id_salt("showroom-library")
+            .show(ui, |ui| {
+                if section == 0 || section == 1 {
+                    ui.heading("收藏");
+                    self.showroom_cards(
+                        ui,
+                        &self.library_refs.clone(),
+                        "暂无收藏",
+                        |app, ui, e, width| {
+                            let cover = app.showroom_cover(&s(e, "item_id"));
+                            app.showroom_card(ui, width, &s(e, "title"), &cover, |app, ui| {
+                                let folder = s(&e, "folder");
+                                if !folder.is_empty() {
+                                    ui.label(egui::RichText::new(folder).small().weak());
+                                }
+                                if s(&e, "item_kind") == "showroom" {
+                                    if ui.small_button("看整稿").clicked() {
+                                        app.open_deck_for_ref(
+                                            "showroom",
+                                            &s(&e, "item_id"),
+                                            &s(&e, "title"),
+                                        );
+                                    }
+                                    if ui.small_button("导出 PPT").clicked() {
+                                        let item_id = s(&e, "item_id");
+                                        let title = s(&e, "title");
+                                        if let Some(path) = rfd::FileDialog::new()
+                                            .set_file_name(format!("{title}.pptx"))
+                                            .save_file()
+                                        {
+                                            match app.call(
+                                                "POST",
+                                                &format!("/v1/showroom/{item_id}/export"),
+                                                Some(json!({ "kind": "personal" })),
+                                            ) {
+                                                Ok(v) => {
+                                                    if let Some(data) = v
+                                                        .get("data_base64")
+                                                        .and_then(|x| x.as_str())
+                                                    {
+                                                        if let Ok(bytes) = b64d(data) {
+                                                            let _ = std::fs::write(&path, bytes);
+                                                            app.msg = "已导出".into();
+                                                        }
+                                                    }
+                                                }
+                                                Err(e2) => app.msg = format!("导出失败：{e2}"),
+                                            }
+                                        }
+                                    }
+                                }
+                                if ui.small_button("移除").clicked() {
+                                    let lid = s(&e, "id");
+                                    match app.call(
+                                        "POST",
+                                        &format!("/v1/library/{lid}/delete"),
+                                        Some(json!({})),
+                                    ) {
+                                        Ok(_) => {
+                                            app.msg = "已移除".into();
+                                            app.refresh_all();
+                                        }
+                                        Err(e2) => app.msg = format!("移除失败：{e2}"),
+                                    }
+                                }
+                            });
+                        },
+                    );
                 }
-                if sh.get("in_library").and_then(|v| v.as_bool()) == Some(true) {
-                    ui.label(egui::RichText::new("已在我的库").weak());
+                if section == 0 || section == 2 {
+                    ui.heading("本地缓存");
+                    self.showroom_cards(
+                        ui,
+                        &self.cache_entries.clone(),
+                        "暂无缓存",
+                        |app, ui, e, width| {
+                            app.showroom_card(ui, width, &s(e, "title"), "", |app, ui| {
+                                ui.label(format!(
+                                    "{} 页 · {}",
+                                    i(&e, "page_count"),
+                                    fmt_time(i(&e, "cached_ms"))
+                                ));
+                                let key = s(&e, "key");
+                                if ui.button("打开").clicked() {
+                                    app.open_cache(&key);
+                                }
+                                if ui.button("移除缓存").clicked() {
+                                    app.remove_cache(&key);
+                                }
+                            });
+                        },
+                    );
+                }
+                if section == 0 || section == 3 {
+                    ui.heading("我的组装");
+                    self.showroom_cards(
+                        ui,
+                        &self.my_assemblies.clone(),
+                        "暂无组装",
+                        |app, ui, a, width| {
+                            app.showroom_card(ui, width, &s(a, "name"), "", |app, ui| {
+                                ui.label(format!(
+                                    "{} 个条目 · {}",
+                                    i(&a, "entry_count"),
+                                    fmt_time(i(&a, "created_ms"))
+                                ));
+                                if ui.button("缓存到本地").clicked() {
+                                    let aid = s(&a, "id");
+                                    let name = s(&a, "name");
+                                    match app.call(
+                                        "POST",
+                                        &format!("/v1/assemblies/{aid}/export"),
+                                        Some(json!({ "kind": "personal" })),
+                                    ) {
+                                        Ok(v) => {
+                                            if let Some(data) =
+                                                v.get("data_base64").and_then(|x| x.as_str())
+                                            {
+                                                if let Ok(bytes) = b64d(data) {
+                                                    let pages = i(&v, "page_count");
+                                                    app.cache_deck(&aid, &name, &bytes, pages);
+                                                }
+                                            }
+                                        }
+                                        Err(e) => app.msg = format!("缓存失败：{e}"),
+                                    }
+                                }
+                            });
+                        },
+                    );
+                }
+            });
+    }
+
+    fn inbox_view(&mut self, ui: &mut egui::Ui) {
+        let items = self
+            .inbox
+            .iter()
+            .filter(|item| Self::share_matches_source(item, self.showroom.share_source))
+            .cloned()
+            .collect::<Vec<_>>();
+        egui::ScrollArea::vertical()
+            .id_salt("showroom-inbox")
+            .show(ui, |ui| {
+                self.showroom_cards(
+                    ui,
+                    &items,
+                    "这个来源下暂时没有分享。",
+                    Self::showroom_shared_card,
+                );
+            });
+    }
+
+    fn showroom_shared_card(&mut self, ui: &mut egui::Ui, item: &Value, width: f32) {
+        let title = s(item, "title");
+        let id = s(item, "item_id");
+        let cover = self.showroom_cover(&id);
+        let saved = item["in_library"] == true
+            || self
+                .library_refs
+                .iter()
+                .any(|entry| entry["item_id"] == item["item_id"]);
+        let cover_response = self.showroom_card(ui, width, &title, &cover, |app, ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} · {}",
+                    s(item, "from_name"),
+                    fmt_time(i(item, "created_ms"))
+                ))
+                .small()
+                .weak(),
+            );
+            ui.horizontal_wrapped(|ui| {
+                if item["item_kind"] == "showroom" && ui.small_button("打开详情").clicked() {
+                    app.open_deck_for_ref("showroom", &id, &title);
+                }
+                if saved {
+                    ui.label(egui::RichText::new("已在我的库").small().weak());
                 } else if ui.small_button("保存到我的库").clicked() {
-                    let sid = s(&sh, "id");
-                    match self.call(
-                        "POST",
-                        &format!("/v1/shares/{sid}/accept"),
-                        Some(json!({})),
-                    ) {
+                    let sid = s(item, "id");
+                    match app.call("POST", &format!("/v1/shares/{sid}/accept"), Some(json!({}))) {
                         Ok(_) => {
-                            self.msg = "已保存到我的库".into();
-                            self.refresh_all();
+                            app.msg = "已保存到我的库".into();
+                            app.refresh_all();
                         }
-                        Err(e) => self.msg = format!("保存失败：{e}"),
+                        Err(e) => app.msg = format!("保存失败：{e}"),
                     }
                 }
             });
+        });
+        let response = ui.interact(
+            cover_response,
+            ui.scope_id().with(("share", s(item, "id"))),
+            egui::Sense::click(),
+        );
+        if response.double_clicked() && item["item_kind"] == "showroom" {
+            self.open_deck_for_ref("showroom", &id, &title);
         }
     }
 
@@ -7004,8 +7146,13 @@ impl App {
             .and_then(|u| u.as_array())
             .cloned()
             .unwrap_or_default();
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for space in self.group_spaces.clone() {
+        let Some(space) = self.active_showroom_group().cloned() else {
+            ui.label(egui::RichText::new("还没加入任何群组").weak());
+            return;
+        };
+        egui::ScrollArea::vertical()
+            .id_salt("showroom-groups")
+            .show(ui, |ui| {
                 let g = space.get("group").cloned().unwrap_or(json!({}));
                 let gid = s(&g, "id");
                 ui.label(
@@ -7026,7 +7173,11 @@ impl App {
                             .join("、")
                     })
                     .unwrap_or_default();
-                ui.label(egui::RichText::new(format!("成员：{members}")).small().weak());
+                ui.label(
+                    egui::RichText::new(format!("成员：{members}"))
+                        .small()
+                        .weak(),
+                );
                 // owner can add members
                 if s(&g, "owner_id") == self.my_id {
                     ui.horizontal(|ui| {
@@ -7069,62 +7220,28 @@ impl App {
                         }
                     });
                 }
-                if let Some(items) = space.get("items").and_then(|v| v.as_array()) {
-                    if items.is_empty() {
-                        ui.label(egui::RichText::new("暂无分享到本组的内容").weak());
-                    }
-                    for it in items {
-                        ui.horizontal(|ui| {
-                            ui.label(s(it, "title"));
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "{} · {}",
-                                    s(it, "from_name"),
-                                    fmt_time(i(it, "created_ms"))
-                                ))
-                                .small()
-                                .weak(),
-                            );
-                            if s(it, "item_kind") == "showroom" {
-                                if ui.small_button("看整稿").clicked() {
-                                    self.open_deck_for_ref(
-                                        "showroom",
-                                        &s(it, "item_id"),
-                                        &s(it, "title"),
-                                    );
-                                }
-                            }
-                            if ui.small_button("保存到我的库").clicked() {
-                                let sid = s(it, "id");
-                                match self.call(
-                                    "POST",
-                                    &format!("/v1/shares/{sid}/accept"),
-                                    Some(json!({})),
-                                ) {
-                                    Ok(_) => {
-                                        self.msg = "已保存到我的库".into();
-                                        self.refresh_all();
-                                    }
-                                    Err(e) => self.msg = format!("保存失败：{e}"),
-                                }
-                            }
-                        });
-                    }
-                }
-                ui.separator();
-            }
-            if self.group_spaces.is_empty() {
-                ui.label(egui::RichText::new("还没加入任何群组").weak());
-            }
-        });
+                ui.add_space(12.0);
+                ui.heading("群组共享空间");
+                let items = space["items"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                self.showroom_cards(
+                    ui,
+                    items,
+                    "暂无分享到本组的内容",
+                    Self::showroom_shared_card,
+                );
+            });
     }
 
-    /// Showroom navigation frame body: the four zones over the
-    /// folder tree — the page's existing left column, unchanged,
-    /// drawn on its chrome fill inside the dock frame.
     /// Showroom content slot, including the optional review queue.
     fn sr_main_body(&mut self, ui: &mut egui::Ui) {
-        if self.role() == "super" && !self.showroom_pending.is_empty() {
+        if self.showroom.zone == "plaza"
+            && matches!(self.showroom.stack.top(), SrFrame::Wall)
+            && self.role() == "super"
+            && !self.showroom_pending.is_empty()
+        {
             let review_height = ui.available_height() * 0.28;
             egui::Panel::bottom("showroom_review")
                 .exact_size(review_height)
@@ -7645,33 +7762,30 @@ impl App {
         // Frame-state take-out, same pattern as content/index.
         // The deck view carries its own header (title + icon
         // actions); no "演示厅" heading above it (James 2026-11-15).
-        let mut frame = self.showroom.stack.replace_top(SrFrame::Wall);
-        let closed = match &mut frame {
-            SrFrame::Deck(st) => {
-                self.showroom_deck(ui, st);
-                st.closed
+        if matches!(self.showroom.stack.top(), SrFrame::Wall) {
+            self.showroom_wall(ui);
+            return;
+        }
+        if let SrFrame::Deck(mut deck) = self.showroom.stack.replace_top(SrFrame::Wall) {
+            self.showroom_deck(ui, &mut deck);
+            if deck.closed {
+                self.showroom.stack.pop();
+            } else {
+                self.showroom.stack.replace_top(SrFrame::Deck(deck));
             }
-            SrFrame::Wall => {
-                self.showroom_wall(ui);
-                false
-            }
-        };
-        if closed {
-            self.showroom.stack.pop();
-        } else {
-            self.showroom.stack.replace_top(frame);
         }
     }
 
     /// The zone wall (root frame body): the plaza card grid, or
     /// the library / inbox / groups sub-view for the zone.
     fn showroom_wall(&mut self, ui: &mut egui::Ui) {
-        ui.label(
-            egui::RichText::new(tr("演示厅"))
-                .strong()
-                .size(18.0)
-                .color(TEXT_MAIN),
-        );
+        let title = match self.showroom.zone.as_str() {
+            "library" => "我的",
+            "inbox" => "分享",
+            "groups" => "群组",
+            _ => "公共",
+        };
+        ui.heading(title);
         ui.add_space(6.0);
         if self.deep_source == Some(Page::Home) {
             ui.horizontal(|ui| {
@@ -7702,158 +7816,181 @@ impl App {
             self.groups_view(ui);
             return;
         }
-        ui.add_space(6.0);
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
-            // Card grid (prototype .show-grid): fluid columns,
-            // min 216px wide, 12px gaps — no oversized fixed cards.
-            let avail = ui.available_width();
-            let per_row = ((avail + 12.0) / 228.0).floor().max(1.0);
-            let card_w = (avail + 12.0) / per_row - 12.0;
-            let cover_h = card_w * 9.0 / 16.0;
-            let card_h = cover_h + 118.0;
+        let items = self
+            .showroom_live
+            .iter()
+            .filter(|item| {
+                self.folder_filter_ok(
+                    &self.showroom.folder,
+                    &self.index_folder_of(&s(item, "source_index_id")),
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        egui::ScrollArea::vertical()
+            .id_salt("showroom-plaza")
+            .show(ui, |ui| {
+                self.showroom_cards(
+                    ui,
+                    &items,
+                    "这个目录下暂时没有符合的演示稿。",
+                    Self::showroom_plaza_card,
+                );
+            });
+    }
+
+    fn showroom_plaza_card(&mut self, ui: &mut egui::Ui, item: &Value, width: f32) {
+        let id = s(item, "id");
+        let title = s(item, "title");
+        let cover = self.showroom_cover(&id);
+        let selected = self.showroom.selected_card.as_deref() == Some(id.as_str());
+        let cover_rect = self.showroom_card(ui, width, &title, &cover, |app, ui| {
+            let intro = s(item, "intro");
+            if !intro.is_empty() {
+                ui.add(egui::Label::new(egui::RichText::new(intro).small().weak()).truncate());
+            }
             ui.horizontal_wrapped(|ui| {
-                for item in self.showroom_live.clone() {
-                    if !self.folder_filter_ok(
-                        &self.showroom.folder.clone(),
-                        &self.index_folder_of(&s(&item, "source_index_id")),
-                    ) {
-                        continue;
-                    }
-                    let outer = ui.allocate_ui(egui::vec2(card_w, card_h), |ui| {
-                        // allocate_ui inherits the wrapped horizontal layout;
-                        // card content must flow top-down
-                        ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
-                        card_frame_flush().show(ui, |ui| {
-                            ui.set_min_size(egui::vec2(card_w, card_h));
-                            let src0 = s(&item, "source_index_id");
-                            let cover = self
-                                .index_covers
-                                .get(&src0)
-                                .cloned()
-                                .unwrap_or_default();
-                            if !cover.is_empty() {
-                                self.thumb_ui(ui, &cover, 0, card_w);
-                            } else {
-                                ui.allocate_space(egui::vec2(card_w, cover_h));
-                            }
-                            egui::Frame::NONE
-                                .inner_margin(egui::Margin {
-                                    left: 12,
-                                    right: 12,
-                                    top: 10,
-                                    bottom: 11,
-                                })
-                                .show(ui, |ui| {
-                            // the grid's 16px spacing must not leak in here
-                            ui.spacing_mut().item_spacing = egui::vec2(8.0, 5.0);
-                            ui.label(
-                                egui::RichText::new(s(&item, "title")).strong().size(13.0).color(TEXT_MAIN),
-                            );
-                            ui.add_space(3.0);
-                            let intro = s(&item, "intro");
-                            if !intro.is_empty() {
-                                ui.label(
-                                    egui::RichText::new(intro).size(11.5).color(TEXT_WEAK),
-                                );
-                                ui.add_space(3.0);
-                            }
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "{} · {}",
-                                    s(&item, "submitted_by"),
-                                    fmt_time(i(&item, "created_ms"))
-                                ))
-                                .size(11.0)
-                                .color(TEXT_FAINT),
-                            );
-                            ui.add_space(6.0);
-                            ui.horizontal(|ui| {
-                                if text_action(ui, "开始演示", ACCENT, 13.0) {
-                                    self.open_showroom_deck(&item);
-                                    self.start_present_from_deck(ui);
-                                }
-                                let my_name = self
-                                    .user
-                                    .as_ref()
-                                    .map(|u| s(u, "display_name"))
-                                    .unwrap_or_default();
-                                if self.role() == "super"
-                                    || (!my_name.is_empty()
-                                        && my_name == s(&item, "submitted_by"))
-                                {
-                                    if text_action(ui, "删除", BADGE_BAD_FG, 13.0) {
-                                        self.trash_add("showroom", &s(&item, "id"));
-                                    }
-                                }
-                            let src = s(&item, "source_index_id");
-                            if !src.is_empty() {
-                                if text_action(ui, "缓存到本地", TEXT_MAIN, 13.0) {
-                                    let title = s(&item, "title");
-                                    let key = format!("sr_{}", s(&item, "id"));
-                                    match self.call(
-                                        "POST",
-                                        &format!("/v1/indexes/{src}/export"),
-                                        Some(json!({ "branch": "main", "kind": "personal" })),
-                                    ) {
-                                        Ok(v) => {
-                                            if let Some(data) =
-                                                v.get("data_base64").and_then(|x| x.as_str())
-                                            {
-                                                if let Ok(bytes) = b64d(data) {
-                                                    let pages = i(&v, "page_count");
-                                                    self.cache_deck(&key, &title, &bytes, pages);
-                                                }
-                                            }
-                                        }
-                                        Err(e) => self.msg = format!("缓存失败：{e}"),
-                                    }
-                                }
-                            }
-                            });
-                            });
-                        });
-                        });
-                    });
-                    // double-click on the cover opens the whole-deck
-                    // page view (H); the action row below keeps its own
-                    // clicks (the interact only covers the cover area)
-                    let cover_rect = egui::Rect::from_min_size(
-                        outer.response.rect.min,
-                        egui::vec2(card_w, cover_h),
-                    );
-                    let click = ui.interact(
-                        cover_rect,
-                        egui::Id::new(("sr_card", s(&item, "id"))),
-                        egui::Sense::click(),
-                    );
-                    if click.double_clicked() {
-                        self.open_showroom_deck(&item);
+                if ui.small_button("打开详情").clicked() {
+                    app.open_showroom_deck(item);
+                }
+                if ui.small_button("开始演示").clicked() {
+                    app.open_showroom_deck(item);
+                    app.start_present_from_deck(ui);
+                }
+                if !s(item, "source_index_id").is_empty() {
+                    let key = format!("sr_{id}");
+                    let cached = app.cache_entries.iter().any(|entry| entry["key"] == key);
+                    let label = if cached {
+                        "已缓存（点击更新缓存）"
+                    } else {
+                        "缓存到本地"
+                    };
+                    if app.tool_slot(ui, cached, label, "icon-download", *ICON_DOWNLOAD) {
+                        app.cache_showroom_deck(item);
                     }
                 }
-                if self.showroom_live.is_empty() {
-                    ui.add_space(90.0);
-                    ui.vertical_centered(|ui| {
-                        ui.label(egui::RichText::new("暂无内容").size(16.0));
-                        ui.label(
-                            egui::RichText::new("从索引页把成稿推送到演示厅")
-                                .color(TEXT_WEAK),
-                        );
-                    });
+                if app.role() == "super"
+                    || app
+                        .user
+                        .as_ref()
+                        .is_some_and(|u| s(u, "display_name") == s(item, "submitted_by"))
+                {
+                    if text_action(ui, "删除", BADGE_BAD_FG, 12.0) {
+                        app.trash_add("showroom", &id);
+                    }
                 }
             });
         });
-        // NOTE: there is deliberately no "submit to showroom" form here
-        // any more (James 2026-11-15): pushing to the showroom happens
-        // from the index detail （推送到演示厅）, which feeds the same
-        // The review queue has its own region below the showroom wall.
+        let response = ui
+            .interact(
+                cover_rect,
+                ui.scope_id().with(("plaza", &id)),
+                egui::Sense::click(),
+            )
+            .on_hover_text(format!(
+                "{} · {}",
+                s(item, "submitted_by"),
+                fmt_time(i(item, "created_ms"))
+            ));
+        if selected {
+            ui.painter().rect_stroke(
+                cover_rect,
+                6.0,
+                egui::Stroke::new(2.0, ACCENT),
+                egui::StrokeKind::Inside,
+            );
+        }
+        if response.clicked() {
+            self.showroom.selected_card = Some(id);
+        }
+        if response.double_clicked() {
+            self.open_showroom_deck(item);
+        }
     }
 
-    /// Content folder frame body: the folder tree over the panel
-    /// footer strip.
-    /// 智能分块导入 (content page action, also the content page's
-    /// toolbar slot): pick a deck, let the server propose blocks,
-    /// then import with the proposal confirmed as-is.
+    fn showroom_cover(&self, item_id: &str) -> String {
+        let Some(item) = self.showroom_live.iter().find(|item| item["id"] == item_id) else {
+            return String::new();
+        };
+        self.index_covers
+            .get(&s(item, "source_index_id"))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn showroom_cards(
+        &mut self,
+        ui: &mut egui::Ui,
+        items: &[Value],
+        empty: &str,
+        mut card: impl FnMut(&mut Self, &mut egui::Ui, &Value, f32),
+    ) {
+        if items.is_empty() {
+            ui.label(egui::RichText::new(empty).color(TEXT_WEAK));
+            return;
+        }
+        ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
+        let (columns, width) = showroom_columns(ui, 216.0);
+        for row in items.chunks(columns) {
+            ui.horizontal_top(|ui| {
+                for item in row {
+                    card(self, ui, item, (width - 2.0).max(1.0));
+                }
+            });
+        }
+    }
+
+    fn showroom_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        width: f32,
+        title: &str,
+        cover: &str,
+        body: impl FnOnce(&mut Self, &mut egui::Ui),
+    ) -> egui::Rect {
+        ui.vertical(|ui| {
+            card_frame_flush()
+                .show(ui, |ui| {
+                    ui.set_width(width);
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    let cover_rect = ui
+                        .allocate_ui(egui::vec2(width, width * 9.0 / 16.0), |ui| {
+                            if cover.is_empty() {
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(width, width * 9.0 / 16.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().rect_filled(rect, 0.0, HOVER_BG);
+                                ui.painter().text(
+                                    rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "PPT",
+                                    egui::FontId::proportional(17.0),
+                                    TEXT_WEAK,
+                                );
+                            } else {
+                                self.thumb_ui(ui, cover, 0, width);
+                            }
+                        })
+                        .response
+                        .rect;
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::symmetric(12, 10))
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(6.0, 5.0);
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(title).strong().size(13.0))
+                                    .truncate(),
+                            );
+                            body(self, ui);
+                        });
+                    cover_rect
+                })
+                .inner
+        })
+        .inner
+    }
+
     fn act_import_split(&mut self) {
         if !self.need_identity("智能分块导入") {
             return;
@@ -9508,6 +9645,10 @@ impl App {
             SrFrame::Deck(d) => (d.item.clone(), d.deck.clone()),
             _ => return,
         };
+        self.start_presentation(ui, &detail, deck.as_ref());
+    }
+
+    fn start_presentation(&mut self, ui: &egui::Ui, detail: &Value, deck: Option<&Value>) {
         let Some(deck) = deck else {
             self.msg = "演示内容尚未加载".into();
             return;
@@ -9547,7 +9688,7 @@ impl App {
         ui.ctx()
             .send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
         self.overlays.push(Overlay::Present(PresentState {
-            title: s(&detail, "title"),
+            title: s(detail, "title"),
             pages,
             scripts,
             cur: 0,
