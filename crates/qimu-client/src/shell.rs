@@ -426,7 +426,7 @@ impl App {
             });
     }
 
-    fn page_footer(&self, ui: &mut egui::Ui) {
+    fn page_footer(&mut self, ui: &mut egui::Ui) {
         egui::Panel::bottom("deck_bar")
             .exact_size(46.0)
             .frame(egui::Frame::NONE.fill(PANEL_BG))
@@ -469,6 +469,13 @@ impl App {
                         egui::FontId::proportional(11.5),
                         TEXT_WEAK,
                     );
+                    if self.page == Page::Showroom
+                        && matches!(self.showroom.stack.top(), SrFrame::Deck(_))
+                    {
+                        if self.tool_slot(ui, false, "返回上一层", "icon-back", *ICON_BACK) {
+                            self.back_from_showroom_detail();
+                        }
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(22.0);
                         for (label, url) in [

@@ -1998,7 +1998,6 @@ struct PickTemplateState {
 /// frames in stack order; Confirm is the top-most kind and is the
 /// only one allowed to stack over another overlay (over PageEdit).
 enum Overlay {
-    PagePreview { version_id: String, page: usize, global: usize, item: Value },
     AllVersions { entry_pos: usize },
     Present(PresentState),
     PageEdit(PageEditState),
@@ -2058,10 +2057,57 @@ enum SrFrame {
 /// 组装或加载失败时逐页列表不可用，与旧 sr_deck=None 同义）。
 struct DeckState {
     item: Value,
-    deck: Option<Value>,
-    notes_view: bool,
-    /// Set by the header 返回 action; the dispatcher pops.
+    pages: Vec<ShowroomPage>,
+    selected_page: Option<usize>,
+    view: DeckView,
+    preview_open: bool,
+    /// Set by the detail breadcrumb; the dispatcher pops the frame.
     closed: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeckView {
+    Thumbnails,
+    Notes,
+}
+
+#[derive(Clone)]
+struct ShowroomPage {
+    version_id: String,
+    slot: usize,
+    note: String,
+}
+
+fn showroom_pages(deck: &Value) -> Vec<ShowroomPage> {
+    let mut pages = Vec::new();
+    for entry in deck["resolved_entries"].as_array().into_iter().flatten() {
+        let version = &entry["resolved"];
+        let version_id = s(version, "id");
+        if version_id.is_empty() {
+            continue;
+        }
+        let total = i(version, "page_count").max(0) as usize;
+        let slots = match entry["entry"]["excerpt_slots"].as_array() {
+            Some(slots) => slots
+                .iter()
+                .filter_map(|slot| slot.as_str()?.parse::<usize>().ok())
+                .filter(|slot| *slot < total)
+                .collect::<Vec<_>>(),
+            None => (0..total).collect(),
+        };
+        pages.extend(slots.into_iter().map(|slot| {
+            ShowroomPage {
+                version_id: version_id.clone(),
+                slot,
+                note: version["scripts"]
+                    .get(slot)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            }
+        }));
+    }
+    pages
 }
 
 /// Events from the AI-translation worker thread: progress ticks
@@ -6142,9 +6188,20 @@ impl App {
         width: f32,
         current: bool,
     ) -> bool {
+        self.thumb_response(ui, version_id, page, width, current)
+            .clicked()
+    }
+
+    fn thumb_response(
+        &mut self,
+        ui: &mut egui::Ui,
+        version_id: &str,
+        page: usize,
+        width: f32,
+        current: bool,
+    ) -> egui::Response {
         let h = width * 9.0 / 16.0;
-        let (rect, resp) =
-            ui.allocate_exact_size(egui::vec2(width, h), egui::Sense::click());
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, h), egui::Sense::click());
         if let Some(tex) = self.thumb(version_id, page) {
             ui.painter().image(
                 tex.id(),
@@ -6156,16 +6213,24 @@ impl App {
             ui.painter().rect_filled(rect, 0.0, HOVER_BG);
         }
         if current {
-            ui.painter()
-                .rect_stroke(rect, 0.0, egui::Stroke::new(1.5, ACCENT), egui::StrokeKind::Middle);
+            ui.painter().rect_stroke(
+                rect,
+                0.0,
+                egui::Stroke::new(1.5, ACCENT),
+                egui::StrokeKind::Middle,
+            );
         } else if resp.hovered() {
             // hover outline sits in the selected-fill tier (#2E2F36),
             // not the text gray — a #9E9E9E stroke reads as a bright
             // white line against the dark panels.
-            ui.painter()
-                .rect_stroke(rect, 0.0, egui::Stroke::new(1.0, FIELD_BORDER), egui::StrokeKind::Middle);
+            ui.painter().rect_stroke(
+                rect,
+                0.0,
+                egui::Stroke::new(1.0, FIELD_BORDER),
+                egui::StrokeKind::Middle,
+            );
         }
-        resp.clicked()
+        resp
     }
 
     /// Switch one index entry to a specific version: picking the latest
@@ -6409,8 +6474,10 @@ impl App {
                     "id": item_id, "title": title,
                     "source_index_id": "", "submitted_by": "",
                 }),
-                deck: None,
-                notes_view: false,
+                pages: Vec::new(),
+                selected_page: None,
+                view: DeckView::Thumbnails,
+                preview_open: false,
                 closed: false,
             }));
         }
@@ -6423,15 +6490,17 @@ impl App {
         self.showroom.stack.pop_to(0);
         self.showroom.stack.push(SrFrame::Deck(DeckState {
             item: item.clone(),
-            deck: None,
-            notes_view: false,
+            pages: Vec::new(),
+            selected_page: None,
+            view: DeckView::Thumbnails,
+            preview_open: false,
             closed: false,
         }));
         let src = s(item, "source_index_id");
         if !src.is_empty() {
             if let Ok(v) = self.call("GET", &format!("/v1/indexes/{src}"), None) {
                 if let SrFrame::Deck(d) = self.showroom.stack.top_mut() {
-                    d.deck = Some(v);
+                    d.pages = showroom_pages(&v);
                 }
             }
         }
@@ -6663,14 +6732,26 @@ impl App {
     /// in entry order; clicking a page opens the large preview.
     fn showroom_deck(&mut self, ui: &mut egui::Ui, st: &mut DeckState) {
         let item = st.item.clone();
-        // Header (James 2026-11-15): deck title on the left; the
-        // actions as IconPark icons at the top-right — 开始演示 /
-        // 导出 / 缓存到本地 in light gray, 返回 in red. No text buttons
-        // here, and the old top-left "‹ 返回" text entry is gone (back
-        // is the red icon). The 分享 icon is gone (2026-11-23 ruling:
-        // sharing is export-only at this stage; the permissioned
-        // in-server share flow returns with the organization phase).
-        let mut go_back = false;
+        let preview_open = st.preview_open;
+        let return_label = if preview_open {
+            "稿件详情"
+        } else {
+            "演示厅"
+        };
+        let current_label = if preview_open {
+            "单页预览"
+        } else {
+            "稿件详情"
+        };
+        if crumb_bar(ui, &[return_label, current_label]) == Some(0) {
+            if preview_open {
+                st.preview_open = false;
+            } else {
+                st.closed = true;
+            }
+            return;
+        }
+        ui.add_space(8.0);
         let mut act: Option<&'static str> = None;
         let mut pdf_act: Option<(&'static str, Option<usize>)> = None;
         let cache_key = format!("sr_{}", s(&item, "id"));
@@ -6684,13 +6765,6 @@ impl App {
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
-                // right_to_left: the first button added sits at the far right.
-                if self.icon_button(ui, "icon-back", *ICON_BACK, "返回") {
-                    go_back = true;
-                }
-                // 缓存到本地 sits between 导出 and 返回 (James: fifth
-                // icon); an already-cached entry weakens the glyph and
-                // says so in the tooltip.
                 let (cache_label, cache_tint) = if already_cached {
                     ("已缓存（点击更新缓存）", egui::Color32::from_gray(150))
                 } else {
@@ -6713,10 +6787,6 @@ impl App {
                 }
             });
         });
-        if go_back {
-            st.closed = true;
-            return;
-        }
         let src_name = self
             .indexes
             .iter()
@@ -6760,7 +6830,7 @@ impl App {
         ui.add_space(8.0);
         match act {
             Some("play") => {
-                self.start_presentation(ui, &item, st.deck.as_ref());
+                self.start_presentation(ui, &item, &st.pages);
             }
             Some("export") => {
                 match self.call(
@@ -6791,100 +6861,170 @@ impl App {
             self.export_showroom_pdf(&item, form, page);
         }
         ui.add_space(8.0);
-        if let Some(view) = segmented(
-            ui,
-            &["逐页缩略图", "讲稿"],
-            usize::from(st.notes_view),
-            SegStyle::Soft,
-        ) {
-            st.notes_view = view == 1;
+        self.showroom_deck_pages(ui, st, &item);
+    }
+
+    fn showroom_deck_pages(&mut self, ui: &mut egui::Ui, st: &mut DeckState, item: &Value) {
+        if st.pages.is_empty() {
+            ui.label(egui::RichText::new("该稿件暂无可查看的页面").color(TEXT_WEAK));
+            return;
         }
+        if st.preview_open {
+            self.showroom_page_preview(ui, st, item);
+            return;
+        }
+        ui.horizontal(|ui| {
+            if let Some(view) = segmented(
+                ui,
+                &["逐页缩略图", "讲稿"],
+                usize::from(st.view == DeckView::Notes),
+                SegStyle::Soft,
+            ) {
+                st.view = if view == 1 {
+                    DeckView::Notes
+                } else {
+                    DeckView::Thumbnails
+                };
+            }
+            ui.label(egui::RichText::new(format!("{} 页", st.pages.len())).color(TEXT_WEAK));
+            if ui
+                .add_enabled(st.selected_page.is_some(), egui::Button::new("预览所选页"))
+                .clicked()
+            {
+                st.preview_open = true;
+            }
+        });
         ui.add_space(10.0);
-        match &st.deck {
-            Some(deck) => {
-                let resolved = deck
-                    .get("resolved_entries")
-                    .and_then(|r| r.as_array())
-                    .cloned()
-                    .unwrap_or_default();
-                // Flatten to a page list, then lay out in explicit rows:
-                // horizontal_wrapped proved unreliable inside this
-                // nested scroll area (pages ran off the right edge).
-                let mut pages: Vec<(String, usize, String)> = Vec::new();
-                for re in &resolved {
-                    let ver = re.get("resolved").cloned().unwrap_or(Value::Null);
-                    if !ver.is_object() {
-                        continue;
-                    }
-                    let vid = s(&ver, "id");
-                    let total = i(&ver, "page_count");
-                    for p in 0..total {
-                        let note = ver["scripts"]
-                            .get(p as usize)
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        pages.push((vid.clone(), p as usize, note.to_owned()));
-                    }
-                }
-                egui::ScrollArea::vertical()
-                    .id_salt(st.notes_view)
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
-                        if st.notes_view {
-                            for (index, (vid, page, note)) in pages.iter().enumerate() {
-                                card_frame().show(ui, |ui| {
-                                    ui.horizontal_top(|ui| {
-                                        self.thumb_ui(ui, vid, *page, 180.0);
-                                        ui.vertical(|ui| {
-                                            ui.label(
-                                                egui::RichText::new(format!("第 {} 页", index + 1))
-                                                    .strong(),
-                                            );
-                                            ui.label(if note.is_empty() {
-                                                "暂无讲稿"
-                                            } else {
-                                                note
-                                            });
-                                        });
+        egui::ScrollArea::vertical()
+            .id_salt((item["id"].as_str(), st.view == DeckView::Notes))
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
+                let mut open = false;
+                if st.view == DeckView::Notes {
+                    for (index, page) in st.pages.iter().enumerate() {
+                        let width = ui.available_width();
+                        card_frame().show(ui, |ui| {
+                            ui.set_min_width((width - 26.0).max(0.0));
+                            ui.horizontal_top(|ui| {
+                                let response = self.showroom_page_thumbnail(
+                                    ui,
+                                    page,
+                                    180.0,
+                                    st.selected_page == Some(index),
+                                );
+                                if response.clicked() {
+                                    st.selected_page = Some(index);
+                                    open = response.double_clicked();
+                                }
+                                ui.vertical(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!("第 {} 页", index + 1))
+                                            .strong(),
+                                    );
+                                    ui.label(if page.note.is_empty() {
+                                        "暂无讲稿"
+                                    } else {
+                                        &page.note
                                     });
                                 });
-                            }
-                            return;
-                        }
-                        let (columns, width) = showroom_columns(ui, 212.0);
-                        for (row_index, row) in pages.chunks(columns).enumerate() {
-                            ui.horizontal_top(|ui| {
-                                for (column, (vid, page, _)) in row.iter().enumerate() {
-                                    let global = row_index * columns + column;
-                                    ui.vertical(|ui| {
-                                        if self.thumb_button(ui, vid, *page, width, false) {
-                                            self.overlays.push(Overlay::PagePreview {
-                                                version_id: vid.clone(),
-                                                page: *page,
-                                                global,
-                                                item: item.clone(),
-                                            });
-                                        }
-                                        ui.label(
-                                            egui::RichText::new(format!("第 {} 页", global + 1))
-                                                .size(11.0)
-                                                .color(TEXT_FAINT),
-                                        );
-                                    });
-                                }
                             });
-                        }
-                    });
+                        });
+                    }
+                } else {
+                    let (columns, width) = showroom_columns(ui, 212.0);
+                    for (row_index, row) in st.pages.chunks(columns).enumerate() {
+                        ui.horizontal_top(|ui| {
+                            for (column, page) in row.iter().enumerate() {
+                                let index = row_index * columns + column;
+                                ui.vertical(|ui| {
+                                    let response = self.showroom_page_thumbnail(
+                                        ui,
+                                        page,
+                                        width,
+                                        st.selected_page == Some(index),
+                                    );
+                                    if response.clicked() {
+                                        st.selected_page = Some(index);
+                                        open = response.double_clicked();
+                                    }
+                                    ui.label(
+                                        egui::RichText::new(format!("第 {} 页", index + 1))
+                                            .size(11.0)
+                                            .color(TEXT_FAINT),
+                                    );
+                                });
+                            }
+                        });
+                    }
+                }
+                if open {
+                    st.preview_open = true;
+                }
+            });
+    }
+
+    fn showroom_page_thumbnail(
+        &mut self,
+        ui: &mut egui::Ui,
+        page: &ShowroomPage,
+        width: f32,
+        selected: bool,
+    ) -> egui::Response {
+        self.thumb_response(ui, &page.version_id, page.slot, width, selected)
+            .on_hover_text("单击选定，双击预览")
+    }
+
+    fn showroom_page_preview(&mut self, ui: &mut egui::Ui, st: &mut DeckState, item: &Value) {
+        let last = st.pages.len() - 1;
+        let mut index = st.selected_page.unwrap_or(0).min(last);
+        if ui.input(|input| input.key_pressed(egui::Key::ArrowLeft)) {
+            index = index.saturating_sub(1);
+        }
+        if ui.input(|input| input.key_pressed(egui::Key::ArrowRight)) {
+            index = (index + 1).min(last);
+        }
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(index > 0, egui::Button::new("上一页"))
+                .clicked()
+            {
+                index -= 1;
             }
-            None => {
-                ui.add_space(60.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(
-                        egui::RichText::new("该条目暂不支持逐页查看")
-                            .size(13.0)
-                            .color(TEXT_WEAK),
-                    );
-                });
+            if ui
+                .add_enabled(index < last, egui::Button::new("下一页"))
+                .clicked()
+            {
+                index += 1;
+            }
+            ui.label(format!("{} / {}", index + 1, st.pages.len()));
+            if ui.small_button("导出本页 PDF").clicked() {
+                self.export_showroom_pdf(item, "slides", Some(index));
+            }
+        });
+        st.selected_page = Some(index);
+        let page = &st.pages[index];
+        ui.add_space(10.0);
+        let width = ui
+            .available_width()
+            .min(ui.available_height().max(240.0) * 16.0 / 9.0 * 0.8);
+        egui::ScrollArea::vertical()
+            .id_salt("showroom-page-preview")
+            .show(ui, |ui| {
+                self.thumb_ui(ui, &page.version_id, page.slot, width);
+                if !page.note.is_empty() {
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new("讲稿").strong());
+                    ui.label(&page.note);
+                }
+            });
+    }
+
+    fn back_from_showroom_detail(&mut self) {
+        if let SrFrame::Deck(st) = self.showroom.stack.top_mut() {
+            if st.preview_open {
+                st.preview_open = false;
+            } else {
+                self.showroom.stack.pop();
             }
         }
     }
@@ -9261,9 +9401,6 @@ impl App {
                 Some(Overlay::AllVersions { entry_pos: _ }) => {
                     self.overlays.pop();
                 }
-                Some(Overlay::PagePreview { .. }) => {
-                    self.overlays.pop();
-                }
                 None => {}
             }
         }
@@ -9287,37 +9424,6 @@ impl App {
     /// full-history Window, now an overlay above the detail frame.
     /// Data comes from the open Detail frame; picking a version
     /// commits through switch_entry_version and closes.
-    /// 大页预览 (drill retrofit): the old sr_preview Window at
-    /// the end of the deck view, now an overlay. Returns false
-    /// when the window was closed.
-    fn page_preview_ui(
-        &mut self,
-        ui: &mut egui::Ui,
-        version_id: &str,
-        page: usize,
-        global: usize,
-        item: &Value,
-    ) -> bool {
-        let mut open = true;
-        let mut export_page = false;
-        egui::Window::new(format!("第 {} 页", global + 1))
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-            .show(ui.ctx(), |ui| {
-                self.thumb_ui(ui, version_id, page, 880.0);
-                ui.add_space(6.0);
-                if ui.small_button("导出本页 PDF").clicked() {
-                    export_page = true;
-                }
-            });
-        if export_page {
-            self.export_showroom_pdf(item, "slides", Some(global));
-        }
-        open
-    }
-
     fn all_versions_ui(&mut self, ui: &mut egui::Ui, entry_pos: usize) -> bool {
         let entries_now = self.current_entries();
         let rid = entries_now
@@ -9390,13 +9496,6 @@ impl App {
     ) -> Option<Overlay> {
         match ov {
             Overlay::Confirm(c) => self.confirm_ui(ui, c),
-            Overlay::PagePreview { version_id, page, global, item } => {
-                if self.page_preview_ui(ui, &version_id, page, global, &item) {
-                    Some(Overlay::PagePreview { version_id, page, global, item })
-                } else {
-                    None
-                }
-            }
             Overlay::AllVersions { entry_pos } => {
                 if self.all_versions_ui(ui, entry_pos) {
                     Some(Overlay::AllVersions { entry_pos })
@@ -9634,57 +9733,26 @@ impl App {
         Some(Overlay::PickTemplate(t))
     }
 
-    /// Built-in presenter (prototype A28): full-screen stage on
-    /// the overlay stack. Pages render through the existing server
-    /// thumbnail pipeline (DeckCraft CLI server-side, LibreOffice
-    /// fallback) — the same textures as the deck grid; local
-    /// DeckCraft rendering is route phase 2. Cached offline decks
-    /// keep the external open (no thumbs without a server).
+    /// Playback uses the same DeckCraft thumbnails as the detail page until
+    /// the DeckCraft playback view is connected.
     fn start_present_from_deck(&mut self, ui: &egui::Ui) {
-        let (detail, deck) = match self.showroom.stack.top() {
-            SrFrame::Deck(d) => (d.item.clone(), d.deck.clone()),
-            _ => return,
-        };
-        self.start_presentation(ui, &detail, deck.as_ref());
-    }
-
-    fn start_presentation(&mut self, ui: &egui::Ui, detail: &Value, deck: Option<&Value>) {
-        let Some(deck) = deck else {
-            self.msg = "演示内容尚未加载".into();
+        let SrFrame::Deck(deck) = self.showroom.stack.top() else {
             return;
         };
-        let resolved = deck
-            .get("resolved_entries")
-            .and_then(|r| r.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let mut pages: Vec<(String, usize)> = Vec::new();
-        let mut scripts: Vec<String> = Vec::new();
-        for re in &resolved {
-            let ver = re.get("resolved").cloned().unwrap_or(Value::Null);
-            if !ver.is_object() {
-                continue;
-            }
-            let vid = s(&ver, "id");
-            let ver_scripts: Vec<String> = ver
-                .get("scripts")
-                .and_then(|x| x.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .map(|t| t.as_str().unwrap_or("").to_string())
-                        .collect()
-                })
-                .unwrap_or_default();
-            let total = i(&ver, "page_count").max(0) as usize;
-            for p in 0..total {
-                pages.push((vid.clone(), p));
-                scripts.push(ver_scripts.get(p).cloned().unwrap_or_default());
-            }
-        }
-        if pages.is_empty() {
+        let item = deck.item.clone();
+        let pages = deck.pages.clone();
+        self.start_presentation(ui, &item, &pages);
+    }
+
+    fn start_presentation(&mut self, ui: &egui::Ui, detail: &Value, deck: &[ShowroomPage]) {
+        if deck.is_empty() {
             self.msg = "没有可放映的页面".into();
             return;
         }
+        let (pages, scripts): (Vec<_>, Vec<_>) = deck
+            .iter()
+            .map(|page| ((page.version_id.clone(), page.slot), page.note.clone()))
+            .unzip();
         ui.ctx()
             .send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
         self.overlays.push(Overlay::Present(PresentState {
