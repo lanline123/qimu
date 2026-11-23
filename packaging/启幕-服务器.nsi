@@ -1,10 +1,11 @@
 ; 启幕服务器 · 独立 Windows 安装包 (NSIS) —— 第一期分开打包 (2026-11-23)
 ; 与客户端安装包 (启幕-客户端.nsi) 完全独立: 服务器装在一台常开的电脑上即可,
 ; 客户端不在这台机器上也能用 (从各自的客户端包安装后填本机地址连接)。
-; 服务器只含 qimu-server.exe 一个二进制 + 数据目录 qimu-data (exe 同目录优先)。
+; 服务器含 qimu-server.exe + deckcraft-cli.exe (缩略图渲染器, 服务器 exe 同目录解析)
+; 两个二进制 + 数据目录 qimu-data (exe 同目录优先)。
 ; 构建 (Linux): cp 启幕-服务器.nsi qimu-server-setup.nsi && LC_ALL=C.UTF-8 makensis qimu-server-setup.nsi
 ; 产物: 启幕服务器-Setup.exe
-; 二进制来源: win\ 子目录 (windows-gnu release 构建的 qimu-server.exe)
+; 二进制来源: win\ 子目录 (windows-gnu release 构建的 qimu-server.exe 与 deckcraft-cli.exe)
 
 Unicode true
 SetCompressor lzma
@@ -45,6 +46,7 @@ Section "启幕服务器" SEC_SERVER
   SetOutPath "$INSTDIR"
   File "win/qimu-server.exe"
   File "win/qimu.ico"
+  File "win/deckcraft-cli.exe"
   ; 数据目录预建: 服务器 exe 同目录有 qimu-data 时优先用它
   CreateDirectory "$INSTDIR\qimu-data"
   CreateDirectory "$SMPROGRAMS\启幕"
@@ -70,6 +72,7 @@ Section "Uninstall"
   RMDir "$SMPROGRAMS\启幕"
   Delete "$INSTDIR\qimu-server.exe"
   Delete "$INSTDIR\qimu.ico"
+  Delete "$INSTDIR\deckcraft-cli.exe"
   Delete "$INSTDIR\uninstall.exe"
   ; 服务器数据默认保留, 询问后才删
   ${If} ${FileExists} "$INSTDIR\qimu-data\*.*"

@@ -61,8 +61,9 @@
   （任务管理器里找 qimu-server.exe）。
 
 
-页面图由服务器调用 LibreOffice 渲染。服务器电脑上装了 LibreOffice
-（免费）时显示真实页面图；没装时显示占位图，其余功能不受影响。
+页面图由服务器内置的 DeckCraft 引擎渲染（deckcraft-cli.exe 随服务器
+安装包一同安装，位于服务器程序同目录），无需另装 LibreOffice。
+渲染失败时该页页面图暂缺，服务器日志中有记录，其余功能不受影响。
 
 界面字体：优先使用系统自带的微软雅黑（Windows）/ Noto Sans CJK
 （Linux）；显示为方框时请检查系统字体是否完整。
