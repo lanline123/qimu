@@ -43,7 +43,7 @@ impl App {
         self.shell_sidebar(ui);
         self.page_footer(ui);
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(APP_BG))
+            .frame(egui::Frame::NONE.fill(palette_color(APP_BG)))
             .show(ui, |ui| {
                 ui.push_id(self.page.label(), |ui| match self.page {
                     Page::Home => self.page_home(ui),
@@ -54,6 +54,7 @@ impl App {
                     Page::Settings => self.st_main_body(ui),
                 });
             });
+        self.workspace_control_windows(ui.ctx());
     }
 
     pub(super) fn navigate_to(&mut self, page: Page) {
@@ -67,7 +68,7 @@ impl App {
         egui::Panel::left("workspace_sidebar")
             .exact_size(SIDEBAR_WIDTH)
             .resizable(false)
-            .frame(egui::Frame::NONE.fill(PANEL_BG))
+            .frame(egui::Frame::NONE.fill(palette_color(PANEL_BG)))
             .show(ui, |ui| {
                 let action_height = match page {
                     Page::Home => 166.0,
@@ -80,7 +81,7 @@ impl App {
                         .exact_size(action_height)
                         .frame(
                             egui::Frame::NONE
-                                .fill(PANEL_BG)
+                                .fill(palette_color(PANEL_BG))
                                 .inner_margin(egui::Margin::symmetric(12, 8)),
                         )
                         .show(ui, |ui| {
@@ -120,7 +121,7 @@ impl App {
         };
         for &(key, label) in actions {
             let button = egui::Button::new(tr(label))
-                .fill(if key == "new" { ACCENT } else { HOVER_BG })
+                .fill(if key == "new" { ACCENT } else { palette_color(HOVER_BG) })
                 .corner_radius(6);
             if ui.add_sized([ui.available_width(), 32.0], button).clicked() {
                 self.run_home_action(Some(key));
@@ -167,7 +168,7 @@ impl App {
             .exact_size(32.0)
             .frame(
                 egui::Frame::NONE
-                    .fill(PANEL_BG)
+                    .fill(palette_color(PANEL_BG))
                     .inner_margin(egui::Margin::symmetric(10, 0)),
             )
             .show_separator_line(false)
@@ -179,19 +180,19 @@ impl App {
                         egui::RichText::new("启幕")
                             .size(12.0)
                             .strong()
-                            .color(TEXT_MAIN),
+                            .color(palette_color(TEXT_MAIN)),
                     );
-                    ui.label(egui::RichText::new("·").size(12.0).color(TEXT_WEAK));
+                    ui.label(egui::RichText::new("·").size(12.0).color(palette_color(TEXT_WEAK)));
                     ui.label(
                         egui::RichText::new(tr(self.page.label()))
                             .size(12.0)
-                            .color(TEXT_WEAK),
+                            .color(palette_color(TEXT_WEAK)),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
                                 .size(11.5)
-                                .color(TEXT_FAINT),
+                                .color(palette_color(TEXT_FAINT)),
                         );
                     });
                 });
@@ -199,7 +200,7 @@ impl App {
                 ui.painter().hline(
                     r.x_range(),
                     r.max.y - 0.5,
-                    egui::Stroke::new(1.0, SEPARATOR),
+                    egui::Stroke::new(1.0, palette_color(SEPARATOR)),
                 );
             });
         // Row 2 — menu bar (.menubar-row): the text menus on the
@@ -211,7 +212,7 @@ impl App {
             .exact_size(32.0)
             .frame(
                 egui::Frame::NONE
-                    .fill(PANEL_BG)
+                    .fill(palette_color(PANEL_BG))
                     .inner_margin(egui::Margin::symmetric(10, 0)),
             )
             .show_separator_line(false)
@@ -243,6 +244,7 @@ impl App {
                             ui.close();
                         }
                     });
+                    self.workspace_edit_menu(ui);
                     ui.menu_button(egui::RichText::new(tr("视图")).size(12.0), |ui| {
                         ui.set_min_width(160.0);
                         for page in Page::ALL {
@@ -252,6 +254,7 @@ impl App {
                             }
                         }
                     });
+                    self.workspace_context_menus(ui);
                     ui.menu_button(egui::RichText::new(tr("帮助")).size(12.0), |ui| {
                         ui.set_min_width(160.0);
                         if ui.button(tr("检查更新")).clicked() {
@@ -264,6 +267,7 @@ impl App {
                         }
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        self.workspace_preferences(ui);
                         if self.user.is_some() {
                             if self.tool_slot(ui, false, tr("退出"), "power", *ICON_POWER) {
                                 self.logout();
@@ -297,7 +301,9 @@ impl App {
                         } else {
                             tr("未登录").to_string()
                         };
-                        ui.label(egui::RichText::new(user_text).size(12.0).color(TEXT_WEAK));
+                        let user_label = egui::Label::new(egui::RichText::new(&user_text).size(12.0).color(palette_color(TEXT_WEAK)))
+                            .truncate();
+                        ui.add_sized([108.0, 24.0], user_label).on_hover_text(user_text);
                         ui.add_space(6.0);
                         // Current server: click cycles through the other
                         // connected servers, or opens 服务器 settings.
@@ -306,14 +312,17 @@ impl App {
                             &[("name", &self.active_server_label())],
                         );
                         if ui
-                            .add(
+                            .add_sized(
+                                [if ui.ctx().content_rect().width() < 1120.0 { 92.0 } else { 156.0 }, 24.0],
                                 egui::Button::new(
-                                    egui::RichText::new(srv_label).size(12.0).color(TEXT_WEAK),
+                                    egui::RichText::new(&srv_label).size(12.0).color(palette_color(TEXT_WEAK)),
                                 )
                                 .fill(egui::Color32::TRANSPARENT)
                                 .stroke(egui::Stroke::NONE)
-                                .corner_radius(6),
+                                .corner_radius(6)
+                                .truncate(),
                             )
+                            .on_hover_text(srv_label)
                             .clicked()
                         {
                             let connected: Vec<usize> = (0..self.conns.len())
@@ -335,7 +344,7 @@ impl App {
                 ui.painter().hline(
                     r.x_range(),
                     r.max.y - 0.5,
-                    egui::Stroke::new(1.0, SEPARATOR),
+                    egui::Stroke::new(1.0, palette_color(SEPARATOR)),
                 );
             });
         // Prototype toolbar: page navigation, then context-specific tools.
@@ -344,7 +353,7 @@ impl App {
             .show_separator_line(false)
             .frame(
                 egui::Frame::NONE
-                    .fill(HEADER_BG)
+                    .fill(palette_color(HEADER_BG))
                     .inner_margin(egui::Margin {
                         left: 10,
                         right: 10,
@@ -373,6 +382,7 @@ impl App {
                         }
                     }
                     tool_vsep(ui);
+                    self.workspace_search_box(ui);
                     // Page tool slots: only actions the page already
                     // has (the pages keep their in-body buttons; these
                     // call the same methods) — showroom refreshes,
@@ -416,12 +426,15 @@ impl App {
                         Page::Home | Page::Trash => {}
                         Page::Settings => {}
                     }
+                    if self.page == Page::Index {
+                        self.index_toolbar(ui);
+                    }
                 });
                 let r = ui.max_rect();
                 ui.painter().hline(
                     r.x_range(),
                     r.max.y - 0.5,
-                    egui::Stroke::new(1.0, SEPARATOR),
+                    egui::Stroke::new(1.0, palette_color(SEPARATOR)),
                 );
             });
     }
@@ -429,14 +442,14 @@ impl App {
     fn page_footer(&mut self, ui: &mut egui::Ui) {
         egui::Panel::bottom("deck_bar")
             .exact_size(46.0)
-            .frame(egui::Frame::NONE.fill(PANEL_BG))
+            .frame(egui::Frame::NONE.fill(palette_color(PANEL_BG)))
             .show_separator_line(false)
             .show(ui, |ui| {
                 let r = ui.max_rect();
                 ui.painter().hline(
                     r.x_range(),
                     r.min.y + 0.5,
-                    egui::Stroke::new(1.0, SEPARATOR),
+                    egui::Stroke::new(1.0, palette_color(SEPARATOR)),
                 );
                 ui.horizontal_centered(|ui| {
                     ui.add_space(22.0);
@@ -458,8 +471,8 @@ impl App {
                     ui.painter().rect(
                         badge,
                         6.0,
-                        HOVER_BG,
-                        egui::Stroke::new(1.0, FIELD_BORDER),
+                        palette_color(HOVER_BG),
+                        egui::Stroke::new(1.0, palette_color(FIELD_BORDER)),
                         egui::StrokeKind::Inside,
                     );
                     ui.painter().text(
@@ -467,7 +480,7 @@ impl App {
                         egui::Align2::CENTER_CENTER,
                         pid,
                         egui::FontId::proportional(11.5),
-                        TEXT_WEAK,
+                        palette_color(TEXT_WEAK),
                     );
                     if self.page == Page::Showroom
                         && matches!(self.showroom.stack.top(), SrFrame::Deck(_))
@@ -487,7 +500,7 @@ impl App {
                             ("项目主页", "https://github.com/lanline123/qimu"),
                         ] {
                             ui.hyperlink_to(
-                                egui::RichText::new(tr(label)).size(11.5).color(TEXT_WEAK),
+                                egui::RichText::new(tr(label)).size(11.5).color(palette_color(TEXT_WEAK)),
                                 url,
                             );
                         }

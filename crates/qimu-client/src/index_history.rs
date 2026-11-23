@@ -7,11 +7,12 @@ impl App {
             IndexDetailView::Commits,
             IndexDetailView::Versions,
             IndexDetailView::Exports,
+            IndexDetailView::Lineage,
         ];
         let selected = views.iter().position(|view| *view == st.view).unwrap_or(0);
         if let Some(next) = segmented(
             ui,
-            &["条目图墙", "提交图", "历史版本", "导出记录"],
+            &["条目图墙", "提交图", "历史版本", "导出记录", "派生关系"],
             selected,
             SegStyle::Soft,
         ) {
@@ -35,6 +36,7 @@ impl App {
                 }
                 IndexDetailView::Versions => Self::index_published_versions(ui, st, action),
                 IndexDetailView::Exports => Self::index_export_records(ui, st, action),
+                IndexDetailView::Lineage => self.index_detail_lineage(ui, st, action),
                 IndexDetailView::Wall => {}
             });
     }
@@ -46,11 +48,11 @@ impl App {
             .as_ref()
             .and_then(|list| list["commits"].as_array())
         else {
-            ui.label(egui::RichText::new("提交记录暂无法读取。").color(TEXT_WEAK));
+            ui.label(egui::RichText::new("提交记录暂无法读取。").color(palette_color(TEXT_WEAK)));
             return;
         };
         if commits.is_empty() {
-            ui.label(egui::RichText::new("这个分支还没有提交。").color(TEXT_WEAK));
+            ui.label(egui::RichText::new("这个分支还没有提交。").color(palette_color(TEXT_WEAK)));
             return;
         }
         let selected = match st.selected_commit.as_deref() {
@@ -66,7 +68,7 @@ impl App {
                 let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
                 let center = rect.center();
                 let painter = ui.painter();
-                let stroke = egui::Stroke::new(1.0, FIELD_BORDER);
+                let stroke = egui::Stroke::new(1.0, palette_color(FIELD_BORDER));
                 if position > 0 && commits[position - 1]["parent_id"] == commit["id"] {
                     painter.line_segment(
                         [
@@ -82,7 +84,7 @@ impl App {
                 {
                     painter.line_segment([center, egui::pos2(center.x, rect.bottom())], stroke);
                 }
-                painter.circle_filled(center, 3.5, if is_selected { ACCENT } else { TEXT_WEAK });
+                painter.circle_filled(center, 3.5, if is_selected { ACCENT } else { palette_color(TEXT_WEAK) });
                 if ui
                     .selectable_label(is_selected, s(commit, "message"))
                     .clicked()
@@ -92,18 +94,18 @@ impl App {
                 ui.label(
                     egui::RichText::new(s(commit, "branch"))
                         .small()
-                        .color(TEXT_WEAK),
+                        .color(palette_color(TEXT_WEAK)),
                 );
                 ui.label(
                     egui::RichText::new(fmt_time(i(commit, "created_ms")))
                         .small()
-                        .color(TEXT_WEAK),
+                        .color(palette_color(TEXT_WEAK)),
                 );
             });
         }
         ui.add_space(8.0);
         let Some(commit) = selected.and_then(|index| commits.get(index)) else {
-            ui.label(egui::RichText::new("所选提交不在当前返回的记录中。").color(TEXT_WEAK));
+            ui.label(egui::RichText::new("所选提交不在当前返回的记录中。").color(palette_color(TEXT_WEAK)));
             return;
         };
         card_frame().show(ui, |ui| {
@@ -133,7 +135,7 @@ impl App {
             .map(Vec::as_slice)
             .unwrap_or_default();
         if tags.is_empty() {
-            ui.label(egui::RichText::new("暂无发布版本。").color(TEXT_WEAK));
+            ui.label(egui::RichText::new("暂无发布版本。").color(palette_color(TEXT_WEAK)));
             return;
         }
         for tag in tags {
@@ -142,7 +144,7 @@ impl App {
                     ui.label(
                         egui::RichText::new(format!("V{}", s(tag, "name")))
                             .strong()
-                            .color(ACCENT_DEEP),
+                            .color(palette_color(ACCENT_DEEP)),
                     );
                     ui.label(s(tag, "branch"));
                     if ui.small_button("查看提交").clicked() {
@@ -155,7 +157,7 @@ impl App {
                 ui.label(
                     egui::RichText::new(s(tag, "commit_id"))
                         .small()
-                        .color(TEXT_WEAK),
+                        .color(palette_color(TEXT_WEAK)),
                 );
             });
         }
@@ -172,11 +174,11 @@ impl App {
             .as_ref()
             .and_then(|list| list["exports"].as_array())
         else {
-            ui.label(egui::RichText::new("导出记录暂无法读取。").color(TEXT_WEAK));
+            ui.label(egui::RichText::new("导出记录暂无法读取。").color(palette_color(TEXT_WEAK)));
             return;
         };
         if exports.is_empty() {
-            ui.label(egui::RichText::new("暂无导出记录。").color(TEXT_WEAK));
+            ui.label(egui::RichText::new("暂无导出记录。").color(palette_color(TEXT_WEAK)));
             return;
         }
         for record in exports {
@@ -195,7 +197,7 @@ impl App {
                     ui.label(coordinate);
                     ui.label(format!("{} 页", i(record, "page_count")));
                     ui.label(
-                        egui::RichText::new(fmt_time(i(record, "created_ms"))).color(TEXT_WEAK),
+                        egui::RichText::new(fmt_time(i(record, "created_ms"))).color(palette_color(TEXT_WEAK)),
                     );
                     if ui.small_button("查看提交").clicked() {
                         *action = Some(IndexDetailAction::FocusCommit {
@@ -207,7 +209,7 @@ impl App {
                 ui.label(
                     egui::RichText::new(format!("提交 {}", s(record, "commit_id")))
                         .small()
-                        .color(TEXT_WEAK),
+                        .color(palette_color(TEXT_WEAK)),
                 );
             });
         }

@@ -4,8 +4,13 @@
 //! exactly like the CLI (spec §4.4 parity).
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+mod index_controls;
 mod index_history;
 mod shell;
+mod workspace_controls;
+
+use index_controls::{BranchLineage, IndexOverviewControls, IndexScope};
+use workspace_controls::{palette_color, query_component, WorkspaceControls, ENGLISH_UI, LIGHT_THEME};
 
 use base64::Engine;
 use eframe::egui;
@@ -210,8 +215,7 @@ fn install_cjk_font(ctx: &egui::Context) {
 /// #2D8CEB, widget radius 5); phase 1 (2026-11-23) moved only the
 /// accent to the prototype's #2F6BF5; this alignment completes the
 /// move for every remaining parameter. Do not re-align to the design
-/// spec. The prototype's light-theme tokens are catalogued in the
-/// alignment report; the client is dark-only today.
+/// spec. Light mode maps the shared colors to the prototype’s light palette.
 /// State ladder (prototype): rest --panel → row hover --panel2
 /// (.tree button:hover) / button hover --panel3 (.btn:hover) →
 /// pressed/open --panel3; selected list rows take --accent-soft fill
@@ -278,17 +282,21 @@ pub const PAGE_PAD_L: f32 = 22.0;
 
 fn apply_modern_style(ctx: &egui::Context) {
     let mut style = (*ctx.global_style()).clone();
-    let mut v = egui::Visuals::dark();
-    v.panel_fill = CHROME;
-    v.window_fill = CARD_BG;
+    let mut v = if LIGHT_THEME.get() {
+        egui::Visuals::light()
+    } else {
+        egui::Visuals::dark()
+    };
+    v.panel_fill = palette_color(CHROME);
+    v.window_fill = palette_color(CARD_BG);
     // egui's default window stroke is gray-60 (#3C3C3C) — brighter
     // than anything the framework draws; windows, popups and menus
     // all take it. Press it to the separator tier (#26262B).
-    v.window_stroke = egui::Stroke::new(1.0, SEPARATOR);
+    v.window_stroke = egui::Stroke::new(1.0, palette_color(SEPARATOR));
     // extreme_bg serves as the text-field fill: inset #1A1A1A, darker
     // than panels and cards alike, no stroke (spec §1).
-    v.extreme_bg_color = FIELD_BG;
-    v.faint_bg_color = CHROME;
+    v.extreme_bg_color = palette_color(FIELD_BG);
+    v.faint_bg_color = palette_color(CHROME);
     // Text selection: the prototype accent's hue (the prototype sets
     // no ::selection rule, so the framework's alpha 90 is kept); the
     // selection stroke doubles as the focused text field's outline,
@@ -296,7 +304,7 @@ fn apply_modern_style(ctx: &egui::Context) {
     v.selection.bg_fill = egui::Color32::from_rgba_unmultiplied(0x2F, 0x6B, 0xF5, 90);
     v.selection.stroke = egui::Stroke::new(1.0, ACCENT);
     v.hyperlink_color = ACCENT;
-    v.override_text_color = Some(TEXT_MAIN);
+    v.override_text_color = Some(palette_color(TEXT_MAIN));
     // Windows/dialogs: the prototype's dialog cascade resolves to
     // 10px (18px → 14px → 10px rules of equal specificity, last wins).
     v.window_corner_radius = egui::CornerRadius::same(10);
@@ -306,17 +314,22 @@ fn apply_modern_style(ctx: &egui::Context) {
     // Shadows live only on windows/popups: the prototype's single
     // --shadow token (0 14px 34px rgba(0,0,0,.5)); cards and chrome
     // layer by brightness + border alone.
+    let shadow = if LIGHT_THEME.get() {
+        egui::Color32::from_rgba_unmultiplied(20, 25, 40, 26)
+    } else {
+        egui::Color32::from_black_alpha(128)
+    };
     v.window_shadow = egui::epaint::Shadow {
         offset: [0, 14],
         blur: 34,
         spread: 0,
-        color: egui::Color32::from_black_alpha(128),
+        color: shadow,
     };
     v.popup_shadow = egui::epaint::Shadow {
         offset: [0, 14],
         blur: 34,
         spread: 0,
-        color: egui::Color32::from_black_alpha(128),
+        color: shadow,
     };
     // Widget-level corner radius 6 across the board: the prototype's
     // final tightening layer puts every control (.btn, inputs, .tree
@@ -333,24 +346,24 @@ fn apply_modern_style(ctx: &egui::Context) {
     ] {
         w.corner_radius = r;
     }
-    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, SEPARATOR);
+    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, palette_color(SEPARATOR));
     // State ladder (prototype, skin layer §5): buttons/fields rest
     // on --panel2 with a 1px --line2 border; button hover steps to
     // --panel3 (.btn:hover), weak/ghost hover to --panel2 (.tree
     // button:hover); pressed/open sit on --panel3. State colors
     // apply instantly — no color tweening anywhere.
     v.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
-    v.widgets.inactive.bg_fill = BTN_BG;
-    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, FIELD_BORDER);
-    v.widgets.hovered.weak_bg_fill = HOVER_BG;
-    v.widgets.hovered.bg_fill = PRESSED_BG;
-    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, FIELD_BORDER);
-    v.widgets.active.weak_bg_fill = PRESSED_BG;
-    v.widgets.active.bg_fill = PRESSED_BG;
-    v.widgets.active.bg_stroke = egui::Stroke::new(1.0, FIELD_BORDER);
-    v.widgets.open.weak_bg_fill = HOVER_BG;
-    v.widgets.open.bg_fill = PRESSED_BG;
-    v.widgets.open.bg_stroke = egui::Stroke::new(1.0, FIELD_BORDER);
+    v.widgets.inactive.bg_fill = palette_color(BTN_BG);
+    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, palette_color(FIELD_BORDER));
+    v.widgets.hovered.weak_bg_fill = palette_color(HOVER_BG);
+    v.widgets.hovered.bg_fill = palette_color(PRESSED_BG);
+    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, palette_color(FIELD_BORDER));
+    v.widgets.active.weak_bg_fill = palette_color(PRESSED_BG);
+    v.widgets.active.bg_fill = palette_color(PRESSED_BG);
+    v.widgets.active.bg_stroke = egui::Stroke::new(1.0, palette_color(FIELD_BORDER));
+    v.widgets.open.weak_bg_fill = palette_color(HOVER_BG);
+    v.widgets.open.bg_fill = palette_color(PRESSED_BG);
+    v.widgets.open.bg_stroke = egui::Stroke::new(1.0, palette_color(FIELD_BORDER));
     style.visuals = v;
     use egui::{FontFamily, FontId, TextStyle};
     // Type ladder (prototype): body copy 13.5px (the skin layer's
@@ -412,8 +425,8 @@ fn apply_modern_style(ctx: &egui::Context) {
 /// final .card-body padding (10px top / 12px sides / 11px bottom).
 fn card_frame() -> egui::Frame {
     egui::Frame::NONE
-        .fill(CARD_BG)
-        .stroke(egui::Stroke::new(1.0, CARD_BORDER))
+        .fill(palette_color(CARD_BG))
+        .stroke(egui::Stroke::new(1.0, palette_color(CARD_BORDER)))
         .corner_radius(egui::CornerRadius::same(6))
         .inner_margin(egui::Margin {
             left: 12,
@@ -532,9 +545,9 @@ fn tree_row(
         ui.allocate_exact_size(egui::vec2(width, 28.0), egui::Sense::click());
     let painter = ui.painter();
     if selected {
-        painter.rect_filled(rect, 6.0, SEL_BG);
+        painter.rect_filled(rect, 6.0, palette_color(SEL_BG));
     } else if resp.hovered() {
-        painter.rect_filled(rect, 6.0, HOVER_BG);
+        painter.rect_filled(rect, 6.0, palette_color(HOVER_BG));
     }
     let mut tx = rect.min.x + 10.0 + indent;
     if let Some(tex) = icon {
@@ -546,12 +559,12 @@ fn tree_row(
             tex,
             ir,
             egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
-            ICON_TINT,
+            palette_color(ICON_TINT),
         );
         tx += 15.0 + 6.0;
     }
     let font = egui::FontId::new(size, egui::FontFamily::Proportional);
-    let color = if selected { ACCENT } else { TEXT_MAIN };
+    let color = if selected { ACCENT } else { palette_color(TEXT_MAIN) };
     let galley = painter.layout_no_wrap(label.to_string(), font, color);
     let ty = rect.center().y - galley.size().y / 2.0;
     painter.galley(egui::pos2(tx, ty), galley, color);
@@ -563,7 +576,7 @@ fn tree_row(
 /// --bottombar-h the prototype's content column reserves. The fill
 /// is the canvas fill used by the prototype's content column.
 fn body_frame() -> egui::Frame {
-    egui::Frame::NONE.fill(APP_BG).inner_margin(egui::Margin {
+    egui::Frame::NONE.fill(palette_color(APP_BG)).inner_margin(egui::Margin {
         left: PAGE_PAD_L as i8,
         right: 22,
         top: 20,
@@ -962,6 +975,7 @@ impl UnitState {
 struct IndexState {
     /// 概览按文件夹筛选（页级：概览帧与导航树共用）。
     overview_folder: Option<String>,
+    overview_controls: IndexOverviewControls,
     stack: NavStack<IndexFrame>,
 }
 
@@ -969,6 +983,7 @@ impl Default for IndexState {
     fn default() -> Self {
         Self {
             overview_folder: None,
+            overview_controls: IndexOverviewControls::default(),
             stack: NavStack::new(IndexFrame::Overview(OverviewState::default())),
         }
     }
@@ -996,6 +1011,7 @@ enum IndexDetailAction {
 #[derive(Default)]
 struct OverviewState {
     selected: Option<String>,
+    lineages: BTreeMap<String, Result<Vec<BranchLineage>, String>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1004,6 +1020,7 @@ enum IndexDetailView {
     Commits,
     Versions,
     Exports,
+    Lineage,
 }
 
 /// 索引详情帧状态：一个打开的索引的全部工作状态，随帧销毁。
@@ -1013,13 +1030,16 @@ struct IndexDetailState {
     branch: String,
     commits: Option<Value>,
     exports: Option<Value>,
+    lineage: Option<Result<Vec<BranchLineage>, String>>,
     view: IndexDetailView,
     selected_commit: Option<String>,
     /// rendition_id -> versions, semver desc（打开时预取）。
     unit_versions: std::collections::HashMap<String, Vec<Value>>,
     tag_name: String,
+    focus_tag: bool,
     new_branch: String,
     merge_from: String,
+    focus_merge: bool,
     merge_preview: Option<Value>,
     merge_resolutions: std::collections::HashMap<String, String>,
     include_notes: bool,
@@ -1035,12 +1055,15 @@ impl IndexDetailState {
             branch,
             commits: None,
             exports: None,
+            lineage: None,
             view: IndexDetailView::Wall,
             selected_commit: None,
             unit_versions: Default::default(),
             tag_name: String::new(),
+            focus_tag: false,
             new_branch: String::new(),
             merge_from: String::new(),
+            focus_merge: false,
             merge_preview: None,
             merge_resolutions: Default::default(),
             include_notes: true,
@@ -1173,13 +1196,13 @@ fn crumb_bar(ui: &mut egui::Ui, crumbs: &[&str]) -> Option<usize> {
     ui.horizontal(|ui| {
         for (idx, label) in crumbs.iter().enumerate() {
             if idx > 0 {
-                ui.label(egui::RichText::new("›").color(TEXT_FAINT));
+                ui.label(egui::RichText::new("›").color(palette_color(TEXT_FAINT)));
             }
             if idx + 1 == crumbs.len() {
                 ui.label(
                     egui::RichText::new(*label)
                         .size(12.5)
-                        .color(TEXT_MAIN)
+                        .color(palette_color(TEXT_MAIN))
                         .strong(),
                 );
             } else if text_action(ui, label, ACCENT, 12.5) {
@@ -1722,7 +1745,7 @@ fn mm_field(
     let mut v = emu_mm(emu);
     let mut out = None;
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(label).size(11.5).color(TEXT_FAINT));
+        ui.label(egui::RichText::new(label).size(11.5).color(palette_color(TEXT_FAINT)));
         let resp = ui.add(
             egui::DragValue::new(&mut v)
                 .speed(0.1)
@@ -1758,14 +1781,14 @@ fn page_edit_inspector(
     ui.label(
         egui::RichText::new(format!("{}（{}）", tr("元素"), list.len()))
             .size(12.5)
-            .color(TEXT_MAIN),
+            .color(palette_color(TEXT_MAIN)),
     );
     ui.add_space(4.0);
     if list.is_empty() {
         ui.label(
             egui::RichText::new(tr("本页没有元素。"))
                 .size(12.0)
-                .color(TEXT_WEAK),
+                .color(palette_color(TEXT_WEAK)),
         );
         return;
     }
@@ -1788,7 +1811,7 @@ fn page_edit_inspector(
         ui.label(
             egui::RichText::new(tr("点选画布或列表中的元素进行编辑。"))
                 .size(12.0)
-                .color(TEXT_WEAK),
+                .color(palette_color(TEXT_WEAK)),
         );
         return;
     };
@@ -1807,7 +1830,7 @@ fn page_edit_inspector(
             }
         ))
         .size(12.5)
-        .color(TEXT_MAIN),
+        .color(palette_color(TEXT_MAIN)),
     );
     ui.add_space(4.0);
     // Geometry (EMU on the wire, millimetres in the panel).
@@ -1828,7 +1851,7 @@ fn page_edit_inspector(
         ui.label(
             egui::RichText::new(tr("位置由版式决定，不可拖动（可改文本与样式）。"))
                 .size(11.5)
-                .color(TEXT_FAINT),
+                .color(palette_color(TEXT_FAINT)),
         );
     }
     ui.add_space(6.0);
@@ -1838,7 +1861,7 @@ fn page_edit_inspector(
                 ui.label(
                     egui::RichText::new(format!("{}：{}", tr("当前图片"), m))
                         .size(11.5)
-                        .color(TEXT_WEAK),
+                        .color(palette_color(TEXT_WEAK)),
                 );
             }
             if elw.new_image.is_some() {
@@ -1873,7 +1896,7 @@ fn page_edit_inspector(
                     ui.label(
                         egui::RichText::new(format!("{} {}", tr("段"), pi + 1))
                             .size(11.5)
-                            .color(TEXT_FAINT),
+                            .color(palette_color(TEXT_FAINT)),
                     );
                     if ui.small_button(tr("＋文本")).clicked() {
                         para.runs.push(RunWork {
@@ -1895,7 +1918,7 @@ fn page_edit_inspector(
                         ui.label(
                             egui::RichText::new(format!("{}", ri + 1))
                                 .size(11.5)
-                                .color(TEXT_FAINT),
+                                .color(palette_color(TEXT_FAINT)),
                         );
                         let resp = ui.add(
                             egui::TextEdit::singleline(&mut run.text)
@@ -1915,7 +1938,7 @@ fn page_edit_inspector(
                         ui.label(
                             egui::RichText::new(tr("字号"))
                                 .size(11.0)
-                                .color(TEXT_FAINT),
+                                .color(palette_color(TEXT_FAINT)),
                         );
                         let mut szv = run.sz.unwrap_or(18.0);
                         let resp = ui.add(
@@ -1934,7 +1957,7 @@ fn page_edit_inspector(
                             ui.label(
                                 egui::RichText::new(tr("继承"))
                                     .size(11.0)
-                                    .color(TEXT_FAINT),
+                                    .color(palette_color(TEXT_FAINT)),
                             );
                         }
                         let mut bv = run.b.unwrap_or(false);
@@ -1976,21 +1999,21 @@ fn page_edit_inspector(
             ui.label(
                 egui::RichText::new(tr("线条：可移动与缩放；改色与线宽暂不支持。"))
                     .size(11.5)
-                    .color(TEXT_FAINT),
+                    .color(palette_color(TEXT_FAINT)),
             );
         }
         "graphic" => {
             ui.label(
                 egui::RichText::new(tr("图表：仅位置与大小可调，数据请回源文件编辑。"))
                     .size(11.5)
-                    .color(TEXT_FAINT),
+                    .color(palette_color(TEXT_FAINT)),
             );
         }
         "group" => {
             ui.label(
                 egui::RichText::new(tr("组合：可整体移动与缩放；组内元素单独编辑暂不支持。"))
                     .size(11.5)
-                    .color(TEXT_FAINT),
+                    .color(palette_color(TEXT_FAINT)),
             );
         }
         _ => {}
@@ -2188,6 +2211,7 @@ struct App {
     cache_policy: Value,
     index_covers: std::collections::HashMap<String, String>,
     index_tags: std::collections::HashMap<String, String>,
+    index_search_tags: BTreeMap<String, Vec<String>>,
     content: ContentState,
     index: IndexState,
     settings: SettingsState,
@@ -2232,6 +2256,7 @@ struct App {
     lang_options: Vec<(String, String)>,
     /// Toast state (the framework has no status bar): the message
     /// currently floating and when it appeared, in egui time.
+    workspace_controls: WorkspaceControls,
     toast_msg: String,
     toast_since: f64,
     /// Login popup visibility (login is a closable dialog over the
@@ -2362,34 +2387,29 @@ static I18N_EMBEDDED: [(&str, &str, &str); 2] = [
     ("en-us", "", include_str!("../locales/en-us.tsv")),
 ];
 static I18N: std::sync::OnceLock<craft_i18n::I18n> = std::sync::OnceLock::new();
-static I18N_LANG: std::sync::OnceLock<craft_i18n::Lang> = std::sync::OnceLock::new();
-
 fn init_i18n() {
-    let _ = I18N.get_or_init(|| {
-        let (i18n, problems) =
-            craft_i18n::I18n::new(&I18N_EMBEDDED, &["zh-hans", "en-us"]);
-        for p in &problems {
-            eprintln!("i18n: {p}");
-        }
-        let want = match std::env::var("QIMU_LOCALE") {
-            Ok(v) if v.to_ascii_lowercase().starts_with("en") => "en-us",
-            _ => "zh-hans",
-        };
-        let lang = i18n.from_code(want).or_else(|| i18n.from_code("zh-hans"));
-        if let Some(l) = lang {
-            let _ = I18N_LANG.set(l);
+    I18N.get_or_init(|| {
+        let (i18n, problems) = craft_i18n::I18n::new(&I18N_EMBEDDED, &["zh-hans", "en-us"]);
+        for problem in problems {
+            eprintln!("i18n: {problem}");
         }
         i18n
     });
+    let settings = client_settings();
+    let locale = std::env::var("QIMU_LOCALE")
+        .ok()
+        .unwrap_or_else(|| s(&settings, "locale"));
+    ENGLISH_UI.set(locale.to_ascii_lowercase().starts_with("en"));
+    LIGHT_THEME.set(settings["theme"] == "light");
 }
 
-/// Translate a UI string through the embedded catalogs; identity in
-/// the default zh-Hans locale.
+/// Translate a UI string through the embedded catalogs.
 fn tr(source: &str) -> &str {
-    match (I18N.get(), I18N_LANG.get()) {
-        (Some(i18n), Some(lang)) => i18n.t(*lang, source),
-        _ => source,
-    }
+    let Some(i18n) = I18N.get() else {
+        return source;
+    };
+    let code = if ENGLISH_UI.get() { "en-us" } else { "zh-hans" };
+    i18n.from_code(code).map_or(source, |lang| i18n.t(lang, source))
 }
 
 // The icons are embedded as base64 text (assets/icons/*.png.b64), not as
@@ -2862,6 +2882,7 @@ impl App {
             cache_policy: json!({ "allowed": true, "max_mb": 500 }),
             index_covers: std::collections::HashMap::new(),
             index_tags: std::collections::HashMap::new(),
+            index_search_tags: BTreeMap::new(),
             content: ContentState::default(),
             index: IndexState::default(),
             settings: SettingsState {
@@ -2888,6 +2909,7 @@ impl App {
             translating: None,
             ai_status: None,
             lang_options: Vec::new(),
+            workspace_controls: WorkspaceControls::default(),
             toast_msg: String::new(),
             toast_since: 0.0,
             login_open: false,
@@ -3198,6 +3220,9 @@ impl App {
     fn activate(&mut self, i: usize) {
         if i >= self.conns.len() {
             return;
+        }
+        if self.active != Some(i) {
+            self.clear_account_state();
         }
         self.active = Some(i);
         if let Some(user) = self.validate_conn(i) {
@@ -3590,6 +3615,9 @@ impl App {
         self.groups.clear();
         self.units.clear();
         self.indexes.clear();
+        self.index.stack = NavStack::new(IndexFrame::Overview(OverviewState::default()));
+        self.index.overview_folder = None;
+        self.workspace_controls = WorkspaceControls::default();
         self.org = json!({});
         self.showroom_live.clear();
         self.showroom_pending.clear();
@@ -3600,6 +3628,7 @@ impl App {
         self.library_refs.clear();
         self.index_covers.clear();
         self.index_tags.clear();
+        self.index_search_tags.clear();
         self.showroom.stack.pop_to(0);
         self.my_id.clear();
     }
@@ -3615,6 +3644,9 @@ impl App {
             self.units = v.get("units").and_then(|f| f.as_array()).cloned().unwrap_or_default();
         }
         if let Ok(v) = self.call("GET", "/v1/indexes", None) {
+            if let IndexFrame::Overview(overview) = self.index.stack.root_mut() {
+                overview.lineages.clear();
+            }
             self.indexes = v.get("indexes").and_then(|f| f.as_array()).cloned().unwrap_or_default();
         }
         if let Ok(v) = self.call("GET", "/v1/org", None) {
@@ -3631,7 +3663,7 @@ impl App {
         }
         for x in self.indexes.clone() {
             let xid = s(&x, "id");
-            if xid.is_empty() || self.index_tags.contains_key(&xid) {
+            if xid.is_empty() || self.index_search_tags.contains_key(&xid) {
                 continue;
             }
             if let Ok(d) = self.call("GET", &format!("/v1/indexes/{xid}"), None) {
@@ -3652,22 +3684,7 @@ impl App {
                         self.index_covers.insert(xid.clone(), vid.to_string());
                     }
                 }
-                if let Some(tags) = d.get("tags").and_then(|x| x.as_array()) {
-                    let mut best: Option<((u64, u64, u64), String)> = None;
-                    for tg in tags {
-                        if s(tg, "branch") != "main" {
-                            continue;
-                        }
-                        let nm = s(tg, "name");
-                        let key = semver_key(&nm);
-                        if best.as_ref().map(|(k, _)| key > *k).unwrap_or(true) {
-                            best = Some((key, nm));
-                        }
-                    }
-                    if let Some((_, nm)) = best {
-                        self.index_tags.insert(xid.clone(), nm);
-                    }
-                }
+                self.remember_index_tags(&xid, &d);
             }
         }
         if let Ok(v) = self.call("GET", "/v1/showroom?state=pending", None) {
@@ -3916,7 +3933,7 @@ impl App {
         let Some(v) = &self.pdf_view else { return };
         let (note, tex, page, pages) = (v.note.clone(), v.tex.clone(), v.page, v.pages);
         if !note.is_empty() {
-            ui.label(egui::RichText::new(&note).color(TEXT_WEAK));
+            ui.label(egui::RichText::new(&note).color(palette_color(TEXT_WEAK)));
         }
         if let Some(tex) = &tex {
             let size = tex.size_vec2();
@@ -3935,7 +3952,7 @@ impl App {
             }
             ui.label(
                 egui::RichText::new(format!("第 {} / {} 页", page + 1, pages.max(1)))
-                    .color(TEXT_WEAK),
+                    .color(palette_color(TEXT_WEAK)),
             );
             if ui
                 .add_enabled(page + 1 < pages, egui::Button::new("下一页 ›").small())
@@ -3963,7 +3980,7 @@ impl App {
     fn attachments_ui(&mut self, ui: &mut egui::Ui, parent_type: &str, parent_id: &str) {
         ui.add_space(10.0);
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("附件").strong().color(TEXT_MAIN));
+            ui.label(egui::RichText::new("附件").strong().color(palette_color(TEXT_MAIN)));
             if ui.small_button("＋ 添加附件").clicked() {
                 if let Some(path) = rfd::FileDialog::new().pick_file() {
                     let filename = path
@@ -3993,7 +4010,7 @@ impl App {
         });
         let atts = self.att_cache.get(parent_id).cloned().unwrap_or_default();
         if atts.is_empty() {
-            ui.label(egui::RichText::new("暂无附件").color(TEXT_FAINT));
+            ui.label(egui::RichText::new("暂无附件").color(palette_color(TEXT_FAINT)));
         }
         for att in &atts {
             let filename = s(att, "filename");
@@ -4005,10 +4022,10 @@ impl App {
                 format!("{:.0} KB", size as f64 / 1024.0)
             };
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(&filename).color(TEXT_MAIN));
+                ui.label(egui::RichText::new(&filename).color(palette_color(TEXT_MAIN)));
                 ui.label(
                     egui::RichText::new(format!("{size_txt} · {}", s(att, "uploader")))
-                        .color(TEXT_FAINT),
+                        .color(palette_color(TEXT_FAINT)),
                 );
                 if is_pdf && ui.small_button("预览").clicked() {
                     self.pdf_open(att);
@@ -4076,7 +4093,7 @@ impl App {
         } else {
             st.branch.clone()
         };
-        match self.call("GET", &format!("/v1/indexes/{index_id}?branch={b}"), None) {
+        match self.call("GET", &format!("/v1/indexes/{index_id}?branch={}", query_component(&b)), None) {
             Ok(v) => st.detail = v,
             Err(e) => {
                 self.msg = format!("打开索引失败：{e}");
@@ -4084,10 +4101,27 @@ impl App {
             }
         }
         let idx = st.detail.get("index").cloned().unwrap_or(json!({}));
+        self.remember_index_tags(index_id, &st.detail);
         self.index.stack.pop_to(0);
         self.index.stack.push(IndexFrame::Detail(st));
         self.load_index_related(index_id);
         self.note_recent("index", index_id, &s(&idx, "name"), "");
+    }
+
+    fn remember_index_tags(&mut self, id: &str, detail: &Value) {
+        let tags = detail["tags"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+        self.index_search_tags
+            .insert(id.into(), tags.iter().map(|tag| s(tag, "name")).collect());
+        let latest = tags
+            .iter()
+            .filter(|tag| tag["branch"] == "main")
+            .filter_map(|tag| tag["name"].as_str())
+            .max_by_key(|name| semver_key(name));
+        if let Some(name) = latest {
+            self.index_tags.insert(id.into(), name.into());
+        } else {
+            self.index_tags.remove(id);
+        }
     }
 
     fn load_index_detail(&mut self) {
@@ -4102,8 +4136,9 @@ impl App {
             ),
             _ => return,
         };
-        match self.call("GET", &format!("/v1/indexes/{id}?branch={branch}"), None) {
+        match self.call("GET", &format!("/v1/indexes/{id}?branch={}", query_component(&branch)), None) {
             Ok(v) => {
+                self.remember_index_tags(&id, &v);
                 if let IndexFrame::Detail(d) = self.index.stack.top_mut() {
                     d.detail = v;
                 }
@@ -4118,7 +4153,7 @@ impl App {
             return;
         };
         let id = st.index_id.clone();
-        match self.call("GET", &format!("/v1/indexes/{id}?branch={branch}"), None) {
+        match self.call("GET", &format!("/v1/indexes/{id}?branch={}", query_component(&branch)), None) {
             Ok(detail) => {
                 if let IndexFrame::Detail(st) = self.index.stack.top_mut() {
                     st.branch = branch;
@@ -4190,7 +4225,7 @@ impl App {
         let commits = self
             .call(
                 "GET",
-                &format!("/v1/indexes/{id}/commits?branch={branch}"),
+                &format!("/v1/indexes/{id}/commits?branch={}", query_component(&branch)),
                 None,
             )
             .ok();
@@ -4200,6 +4235,7 @@ impl App {
         if let IndexFrame::Detail(d) = self.index.stack.top_mut() {
             d.commits = commits;
             d.exports = exports;
+            d.lineage = None;
         }
     }
 
@@ -4444,7 +4480,7 @@ impl App {
         ui.painter().rect_stroke(
             rect,
             6.0,
-            egui::Stroke::new(1.0, CARD_BORDER),
+            egui::Stroke::new(1.0, palette_color(CARD_BORDER)),
             egui::StrokeKind::Middle,
         );
         let mut blank = resp.clicked();
@@ -4452,8 +4488,8 @@ impl App {
         ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(64.0);
-                ui.label(egui::RichText::new("+").size(34.0).color(TEXT_FAINT));
-                ui.label(egui::RichText::new("新建内容块").size(13.0).color(TEXT_WEAK));
+                ui.label(egui::RichText::new("+").size(34.0).color(palette_color(TEXT_FAINT)));
+                ui.label(egui::RichText::new("新建内容块").size(13.0).color(palette_color(TEXT_WEAK)));
                 ui.add_space(14.0);
                 ui.horizontal(|ui| {
                     let w = ui.available_width();
@@ -4462,7 +4498,7 @@ impl App {
                         .add_sized(
                             [92.0, 28.0],
                             egui::Button::new(egui::RichText::new("新建空白块").size(11.5))
-                                .fill(BTN_BG)
+                                .fill(palette_color(BTN_BG))
                                 .corner_radius(6),
                         )
                         .clicked()
@@ -4473,7 +4509,7 @@ impl App {
                         .add_sized(
                             [104.0, 28.0],
                             egui::Button::new(egui::RichText::new("粘贴 PPT 页新建").size(11.5))
-                                .fill(BTN_BG)
+                                .fill(palette_color(BTN_BG))
                                 .corner_radius(6),
                         )
                         .clicked()
@@ -4611,7 +4647,7 @@ fn i(v: &Value, key: &str) -> i64 {
 fn tool_vsep(ui: &mut egui::Ui) {
     ui.add_space(5.0);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(1.0, 18.0), egui::Sense::hover());
-    ui.painter().vline(rect.center().x, rect.y_range(), egui::Stroke::new(1.0, LINE_34));
+    ui.painter().vline(rect.center().x, rect.y_range(), egui::Stroke::new(1.0, palette_color(LINE_34)));
     ui.add_space(5.0);
 }
 
@@ -4624,15 +4660,15 @@ fn home_recent_row(ui: &mut egui::Ui, columns: [&str; 4], interactive: bool) -> 
     let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), sense);
     let painter = ui.painter();
     if interactive && response.hovered() {
-        painter.rect_filled(rect, 6.0, HOVER_BG);
+        painter.rect_filled(rect, 6.0, palette_color(HOVER_BG));
     }
     let mut x = rect.min.x + 2.0;
     for (index, (text, fraction)) in columns.into_iter().zip([2.2, 1.1, 1.0, 1.0]).enumerate() {
         let width = rect.width() * fraction / 5.3;
         let color = if interactive && index == 0 {
-            TEXT_MAIN
+            palette_color(TEXT_MAIN)
         } else {
-            TEXT_WEAK
+            palette_color(TEXT_WEAK)
         };
         let column = egui::Rect::from_min_size(
             egui::pos2(x, rect.min.y),
@@ -4653,7 +4689,7 @@ fn home_recent_row(ui: &mut egui::Ui, columns: [&str; 4], interactive: bool) -> 
         painter.hline(
             rect.x_range(),
             rect.max.y - 0.5,
-            egui::Stroke::new(1.0, SEPARATOR),
+            egui::Stroke::new(1.0, palette_color(SEPARATOR)),
         );
     }
     response
@@ -4702,9 +4738,9 @@ fn btn_default(ui: &mut egui::Ui, label: &str) -> egui::Response {
 
 fn btn_ghost(ui: &mut egui::Ui, label: &str) -> egui::Response {
     ui.add(
-        egui::Button::new(egui::RichText::new(label).size(12.5).color(TEXT_MAIN))
+        egui::Button::new(egui::RichText::new(label).size(12.5).color(palette_color(TEXT_MAIN)))
             .fill(egui::Color32::TRANSPARENT)
-            .stroke(egui::Stroke::new(1.0, FIELD_BORDER))
+            .stroke(egui::Stroke::new(1.0, palette_color(FIELD_BORDER)))
             .corner_radius(6)
             .min_size(egui::vec2(0.0, 28.0)),
     )
@@ -4713,9 +4749,9 @@ fn btn_ghost(ui: &mut egui::Ui, label: &str) -> egui::Response {
 fn btn_ghost_enabled(ui: &mut egui::Ui, enabled: bool, label: &str) -> egui::Response {
     ui.add_enabled(
         enabled,
-        egui::Button::new(egui::RichText::new(label).size(12.5).color(TEXT_MAIN))
+        egui::Button::new(egui::RichText::new(label).size(12.5).color(palette_color(TEXT_MAIN)))
             .fill(egui::Color32::TRANSPARENT)
-            .stroke(egui::Stroke::new(1.0, FIELD_BORDER))
+            .stroke(egui::Stroke::new(1.0, palette_color(FIELD_BORDER)))
             .corner_radius(6)
             .min_size(egui::vec2(0.0, 28.0)),
     )
@@ -4724,7 +4760,7 @@ fn btn_ghost_enabled(ui: &mut egui::Ui, enabled: bool, label: &str) -> egui::Res
 fn btn_danger(ui: &mut egui::Ui, label: &str) -> egui::Response {
     ui.add(
         egui::Button::new(egui::RichText::new(label).size(12.5).color(egui::Color32::WHITE))
-            .fill(DANGER_BG)
+            .fill(palette_color(DANGER_BG))
             .corner_radius(6)
             .min_size(egui::vec2(0.0, 28.0)),
     )
@@ -4758,8 +4794,8 @@ fn segmented(
             // with ink text, resting = transparent with muted text.
             let mut changed = None;
             egui::Frame::NONE
-                .fill(HOVER_BG)
-                .stroke(egui::Stroke::new(1.0, SEPARATOR))
+                .fill(palette_color(HOVER_BG))
+                .stroke(egui::Stroke::new(1.0, palette_color(SEPARATOR)))
                 .corner_radius(egui::CornerRadius::same(6))
                 .inner_margin(egui::Margin::same(2))
                 .show(ui, |ui| {
@@ -4770,10 +4806,10 @@ fn segmented(
                             let btn = egui::Button::new(
                                 egui::RichText::new(tr(*label))
                                     .size(12.5)
-                                    .color(if active { TEXT_MAIN } else { TEXT_WEAK }),
+                                    .color(if active { palette_color(TEXT_MAIN) } else { palette_color(TEXT_WEAK) }),
                             )
                             .fill(if active {
-                                PRESSED_BG
+                                palette_color(PRESSED_BG)
                             } else {
                                 egui::Color32::TRANSPARENT
                             })
@@ -4805,11 +4841,11 @@ enum BadgeTone {
 
 fn badge(ui: &mut egui::Ui, text: &str, tone: BadgeTone) {
     let (fg, bg) = match tone {
-        BadgeTone::Neutral => (CHIP_GRAY_FG, CHIP_GRAY_BG),
-        BadgeTone::Ok => (CHIP_GREEN_FG, CHIP_GREEN_BG),
-        BadgeTone::Warn | BadgeTone::Pin => (CHIP_ORANGE_FG, CHIP_ORANGE_BG),
-        BadgeTone::Bad => (BADGE_BAD_FG, BADGE_BAD_BG),
-        BadgeTone::Info => (ACCENT_DEEP, CHIP_BLUE_BG),
+        BadgeTone::Neutral => (palette_color(CHIP_GRAY_FG), palette_color(CHIP_GRAY_BG)),
+        BadgeTone::Ok => (palette_color(CHIP_GREEN_FG), CHIP_GREEN_BG),
+        BadgeTone::Warn | BadgeTone::Pin => (palette_color(CHIP_ORANGE_FG), CHIP_ORANGE_BG),
+        BadgeTone::Bad => (palette_color(BADGE_BAD_FG), BADGE_BAD_BG),
+        BadgeTone::Info => (palette_color(ACCENT_DEEP), CHIP_BLUE_BG),
     };
     chip(ui, text, fg, bg);
 }
@@ -4821,7 +4857,7 @@ fn dashed_rule(ui: &mut egui::Ui) {
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 9.0), egui::Sense::hover());
     let painter = ui.painter();
     let y = rect.center().y;
-    let stroke = egui::Stroke::new(1.0, SEPARATOR);
+    let stroke = egui::Stroke::new(1.0, palette_color(SEPARATOR));
     let mut x = rect.min.x;
     while x < rect.max.x {
         let x2 = (x + 4.0).min(rect.max.x);
@@ -4874,26 +4910,26 @@ fn slide_cover(
         );
         return;
     }
-    painter.rect_filled(rect, 4.0, HOVER_BG);
+    painter.rect_filled(rect, 4.0, palette_color(HOVER_BG));
     let inner = rect.shrink(8.0);
     let eyebrow_font = egui::FontId::new(9.0, egui::FontFamily::Proportional);
-    let g = painter.layout_no_wrap(eyebrow.to_string(), eyebrow_font, TEXT_FAINT);
-    painter.galley(egui::pos2(inner.min.x, inner.min.y), g, TEXT_FAINT);
+    let g = painter.layout_no_wrap(eyebrow.to_string(), eyebrow_font, palette_color(TEXT_FAINT));
+    painter.galley(egui::pos2(inner.min.x, inner.min.y), g, palette_color(TEXT_FAINT));
     let title_font = egui::FontId::new(12.0, egui::FontFamily::Proportional);
     let g = painter.layout(
         title.to_string(),
         title_font,
-        TEXT_MAIN,
+        palette_color(TEXT_MAIN),
         inner.width(),
     );
-    painter.galley(egui::pos2(inner.min.x, inner.min.y + 14.0), g, TEXT_MAIN);
+    painter.galley(egui::pos2(inner.min.x, inner.min.y + 14.0), g, palette_color(TEXT_MAIN));
     if !foot.is_empty() {
         let foot_font = egui::FontId::new(9.0, egui::FontFamily::Proportional);
-        let g = painter.layout_no_wrap(foot.to_string(), foot_font, TEXT_FAINT);
+        let g = painter.layout_no_wrap(foot.to_string(), foot_font, palette_color(TEXT_FAINT));
         painter.galley(
             egui::pos2(inner.min.x, inner.max.y - g.size().y),
             g,
-            TEXT_FAINT,
+            palette_color(TEXT_FAINT),
         );
     }
 }
@@ -4915,8 +4951,8 @@ fn q_primary_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
 
 fn q_ghost_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     ui.add(
-        egui::Button::new(egui::RichText::new(label).size(12.5).color(TEXT_MAIN))
-            .fill(BTN_BG)
+        egui::Button::new(egui::RichText::new(label).size(12.5).color(palette_color(TEXT_MAIN)))
+            .fill(palette_color(BTN_BG))
             .corner_radius(6)
             .min_size(egui::vec2(0.0, 28.0)),
     )
@@ -4931,9 +4967,9 @@ fn q_seg_pills(ui: &mut egui::Ui, labels: &[&str], selected: usize) -> Option<us
             let btn = egui::Button::new(
                 egui::RichText::new(tr(*label))
                     .size(12.0)
-                    .color(if active { egui::Color32::WHITE } else { TEXT_WEAK }),
+                    .color(if active { egui::Color32::WHITE } else { palette_color(TEXT_WEAK) }),
             )
-            .fill(if active { ACCENT } else { BTN_BG })
+            .fill(if active { ACCENT } else { palette_color(BTN_BG) })
             .corner_radius(255)
             .min_size(egui::vec2(0.0, 26.0));
             if ui.add(btn).clicked() && !active {
@@ -4951,8 +4987,8 @@ impl App {
             let texture = self.tex_icon(ui, name, icon);
             let image = egui::Image::new((texture, egui::vec2(16.0, 16.0))).tint(ACCENT);
             let button = egui::Button::image_and_text(image, tr(page.label()))
-                .fill(HOVER_BG)
-                .stroke(egui::Stroke::new(1.0, FIELD_BORDER));
+                .fill(palette_color(HOVER_BG))
+                .stroke(egui::Stroke::new(1.0, palette_color(FIELD_BORDER)));
             if ui.add_sized([ui.available_width(), 34.0], button).clicked() {
                 self.navigate_to(page);
             }
@@ -4976,7 +5012,7 @@ impl App {
         ui.add_space(8.0);
         match self.showroom.zone.as_str() {
             "library" => {
-                ui.label(egui::RichText::new("我的目录").size(12.0).color(TEXT_WEAK));
+                ui.label(egui::RichText::new("我的目录").size(12.0).color(palette_color(TEXT_WEAK)));
                 for (idx, label) in ["全部", "收藏", "本地缓存", "我的组装"]
                     .into_iter()
                     .enumerate()
@@ -4997,7 +5033,7 @@ impl App {
                 }
             }
             "inbox" => {
-                ui.label(egui::RichText::new("分享来源").size(12.0).color(TEXT_WEAK));
+                ui.label(egui::RichText::new("分享来源").size(12.0).color(palette_color(TEXT_WEAK)));
                 for (idx, label) in ["全部", "个人分享", "部门分享"].into_iter().enumerate()
                 {
                     let count = self
@@ -5021,7 +5057,7 @@ impl App {
                 }
             }
             "groups" => {
-                ui.label(egui::RichText::new("群组").size(12.0).color(TEXT_WEAK));
+                ui.label(egui::RichText::new("群组").size(12.0).color(palette_color(TEXT_WEAK)));
                 let active = self
                     .active_showroom_group()
                     .map(|space| s(&space["group"], "id"));
@@ -5041,7 +5077,7 @@ impl App {
                 }
             }
             _ => {
-                ui.label(egui::RichText::new("公共目录").size(12.0).color(TEXT_WEAK));
+                ui.label(egui::RichText::new("公共目录").size(12.0).color(palette_color(TEXT_WEAK)));
                 let mut selected = self.showroom.folder.clone();
                 self.folder_tree(ui, &mut selected);
                 if selected != self.showroom.folder {
@@ -5178,7 +5214,7 @@ impl App {
                             env!("CARGO_PKG_VERSION")
                         ))
                         .size(13.0)
-                        .color(TEXT_WEAK),
+                        .color(palette_color(TEXT_WEAK)),
                     );
                     ui.add_space(28.0);
                     let mut action = None;
@@ -5287,7 +5323,7 @@ impl App {
                     ui.label(
                         egui::RichText::new(tr("新建一个索引，或打开示例项目先熟悉一下界面。"))
                             .size(12.0)
-                            .color(TEXT_WEAK),
+                            .color(palette_color(TEXT_WEAK)),
                     );
                 } else {
                     ui.label(tr("没有匹配的最近文件"));
@@ -5328,12 +5364,12 @@ impl App {
         let (rect, resp) =
             ui.allocate_exact_size(egui::vec2(width, 66.0), egui::Sense::click());
         let painter = ui.painter();
-        let fill = if resp.hovered() { HOVER_BG } else { CARD_BG };
+        let fill = if resp.hovered() { palette_color(HOVER_BG) } else { palette_color(CARD_BG) };
         painter.rect_filled(rect, 6.0, fill);
         painter.rect_stroke(
             rect,
             6.0,
-            egui::Stroke::new(1.0, CARD_BORDER),
+            egui::Stroke::new(1.0, palette_color(CARD_BORDER)),
             egui::StrokeKind::Inside,
         );
         let ir = egui::Rect::from_min_size(
@@ -5344,14 +5380,14 @@ impl App {
             tex,
             ir,
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-            TEXT_MAIN,
+            palette_color(TEXT_MAIN),
         );
         let font = egui::FontId::new(13.5, egui::FontFamily::Proportional);
-        let g = painter.layout_no_wrap(label.to_string(), font, TEXT_MAIN);
+        let g = painter.layout_no_wrap(label.to_string(), font, palette_color(TEXT_MAIN));
         painter.galley(
             egui::pos2(rect.min.x + 50.0, rect.center().y - g.size().y / 2.0),
             g,
-            TEXT_MAIN,
+            palette_color(TEXT_MAIN),
         );
         resp.clicked()
     }
@@ -5424,20 +5460,20 @@ impl App {
             // Explicit not-connected state (not an error): the trash
             // lives on the server. Local work is unaffected, and the
             // page says exactly what connecting unlocks.
-            ui.label(egui::RichText::new(tr("回收站")).size(18.0).color(TEXT_MAIN));
+            ui.label(egui::RichText::new(tr("回收站")).size(18.0).color(palette_color(TEXT_MAIN)));
             ui.add_space(16.0);
             card_frame().show(ui, |ui| {
                 ui.label(
                     egui::RichText::new(tr("回收站保存的是服务器上的已删条目"))
                         .size(13.0)
-                        .color(TEXT_MAIN),
+                        .color(palette_color(TEXT_MAIN)),
                 );
                 ui.label(
                     egui::RichText::new(tr(
                         "连接并登录服务器后可查看、恢复或彻底删除；未连接不影响本地的索引、内容与演示功能。",
                     ))
                     .size(11.5)
-                    .color(TEXT_WEAK),
+                    .color(palette_color(TEXT_WEAK)),
                 );
                 ui.add_space(8.0);
                 if btn_primary(ui, tr("登录")).clicked() {
@@ -5553,7 +5589,7 @@ impl App {
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(tr("回收站")).size(18.0).color(TEXT_MAIN));
+                ui.label(egui::RichText::new(tr("回收站")).size(18.0).color(palette_color(TEXT_MAIN)));
                 ui.add_space(12.0);
                 ui.label(
                     egui::RichText::new(format!(
@@ -5563,7 +5599,7 @@ impl App {
                         tr("项 · 原版本与语言绑定原样保留")
                     ))
                     .size(11.5)
-                    .color(TEXT_FAINT),
+                    .color(palette_color(TEXT_FAINT)),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if btn_ghost(ui, tr("刷新")).clicked() {
@@ -5577,7 +5613,7 @@ impl App {
                     ui.label(
                         egui::RichText::new(format!("{} {} {}", tr("已选"), selected.len(), tr("项")))
                             .size(12.0)
-                            .color(TEXT_MAIN),
+                            .color(palette_color(TEXT_MAIN)),
                     );
                     if btn_default(ui, tr("批量恢复")).clicked() {
                         batch = Some("restore");
@@ -5596,7 +5632,7 @@ impl App {
                     ui.label(
                         egui::RichText::new(format!("{}：{}", tr("回收站加载失败"), self.trash.load_error))
                             .size(12.5)
-                            .color(TEXT_MAIN),
+                            .color(palette_color(TEXT_MAIN)),
                     );
                     if btn_primary(ui, tr("重试")).clicked() {
                         retry = true;
@@ -5613,7 +5649,7 @@ impl App {
                             tr("这个板块暂无已删除项。")
                         })
                         .size(12.5)
-                        .color(TEXT_WEAK),
+                        .color(palette_color(TEXT_WEAK)),
                     );
                 });
             }
@@ -5646,7 +5682,7 @@ impl App {
                         slide_cover(ui, tex, kind_label, &title, "", 84.0);
                         ui.vertical(|ui| {
                             ui.label(
-                                egui::RichText::new(&title).size(13.0).color(TEXT_MAIN),
+                                egui::RichText::new(&title).size(13.0).color(palette_color(TEXT_MAIN)),
                             );
                             ui.horizontal(|ui| {
                                 badge(ui, kind_label, tone);
@@ -5679,7 +5715,7 @@ impl App {
                                 at
                             ))
                             .size(11.0)
-                            .color(TEXT_FAINT),
+                            .color(palette_color(TEXT_FAINT)),
                         );
                     });
                 });
@@ -5822,7 +5858,7 @@ impl App {
                         tr("页")
                     ))
                     .size(12.0)
-                    .color(TEXT_WEAK),
+                    .color(palette_color(TEXT_WEAK)),
                 );
                 if ui
                     .add_enabled(page + 1 < page_count, egui::Button::new(tr("下一页")))
@@ -5856,7 +5892,7 @@ impl App {
                         fmt_time(i(t, "deleted_ms"))
                     ))
                     .size(11.5)
-                    .color(TEXT_FAINT),
+                    .color(palette_color(TEXT_FAINT)),
                 );
             }
             ui.add_space(14.0);
@@ -5936,6 +5972,7 @@ impl App {
         if self.msg != self.toast_msg {
             self.toast_msg = self.msg.clone();
             self.toast_since = now;
+            self.workspace_controls.record_message(&self.msg);
         }
         if self.toast_msg.is_empty() || now - self.toast_since > 3.4 {
             return;
@@ -5945,8 +5982,8 @@ impl App {
             .order(egui::Order::Foreground)
             .show(ui.ctx(), |ui| {
                 egui::Frame::NONE
-                    .fill(PRESSED_BG)
-                    .stroke(egui::Stroke::new(1.0, FIELD_BORDER))
+                    .fill(palette_color(PRESSED_BG))
+                    .stroke(egui::Stroke::new(1.0, palette_color(FIELD_BORDER)))
                     .corner_radius(egui::CornerRadius::same(8))
                     .shadow(egui::epaint::Shadow {
                         offset: [0, 14],
@@ -5964,7 +6001,7 @@ impl App {
                         ui.label(
                             egui::RichText::new(&self.toast_msg)
                                 .size(13.0)
-                                .color(TEXT_MAIN),
+                                .color(palette_color(TEXT_MAIN)),
                         );
                     });
             });
@@ -6179,13 +6216,13 @@ impl App {
         } else {
             ui.allocate_ui(egui::vec2(width, h), |ui| {
                 egui::Frame::NONE
-                    .fill(HOVER_BG)
+                    .fill(palette_color(HOVER_BG))
                     .show(ui, |ui| {
                         ui.set_min_size(egui::vec2(width, h));
                         ui.centered_and_justified(|ui| {
                             ui.label(
                                 egui::RichText::new(format!("第 {} 页", page + 1))
-                                    .color(TEXT_WEAK),
+                                    .color(palette_color(TEXT_WEAK)),
                             );
                         });
                     });
@@ -6225,7 +6262,7 @@ impl App {
                 egui::Color32::WHITE,
             );
         } else {
-            ui.painter().rect_filled(rect, 0.0, HOVER_BG);
+            ui.painter().rect_filled(rect, 0.0, palette_color(HOVER_BG));
         }
         if current {
             ui.painter().rect_stroke(
@@ -6241,7 +6278,7 @@ impl App {
             ui.painter().rect_stroke(
                 rect,
                 0.0,
-                egui::Stroke::new(1.0, FIELD_BORDER),
+                egui::Stroke::new(1.0, palette_color(FIELD_BORDER)),
                 egui::StrokeKind::Middle,
             );
         }
@@ -6589,9 +6626,9 @@ impl App {
         };
         let style = craft_ui::buttons::IconButtonStyle {
             normal: visuals(egui::Color32::TRANSPARENT),
-            hovered: visuals(ICON_HOVER),
+            hovered: visuals(palette_color(ICON_HOVER)),
             pressed: None,
-            selected: visuals(ICON_HOVER),
+            selected: visuals(palette_color(ICON_HOVER)),
             corner_radius: egui::CornerRadius::same(6),
             focus_stroke: egui::Stroke::new(1.0, ACCENT),
         };
@@ -6644,8 +6681,8 @@ impl App {
             }
         };
         let style = craft_ui::buttons::IconButtonStyle {
-            normal: visuals(egui::Color32::TRANSPARENT, ICON_TINT),
-            hovered: visuals(ICON_HOVER, ICON_TINT),
+            normal: visuals(egui::Color32::TRANSPARENT, palette_color(ICON_TINT)),
+            hovered: visuals(palette_color(ICON_HOVER), palette_color(ICON_TINT)),
             pressed: None,
             selected: visuals(ACCENT, egui::Color32::WHITE),
             corner_radius: egui::CornerRadius::same(6),
@@ -6680,13 +6717,13 @@ impl App {
         let visuals = |fill: egui::Color32| craft_ui::buttons::ButtonVisuals {
             fill,
             stroke: egui::Stroke::NONE,
-            icon: ICON_TINT,
+            icon: palette_color(ICON_TINT),
         };
         let style = craft_ui::buttons::IconButtonStyle {
             normal: visuals(egui::Color32::TRANSPARENT),
-            hovered: visuals(ICON_HOVER),
+            hovered: visuals(palette_color(ICON_HOVER)),
             pressed: None,
-            selected: visuals(ICON_HOVER),
+            selected: visuals(palette_color(ICON_HOVER)),
             corner_radius: egui::CornerRadius::same(6),
             focus_stroke: egui::Stroke::new(1.0, ACCENT),
         };
@@ -6776,7 +6813,7 @@ impl App {
                 egui::RichText::new(s(&item, "title"))
                     .strong()
                     .size(18.0)
-                    .color(TEXT_MAIN),
+                    .color(palette_color(TEXT_MAIN)),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
@@ -6821,9 +6858,9 @@ impl App {
                 s(&item, "submitted_by")
             ))
             .size(11.5)
-            .color(TEXT_FAINT),
+            .color(palette_color(TEXT_FAINT)),
         );
-        if text_action(ui, "用系统应用打开", TEXT_WEAK, 11.5) {
+        if text_action(ui, "用系统应用打开", palette_color(TEXT_WEAK), 11.5) {
             self.present_showroom(&s(&item, "id"), &s(&item, "title"));
         }
         // PDF export (Q21): whole deck in the three DeckCraft forms.
@@ -6881,7 +6918,7 @@ impl App {
 
     fn showroom_deck_pages(&mut self, ui: &mut egui::Ui, st: &mut DeckState, item: &Value) {
         if st.pages.is_empty() {
-            ui.label(egui::RichText::new("该稿件暂无可查看的页面").color(TEXT_WEAK));
+            ui.label(egui::RichText::new("该稿件暂无可查看的页面").color(palette_color(TEXT_WEAK)));
             return;
         }
         if st.preview_open {
@@ -6901,7 +6938,7 @@ impl App {
                     DeckView::Thumbnails
                 };
             }
-            ui.label(egui::RichText::new(format!("{} 页", st.pages.len())).color(TEXT_WEAK));
+            ui.label(egui::RichText::new(format!("{} 页", st.pages.len())).color(palette_color(TEXT_WEAK)));
             if ui
                 .add_enabled(st.selected_page.is_some(), egui::Button::new("预览所选页"))
                 .clicked()
@@ -6965,7 +7002,7 @@ impl App {
                                     ui.label(
                                         egui::RichText::new(format!("第 {} 页", index + 1))
                                             .size(11.0)
-                                            .color(TEXT_FAINT),
+                                            .color(palette_color(TEXT_FAINT)),
                                     );
                                 });
                             }
@@ -7408,7 +7445,7 @@ impl App {
     /// Review queue below the showroom wall for super admins.
     fn sr_review_body(&mut self, ui: &mut egui::Ui) {
         egui::Frame::NONE
-            .fill(APP_BG)
+            .fill(palette_color(APP_BG))
             .inner_margin(egui::Margin {
                 left: 22,
                 right: 22,
@@ -7422,7 +7459,7 @@ impl App {
                         egui::RichText::new(tr("待审队列"))
                             .size(15.0)
                             .strong()
-                            .color(TEXT_MAIN),
+                            .color(palette_color(TEXT_MAIN)),
                     );
                     ui.add_space(10.0);
                     for item in self.showroom_pending.clone() {
@@ -7570,7 +7607,7 @@ impl App {
                 ui.label(
                     egui::RichText::new(tr("暂无待审批的演示成品。新提交会先进入这里，人工通过后才公开展示。"))
                         .size(12.5)
-                        .color(TEXT_WEAK),
+                        .color(palette_color(TEXT_WEAK)),
                 );
             }
             for item in &pending {
@@ -7597,7 +7634,7 @@ impl App {
                         slide_cover(ui, tex, tr("演示成品"), &title, "", 84.0);
                         ui.vertical(|ui| {
                             ui.label(
-                                egui::RichText::new(&title).size(13.0).color(TEXT_MAIN),
+                                egui::RichText::new(&title).size(13.0).color(palette_color(TEXT_MAIN)),
                             );
                             ui.horizontal(|ui| {
                                 badge(ui, tr("待审"), BadgeTone::Warn);
@@ -7628,7 +7665,7 @@ impl App {
                                 src_name
                             ))
                             .size(11.0)
-                            .color(TEXT_FAINT),
+                            .color(palette_color(TEXT_FAINT)),
                         );
                     });
                 });
@@ -7640,7 +7677,7 @@ impl App {
                 ui.label(
                     egui::RichText::new(tr("暂无已处理记录。"))
                         .size(12.5)
-                        .color(TEXT_WEAK),
+                        .color(palette_color(TEXT_WEAK)),
                 );
             }
             for item in &records {
@@ -7650,7 +7687,7 @@ impl App {
                         ui.label(
                             egui::RichText::new(s(item, "title"))
                                 .size(13.0)
-                                .color(TEXT_MAIN),
+                                .color(palette_color(TEXT_MAIN)),
                         );
                         badge(
                             ui,
@@ -7666,14 +7703,14 @@ impl App {
                             fmt_time(i(item, "reviewed_ms"))
                         ))
                         .size(11.0)
-                        .color(TEXT_FAINT),
+                        .color(palette_color(TEXT_FAINT)),
                     );
                     let note = s(item, "review_note");
                     if !note.is_empty() {
                         ui.label(
                             egui::RichText::new(format!("{}：{}", tr("理由"), note))
                                 .size(11.5)
-                                .color(TEXT_WEAK),
+                                .color(palette_color(TEXT_WEAK)),
                         );
                     }
                 });
@@ -7752,7 +7789,7 @@ impl App {
                 ui.label(
                     egui::RichText::new(tr("这条提交已不在队列中（可能已被处理或删除）。"))
                         .size(12.5)
-                        .color(TEXT_WEAK),
+                        .color(palette_color(TEXT_WEAK)),
                 );
                 return;
             };
@@ -7760,7 +7797,7 @@ impl App {
             card_frame().show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new(s(it, "title")).size(14.0).color(TEXT_MAIN),
+                        egui::RichText::new(s(it, "title")).size(14.0).color(palette_color(TEXT_MAIN)),
                     );
                     match state.as_str() {
                         "pending" => badge(ui, tr("待审"), BadgeTone::Warn),
@@ -7771,7 +7808,7 @@ impl App {
                 });
                 let intro = s(it, "intro");
                 if !intro.is_empty() {
-                    ui.label(egui::RichText::new(intro).size(12.0).color(TEXT_WEAK));
+                    ui.label(egui::RichText::new(intro).size(12.0).color(palette_color(TEXT_WEAK)));
                 }
                 ui.label(
                     egui::RichText::new(format!(
@@ -7781,7 +7818,7 @@ impl App {
                         fmt_time(i(it, "created_ms"))
                     ))
                     .size(11.0)
-                    .color(TEXT_FAINT),
+                    .color(palette_color(TEXT_FAINT)),
                 );
                 if state != "pending" && i(it, "reviewed_ms") > 0 {
                     ui.label(
@@ -7792,14 +7829,14 @@ impl App {
                             fmt_time(i(it, "reviewed_ms"))
                         ))
                         .size(11.0)
-                        .color(TEXT_FAINT),
+                        .color(palette_color(TEXT_FAINT)),
                     );
                     let note = s(it, "review_note");
                     if !note.is_empty() {
                         ui.label(
                             egui::RichText::new(format!("{}：{}", tr("理由"), note))
                                 .size(11.5)
-                                .color(TEXT_WEAK),
+                                .color(palette_color(TEXT_WEAK)),
                         );
                     }
                 }
@@ -7831,7 +7868,7 @@ impl App {
                             ui.label(
                                 egui::RichText::new(format!("{} {n} {}", tr("第"), tr("页")))
                                     .size(11.0)
-                                    .color(TEXT_FAINT),
+                                    .color(palette_color(TEXT_FAINT)),
                             );
                         });
                     }
@@ -7840,7 +7877,7 @@ impl App {
                 ui.label(
                     egui::RichText::new(tr("来源索引暂不可用，无法预览页面。"))
                         .size(12.0)
-                        .color(TEXT_WEAK),
+                        .color(palette_color(TEXT_WEAK)),
                 );
             }
             ui.add_space(14.0);
@@ -7858,7 +7895,7 @@ impl App {
                     ui.label(
                         egui::RichText::new(tr("驳回理由（必填，将随结果一并记录）"))
                             .size(12.0)
-                            .color(TEXT_MAIN),
+                            .color(palette_color(TEXT_MAIN)),
                     );
                     if let ReviewFrame::Detail(d) = self.review.stack.top_mut() {
                         ui.add(
@@ -7955,7 +7992,7 @@ impl App {
             ui.label(
                 egui::RichText::new(tr("匿名连接：仅显示公开内容，发布与审批需实名登录"))
                     .size(12.0)
-                    .color(TEXT_WEAK),
+                    .color(palette_color(TEXT_WEAK)),
             );
             ui.add_space(4.0);
         }
@@ -8030,7 +8067,7 @@ impl App {
                         .as_ref()
                         .is_some_and(|u| s(u, "display_name") == s(item, "submitted_by"))
                 {
-                    if text_action(ui, "删除", BADGE_BAD_FG, 12.0) {
+                    if text_action(ui, "删除", palette_color(BADGE_BAD_FG), 12.0) {
                         app.trash_add("showroom", &id);
                     }
                 }
@@ -8081,7 +8118,7 @@ impl App {
         mut card: impl FnMut(&mut Self, &mut egui::Ui, &Value, f32),
     ) {
         if items.is_empty() {
-            ui.label(egui::RichText::new(empty).color(TEXT_WEAK));
+            ui.label(egui::RichText::new(empty).color(palette_color(TEXT_WEAK)));
             return;
         }
         ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
@@ -8115,13 +8152,13 @@ impl App {
                                     egui::vec2(width, width * 9.0 / 16.0),
                                     egui::Sense::hover(),
                                 );
-                                ui.painter().rect_filled(rect, 0.0, HOVER_BG);
+                                ui.painter().rect_filled(rect, 0.0, palette_color(HOVER_BG));
                                 ui.painter().text(
                                     rect.center(),
                                     egui::Align2::CENTER_CENTER,
                                     "PPT",
                                     egui::FontId::proportional(17.0),
-                                    TEXT_WEAK,
+                                    palette_color(TEXT_WEAK),
                                 );
                             } else {
                                 self.thumb_ui(ui, cover, 0, width);
@@ -8294,21 +8331,21 @@ impl App {
                     .margin(egui::vec2(14.0, 7.0)),
             );
             if resp.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
-                match self.call("GET", &format!("/v1/search?q={}", w.search_text), None) {
+                match self.call("GET", &format!("/v1/search?q={}", query_component(&w.search_text)), None) {
                     Ok(v) => w.search_hits = Some(v),
                     Err(e) => self.msg = e,
                 }
             }
-            if text_action(ui, "智能分块导入", TEXT_MAIN, 13.0) {
+            if text_action(ui, "智能分块导入", palette_color(TEXT_MAIN), 13.0) {
                 self.act_import_split();
             }
-            if text_action(ui, "导入 PPT", TEXT_MAIN, 13.0) {
+            if text_action(ui, "导入 PPT", palette_color(TEXT_MAIN), 13.0) {
                 self.act_import_ppt();
             }
             ui.label(
                 egui::RichText::new("导入到组")
                     .size(13.0)
-                    .color(TEXT_WEAK),
+                    .color(palette_color(TEXT_WEAK)),
             );
             let cur_group = self.group_name(&self.content.import_group.clone());
             egui::ComboBox::from_id_salt("import_group")
@@ -8390,7 +8427,7 @@ impl App {
                                         egui::RichText::new(s(&unit, "name"))
                                             .strong()
                                             .size(13.0)
-                                            .color(TEXT_MAIN),
+                                            .color(palette_color(TEXT_MAIN)),
                                     );
                                     ui.add_space(5.0);
                                     ui.horizontal(|ui| {
@@ -8398,7 +8435,7 @@ impl App {
                                             chip(
                                                 ui,
                                                 &format!("v{}", s(&latest, "semver")),
-                                                ACCENT_DEEP,
+                                                palette_color(ACCENT_DEEP),
                                                 CHIP_BLUE_BG,
                                             );
                                             ui.label(
@@ -8407,13 +8444,13 @@ impl App {
                                                     i(&latest, "page_count")
                                                 ))
                                                 .small()
-                                                .color(TEXT_WEAK),
+                                                .color(palette_color(TEXT_WEAK)),
                                             );
                                         } else {
                                             ui.label(
                                                 egui::RichText::new("暂无版本")
                                                     .small()
-                                                    .color(TEXT_WEAK),
+                                                    .color(palette_color(TEXT_WEAK)),
                                             );
                                         }
                                         ui.with_layout(
@@ -8430,7 +8467,7 @@ impl App {
                                                         s(&unit, "maintainer")
                                                     ))
                                                     .small()
-                                                    .color(TEXT_WEAK),
+                                                    .color(palette_color(TEXT_WEAK)),
                                                 );
                                             },
                                         );
@@ -8716,7 +8753,7 @@ impl App {
                         ui.label(
                             egui::RichText::new("当前为 stub 占位（未配置真实 AI）")
                                 .small()
-                                .color(TEXT_WEAK),
+                                .color(palette_color(TEXT_WEAK)),
                         );
                     } else if st
                         .get("configured")
@@ -8726,7 +8763,7 @@ impl App {
                         ui.label(
                             egui::RichText::new(format!("AI 已配置：{}", s(st, "model")))
                                 .small()
-                                .color(TEXT_WEAK),
+                                .color(palette_color(TEXT_WEAK)),
                         );
                     }
                 }
@@ -9064,7 +9101,7 @@ impl App {
                                         .add(
                                             egui::Button::new(
                                                 egui::RichText::new("已绑定 ✓")
-                                                    .color(CHIP_GREEN_FG),
+                                                    .color(palette_color(CHIP_GREEN_FG)),
                                             )
                                             .fill(CHIP_GREEN_BG)
                                             .corner_radius(6),
@@ -9489,7 +9526,7 @@ impl App {
                                             i(v, "page_count")
                                         ))
                                         .small()
-                                        .color(if is_cur { ACCENT } else { TEXT_WEAK }),
+                                        .color(if is_cur { ACCENT } else { palette_color(TEXT_WEAK) }),
                                     );
                                 });
                             }
@@ -9535,7 +9572,7 @@ impl App {
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ui.ctx(), |ui| {
                 ui.set_width(360.0);
-                ui.label(egui::RichText::new(&c.body).size(12.5).color(TEXT_MAIN));
+                ui.label(egui::RichText::new(&c.body).size(12.5).color(palette_color(TEXT_MAIN)));
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -9629,14 +9666,14 @@ impl App {
                 ui.label(
                     egui::RichText::new(tr("选择模板（现有索引将作为模板）"))
                         .size(12.5)
-                        .color(TEXT_MAIN),
+                        .color(palette_color(TEXT_MAIN)),
                 );
                 ui.add_space(6.0);
                 if self.indexes.is_empty() {
                     ui.label(
                         egui::RichText::new(tr("暂无可用模板：先创建一个索引，之后就能以它为模板新建。"))
                             .size(12.0)
-                            .color(TEXT_WEAK),
+                            .color(palette_color(TEXT_WEAK)),
                     );
                 } else {
                     egui::ScrollArea::vertical()
@@ -9652,7 +9689,7 @@ impl App {
                         });
                 }
                 ui.add_space(10.0);
-                ui.label(egui::RichText::new(tr("新索引名称")).size(12.5).color(TEXT_MAIN));
+                ui.label(egui::RichText::new(tr("新索引名称")).size(12.5).color(palette_color(TEXT_MAIN)));
                 ui.add(
                     egui::TextEdit::singleline(&mut t.new_name)
                         .desired_width(360.0)
@@ -10079,7 +10116,7 @@ impl App {
             .fixed_pos(screen.min)
             .order(egui::Order::Foreground)
             .show(ui.ctx(), |ui| {
-                egui::Frame::NONE.fill(PANEL_BG).show(ui, |ui| {
+                egui::Frame::NONE.fill(palette_color(PANEL_BG)).show(ui, |ui| {
                     ui.set_min_size(screen.size());
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
@@ -10092,7 +10129,7 @@ impl App {
                                 tr("页面编辑")
                             ))
                             .size(14.0)
-                            .color(TEXT_MAIN),
+                            .color(palette_color(TEXT_MAIN)),
                         );
                         ui.add_space(10.0);
                         if ui
@@ -10117,7 +10154,7 @@ impl App {
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
                                 ui.add_space(14.0);
-                                if text_action(ui, "✕ 关闭", TEXT_MAIN, 13.0) {
+                                if text_action(ui, "✕ 关闭", palette_color(TEXT_MAIN), 13.0) {
                                     close = true;
                                 }
                             },
@@ -10171,7 +10208,7 @@ impl App {
                                 ui.label(
                                     egui::RichText::new(hint)
                                         .size(12.0)
-                                        .color(TEXT_WEAK),
+                                        .color(palette_color(TEXT_WEAK)),
                                 );
                             });
                         } else {
@@ -10181,7 +10218,7 @@ impl App {
                                 ui.label(
                                     egui::RichText::new(tr("文本内容（逐段编辑，保存后生成新版本）"))
                                         .size(12.5)
-                                        .color(TEXT_MAIN),
+                                        .color(palette_color(TEXT_MAIN)),
                                 );
                                 ui.add_space(6.0);
                                 let has_runs = pe
@@ -10193,7 +10230,7 @@ impl App {
                                     ui.label(
                                         egui::RichText::new(tr("本页没有可编辑的文本段。"))
                                             .size(12.0)
-                                            .color(TEXT_WEAK),
+                                            .color(palette_color(TEXT_WEAK)),
                                     );
                                 }
                                 if let Some(runs) = pe.work.get_mut(&pe.page) {
@@ -10206,7 +10243,7 @@ impl App {
                                                     ri + 1
                                                 ))
                                                 .size(11.5)
-                                                .color(TEXT_FAINT),
+                                                .color(palette_color(TEXT_FAINT)),
                                             );
                                             let resp = ui.add(
                                                 egui::TextEdit::singleline(run)
@@ -10238,7 +10275,7 @@ impl App {
                                         tr("页")
                                     ))
                                     .size(12.0)
-                                    .color(TEXT_WEAK),
+                                    .color(palette_color(TEXT_WEAK)),
                                 );
                                 if v2 {
                                     ui.add_space(8.0);
@@ -10254,7 +10291,7 @@ impl App {
                                 ui.label(
                                     egui::RichText::new(tr("讲稿"))
                                         .size(12.5)
-                                        .color(TEXT_MAIN),
+                                        .color(palette_color(TEXT_MAIN)),
                                 );
                                 if pe.page < pe.scripts.len() {
                                     let resp = ui.add(
@@ -10449,13 +10486,13 @@ impl App {
                 egui::Color32::WHITE,
             );
         } else {
-            ui.painter().rect_filled(rect, 0.0, HOVER_BG);
+            ui.painter().rect_filled(rect, 0.0, palette_color(HOVER_BG));
             ui.painter().text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
                 format!("第 {} 页", page + 1),
                 egui::FontId::proportional(13.0),
-                TEXT_WEAK,
+                palette_color(TEXT_WEAK),
             );
         }
         let k = w / scx; // screen points per EMU
@@ -10474,7 +10511,7 @@ impl App {
                 0.0,
                 egui::Stroke::new(
                     if selected { 1.8 } else { 1.0 },
-                    if selected { ACCENT } else { TEXT_FAINT },
+                    if selected { ACCENT } else { palette_color(TEXT_FAINT) },
                 ),
                 egui::StrokeKind::Middle,
             );
@@ -10664,13 +10701,13 @@ impl App {
                         egui::RichText::new("启幕")
                             .strong()
                             .size(24.0)
-                            .color(TEXT_MAIN),
+                            .color(palette_color(TEXT_MAIN)),
                     );
                     ui.add_space(4.0);
                     ui.label(
                         egui::RichText::new(tr("PPT 内容管理与更新系统"))
                             .size(13.0)
-                            .color(TEXT_WEAK),
+                            .color(palette_color(TEXT_WEAK)),
                     );
                 });
                 ui.add_space(18.0);
@@ -10686,7 +10723,7 @@ impl App {
                             ui.label(
                                 egui::RichText::new(tr(label))
                                     .size(13.0)
-                                    .color(TEXT_WEAK),
+                                    .color(palette_color(TEXT_WEAK)),
                             );
                             ui.add_sized(
                                 [300.0, 34.0],
@@ -10702,7 +10739,7 @@ impl App {
                     ui.label(
                         egui::RichText::new(&self.msg)
                             .size(12.0)
-                            .color(TEXT_WEAK),
+                            .color(palette_color(TEXT_WEAK)),
                     );
                 }
                 ui.add_space(10.0);
@@ -10711,7 +10748,7 @@ impl App {
                         "只填服务器地址可「匿名进入」：浏览公开内容；发布、审批需实名登录。",
                     ))
                     .size(11.5)
-                    .color(TEXT_WEAK),
+                    .color(palette_color(TEXT_WEAK)),
                 );
                 ui.add_space(16.0);
                 ui.horizontal(|ui| {
@@ -10775,7 +10812,7 @@ impl App {
                         egui::RichText::new("启幕")
                             .strong()
                             .size(22.0)
-                            .color(TEXT_MAIN),
+                            .color(palette_color(TEXT_MAIN)),
                     );
                     ui.add_space(4.0);
                     ui.label(
@@ -10785,7 +10822,7 @@ impl App {
                             env!("CARGO_PKG_VERSION")
                         ))
                         .size(12.5)
-                        .color(TEXT_WEAK),
+                        .color(palette_color(TEXT_WEAK)),
                     );
                 });
             });
@@ -10974,18 +11011,26 @@ impl App {
             });
             ui.add_space(6.0);
         }
-        ui.label(egui::RichText::new(title).size(18.0).strong());
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new(title).size(18.0).strong());
+            ui.add_space(8.0);
+            self.index.overview_controls.ui(ui);
+        });
         ui.add_space(14.0);
         let items: Vec<Value> = self
             .indexes
-            .clone()
-            .into_iter()
+            .iter()
             .filter(|x| self.folder_filter_ok(&filter, &s(x, "folder_id")))
+            .filter(|x| self.index.overview_controls.matches(x))
+            .cloned()
             .collect();
         if items.is_empty() {
             ov.selected = None;
-            ui.label(egui::RichText::new("当前目录没有索引。").color(TEXT_WEAK));
+            ui.label(egui::RichText::new(tr("当前筛选下没有索引")).color(palette_color(TEXT_WEAK)));
             return None;
+        }
+        if self.index.overview_controls.relationships {
+            return self.index_overview_relationships(ui, ov, &items);
         }
         let mut open = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -11005,19 +11050,11 @@ impl App {
                     for x in items {
                         let xid = s(&x, "id");
                         let selected = ov.selected.as_deref() == Some(xid.as_str());
-                        // Scope ring colors: the prototype's .std-card
-                        // scope palette (company/ancestor/deptsub/dept/none).
-                        let scope_color = match s(&x, "scope").as_str() {
-                            "company" => egui::Color32::from_rgb(0x3B, 0x82, 0xC4),
-                            "ancestor" => egui::Color32::from_rgb(0x8B, 0x7C, 0xC9),
-                            "dept_sub" => egui::Color32::from_rgb(0x4D, 0xA6, 0x74),
-                            "dept" => egui::Color32::from_rgb(0xD0, 0x8A, 0x3E),
-                            _ => egui::Color32::from_rgb(0x9A, 0xA3, 0x9C),
-                        };
+                        let scope_color = IndexScope::of(&x).color();
                         let resp = ui.allocate_ui(egui::vec2(card_w, card_h), |ui| {
                             ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
                                 egui::Frame::NONE
-                                    .fill(CARD_BG)
+                                    .fill(palette_color(CARD_BG))
                                     .corner_radius(6)
                                     .stroke(egui::Stroke::new(1.0, scope_color))
                                     .show(ui, |ui| {
@@ -11036,7 +11073,7 @@ impl App {
                                                 egui::vec2(card_w, cover_h),
                                                 egui::Sense::hover(),
                                             );
-                                            ui.painter().rect_filled(rect, 0.0, HOVER_BG);
+                                            ui.painter().rect_filled(rect, 0.0, palette_color(HOVER_BG));
                                         }
                                         egui::Frame::NONE
                                             .inner_margin(egui::Margin {
@@ -11061,7 +11098,7 @@ impl App {
                                                         chip(
                                                             ui,
                                                             &format!("V{tag}"),
-                                                            ACCENT_DEEP,
+                                                            palette_color(ACCENT_DEEP),
                                                             CHIP_BLUE_BG,
                                                         );
                                                     }
@@ -11078,7 +11115,7 @@ impl App {
                                                         chip(
                                                             ui,
                                                             "主索引",
-                                                            ACCENT_DEEP,
+                                                            palette_color(ACCENT_DEEP),
                                                             CHIP_BLUE_BG,
                                                         );
                                                     }
@@ -11086,11 +11123,11 @@ impl App {
                                                         "history" => chip(
                                                             ui,
                                                             "历史",
-                                                            TEXT_WEAK,
-                                                            CHIP_GRAY_BG,
+                                                            palette_color(TEXT_WEAK),
+                                                            palette_color(CHIP_GRAY_BG),
                                                         ),
                                                         "void" => {
-                                                            chip(ui, "已作废", ROSE, ROSE_SOFT_BG)
+                                                            chip(ui, "已作废", palette_color(ROSE), ROSE_SOFT_BG)
                                                         }
                                                         _ => {}
                                                     }
@@ -11110,7 +11147,7 @@ impl App {
                         let stroke = if selected {
                             Some(egui::Stroke::new(2.0, ACCENT))
                         } else if click.hovered() || click.has_focus() {
-                            Some(egui::Stroke::new(1.0, FIELD_BORDER))
+                            Some(egui::Stroke::new(1.0, palette_color(FIELD_BORDER)))
                         } else {
                             None
                         };
@@ -11226,12 +11263,12 @@ impl App {
             ui.label(
                 egui::RichText::new(format!("· {}", s(&index, "maintainer")))
                     .size(11.5)
-                    .color(TEXT_WEAK),
+                    .color(palette_color(TEXT_WEAK)),
             );
         });
         ui.add_space(2.0);
         ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("分支").size(11.5).color(TEXT_WEAK));
+            ui.label(egui::RichText::new("分支").size(11.5).color(palette_color(TEXT_WEAK)));
             let current_branch = if st.branch.is_empty() {
                 "main"
             } else {
@@ -11252,15 +11289,18 @@ impl App {
                 *action = Some(IndexDetailAction::ChangeBranch(branch));
                 return;
             }
-            ui.add(
+            let version = ui.add(
                 egui::TextEdit::singleline(&mut st.tag_name)
                     .hint_text("新版本号")
                     .desired_width(176.0)
                     .margin(egui::vec2(10.0, 5.0)),
             );
-            if ui
+            if std::mem::take(&mut st.focus_tag) {
+                version.request_focus();
+            }
+            let publish = ui
                 .add_enabled(
-                    !st.tag_name.is_empty(),
+                    !st.tag_name.trim().is_empty(),
                     egui::Button::new(
                         egui::RichText::new("发布版本")
                             .size(13.0)
@@ -11270,8 +11310,10 @@ impl App {
                     .corner_radius(6)
                     .min_size(egui::vec2(88.0, 30.0)),
                 )
-                .clicked()
-            {
+                .clicked();
+            let enter = (version.has_focus() || version.lost_focus())
+                && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            if publish || (enter && !st.tag_name.trim().is_empty()) {
                 if !self.need_identity("发布版本") {
                     // Anonymous session: the login popup is open;
                     // the typed tag name stays for after the login.
@@ -11280,7 +11322,7 @@ impl App {
                     let r = self.call(
                         "POST",
                         &format!("/v1/indexes/{id}/tags"),
-                        Some(json!({ "branch": st.branch, "name": st.tag_name })),
+                        Some(json!({ "branch": st.branch, "name": st.tag_name.trim() })),
                     );
                     match r {
                         Ok(_) => {
@@ -11295,14 +11337,14 @@ impl App {
         ui.add_space(2.0);
         ui.horizontal_wrapped(|ui| {
             ui.checkbox(&mut st.include_notes, "添加备注");
-            if text_action(ui, "导出（个人版）", TEXT_MAIN, 13.0) {
+            if text_action(ui, "导出（个人版）", palette_color(TEXT_MAIN), 13.0) {
                 *action = Some(IndexDetailAction::Export("personal"));
             }
-            if text_action(ui, "导出（公用版）", TEXT_MAIN, 13.0) {
+            if text_action(ui, "导出（公用版）", palette_color(TEXT_MAIN), 13.0) {
                 *action = Some(IndexDetailAction::Export("company"));
             }
             ui.add_space(24.0);
-            if text_action(ui, "删除索引", BADGE_BAD_FG, 13.0) {
+            if text_action(ui, "删除索引", palette_color(BADGE_BAD_FG), 13.0) {
                 let iid = s(&index, "id");
                 self.trash_add("index", &iid);
                 st.closed = true;
@@ -11314,7 +11356,7 @@ impl App {
                     .desired_width(110.0)
                     .margin(egui::vec2(8.0, 2.0)),
             );
-            if text_action_enabled(ui, !st.new_branch.is_empty(), "拉分支", TEXT_MAIN, 13.0) {
+            if text_action_enabled(ui, !st.new_branch.is_empty(), "拉分支", palette_color(TEXT_MAIN), 13.0) {
                 let id = st.index_id.clone();
                 let r = self.call(
                     "POST",
@@ -11327,26 +11369,6 @@ impl App {
                         *action = Some(IndexDetailAction::Reload);
                     }
                     Err(e) => self.msg = e,
-                }
-            }
-            if text_action(ui, "推送到演示厅", TEXT_MAIN, 13.0) {
-                if !self.need_identity("推送到演示厅") {
-                    // Anonymous session: the login popup is open instead.
-                } else {
-                    let id = st.index_id.clone();
-                    let r = self.call(
-                        "POST",
-                        "/v1/showroom",
-                        Some(json!({
-                            "title": s(&index, "name"),
-                            "intro": "",
-                            "source_index_id": id,
-                        })),
-                    );
-                    match r {
-                        Ok(_) => self.msg = "已推送，等待审核".into(),
-                        Err(e) => self.msg = e,
-                    }
                 }
             }
         });
@@ -11384,7 +11406,7 @@ impl App {
                     .unwrap_or(false);
                 if pos > 0 {
                     ui.vertical_centered(|ui| {
-                        if text_action(ui, "＋ 插入条目", TEXT_WEAK, 13.0) {
+                        if text_action(ui, "＋ 插入条目", palette_color(TEXT_WEAK), 13.0) {
                             *action = Some(IndexDetailAction::Insert(pos));
                         }
                     });
@@ -11404,7 +11426,7 @@ impl App {
                             ui.label(
                                 egui::RichText::new(format!("#{}", pos + 1))
                                     .size(11.5)
-                                    .color(TEXT_WEAK),
+                                    .color(palette_color(TEXT_WEAK)),
                             );
                             if ver.is_object() {
                                 let vid = s(&ver, "id");
@@ -11428,7 +11450,7 @@ impl App {
                                     egui::RichText::new(re.get("unit_name").and_then(|x| x.as_str()).unwrap_or(""))
                                         .strong()
                                         .size(13.5)
-                                        .color(TEXT_MAIN),
+                                        .color(palette_color(TEXT_MAIN)),
                                 );
                                 ui.label(
                                     egui::RichText::new(format!(
@@ -11442,14 +11464,14 @@ impl App {
                                         }
                                     ))
                                     .size(11.5)
-                                    .color(TEXT_WEAK),
+                                    .color(palette_color(TEXT_WEAK)),
                                 );
                             });
                             ui.horizontal_wrapped(|ui| {
                             if ui
                                 .button(
                                     egui::RichText::new("×")
-                                        .color(ROSE)
+                                        .color(palette_color(ROSE))
                                         .size(17.0)
                                         .strong(),
                                 )
@@ -11509,7 +11531,7 @@ impl App {
                                 if ui
                                     .button(
                                         egui::RichText::new("解除锁定")
-                                            .color(CHIP_GREEN_FG),
+                                            .color(palette_color(CHIP_GREEN_FG)),
                                     )
                                     .clicked()
                                 {
@@ -11519,7 +11541,7 @@ impl App {
                                     *action = Some(IndexDetailAction::Commit(es, "解除锁定"));
                                     return;
                                 }
-                                chip(ui, "版本锁定", CHIP_ORANGE_FG, CHIP_ORANGE_BG);
+                                chip(ui, "版本锁定", palette_color(CHIP_ORANGE_FG), CHIP_ORANGE_BG);
                             } else {
                                 if ui
                                     .add_enabled(
@@ -11537,7 +11559,7 @@ impl App {
                                         return;
                                     }
                                 }
-                                chip(ui, "跟随最新", CHIP_GREEN_FG, CHIP_GREEN_BG);
+                                chip(ui, "跟随最新", palette_color(CHIP_GREEN_FG), CHIP_GREEN_BG);
                             }
                             });
                             ui.horizontal(|ui| {
@@ -11547,12 +11569,12 @@ impl App {
                                     chip(
                                         ui,
                                         &format!("摘录 {} 页", slots.len()),
-                                        ACCENT_DEEP,
+                                        palette_color(ACCENT_DEEP),
                                         CHIP_BLUE_BG,
                                     );
                                 }
                                 if re.get("substituted").and_then(|x| x.as_bool()) == Some(true) {
-                                    chip(ui, "原版已删 · 已替代", CHIP_ORANGE_FG, CHIP_ORANGE_BG);
+                                    chip(ui, "原版已删 · 已替代", palette_color(CHIP_ORANGE_FG), CHIP_ORANGE_BG);
                                 }
                             });
                             // quick-switch strip: history versions, newest
@@ -11585,7 +11607,7 @@ impl App {
                                                         s(v, "semver")
                                                     ))
                                                     .size(10.5)
-                                                    .color(if is_cur { ACCENT } else { TEXT_WEAK }),
+                                                    .color(if is_cur { ACCENT } else { palette_color(TEXT_WEAK) }),
                                                 );
                                             });
                                         }
@@ -11621,7 +11643,11 @@ impl App {
         ui.label(egui::RichText::new("分支合并").strong().size(16.0));
         ui.horizontal(|ui| {
             ui.label("来源分支");
-            ui.text_edit_singleline(&mut st.merge_from);
+            let source = ui.text_edit_singleline(&mut st.merge_from);
+            if std::mem::take(&mut st.focus_merge) {
+                source.scroll_to_me(Some(egui::Align::Center));
+                source.request_focus();
+            }
             if ui
                 .add_enabled(!st.merge_from.is_empty(), egui::Button::new("预览合并"))
                 .clicked()
@@ -11662,7 +11688,7 @@ impl App {
                 }
             }
             if conflicts.is_empty() {
-                ui.label(egui::RichText::new("无冲突，可自动合并").color(CHIP_GREEN_FG));
+                ui.label(egui::RichText::new("无冲突，可自动合并").color(palette_color(CHIP_GREEN_FG)));
             } else {
                 ui.label(format!("{} 个条目冲突，逐条裁决：", conflicts.len()));
                 for c in &conflicts {
@@ -11743,14 +11769,14 @@ impl App {
             egui::RichText::new("已保存的服务器")
                 .strong()
                 .size(16.0)
-                .color(TEXT_MAIN),
+                .color(palette_color(TEXT_MAIN)),
         );
         ui.add_space(6.0);
         if self.conns.is_empty() {
             ui.label(
                 egui::RichText::new("暂无保存的服务器。在下方手动添加，或搜索局域网服务器。")
                     .size(11.5)
-                    .color(TEXT_WEAK),
+                    .color(palette_color(TEXT_WEAK)),
             );
         }
         let mut action: Option<(usize, &'static str)> = None;
@@ -11758,8 +11784,8 @@ impl App {
             let c = self.conns[i].clone();
             let is_active = self.active == Some(i);
             egui::Frame::NONE
-                .fill(CARD_BG)
-                .stroke(egui::Stroke::new(1.0, CARD_BORDER))
+                .fill(palette_color(CARD_BG))
+                .stroke(egui::Stroke::new(1.0, palette_color(CARD_BORDER)))
                 .corner_radius(egui::CornerRadius::same(12))
                 .inner_margin(egui::Margin::same(12))
                 .show(ui, |ui| {
@@ -11768,13 +11794,13 @@ impl App {
                             egui::RichText::new(&c.name)
                                 .strong()
                                 .size(13.5)
-                                .color(TEXT_MAIN),
+                                .color(palette_color(TEXT_MAIN)),
                         );
                         if is_active {
                             ui.label(
                                 egui::RichText::new("当前")
                                     .size(11.0)
-                                    .color(ACCENT_DEEP),
+                                    .color(palette_color(ACCENT_DEEP)),
                             );
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -11791,9 +11817,9 @@ impl App {
                     });
                     ui.add_space(4.0);
                     let (status, color) = match c.status {
-                        ConnStatus::Connected => ("已连接", CHIP_GREEN_FG),
-                        ConnStatus::Failed => ("连接失败", ROSE),
-                        ConnStatus::LoggedOut => ("未登录", TEXT_WEAK),
+                        ConnStatus::Connected => ("已连接", palette_color(CHIP_GREEN_FG)),
+                        ConnStatus::Failed => ("连接失败", palette_color(ROSE)),
+                        ConnStatus::LoggedOut => ("未登录", palette_color(TEXT_WEAK)),
                         ConnStatus::Anonymous => ("匿名连接", egui::Color32::from_rgb(0x2F, 0x6B, 0xF5)),
                     };
                     ui.horizontal(|ui| {
@@ -11804,7 +11830,7 @@ impl App {
                                 format!("{} · {}", c.url, c.username)
                             })
                                 .size(11.5)
-                                .color(TEXT_WEAK),
+                                .color(palette_color(TEXT_WEAK)),
                         );
                         ui.label(egui::RichText::new(status).size(11.5).color(color));
                     });
@@ -11867,7 +11893,7 @@ impl App {
             egui::RichText::new("添加服务器")
                 .strong()
                 .size(16.0)
-                .color(TEXT_MAIN),
+                .color(palette_color(TEXT_MAIN)),
         );
         ui.add_space(6.0);
         egui::Grid::new("add_server_grid")
@@ -11925,10 +11951,10 @@ impl App {
                 egui::RichText::new("局域网发现")
                     .strong()
                     .size(16.0)
-                    .color(TEXT_MAIN),
+                    .color(palette_color(TEXT_MAIN)),
             );
             if self.disc_scanning {
-                ui.label(egui::RichText::new("搜索中…").size(11.5).color(TEXT_WEAK));
+                ui.label(egui::RichText::new("搜索中…").size(11.5).color(palette_color(TEXT_WEAK)));
             } else if ui.button("搜索局域网服务器").clicked() {
                 self.start_discovery();
             }
@@ -11938,7 +11964,7 @@ impl App {
             ui.label(
                 egui::RichText::new("点「搜索局域网服务器」自动发现同一局域网内的启幕服务器。")
                     .size(11.5)
-                    .color(TEXT_WEAK),
+                    .color(palette_color(TEXT_WEAK)),
             );
         }
         let mut use_url: Option<String> = None;
@@ -11947,8 +11973,8 @@ impl App {
             let url = s(&d, "url");
             let ver = s(&d, "version");
             egui::Frame::NONE
-                .fill(CARD_BG)
-                .stroke(egui::Stroke::new(1.0, CARD_BORDER))
+                .fill(palette_color(CARD_BG))
+                .stroke(egui::Stroke::new(1.0, palette_color(CARD_BORDER)))
                 .corner_radius(egui::CornerRadius::same(12))
                 .inner_margin(egui::Margin::same(12))
                 .show(ui, |ui| {
@@ -11956,12 +11982,12 @@ impl App {
                         ui.label(
                             egui::RichText::new(if name.is_empty() { "启幕服务器" } else { &name })
                                 .size(13.0)
-                                .color(TEXT_MAIN),
+                                .color(palette_color(TEXT_MAIN)),
                         );
                         ui.label(
                             egui::RichText::new(format!("{url} · v{ver}"))
                                 .size(11.5)
-                                .color(TEXT_WEAK),
+                                .color(palette_color(TEXT_WEAK)),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("添加并登录").clicked() {
@@ -11981,14 +12007,14 @@ impl App {
             egui::RichText::new("软件更新（局域网镜像）")
                 .strong()
                 .size(16.0)
-                .color(TEXT_MAIN),
+                .color(palette_color(TEXT_MAIN)),
         );
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new(format!("当前版本 v{}", env!("CARGO_PKG_VERSION")))
                     .size(11.5)
-                    .color(TEXT_WEAK),
+                    .color(palette_color(TEXT_WEAK)),
             );
             if ui.button("检查更新").clicked() {
                 self.check_lan_update(true);
@@ -11996,7 +12022,7 @@ impl App {
         });
         if let Some(note) = &self.upd_note {
             ui.add_space(4.0);
-            ui.label(egui::RichText::new(note.clone()).size(11.5).color(ACCENT_DEEP));
+            ui.label(egui::RichText::new(note.clone()).size(11.5).color(palette_color(ACCENT_DEEP)));
         }
     }
 
@@ -12007,7 +12033,7 @@ impl App {
             egui::RichText::new("缓存路径（本机设置）")
                 .strong()
                 .size(16.0)
-                .color(TEXT_MAIN),
+                .color(palette_color(TEXT_MAIN)),
         );
         ui.add_space(4.0);
         ui.label(
@@ -12015,7 +12041,7 @@ impl App {
                 "离线缓存的加密快照保存在这个目录，装在本机的所有账号共用；与管理员下发的缓存策略无关。",
             )
             .size(11.5)
-            .color(TEXT_WEAK),
+            .color(palette_color(TEXT_WEAK)),
         );
         ui.add_space(8.0);
         let effective = cache_dir();
@@ -12028,7 +12054,7 @@ impl App {
                 total_bytes as f64 / 1_000_000.0
             ))
             .size(11.5)
-            .color(TEXT_WEAK),
+            .color(palette_color(TEXT_WEAK)),
         );
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -12073,7 +12099,7 @@ impl App {
         }
         let current = sections[self.settings.section];
         egui::Frame::NONE
-            .fill(APP_BG)
+            .fill(palette_color(APP_BG))
             .inner_margin(egui::Margin {
                 left: 22,
                 right: 22,
@@ -12116,7 +12142,7 @@ impl App {
                                             ui.label(
                                                 egui::RichText::new(label)
                                                     .size(13.0)
-                                                    .color(TEXT_WEAK),
+                                                    .color(palette_color(TEXT_WEAK)),
                                             );
                                             let v = self
                                                 .settings
@@ -12607,7 +12633,7 @@ impl App {
                                     "密钥：未设置"
                                 })
                                 .small()
-                                .color(TEXT_WEAK),
+                                .color(palette_color(TEXT_WEAK)),
                             );
                             ui.add_space(8.0);
                             if ui
@@ -12679,7 +12705,7 @@ impl App {
                                 egui::RichText::new("管理员策略（服务器下发）")
                                     .strong()
                                     .size(16.0)
-                                    .color(TEXT_MAIN),
+                                    .color(palette_color(TEXT_MAIN)),
                             );
                             ui.add_space(8.0);
                             let mut allowed = self
