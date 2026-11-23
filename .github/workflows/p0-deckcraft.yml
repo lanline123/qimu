@@ -61,6 +61,18 @@ jobs:
           QIMU_CASE2_OUT="$GITHUB_WORKSPACE/crates/qimu-core/tests/fixtures/Case2_Charts_Animation.pptx" \
             python3 tools/make_case2.py
 
+      - name: Build deckcraft-cli (for PDF export verification)
+        working-directory: vendor/deckcraft
+        run: cargo build --release -p deckcraft-cli
+
+      - name: Verify PDF export (pypdf gate)
+        # tools/verify_pdf_export.py drives the CLI with the server's exact
+        # export call on the generated Case2 deck: page count, extractable
+        # text (hard assert), HYBRID form line. Exit code is the gate.
+        run: |
+          python3 -m pip install --quiet pypdf
+          python3 tools/verify_pdf_export.py vendor/deckcraft/target/release/deckcraft-cli crates/qimu-core/tests/fixtures/Case2_Charts_Animation.pptx
+
       - name: qimu-core unit tests (incl. section_link gate)
         # --nocapture keeps fixture SKIP markers visible in the log.
         # Redwood-deck tests may skip (real deck, not in the repo by
