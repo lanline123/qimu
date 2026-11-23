@@ -1593,32 +1593,6 @@ async fn version_fragment(
     Ok(Json(json!({ "version": ver, "data_base64": b64e(&bytes) })))
 }
 
-/// Thumbnail renderer selection (step 3 of the storytold integration
-/// ledger): DeckCraft by default — the pilot (tools/pilot_deckcraft_
-/// render.py) rendered Redwood 17/17, Case2 7/7 and Case2b 1/1 pages with
-/// mean abs pixel diff vs LibreOffice <= 4.8 per deck (worst page 8.2, a
-/// chart page) at ~4x the speed. QIMU_THUMB_RENDERER=libreoffice pins
-/// the old pipeline; a DeckCraft failure also falls back to it per render.
-/// The on-disk cache is namespaced by this name (see version_thumb).
-fn thumb_renderer() -> &'static str {
-    match std::env::var("QIMU_THUMB_RENDERER").as_deref() {
-        Ok("libreoffice") => "libreoffice",
-        _ => "deckcraft",
-    }
-}
-
-fn render_thumbs(root: &std::path::Path, version_id: &str, frag: &[u8]) -> Result<Vec<Vec<u8>>, String> {
-    if thumb_renderer() == "deckcraft" {
-        match render_thumbs_deckcraft(root, version_id, frag) {
-            Ok(pages) => return Ok(pages),
-            Err(e) => {
-                eprintln!("[thumb] DeckCraft 渲染失败，回退 LibreOffice（{version_id}）: {e}");
-            }
-        }
-    }
-    render_thumbs_lo(root, version_id, frag)
-}
-
 /// Resolve the deckcraft-cli binary: $QIMU_DECKCRAFT_CLI, then a
 /// deckcraft-cli sitting next to this server executable, then PATH.
 /// Shared by the thumbnail renderer and the PDF exporter (Q21).
@@ -1637,20 +1611,15 @@ fn deckcraft_cli_bin() -> String {
         .unwrap_or_else(|| "deckcraft-cli".to_string())
 }
 
-/// Render a fragment PPTX to per-slide PNGs with the DeckCraft CLI
-/// (storytold/deckcraft, MIT OR Apache-2.0). Scale 0.75 lands near the
-/// old pipeline's 55-DPI page size (733px wide for a 16:9 deck).
-fn render_thumbs_deckcraft(root: &std::path::Path, version_id: &str, frag: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+/// Render a fragment PPTX with DeckCraft. Each request gets its own work
+/// directory on the cache filesystem, and only complete PNGs are published.
+fn render_thumbs_deckcraft(cache_dir: &std::path::Path, frag: &[u8]) -> Result<(), String> {
     let bin = deckcraft_cli_bin();
-    let work = root.join("thumbs").join(format!(".work-dc-{version_id}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&work);
-    std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
-    let cleanup = |work: &std::path::Path| {
-        let _ = std::fs::remove_dir_all(work);
-    };
-    let pptx = work.join("frag.pptx");
+    std::fs::create_dir_all(cache_dir).map_err(|e| e.to_string())?;
+    let work = tempfile::tempdir_in(cache_dir).map_err(|e| e.to_string())?;
+    let pptx = work.path().join("frag.pptx");
     std::fs::write(&pptx, frag).map_err(|e| e.to_string())?;
-    let outdir = work.join("dc");
+    let outdir = work.path().join("rendered");
     let out = std::process::Command::new(&bin)
         .arg("render")
         .arg(&pptx)
@@ -1660,113 +1629,49 @@ fn render_thumbs_deckcraft(root: &std::path::Path, version_id: &str, frag: &[u8]
         .output()
         .map_err(|e| format!("启动 deckcraft-cli 失败（{bin}）: {e}"))?;
     if !out.status.success() {
-        cleanup(&work);
         return Err(format!(
             "deckcraft-cli 渲染失败: {}",
             String::from_utf8_lossy(&out.stderr)
         ));
     }
-    let mut pages: Vec<(u32, Vec<u8>)> = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(&outdir) {
-        for ent in rd.flatten() {
-            let name = ent.file_name().to_string_lossy().to_string();
-            if let Some(num) = name
-                .strip_prefix("slide-")
-                .and_then(|n| n.strip_suffix(".png"))
-                .and_then(|n| n.parse::<u32>().ok())
-            {
-                if let Ok(bytes) = std::fs::read(ent.path()) {
-                    pages.push((num, bytes));
-                }
-            }
+
+    let mut pages = Vec::new();
+    for entry in std::fs::read_dir(&outdir)
+        .map_err(|e| format!("读取 DeckCraft 渲染结果失败: {e}"))?
+    {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        if let Some(number) = name
+            .to_str()
+            .and_then(|s| s.strip_prefix("slide-"))
+            .and_then(|s| s.strip_suffix(".png"))
+            .and_then(|s| s.parse::<u32>().ok())
+        {
+            pages.push((number, entry.path()));
         }
     }
-    pages.sort_by_key(|(n, _)| *n);
-    cleanup(&work);
     if pages.is_empty() {
         return Err("DeckCraft 渲染未产出任何页面".into());
     }
-    Ok(pages.into_iter().map(|(_, b)| b).collect())
-}
 
-/// Render a fragment PPTX to per-slide PNGs with LibreOffice headless
-/// (PPTX -> PDF -> pdftoppm). Runs in a private temp dir with its own LO
-/// profile so concurrent renders don't fight over the default profile.
-fn render_thumbs_lo(root: &std::path::Path, version_id: &str, frag: &[u8]) -> Result<Vec<Vec<u8>>, String> {
-    let work = root.join("thumbs").join(format!(".work-{version_id}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&work);
-    std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
-    let cleanup = |work: &std::path::Path| {
-        let _ = std::fs::remove_dir_all(work);
-    };
-    let pptx = work.join("frag.pptx");
-    std::fs::write(&pptx, frag).map_err(|e| e.to_string())?;
-    // The profile must be a real file:// URI: with a relative data root
-    // (the packaged default "qimu-data") the naive concatenation yields
-    // file://qimu-data/... — "qimu-data" parses as a host name and
-    // LibreOffice hangs forever. Absolutize, and normalize for Windows
-    // (strip the \\?\ prefix, use forward slashes).
-    let work_abs = std::fs::canonicalize(&work).unwrap_or_else(|_| work.clone());
-    let profile_str = work_abs.join("lo-profile").display().to_string();
-    let profile_str = profile_str
-        .strip_prefix(r"\\?\")
-        .unwrap_or(&profile_str)
-        .replace('\\', "/");
-    let profile = format!("file://{profile_str}");
-    let lo = std::process::Command::new("soffice")
-        .arg(format!("-env:UserInstallation={profile}"))
-        .args(["--headless", "--convert-to", "pdf", "--outdir"])
-        .arg(&work)
-        .arg(&pptx)
-        .output()
-        .map_err(|e| format!("启动 LibreOffice 失败: {e}"))?;
-    let pdf = work.join("frag.pdf");
-    if !lo.status.success() || !pdf.exists() {
-        cleanup(&work);
-        return Err(format!(
-            "LibreOffice 渲染失败: {}",
-            String::from_utf8_lossy(&lo.stderr)
-        ));
-    }
-    let ppm = std::process::Command::new("pdftoppm")
-        .args(["-png", "-r", "55"])
-        .arg(&pdf)
-        .arg(work.join("page"))
-        .output()
-        .map_err(|e| format!("启动 pdftoppm 失败: {e}"))?;
-    if !ppm.status.success() {
-        cleanup(&work);
-        return Err(format!(
-            "pdftoppm 失败: {}",
-            String::from_utf8_lossy(&ppm.stderr)
-        ));
-    }
-    let mut pages: Vec<(u32, Vec<u8>)> = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(&work) {
-        for ent in rd.flatten() {
-            let name = ent.file_name().to_string_lossy().to_string();
-            if let Some(num) = name
-                .strip_prefix("page-")
-                .and_then(|n| n.strip_suffix(".png"))
-                .and_then(|n| n.parse::<u32>().ok())
-            {
-                if let Ok(bytes) = std::fs::read(ent.path()) {
-                    pages.push((num, bytes));
+    pages.sort_by_key(|(number, _)| *number);
+    for (page, (_, rendered)) in pages.into_iter().enumerate() {
+        let cached = cache_dir.join(format!("{page}.png"));
+        if !cached.exists() {
+            if let Err(error) = std::fs::rename(rendered, &cached) {
+                // Another render may have published this page already.
+                if !cached.exists() {
+                    return Err(error.to_string());
                 }
             }
         }
     }
-    pages.sort_by_key(|(n, _)| *n);
-    cleanup(&work);
-    if pages.is_empty() {
-        return Err("渲染未产出任何页面".into());
-    }
-    Ok(pages.into_iter().map(|(_, b)| b).collect())
+    Ok(())
 }
 
-/// GET /v1/versions/:id/thumb/:page — real slide thumbnail (PNG, base64
-/// JSON like the fragment endpoint). Rendered once per version, then
-/// cached on disk under <data>/thumbs/<version_id>/<page>.png.
+/// GET /v1/versions/:id/thumb/:page — DeckCraft PNG, returned as base64.
+/// Use a fresh cache namespace because older DeckCraft caches can contain
+/// thumbnails produced by the legacy LibreOffice fallback.
 async fn version_thumb(
     State(st): State<St>,
     headers: HeaderMap,
@@ -1791,22 +1696,13 @@ async fn version_thumb(
         let frag = store.file_get(&ver.fragment_hash).map_err(bad)?;
         (store.root().to_path_buf(), frag)
     };
-    let cache_dir = root.join("thumbs").join(thumb_renderer()).join(&id);
+    let cache_dir = root.join("thumbs").join("deckcraft-v2").join(&id);
     let cache_file = cache_dir.join(format!("{page}.png"));
     if !cache_file.exists() {
-        let root2 = root.clone();
-        let id2 = id.clone();
-        let rendered = tokio::task::spawn_blocking(move || render_thumbs(&root2, &id2, &frag))
+        tokio::task::spawn_blocking(move || render_thumbs_deckcraft(&cache_dir, &frag))
             .await
             .map_err(|e| bad(e.to_string()))?
             .map_err(bad)?;
-        std::fs::create_dir_all(&cache_dir).map_err(|e| bad(e.to_string()))?;
-        for (n, bytes) in rendered.iter().enumerate() {
-            let f = cache_dir.join(format!("{n}.png"));
-            if !f.exists() {
-                std::fs::write(&f, bytes).map_err(|e| bad(e.to_string()))?;
-            }
-        }
     }
     let bytes = std::fs::read(&cache_file).map_err(|_| not_found())?;
     Ok(Json(json!({ "page": page, "image_base64": b64e(&bytes) })))

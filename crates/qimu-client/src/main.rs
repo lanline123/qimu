@@ -4,6 +4,8 @@
 //! exactly like the CLI (spec §4.4 parity).
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+mod shell;
+
 use base64::Engine;
 use eframe::egui;
 use serde_json::{json, Value};
@@ -509,20 +511,6 @@ fn text_action_enabled(
     .clicked()
 }
 
-/// Split a nav-panel body rect into (content, footer strip): the
-/// prototype's sidepanel rhythm — .sp-body padding 12px (14px at
-/// the bottom) over a .sp-foot strip (10px top / 14px sides / 12px
-/// bottom around a 28px action row ≈ 42px) with its 1px --line
-/// top border.
-fn nav_split(rect: egui::Rect) -> (egui::Rect, egui::Rect) {
-    let footer = egui::Rect::from_min_max(egui::pos2(rect.min.x, rect.max.y - 42.0), rect.max);
-    let content = egui::Rect::from_min_max(
-        egui::pos2(rect.min.x + 12.0, rect.min.y + 12.0),
-        egui::pos2(rect.max.x - 12.0, rect.max.y - 42.0),
-    );
-    (content, footer)
-}
-
 /// Full-width panel row (folder tree / settings nav): the
 /// prototype's .tree button — 28px min height (final compact
 /// layer), 6px radius (tightening layer), ink text at rest, hover
@@ -569,18 +557,16 @@ fn tree_row(
     resp
 }
 
-/// Page body padding inside a dock frame: the prototype's main
+/// Page body padding inside the shared content area: the prototype's main
 /// padding — 22px sides, 20px top — with 46px at the bottom, the
 /// --bottombar-h the prototype's content column reserves. The fill
-/// is the app canvas: inside a dock frame the panel_bg would
-/// otherwise show through, and the page content sits directly on
-/// the canvas, as the prototype's content column does.
+/// is the canvas fill used by the prototype's content column.
 fn body_frame() -> egui::Frame {
     egui::Frame::NONE.fill(APP_BG).inner_margin(egui::Margin {
         left: PAGE_PAD_L as i8,
         right: 22,
         top: 20,
-        bottom: 46,
+        bottom: 14,
     })
 }
 
@@ -886,25 +872,6 @@ enum Page {
     Settings,
 }
 
-/// Panels of the dock framework (craft-ui docking — the same
-/// component EffectCraft's main window is built on; layout authority:
-/// design/EffectCraft主页布局拆解.md). Each top-level page is one
-/// workspace: a fixed-width left frame beside the page's main frame;
-/// the showroom adds a bottom frame for the review queue, the slot
-/// the framework's Default workspace gives its Render Queue.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-enum QPanel {
-    SrNav,
-    SrMain,
-    SrReview,
-    CtNav,
-    CtMain,
-    IxNav,
-    IxMain,
-    StNav,
-    StMain,
-}
-
 /// Content page state. Only page-level fields live here: the
 /// folder filter (driven by the nav frame, covers every frame)
 /// and the import group (wall toolbar). The
@@ -1011,6 +978,16 @@ enum IndexFrame {
     Overview(OverviewState),
     Detail(IndexDetailState),
     Create(CreateState),
+}
+
+enum IndexDetailAction {
+    Reload,
+    ChangeBranch(String),
+    Export(&'static str),
+    Commit(Vec<Value>, &'static str),
+    Insert(usize),
+    PickPages(usize, Value, Vec<bool>),
+    SwitchVersion(usize, String, String, bool),
 }
 
 /// 概览帧状态：卡片墙的选中索引（单选高亮）。
@@ -2021,7 +1998,6 @@ struct PickTemplateState {
 /// frames in stack order; Confirm is the top-most kind and is the
 /// only one allowed to stack over another overlay (over PageEdit).
 enum Overlay {
-    PagePreview { version_id: String, page: usize, global: usize, item: Value },
     AllVersions { entry_pos: usize },
     Present(PresentState),
     PageEdit(PageEditState),
@@ -2050,6 +2026,10 @@ enum ConfirmAction {
 struct ShowroomState {
     zone: String, // plaza | library | inbox | groups
     folder: Option<String>,
+    library_view: usize,
+    share_source: usize,
+    group_id: Option<String>,
+    selected_card: Option<String>,
     stack: NavStack<SrFrame>,
 }
 
@@ -2058,6 +2038,10 @@ impl Default for ShowroomState {
         Self {
             zone: std::env::var("QIMU_ZONE").unwrap_or_else(|_| "plaza".into()),
             folder: None,
+            library_view: 0,
+            share_source: 0,
+            group_id: None,
+            selected_card: None,
             stack: NavStack::new(SrFrame::Wall),
         }
     }
@@ -2073,9 +2057,57 @@ enum SrFrame {
 /// 组装或加载失败时逐页列表不可用，与旧 sr_deck=None 同义）。
 struct DeckState {
     item: Value,
-    deck: Option<Value>,
-    /// Set by the header 返回 action; the dispatcher pops.
+    pages: Vec<ShowroomPage>,
+    selected_page: Option<usize>,
+    view: DeckView,
+    preview_open: bool,
+    /// Set by the detail breadcrumb; the dispatcher pops the frame.
     closed: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeckView {
+    Thumbnails,
+    Notes,
+}
+
+#[derive(Clone)]
+struct ShowroomPage {
+    version_id: String,
+    slot: usize,
+    note: String,
+}
+
+fn showroom_pages(deck: &Value) -> Vec<ShowroomPage> {
+    let mut pages = Vec::new();
+    for entry in deck["resolved_entries"].as_array().into_iter().flatten() {
+        let version = &entry["resolved"];
+        let version_id = s(version, "id");
+        if version_id.is_empty() {
+            continue;
+        }
+        let total = i(version, "page_count").max(0) as usize;
+        let slots = match entry["entry"]["excerpt_slots"].as_array() {
+            Some(slots) => slots
+                .iter()
+                .filter_map(|slot| slot.as_str()?.parse::<usize>().ok())
+                .filter(|slot| *slot < total)
+                .collect::<Vec<_>>(),
+            None => (0..total).collect(),
+        };
+        pages.extend(slots.into_iter().map(|slot| {
+            ShowroomPage {
+                version_id: version_id.clone(),
+                slot,
+                note: version["scripts"]
+                    .get(slot)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            }
+        }));
+    }
+    pages
 }
 
 /// Events from the AI-translation worker thread: progress ticks
@@ -2118,6 +2150,7 @@ struct App {
     trash: TrashState,
     review: ReviewState,
     nav_home: NavStack<HomeFrame>,
+    home_recent_query: String,
     overlays: Vec<Overlay>,
     msg: String,
     folders: Vec<Value>,
@@ -2183,18 +2216,6 @@ struct App {
     /// (code, label) target-language options from the server's
     /// languages setting; codes are what renditions store.
     lang_options: Vec<(String, String)>,
-    /// Dock workspaces (craft-ui docking), one per top-level page,
-    /// built lazily on first show. Layout variants that replace the
-    /// split (content detail, index creation, the showroom review
-    /// frame appearing) rebuild the workspace; the split sizes are
-    /// fixed/ratio, so a rebuild restores the same geometry.
-    ws_sr: Option<craft_ui::docking::Workspace<QPanel>>,
-    ws_sr_review: bool,
-    ws_ct: Option<craft_ui::docking::Workspace<QPanel>>,
-    ws_ct_detail: bool,
-    ws_ix: Option<craft_ui::docking::Workspace<QPanel>>,
-    ws_ix_creating: bool,
-    ws_st: Option<craft_ui::docking::Workspace<QPanel>>,
     /// Toast state (the framework has no status bar): the message
     /// currently floating and when it appeared, in egui time.
     toast_msg: String,
@@ -2385,6 +2406,16 @@ static ICON_BACK: std::sync::LazyLock<&'static [u8]> =
 /// Shell icons, second batch (IconPark; inventory and sources in
 /// `assets/icons/README.md`): white glyphs colored by tint at draw
 /// time — toolbar slots, showroom zones, folder rows, panel footer.
+static ICON_NAV_HOME: std::sync::LazyLock<&'static [u8]> =
+    std::sync::LazyLock::new(|| icon_png(include_str!("../assets/icons/nav-home.png.b64")));
+static ICON_NAV_SHOW: std::sync::LazyLock<&'static [u8]> =
+    std::sync::LazyLock::new(|| icon_png(include_str!("../assets/icons/nav-show.png.b64")));
+static ICON_NAV_INDEX: std::sync::LazyLock<&'static [u8]> =
+    std::sync::LazyLock::new(|| icon_png(include_str!("../assets/icons/nav-index.png.b64")));
+static ICON_NAV_CONTENT: std::sync::LazyLock<&'static [u8]> =
+    std::sync::LazyLock::new(|| icon_png(include_str!("../assets/icons/nav-content.png.b64")));
+static ICON_NAV_TRASH: std::sync::LazyLock<&'static [u8]> =
+    std::sync::LazyLock::new(|| icon_png(include_str!("../assets/icons/nav-trash.png.b64")));
 static ICON_HOME: std::sync::LazyLock<&'static [u8]> =
     std::sync::LazyLock::new(|| icon_png(include_str!("../assets/icons/home.png.b64")));
 static ICON_REFRESH: std::sync::LazyLock<&'static [u8]> =
@@ -2793,6 +2824,7 @@ impl App {
             trash: TrashState::new(),
             review: ReviewState::new(),
             nav_home: NavStack::new(HomeFrame::Root),
+            home_recent_query: String::new(),
             overlays: vec![],
             msg: String::new(),
             folders: vec![],
@@ -2842,13 +2874,6 @@ impl App {
             translating: None,
             ai_status: None,
             lang_options: Vec::new(),
-            ws_sr: None,
-            ws_sr_review: false,
-            ws_ct: None,
-            ws_ct_detail: false,
-            ws_ix: None,
-            ws_ix_creating: false,
-            ws_st: None,
             toast_msg: String::new(),
             toast_since: 0.0,
             login_open: false,
@@ -4074,6 +4099,25 @@ impl App {
         self.load_index_related(&id);
     }
 
+    fn change_index_branch(&mut self, branch: String) {
+        let IndexFrame::Detail(st) = self.index.stack.top() else {
+            return;
+        };
+        let id = st.index_id.clone();
+        match self.call("GET", &format!("/v1/indexes/{id}?branch={branch}"), None) {
+            Ok(detail) => {
+                if let IndexFrame::Detail(st) = self.index.stack.top_mut() {
+                    st.branch = branch;
+                    st.detail = detail;
+                    st.merge_preview = None;
+                    st.merge_resolutions.clear();
+                }
+                self.load_index_related(&id);
+            }
+            Err(e) => self.msg = format!("切换分支失败：{e}"),
+        }
+    }
+
     /// Attachments, per-rendition version prefetch, commits and
     /// exports for the open index (split out of load_index_detail
     /// so open_index_detail can load the detail before drilling in).
@@ -4556,33 +4600,56 @@ fn tool_vsep(ui: &mut egui::Ui) {
     ui.add_space(5.0);
 }
 
-/// Page tab (tool row, right side): the prototype's .pagetabs
-/// form — 28px tall, 6px radius, active = accent fill with white
-/// text, inactive = transparent with muted text. The prototype's
-/// tabs are icon-only; the client's icon set has no glyphs for
-/// 索引 / 回收站 / 设置, so the tabs carry text labels instead
-/// (declared approximation in the alignment report).
-fn page_tab(ui: &mut egui::Ui, active: bool, label: &str) -> egui::Response {
-    let btn = egui::Button::new(
-        egui::RichText::new(label)
-            .size(12.5)
-            .color(if active {
-                egui::Color32::WHITE
-            } else {
-                TAB_TEXT
-            }),
-    )
-    .fill(if active {
-        ACCENT
+fn home_recent_row(ui: &mut egui::Ui, columns: [&str; 4], interactive: bool) -> egui::Response {
+    let sense = if interactive {
+        egui::Sense::click()
     } else {
-        egui::Color32::TRANSPARENT
-    })
-    .stroke(egui::Stroke::NONE)
-    .corner_radius(egui::CornerRadius::same(6))
-    .min_size(egui::vec2(0.0, 28.0));
-    ui.add(btn)
+        egui::Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), sense);
+    let painter = ui.painter();
+    if interactive && response.hovered() {
+        painter.rect_filled(rect, 6.0, HOVER_BG);
+    }
+    let mut x = rect.min.x + 2.0;
+    for (index, (text, fraction)) in columns.into_iter().zip([2.2, 1.1, 1.0, 1.0]).enumerate() {
+        let width = rect.width() * fraction / 5.3;
+        let color = if interactive && index == 0 {
+            TEXT_MAIN
+        } else {
+            TEXT_WEAK
+        };
+        let column = egui::Rect::from_min_size(
+            egui::pos2(x, rect.min.y),
+            egui::vec2((width - 10.0).max(0.0), rect.height()),
+        );
+        painter
+            .with_clip_rect(painter.clip_rect().intersect(column))
+            .text(
+                column.left_center(),
+                egui::Align2::LEFT_CENTER,
+                text,
+                egui::FontId::proportional(12.0),
+                color,
+            );
+        x += width;
+    }
+    if !interactive {
+        painter.hline(
+            rect.x_range(),
+            rect.max.y - 0.5,
+            egui::Stroke::new(1.0, SEPARATOR),
+        );
+    }
+    response
 }
 
+fn showroom_columns(ui: &egui::Ui, minimum_width: f32) -> (usize, f32) {
+    let available = ui.available_width();
+    let columns = ((available + 12.0) / (minimum_width + 12.0)).floor().max(1.0) as usize;
+    let width = ((available + 12.0) / columns as f32 - 12.0).floor();
+    (columns, width.max(1.0))
+}
 
 fn client_now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -4863,262 +4930,373 @@ fn q_seg_pills(ui: &mut egui::Ui, labels: &[&str], selected: usize) -> Option<us
 }
 
 impl App {
-    /// Home / launchpad (prototype #homeView, A27): welcome line
-    /// with the app version, the four prototype action cards and
-    /// the recent-use table. Plain page (no dock workspace). The
-    /// launcher's stack holds only its root frame — the actions
-    /// navigate to the other pages instead of drilling in. Recent
-    /// use is recorded on this device (client settings), so the
-    /// launcher is fully useful with no server at all.
+    fn home_nav_body(&mut self, ui: &mut egui::Ui) {
+        for page in [Page::Showroom, Page::Index, Page::Content] {
+            let (name, icon) = page.icon();
+            let texture = self.tex_icon(ui, name, icon);
+            let image = egui::Image::new((texture, egui::vec2(16.0, 16.0))).tint(ACCENT);
+            let button = egui::Button::image_and_text(image, tr(page.label()))
+                .fill(HOVER_BG)
+                .stroke(egui::Stroke::new(1.0, FIELD_BORDER));
+            if ui.add_sized([ui.available_width(), 34.0], button).clicked() {
+                self.navigate_to(page);
+            }
+        }
+    }
+
+    fn sr_nav_body(&mut self, ui: &mut egui::Ui) {
+        let zones = ["plaza", "library", "inbox", "groups"];
+        let active = zones
+            .iter()
+            .position(|id| *id == self.showroom.zone)
+            .unwrap_or(0);
+        let labels = ["公共", "我的", "分享", "群组"];
+        ui.horizontal(|ui| {
+            if let Some(next) = segmented(ui, &labels, active, SegStyle::Soft) {
+                self.showroom.zone = zones[next].to_string();
+                self.showroom.selected_card = None;
+                self.showroom.stack.pop_to(0);
+            }
+        });
+        ui.add_space(8.0);
+        match self.showroom.zone.as_str() {
+            "library" => {
+                ui.label(egui::RichText::new("我的目录").size(12.0).color(TEXT_WEAK));
+                for (idx, label) in ["全部", "收藏", "本地缓存", "我的组装"]
+                    .into_iter()
+                    .enumerate()
+                {
+                    if tree_row(
+                        ui,
+                        self.showroom.library_view == idx,
+                        0.0,
+                        None,
+                        label,
+                        12.5,
+                    )
+                    .clicked()
+                    {
+                        self.showroom.library_view = idx;
+                        self.showroom.stack.pop_to(0);
+                    }
+                }
+            }
+            "inbox" => {
+                ui.label(egui::RichText::new("分享来源").size(12.0).color(TEXT_WEAK));
+                for (idx, label) in ["全部", "个人分享", "部门分享"].into_iter().enumerate()
+                {
+                    let count = self
+                        .inbox
+                        .iter()
+                        .filter(|item| Self::share_matches_source(item, idx))
+                        .count();
+                    if tree_row(
+                        ui,
+                        self.showroom.share_source == idx,
+                        0.0,
+                        None,
+                        &format!("{label} · {count}"),
+                        12.5,
+                    )
+                    .clicked()
+                    {
+                        self.showroom.share_source = idx;
+                        self.showroom.stack.pop_to(0);
+                    }
+                }
+            }
+            "groups" => {
+                ui.label(egui::RichText::new("群组").size(12.0).color(TEXT_WEAK));
+                let active = self
+                    .active_showroom_group()
+                    .map(|space| s(&space["group"], "id"));
+                for space in &self.group_spaces {
+                    let group = &space["group"];
+                    let id = s(group, "id");
+                    let label = format!(
+                        "{} · {} 人",
+                        s(group, "name"),
+                        group["members"].as_array().map_or(0, Vec::len),
+                    );
+                    if tree_row(ui, active.as_ref() == Some(&id), 0.0, None, &label, 12.5).clicked()
+                    {
+                        self.showroom.group_id = Some(id);
+                        self.showroom.stack.pop_to(0);
+                    }
+                }
+            }
+            _ => {
+                ui.label(egui::RichText::new("公共目录").size(12.0).color(TEXT_WEAK));
+                let mut selected = self.showroom.folder.clone();
+                self.folder_tree(ui, &mut selected);
+                if selected != self.showroom.folder {
+                    self.showroom.stack.pop_to(0);
+                    self.showroom.selected_card = None;
+                    self.showroom.folder = selected;
+                }
+            }
+        }
+    }
+
+    fn active_showroom_group(&self) -> Option<&Value> {
+        self.group_spaces
+            .iter()
+            .find(|space| space["group"]["id"].as_str() == self.showroom.group_id.as_deref())
+            .or_else(|| self.group_spaces.first())
+    }
+
+    fn share_matches_source(item: &Value, source: usize) -> bool {
+        match source {
+            1 => item["target_kind"] == "user",
+            2 => item["target_kind"] == "dept",
+            _ => true,
+        }
+    }
+
+    fn ct_nav_body(&mut self, ui: &mut egui::Ui) {
+        let mut selected = self.content.folder_filter.clone();
+        self.folder_tree(ui, &mut selected);
+        if self.content.folder_filter != selected
+            && self.pick.is_none()
+            && self.content.stack.depth() > 1
+        {
+            self.close_unit_detail();
+        }
+        self.content.folder_filter = selected;
+    }
+
+    fn ix_nav_body(&mut self, ui: &mut egui::Ui) {
+        let (in_detail, mut selected) = match self.index.stack.top() {
+            IndexFrame::Detail(detail) => {
+                let folder = self.index_folder_of(&detail.index_id);
+                (true, (!folder.is_empty()).then_some(folder))
+            }
+            _ => (false, self.index.overview_folder.clone()),
+        };
+        let previous = selected.clone();
+        self.folder_tree(ui, &mut selected);
+        if in_detail && selected != previous {
+            self.index.stack.pop_to(0);
+        }
+        if !in_detail || selected != previous {
+            self.index.overview_folder = selected;
+        }
+    }
+
+    fn st_nav_body(&mut self, ui: &mut egui::Ui) {
+        let sections = self.settings_sections();
+        if self.settings.section >= sections.len() {
+            self.settings.section = 0;
+        }
+        for (i, name) in sections.iter().enumerate() {
+            if tree_row(ui, self.settings.section == i, 0.0, None, tr(name), 12.5).clicked() {
+                self.settings.section = i;
+            }
+        }
+    }
+
+    fn trash_nav_body(&mut self, ui: &mut egui::Ui) {
+        if self.token.is_none() {
+            return;
+        }
+        let active = match self.trash.stack.top() {
+            TrashFrame::List(state) => state.filter,
+            TrashFrame::Preview(_) => usize::MAX,
+        };
+        for (filter, (kind, label)) in [
+            ("", "全部"),
+            ("index", "索引"),
+            ("unit", "内容块"),
+            ("showroom", "演示成品"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let count = self
+                .trash
+                .items
+                .iter()
+                .filter(|item| kind.is_empty() || s(item, "kind") == kind)
+                .count();
+            let text = format!("{} {}", tr(label), count);
+            if tree_row(ui, active == filter, 0.0, None, &text, 12.5).clicked() {
+                self.trash.stack.pop_to(0);
+                if let TrashFrame::List(state) = self.trash.stack.top_mut() {
+                    state.filter = filter;
+                }
+            }
+        }
+    }
+
+    fn confirm_empty_trash(&mut self) {
+        self.overlays.push(Overlay::Confirm(ConfirmState {
+            title: tr("清空回收站").to_string(),
+            body: format!(
+                "{} {} {}",
+                tr("回收站中的"),
+                self.trash.items.len(),
+                tr("项将被永久删除，不可恢复。")
+            ),
+            confirm_label: tr("清空回收站").to_string(),
+            danger: true,
+            action: ConfirmAction::EmptyTrash,
+        }));
+    }
+
     fn page_home(&mut self, ui: &mut egui::Ui) {
-        // The prototype's home wrap (.home-wrap, final cascade):
-        // 52px top / 40px sides / 64px bottom, full width.
+        let viewport_width = ui.ctx().viewport_rect().width();
         egui::Frame::NONE
             .inner_margin(egui::Margin {
                 left: 40,
                 right: 40,
                 top: 52,
-                bottom: 64,
+                bottom: 18,
             })
             .show(ui, |ui| {
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(tr("欢迎使用启幕"))
-                    .size(30.0)
-                    .color(TEXT_MAIN),
-            );
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new(format!(
-                    "{} · 版本 {}",
-                    tr("PPT 内容管理与索引系统"),
-                    env!("CARGO_PKG_VERSION")
-                ))
-                .size(13.0)
-                .color(TEXT_WEAK),
-            );
-            ui.add_space(6.0);
-            // Connection state, stated neutrally: the launcher and
-            // every local feature work the same with no server; the
-            // line only says what this device can currently reach.
-            // Identity keys on the connection's anon flag, never on
-            // token presence: an anonymous connection mirrors a
-            // server-issued guest token into self.token (G1), so a
-            // token-first check would mislabel it as a named session.
-            let conn_line = if self.anon_active() {
-                format!("{} · {}", tr("已连接服务器（匿名）"), self.active_server_label())
-            } else if self.token.is_some()
-                || self
-                    .conns
-                    .iter()
-                    .any(|c| c.status == ConnStatus::Connected)
-            {
-                format!("{} · {}", tr("已连接服务器"), self.active_server_label())
-            } else {
-                tr("单机模式：未连接服务器，本地功能完整可用").to_string()
-            };
-            ui.label(egui::RichText::new(conn_line).size(12.0).color(TEXT_FAINT));
-            ui.add_space(16.0);
-            if self.user.is_none() {
-                ui.horizontal(|ui| {
-                    if self.anon_active() {
-                        ui.label(
-                            egui::RichText::new(tr(
-                                "匿名连接：可浏览组织公开内容；发布、审批需实名登录。",
-                            ))
-                            .size(12.5)
-                            .color(TEXT_WEAK),
-                        );
-                        if q_primary_button(ui, tr("实名登录")).clicked() {
-                            self.login_open = true;
-                        }
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.label(egui::RichText::new(tr("欢迎使用启幕")).size(30.0).strong());
+                    ui.add_space(5.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} · 版本 {}",
+                            tr("PPT 内容管理与索引系统"),
+                            env!("CARGO_PKG_VERSION")
+                        ))
+                        .size(13.0)
+                        .color(TEXT_WEAK),
+                    );
+                    ui.add_space(28.0);
+                    let mut action = None;
+                    let columns = if viewport_width <= 1000.0 { 2 } else { 4 };
+                    let width = if viewport_width > 1200.0 {
+                        ui.available_width().min(980.0)
                     } else {
-                        ui.label(
-                            egui::RichText::new(tr(
-                                "本机功能无需登录即可完整使用；连接组织服务器可浏览公开内容。",
-                            ))
-                            .size(12.5)
-                            .color(TEXT_WEAK),
-                        );
-                        if q_primary_button(ui, tr("连接服务器")).clicked() {
-                            self.login_open = true;
-                        }
+                        ui.available_width()
+                    };
+                    let card_width = ((width + 12.0) / columns as f32 - 12.0).floor();
+                    let actions = [
+                        ("new", "新建索引", "icon-doc-add", *ICON_DOC_ADD),
+                        ("sample", "打开示例项目", "nav-show", *ICON_NAV_SHOW),
+                        ("import", "导入素材…", "icon-upload", *ICON_UPLOAD),
+                        ("template", "从模板新建", "icon-all-apps", *ICON_ALL_APPS),
+                    ];
+                    ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
+                    for row in actions.chunks(columns) {
+                        ui.horizontal(|ui| {
+                            for &(key, label, name, icon) in row {
+                                if self.home_action_card(ui, card_width, name, icon, tr(label)) {
+                                    action = Some(key);
+                                }
+                            }
+                        });
                     }
+                    self.run_home_action(action);
+                    ui.add_space(40.0);
+                    self.home_recent_ui(ui);
                 });
-                ui.add_space(12.0);
+            });
+    }
+
+    fn run_home_action(&mut self, action: Option<&str>) {
+        match action {
+            Some("new") => self.act_new_index(),
+            Some("sample") => self.open_sample_project(),
+            Some("import") => {
+                self.page = Page::Content;
+                self.act_import_ppt();
             }
-            // The prototype's four launch cards: one row of four
-            // with 12px gaps, the row capped at 980px (.home-actions).
-            let mut act: Option<&'static str> = None;
-            let card_w = (ui.available_width().min(980.0) - 36.0) / 4.0;
-            ui.spacing_mut().item_spacing.x = 12.0;
-            ui.horizontal_wrapped(|ui| {
-                if self.home_action_card(ui, card_w, "icon-doc-add", *ICON_DOC_ADD, tr("新建索引")) {
-                    act = Some("new");
-                }
-                if self.home_action_card(ui, card_w, "icon-play", *ICON_PLAY, tr("打开示例项目")) {
-                    act = Some("sample");
-                }
-                if self.home_action_card(ui, card_w, "icon-upload", *ICON_UPLOAD, tr("导入素材…")) {
-                    act = Some("import");
-                }
-                if self.home_action_card(ui, card_w, "icon-all-apps", *ICON_ALL_APPS, tr("从模板新建")) {
-                    act = Some("template");
+            Some("template") => {
+                let first = self.indexes.first().map(|x| s(x, "id")).unwrap_or_default();
+                self.overlays.push(Overlay::PickTemplate(PickTemplateState {
+                    new_name: String::new(),
+                    template_id: first,
+                }));
+            }
+            _ => {}
+        }
+    }
+
+    fn home_recent_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(tr("最近使用")).size(13.0).strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.home_recent_query)
+                        .hint_text(tr("搜索最近文件"))
+                        .desired_width(170.0)
+                        .margin(egui::vec2(9.0, 6.0)),
+                );
+            });
+        });
+        ui.spacing_mut().item_spacing.y = 0.0;
+        home_recent_row(
+            ui,
+            [tr("名称"), tr("打开时间"), tr("大小"), tr("类型")],
+            false,
+        );
+
+        let query = self.home_recent_query.trim().to_lowercase();
+        let mut open = None;
+        let mut found = false;
+        for r in recent_items() {
+            let kind = match s(&r, "kind").as_str() {
+                "index" => tr("索引"),
+                "unit" => tr("内容块"),
+                "showroom" => tr("演示成品"),
+                _ => "",
+            };
+            let title = s(&r, "title");
+            let version = s(&r, "ver");
+            if ![title.as_str(), kind, version.as_str()]
+                .iter()
+                .any(|value| value.to_lowercase().contains(&query))
+            {
+                continue;
+            }
+            found = true;
+            let time = fmt_time(i(&r, "ms"));
+            let response = home_recent_row(ui, [&title, &time, "—", kind], true);
+            if !version.is_empty() {
+                response.clone().on_hover_text(version);
+            }
+            if response.clicked() {
+                open = Some(r);
+            }
+        }
+        if !found {
+            ui.add_space(56.0);
+            ui.vertical_centered(|ui| {
+                if query.is_empty() {
+                    ui.label(tr("你最近使用的文件会显示在这里"));
+                    ui.add_space(7.0);
+                    ui.label(
+                        egui::RichText::new(tr("新建一个索引，或打开示例项目先熟悉一下界面。"))
+                            .size(12.0)
+                            .color(TEXT_WEAK),
+                    );
+                } else {
+                    ui.label(tr("没有匹配的最近文件"));
                 }
             });
-            match act {
-                Some("new") => self.act_new_index(),
-                Some("sample") => self.open_sample_project(),
-                Some("import") => {
-                    self.page = Page::Content;
-                    self.act_import_ppt();
+        }
+        if let Some(r) = open {
+            self.deep_source = Some(Page::Home);
+            match s(&r, "kind").as_str() {
+                "index" => {
+                    self.page = Page::Index;
+                    self.open_index_detail(&s(&r, "id"));
                 }
-                Some("template") => {
-                    let first = self
-                        .indexes
-                        .first()
-                        .map(|x| s(x, "id"))
-                        .unwrap_or_default();
-                    self.overlays.push(Overlay::PickTemplate(PickTemplateState {
-                        new_name: String::new(),
-                        template_id: first,
-                    }));
+                "unit" => {
+                    self.page = Page::Content;
+                    self.open_unit_detail(&s(&r, "id"));
+                }
+                "showroom" => {
+                    self.page = Page::Showroom;
+                    self.open_deck_for_ref("showroom", &s(&r, "id"), &s(&r, "title"));
                 }
                 _ => {}
             }
-            ui.add_space(16.0);
-            // At-a-glance counts from loaded state.
-            ui.label(
-                egui::RichText::new(format!(
-                    "{} · {} {} · {} {} · {} {}",
-                    tr("当前内容"),
-                    self.indexes.len(),
-                    tr("个索引"),
-                    self.units.len(),
-                    tr("个内容块"),
-                    self.showroom_live.len(),
-                    tr("个演示成品"),
-                ))
-                .size(12.0)
-                .color(TEXT_WEAK),
-            );
-            ui.add_space(38.0);
-            ui.label(egui::RichText::new(tr("最近使用")).size(13.0).color(TEXT_MAIN));
-            ui.add_space(6.0);
-            let recents = recent_items();
-            if recents.is_empty() {
-                // The prototype's .hr-empty: centered title + sub
-                // copy with generous vertical padding.
-                ui.add_space(48.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(
-                        egui::RichText::new(tr("暂无最近使用"))
-                            .size(13.0)
-                            .color(TEXT_MAIN),
-                    );
-                    ui.add_space(7.0);
-                    ui.label(
-                        egui::RichText::new(tr(
-                            "打开过的索引、内容块和演示成品会出现在这里。",
-                        ))
-                        .size(12.0)
-                        .color(TEXT_WEAK),
-                    );
-                });
-                ui.add_space(48.0);
-            } else {
-                // Borderless table (A27): name / kind / version /
-                // last opened; a row click reopens the item. The
-                // header row is the prototype's .hr-head: muted
-                // 11.5px labels on the 2.2/1.1/1/1 column grid with
-                // a 1px --line under it.
-                {
-                    let w = ui.available_width();
-                    let (hrect, _) =
-                        ui.allocate_exact_size(egui::vec2(w, 26.0), egui::Sense::hover());
-                    let painter = ui.painter();
-                    let font = egui::FontId::new(11.5, egui::FontFamily::Proportional);
-                    for (text, fx) in [
-                        (tr("名称"), 0.0f32),
-                        (tr("类型"), 2.2 / 5.3),
-                        (tr("版本"), 3.3 / 5.3),
-                        (tr("最近打开"), 4.3 / 5.3),
-                    ] {
-                        let g = painter.layout_no_wrap(text.to_string(), font.clone(), TEXT_WEAK);
-                        painter.galley(
-                            egui::pos2(
-                                hrect.min.x + 2.0 + w * fx,
-                                hrect.center().y - g.size().y / 2.0,
-                            ),
-                            g,
-                            TEXT_WEAK,
-                        );
-                    }
-                    painter.hline(
-                        hrect.x_range(),
-                        hrect.max.y - 0.5,
-                        egui::Stroke::new(1.0, SEPARATOR),
-                    );
-                }
-                let mut open: Option<Value> = None;
-                for r in &recents {
-                    let (rect, resp) = ui.allocate_exact_size(
-                        egui::vec2(ui.available_width(), 30.0),
-                        egui::Sense::click(),
-                    );
-                    let painter = ui.painter();
-                    if resp.hovered() {
-                        painter.rect_filled(rect, 6.0, HOVER_BG);
-                    }
-                    let kind_label = match s(r, "kind").as_str() {
-                        "index" => tr("索引"),
-                        "unit" => tr("内容块"),
-                        "showroom" => tr("演示成品"),
-                        _ => "",
-                    };
-                    let w = rect.width();
-                    let cols: [(String, f32); 4] = [
-                        (s(r, "title"), rect.min.x + 2.0),
-                        (kind_label.to_string(), rect.min.x + w * (2.2 / 5.3)),
-                        (s(r, "ver"), rect.min.x + w * (3.3 / 5.3)),
-                        (fmt_time(i(r, "ms")), rect.min.x + w * (4.3 / 5.3)),
-                    ];
-                    for (j, (text, x)) in cols.iter().enumerate() {
-                        let font = egui::FontId::new(12.0, egui::FontFamily::Proportional);
-                        let color = if j == 0 { TEXT_MAIN } else { TEXT_WEAK };
-                        let g = painter.layout_no_wrap(text.clone(), font, color);
-                        let gx = *x;
-                        painter.galley(
-                            egui::pos2(gx, rect.center().y - g.size().y / 2.0),
-                            g,
-                            color,
-                        );
-                    }
-                    if resp.clicked() {
-                        open = Some(r.clone());
-                    }
-                }
-                if let Some(r) = open {
-                    self.deep_source = Some(Page::Home);
-                    match s(&r, "kind").as_str() {
-                        "index" => {
-                            self.page = Page::Index;
-                            self.open_index_detail(&s(&r, "id"));
-                        }
-                        "unit" => {
-                            self.page = Page::Content;
-                            self.open_unit_detail(&s(&r, "id"));
-                        }
-                        "showroom" => {
-                            self.page = Page::Showroom;
-                            self.open_deck_for_ref("showroom", &s(&r, "id"), &s(&r, "title"));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        });
-            });
+        }
     }
 
     /// One launcher action card (A27): 22px icon + label on a
@@ -5340,7 +5518,6 @@ impl App {
             _ => (0, std::collections::HashSet::new()),
         };
         let items = self.trash.items.clone();
-        let count_of = |kind: &str| items.iter().filter(|t| s(t, "kind") == kind).count();
         let shown: Vec<Value> = items
             .iter()
             .filter(|t| match filter {
@@ -5352,13 +5529,11 @@ impl App {
             .cloned()
             .collect();
 
-        let mut new_filter: Option<usize> = None;
         let mut toggle: Option<String> = None;
         let mut restore: Option<String> = None;
         let mut purge: Option<(String, String)> = None;
         let mut preview: Option<Value> = None;
         let mut batch: Option<&'static str> = None;
-        let mut empty_all = false;
         let mut retry = false;
 
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -5376,25 +5551,11 @@ impl App {
                     .color(TEXT_FAINT),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if btn_ghost_enabled(ui, !items.is_empty(), tr("清空回收站")).clicked() {
-                        empty_all = true;
-                    }
                     if btn_ghost(ui, tr("刷新")).clicked() {
                         retry = true;
                     }
                 });
             });
-            ui.add_space(10.0);
-            let labels: Vec<String> = vec![
-                format!("{} {}", tr("全部"), items.len()),
-                format!("{} {}", tr("索引"), count_of("index")),
-                format!("{} {}", tr("内容块"), count_of("unit")),
-                format!("{} {}", tr("演示成品"), count_of("showroom")),
-            ];
-            let label_refs: Vec<&str> = labels.iter().map(|x| x.as_str()).collect();
-            if let Some(i) = segmented(ui, &label_refs, filter, SegStyle::Soft) {
-                new_filter = Some(i);
-            }
             ui.add_space(10.0);
             if !selected.is_empty() {
                 ui.horizontal(|ui| {
@@ -5519,11 +5680,6 @@ impl App {
         if retry {
             self.trash.loaded = false;
         }
-        if let Some(f) = new_filter {
-            if let TrashFrame::List(ls) = self.trash.stack.top_mut() {
-                ls.filter = f;
-            }
-        }
         if let Some(tid) = toggle {
             if let TrashFrame::List(ls) = self.trash.stack.top_mut() {
                 if !ls.selected.remove(&tid) {
@@ -5597,20 +5753,6 @@ impl App {
                 }));
             }
             _ => {}
-        }
-        if empty_all {
-            self.overlays.push(Overlay::Confirm(ConfirmState {
-                title: tr("清空回收站").to_string(),
-                body: format!(
-                    "{} {} {}",
-                    tr("回收站中的"),
-                    items.len(),
-                    tr("项将被永久删除，不可恢复。")
-                ),
-                confirm_label: tr("清空回收站").to_string(),
-                danger: true,
-                action: ConfirmAction::EmptyTrash,
-            }));
         }
     }
 
@@ -5733,199 +5875,6 @@ impl App {
 
 }
 
-/// Panel permissions inside Qimu workspaces: LOCKED (James
-/// 2026-11-16 — the framework's homepage is a fixed layout, and so
-/// is Qimu's). craft-ui's `Permissions::locked()` clears movable /
-/// floatable / closable, which gates every drag, float and close
-/// path inside the component (tab drags become plain clicks, the
-/// group menu loses its float/move entries). Splits still resize:
-/// workspace apply keeps resizing working under lock — width
-/// adjustment is not panel movement.
-fn qpanel_permissions(_p: &QPanel) -> craft_ui::docking::Permissions {
-    // accepts_tabs is cleared on top of locked(): craft-ui draws
-    // NO tab strip for a lone panel whose permissions are
-    // "protected" (!movable && !closable && !accepts_tabs) — and
-    // the prototype's panes have no tab strips: the sidepanel and
-    // the content column are plain bordered surfaces. Drop targets
-    // stay rejected by the workspace lock, as before.
-    let mut p = craft_ui::docking::Permissions::default().locked();
-    p.accepts_tabs = false;
-    p
-}
-
-/// Build a page workspace with its layout root and lock it: the
-/// workspace-level lock additionally rejects Move / Float / Close
-/// commands at apply time, and DockArea is told the same (dock_show
-/// passes ws.locked), so no gesture can start a move at all.
-fn q_workspace(root: craft_ui::docking::Node<QPanel>) -> craft_ui::docking::Workspace<QPanel> {
-    let mut ws = craft_ui::docking::Workspace::new(q_layout(root));
-    ws.locked = true;
-    ws
-}
-
-/// DockStyle from the prototype tokens: pane bodies paint their
-/// own surfaces (sidepanel --panel, content --bg), so the area
-/// behind the panes is the canvas itself and the split seam is a
-/// 1px canvas hairline — the closest read of the sidepanel's 1px
-/// --line right border the framework's gap painting can give.
-/// Tab-strip fields stay set but unused: every group is stripless
-/// (see qpanel_permissions), exactly like the prototype's panes.
-/// Border: from_ui takes egui's noninteractive bg_stroke, which
-/// the component then draws around the dock area, every group and
-/// every column — a wireframe the prototype does not have — so
-/// the border is switched off entirely.
-fn qimu_dock_style(ui: &egui::Ui) -> craft_ui::docking::DockStyle {
-    let mut style = craft_ui::docking::DockStyle::from_ui(ui);
-    style.border = egui::Stroke::NONE;
-    style.tab_height = 30.0;
-    style.gap = 1.0;
-    style.background = APP_BG;
-    style.tab_background = PANEL_BG;
-    style.active_background = PANEL_BG;
-    style.text = TAB_TEXT_ACTIVE;
-    style.inactive_text = TAB_TEXT;
-    style.accent = ACCENT;
-    style.floating_background = PANEL_BG;
-    style.font = egui::FontId::proportional(12.5);
-    style.min_tab_width = 12.0 * 2.5 + 24.0;
-    style.float_label = "浮动".into();
-    style.close_label = "关闭".into();
-    style.panels_label = "面板".into();
-    style
-}
-
-fn q_tabs(panels: &[QPanel]) -> craft_ui::docking::Node<QPanel> {
-    craft_ui::docking::Node::Tabs {
-        panels: panels.to_vec(),
-        active: 0,
-    }
-}
-
-fn q_hsplit(
-    size: craft_ui::layout::SplitSize,
-    first: craft_ui::docking::Node<QPanel>,
-    second: craft_ui::docking::Node<QPanel>,
-) -> craft_ui::docking::Node<QPanel> {
-    craft_ui::docking::Node::Split {
-        axis: craft_ui::layout::SplitAxis::Horizontal,
-        size,
-        first: Box::new(first),
-        second: Box::new(second),
-    }
-}
-
-fn q_vsplit(
-    size: craft_ui::layout::SplitSize,
-    first: craft_ui::docking::Node<QPanel>,
-    second: craft_ui::docking::Node<QPanel>,
-) -> craft_ui::docking::Node<QPanel> {
-    craft_ui::docking::Node::Split {
-        axis: craft_ui::layout::SplitAxis::Vertical,
-        size,
-        first: Box::new(first),
-        second: Box::new(second),
-    }
-}
-
-fn q_layout(root: craft_ui::docking::Node<QPanel>) -> craft_ui::docking::Layout<QPanel> {
-    craft_ui::docking::Layout {
-        root: Some(root),
-        floating: Vec::new(),
-    }
-}
-
-/// Main frames sit on the app canvas (the pages' content was built
-/// for it): paint the whole body rect before the page's own frame,
-/// whose fill only covers the content's extent.
-fn paint_body_bg(ui: &mut egui::Ui) {
-    ui.painter().rect_filled(ui.max_rect(), 0.0, APP_BG);
-}
-
-/// The DockContent adapter: panel bodies are the pages' existing
-/// render code, unchanged; the group header is the framework's ≡
-/// mark (26 wide) — kept as framework furniture, but rendered as a
-/// static glyph, not a button: the layout is locked, so there is no
-/// menu to offer (and permissions would reject the commands anyway).
-struct QimuDock<'a> {
-    app: &'a mut App,
-    commands: Vec<craft_ui::docking::DockCommand<QPanel>>,
-}
-
-impl craft_ui::docking::DockContent<QPanel> for QimuDock<'_> {
-    fn body(&mut self, ui: &mut egui::Ui, panel: &QPanel) {
-        match panel {
-            QPanel::SrNav => self.app.sr_nav_body(ui),
-            QPanel::SrMain => {
-                paint_body_bg(ui);
-                self.app.sr_main_body(ui);
-            }
-            QPanel::SrReview => self.app.sr_review_body(ui),
-            QPanel::CtNav => self.app.ct_nav_body(ui),
-            QPanel::CtMain => {
-                paint_body_bg(ui);
-                self.app.ct_main_body(ui);
-            }
-            QPanel::IxNav => self.app.ix_nav_body(ui),
-            QPanel::IxMain => {
-                paint_body_bg(ui);
-                self.app.ix_main_body(ui);
-            }
-            QPanel::StNav => self.app.st_nav_body(ui),
-            QPanel::StMain => self.app.st_main_body(ui),
-        }
-    }
-
-    fn logical_label(&self, panel: &QPanel) -> String {
-        match panel {
-            QPanel::SrNav => "导航".into(),
-            QPanel::SrMain => "演示厅".into(),
-            QPanel::SrReview => "待审队列".into(),
-            QPanel::CtNav => "目录".into(),
-            QPanel::CtMain => "内容".into(),
-            QPanel::IxNav => "目录".into(),
-            QPanel::IxMain => "索引".into(),
-            QPanel::StNav => "设置".into(),
-            QPanel::StMain => self.app.settings_section_name(),
-        }
-    }
-
-    fn permissions(&self, panel: &QPanel) -> craft_ui::docking::Permissions {
-        qpanel_permissions(panel)
-    }
-
-    fn panel_menu(&mut self, _ui: &mut egui::Ui, _panel: &QPanel) {
-        // Intentionally empty (locked layout, see qpanel_permissions):
-        // no move/float commands are offered anywhere; the group
-        // header's ≡ is a static glyph and never opens this menu.
-    }
-
-    fn group_header_width(
-        &self,
-        _panels: &[QPanel],
-        _active: &QPanel,
-        _floating: bool,
-        _strip_width: f32,
-    ) -> f32 {
-        26.0
-    }
-
-    fn group_header(&mut self, ui: &mut egui::Ui, _panels: &[QPanel], _active: &QPanel, _floating: bool) {
-        // Locked layout: the ≡ is a static framework mark, painted
-        // directly with hover-only sense — not clickable, no menu
-        // hangs off it (the previous menu_button opened an empty
-        // popup, since panel_menu offers no commands).
-        let (rect, _resp) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
-        let font = egui::FontId::new(16.0, egui::FontFamily::Proportional);
-        let galley = ui.painter().layout_no_wrap("≡".to_string(), font, ICON_TINT);
-        let pos = egui::pos2(
-            rect.center().x - galley.size().x / 2.0,
-            rect.center().y - galley.size().y / 2.0,
-        );
-        ui.painter().galley(pos, galley, ICON_TINT);
-    }
-}
-
-
 impl App {
     /// Settings sections visible to the current role — sections a
     /// role may not see are not rendered at all (§7.9).
@@ -5959,153 +5908,6 @@ impl App {
             sections.push("离线缓存");
         }
         sections
-    }
-
-    fn settings_section_name(&self) -> String {
-        let sections = self.settings_sections();
-        sections
-            .get(self.settings.section)
-            .copied()
-            .unwrap_or("设置")
-            .to_string()
-    }
-
-    /// Render one page's dock workspace into the body ui — the same
-    /// glue EffectCraft's dock_area() uses: the workspace is taken
-    /// out, its layout cloned for the render, bodies draw through
-    /// the DockContent adapter, then the output actions and any
-    /// panel-menu commands are applied back to the workspace.
-    fn dock_show(&mut self, ui: &mut egui::Ui, page: Page) {
-        let mut ws = match page {
-            Page::Showroom => self.ws_sr.take(),
-            Page::Content => self.ws_ct.take(),
-            Page::Index => self.ws_ix.take(),
-            Page::Settings => self.ws_st.take(),
-            // Home / Trash are plain pages and never reach dock_show.
-            Page::Home | Page::Trash => None,
-        }
-        .expect("workspace built by the dock_<page> caller");
-        let area_id = match page {
-            Page::Showroom => "qimu-dock-showroom",
-            Page::Content => "qimu-dock-content",
-            Page::Index => "qimu-dock-index",
-            Page::Settings => "qimu-dock-settings",
-            Page::Home | Page::Trash => "qimu-dock-plain",
-        };
-        let body = ui.max_rect();
-        let style = qimu_dock_style(ui);
-        let layout = ws.layout.clone();
-        let mut content = QimuDock {
-            app: self,
-            commands: Vec::new(),
-        };
-        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(body).id_salt(area_id));
-        child.set_clip_rect(body.intersect(ui.clip_rect()));
-        let out = craft_ui::docking::DockArea::new(egui::Id::new(area_id))
-            .float_bounds(body)
-            .locked(ws.locked)
-            .show_content(&mut child, &layout, &style, &mut content);
-        let commands = std::mem::take(&mut content.commands);
-        drop(content);
-        if let Some(err) = &out.error {
-            self.msg = err.to_string();
-        }
-        let _ = ws.apply_all(out.actions, qpanel_permissions);
-        if !commands.is_empty() {
-            let space = craft_ui::docking::FloatSpace::new(body);
-            for cmd in commands {
-                let _ = cmd.apply(&mut ws, false, &space, qpanel_permissions);
-            }
-        }
-        match page {
-            Page::Showroom => self.ws_sr = Some(ws),
-            Page::Content => self.ws_ct = Some(ws),
-            Page::Index => self.ws_ix = Some(ws),
-            Page::Settings => self.ws_st = Some(ws),
-            Page::Home | Page::Trash => {}
-        }
-    }
-
-    /// Showroom workspace: left frame 268 fixed (navigation), main
-    /// frame (the wall / deck view); for a super admin with a
-    /// non-empty review queue, a bottom frame at ratio 0.72 carries
-    /// the queue — the framework Default tree's bottom-frame slot.
-    fn dock_showroom(&mut self, ui: &mut egui::Ui) {
-        let review = self.role() == "super" && !self.showroom_pending.is_empty();
-        if self.ws_sr.is_none() || self.ws_sr_review != review {
-            let main = q_hsplit(
-                craft_ui::layout::SplitSize::FixedFirst(268.0),
-                q_tabs(&[QPanel::SrNav]),
-                q_tabs(&[QPanel::SrMain]),
-            );
-            let root = if review {
-                q_vsplit(
-                    craft_ui::layout::SplitSize::Ratio(0.72),
-                    main,
-                    q_tabs(&[QPanel::SrReview]),
-                )
-            } else {
-                main
-            };
-            self.ws_sr = Some(q_workspace(root));
-            self.ws_sr_review = review;
-        }
-        self.dock_show(ui, Page::Showroom);
-    }
-
-    /// Content workspace: folder frame 268 fixed + main frame; with
-    /// a block open for maintenance the split gives way to the single
-    /// main frame, exactly as the page behaved before the framework.
-    fn dock_content(&mut self, ui: &mut egui::Ui) {
-        let detail = matches!(self.content.stack.top(), ContentFrame::Unit(_));
-        if self.ws_ct.is_none() || self.ws_ct_detail != detail {
-            let root = if detail {
-                q_tabs(&[QPanel::CtMain])
-            } else {
-                q_hsplit(
-                    craft_ui::layout::SplitSize::FixedFirst(268.0),
-                    q_tabs(&[QPanel::CtNav]),
-                    q_tabs(&[QPanel::CtMain]),
-                )
-            };
-            self.ws_ct = Some(q_workspace(root));
-            self.ws_ct_detail = detail;
-        }
-        self.dock_show(ui, Page::Content);
-    }
-
-    /// Index workspace: folder frame 268 fixed + main frame; the
-    /// create flow takes the whole body, as before.
-    fn dock_index(&mut self, ui: &mut egui::Ui) {
-        let creating = matches!(self.index.stack.top(), IndexFrame::Create(_));
-        if self.ws_ix.is_none() || self.ws_ix_creating != creating {
-            let root = if creating {
-                q_tabs(&[QPanel::IxMain])
-            } else {
-                q_hsplit(
-                    craft_ui::layout::SplitSize::FixedFirst(268.0),
-                    q_tabs(&[QPanel::IxNav]),
-                    q_tabs(&[QPanel::IxMain]),
-                )
-            };
-            self.ws_ix = Some(q_workspace(root));
-            self.ws_ix_creating = creating;
-        }
-        self.dock_show(ui, Page::Index);
-    }
-
-    /// Settings workspace: section nav frame 268 fixed (the
-    /// prototype's one sidepanel width) + section frame.
-    fn dock_settings(&mut self, ui: &mut egui::Ui) {
-        if self.ws_st.is_none() {
-            let root = q_hsplit(
-                craft_ui::layout::SplitSize::FixedFirst(268.0),
-                q_tabs(&[QPanel::StNav]),
-                q_tabs(&[QPanel::StMain]),
-            );
-            self.ws_st = Some(q_workspace(root));
-        }
-        self.dock_show(ui, Page::Settings);
     }
 
     /// The status surface: no status bar — a floating toast where
@@ -6305,360 +6107,8 @@ impl eframe::App for App {
         }
 
 
-        // ==== Main-window chrome, following the HTML prototype's
-        // shell: title bar 32 + menu bar 32 + toolbar 36 = the
-        // prototype's --chrome-h 100px, over a stripless dock body;
-        // no status bar — the message channel floats as a toast.
-        // The title and menu bars sit on --panel, the toolbar on
-        // --bg, each closed by a 1px --line (drawn by hand — the
-        // panels' own separator lines stay off).
-        // ====
         let screen = ui.max_rect();
-        // Row 1 — title bar (.titlebar): 18px logo, the brand, and
-        // the current page as the dim document label. The window
-        // controls on the prototype's right side are the OS
-        // window's own in the client.
-        egui::Panel::top("title_row")
-            .exact_size(32.0)
-            .frame(egui::Frame::NONE.fill(PANEL_BG))
-            .show_separator_line(false)
-            .show(ui, |ui| {
-                ui.horizontal_centered(|ui| {
-                    self.logo_ui(ui, 18.0);
-                    ui.add_space(7.0);
-                    ui.label(
-                        egui::RichText::new("启幕")
-                            .size(12.0)
-                            .strong()
-                            .color(TEXT_MAIN),
-                    );
-                    ui.add_space(8.0);
-                    let page_name = match self.page {
-                        Page::Home => tr("主页"),
-                        Page::Showroom => tr("演示厅"),
-                        Page::Content => tr("内容页"),
-                        Page::Index => tr("索引页"),
-                        Page::Trash => tr("回收站"),
-                        Page::Settings => tr("设置"),
-                    };
-                    ui.label(egui::RichText::new(page_name).size(12.0).color(TEXT_WEAK));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                                .size(11.5)
-                                .color(TEXT_FAINT),
-                        );
-                    });
-                });
-                let r = ui.max_rect();
-                ui.painter().hline(
-                    r.x_range(),
-                    r.max.y - 0.5,
-                    egui::Stroke::new(1.0, SEPARATOR),
-                );
-            });
-        // Row 2 — menu bar (.menubar-row): the text menus on the
-        // left; on the right, the session cluster in the
-        // prototype's slots — the server and the user as quiet
-        // icon-btn text, sign-in as the .pill-primary, sign-out as
-        // an icon tool.
-        egui::Panel::top("menu_row")
-            .exact_size(32.0)
-            .frame(egui::Frame::NONE.fill(PANEL_BG))
-            .show_separator_line(false)
-            .show(ui, |ui| {
-                egui::MenuBar::new().ui(ui, |ui| {
-                    ui.menu_button(egui::RichText::new(tr("文件")).size(12.0), |ui| {
-                        ui.set_min_width(160.0);
-                        if self.user.is_some() {
-                            if ui.button(tr("退出登录")).clicked() {
-                                self.logout();
-                                ui.close();
-                            }
-                        } else if ui.button(tr("登录")).clicked() {
-                            self.login_open = true;
-                            ui.close();
-                        }
-                        if ui.button(tr("退出")).clicked() {
-                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                            ui.close();
-                        }
-                    });
-                    ui.menu_button(egui::RichText::new(tr("视图")).size(12.0), |ui| {
-                        ui.set_min_width(160.0);
-                        for (page, label) in [
-                            (Page::Home, "主页"),
-                            (Page::Showroom, "演示厅"),
-                            (Page::Content, "内容页"),
-                            (Page::Index, "索引页"),
-                            (Page::Trash, "回收站"),
-                            (Page::Settings, "设置"),
-                        ] {
-                            if ui.button(tr(label)).clicked() {
-                                self.page = page;
-                                self.deep_source = None;
-                                self.review.jump_source = None;
-                                ui.close();
-                            }
-                        }
-                    });
-                    ui.menu_button(egui::RichText::new(tr("帮助")).size(12.0), |ui| {
-                        ui.set_min_width(160.0);
-                        if ui.button(tr("检查更新")).clicked() {
-                            self.check_lan_update(true);
-                            ui.close();
-                        }
-                        if ui.button(tr("关于启幕")).clicked() {
-                            self.about_open = true;
-                            ui.close();
-                        }
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if self.user.is_some() {
-                            if self.tool_slot(ui, false, tr("退出"), "power", *ICON_POWER) {
-                                self.logout();
-                            }
-                        } else if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new(tr("登录"))
-                                        .size(12.5)
-                                        .color(egui::Color32::WHITE),
-                                )
-                                .fill(ACCENT)
-                                .stroke(egui::Stroke::NONE)
-                                .corner_radius(255)
-                                .min_size(egui::vec2(0.0, 26.0)),
-                            )
-                            .clicked()
-                        {
-                            self.login_open = true;
-                        }
-                        ui.add_space(6.0);
-                        let user_text = if self.user.is_some() {
-                            let name = self
-                                .user
-                                .as_ref()
-                                .map(|u| s(u, "display_name"))
-                                .unwrap_or_default();
-                            format!("{name} · {}", self.role())
-                        } else if self.anon_active() {
-                            format!("匿名 · 已连接 {}", self.active_server_label())
-                        } else {
-                            tr("未登录").to_string()
-                        };
-                        ui.label(
-                            egui::RichText::new(user_text)
-                                .size(12.0)
-                                .color(TEXT_WEAK),
-                        );
-                        ui.add_space(6.0);
-                        // Current server: click cycles through the other
-                        // connected servers, or opens 服务器 settings.
-                        let srv_label = craft_i18n::fmt(
-                            tr("服务器：{name}"),
-                            &[("name", &self.active_server_label())],
-                        );
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new(srv_label)
-                                        .size(12.0)
-                                        .color(TEXT_WEAK),
-                                )
-                                .fill(egui::Color32::TRANSPARENT)
-                                .stroke(egui::Stroke::NONE)
-                                .corner_radius(6),
-                            )
-                            .clicked()
-                        {
-                            let connected: Vec<usize> = (0..self.conns.len())
-                                .filter(|&i| self.conns[i].status == ConnStatus::Connected)
-                                .collect();
-                            if connected.len() > 1 {
-                                let cur = self.active.unwrap_or(usize::MAX);
-                                let pos = connected.iter().position(|&i| i == cur).unwrap_or(0);
-                                let next = connected[(pos + 1) % connected.len()];
-                                self.activate(next);
-                            } else {
-                                self.page = Page::Settings;
-                                self.settings.section = 0;
-                            }
-                        }
-                    });
-                });
-                let r = ui.max_rect();
-                ui.painter().hline(
-                    r.x_range(),
-                    r.max.y - 0.5,
-                    egui::Stroke::new(1.0, SEPARATOR),
-                );
-            });
-        // Row 3 — toolbar (.toolbar, on --bg): the current page's
-        // tool slots on the left; on the right, the page tabs in
-        // .pagetabs form, split off by a .tool-sep.
-        egui::Panel::top("tool_row")
-            .exact_size(36.0)
-            .show_separator_line(false)
-            .frame(
-                egui::Frame::NONE.fill(HEADER_BG).inner_margin(egui::Margin {
-                    left: 10,
-                    right: 10,
-                    top: 0,
-                    bottom: 0,
-                }),
-            )
-            .show(ui, |ui| {
-                ui.horizontal_centered(|ui| {
-                    // Page tool slots: only actions the page already
-                    // has (the pages keep their in-body buttons; these
-                    // call the same methods) — showroom refreshes,
-                    // content imports, index creates.
-                    match self.page {
-                        Page::Showroom => {
-                            if self.tool_slot(ui, false, tr("刷新"), "refresh", *ICON_REFRESH) {
-                                if self.user.is_some() {
-                                    self.refresh_all();
-                                } else {
-                                    self.refresh_guest();
-                                }
-                            }
-                        }
-                        Page::Content => {
-                            if self.tool_slot(
-                                ui,
-                                false,
-                                tr("智能分块导入"),
-                                "split",
-                                *ICON_SPLIT,
-                            ) {
-                                self.act_import_split();
-                            }
-                            ui.add_space(2.0);
-                            if self.tool_slot(ui, false, tr("导入 PPT"), "upload", *ICON_UPLOAD)
-                            {
-                                self.act_import_ppt();
-                            }
-                            ui.add_space(2.0);
-                            if self.tool_slot(
-                                ui,
-                                false,
-                                tr("粘贴新建"),
-                                "clipboard",
-                                *ICON_CLIPBOARD,
-                            ) {
-                                self.create_unit_from_paste();
-                            }
-                        }
-                        Page::Index => {
-                            if self.tool_slot(
-                                ui,
-                                false,
-                                tr("新建索引"),
-                                "doc-add",
-                                *ICON_DOC_ADD,
-                            ) {
-                                self.act_new_index();
-                            }
-                        }
-                        Page::Home | Page::Trash => {}
-                        Page::Settings => {}
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // Page tabs, rightmost first (rtl layout):
-                        // they read 演示厅 → 内容页 → 索引页 → 设置.
-                        for (page, label) in [
-                            (Page::Settings, "设置"),
-                            (Page::Index, "索引页"),
-                            (Page::Content, "内容页"),
-                            (Page::Showroom, "演示厅"),
-                            (Page::Trash, "回收站"),
-                            (Page::Home, "主页"),
-                        ] {
-                            if page_tab(ui, self.page == page, tr(label)).clicked() {
-                                self.page = page;
-                                self.deep_source = None;
-                                self.review.jump_source = None;
-                            }
-                        }
-                        ui.add_space(4.0);
-                        tool_vsep(ui);
-                    });
-                });
-                let r = ui.max_rect();
-                ui.painter().hline(
-                    r.x_range(),
-                    r.max.y - 0.5,
-                    egui::Stroke::new(1.0, SEPARATOR),
-                );
-            });
-        // Bottom bar (#deckBar): 46px (--bottombar-h) on --panel
-        // with a 1px --line on top, spanning the full width (the
-        // prototype offsets it past the sidebar; egui panels span
-        // the window — declared approximation). The left slot
-        // carries the prototype's page-id chip: the top-level page
-        // number (showroom zones take #2–#5 positionally). The
-        // deck actions the prototype parks on the right live in
-        // the deck view's own bar in the client.
-        egui::Panel::bottom("deck_bar")
-            .exact_size(46.0)
-            .frame(egui::Frame::NONE.fill(PANEL_BG))
-            .show_separator_line(false)
-            .show(ui, |ui| {
-                let r = ui.max_rect();
-                ui.painter().hline(
-                    r.x_range(),
-                    r.min.y + 0.5,
-                    egui::Stroke::new(1.0, SEPARATOR),
-                );
-                ui.horizontal_centered(|ui| {
-                    ui.add_space(22.0);
-                    let pid = match self.page {
-                        Page::Home => "#1",
-                        Page::Showroom => match self.showroom.zone.as_str() {
-                            "library" => "#3",
-                            "inbox" => "#4",
-                            "groups" => "#5",
-                            _ => "#2",
-                        },
-                        Page::Content => "#6",
-                        Page::Index => "#7",
-                        Page::Settings => "#8",
-                        Page::Trash => "#9",
-                    };
-                    egui::Frame::NONE
-                        .fill(HOVER_BG)
-                        .stroke(egui::Stroke::new(1.0, FIELD_BORDER))
-                        .corner_radius(egui::CornerRadius::same(6))
-                        .inner_margin(egui::Margin {
-                            left: 9,
-                            right: 9,
-                            top: 6,
-                            bottom: 6,
-                        })
-                        .show(ui, |ui| {
-                            ui.label(
-                                egui::RichText::new(pid)
-                                    .size(11.5)
-                                    .strong()
-                                    .color(TEXT_WEAK),
-                            );
-                        });
-                });
-            });
-        // Body: the dock area, flush with the window edges — the
-        // prototype's .appbody has no outer inset; the panes carry
-        // their own padding.
-        egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(APP_BG))
-            .show(ui, |ui| match self.page {
-                Page::Home => self.page_home(ui),
-                Page::Showroom => self.dock_showroom(ui),
-                Page::Content => self.dock_content(ui),
-                Page::Index => self.dock_index(ui),
-                Page::Trash => self.page_trash(ui),
-                Page::Settings => self.dock_settings(ui),
-            });
+        self.workspace_ui(ui);
         self.toast(ui, screen);
         self.login_window(ui);
         self.about_window(ui);
@@ -6738,9 +6188,20 @@ impl App {
         width: f32,
         current: bool,
     ) -> bool {
+        self.thumb_response(ui, version_id, page, width, current)
+            .clicked()
+    }
+
+    fn thumb_response(
+        &mut self,
+        ui: &mut egui::Ui,
+        version_id: &str,
+        page: usize,
+        width: f32,
+        current: bool,
+    ) -> egui::Response {
         let h = width * 9.0 / 16.0;
-        let (rect, resp) =
-            ui.allocate_exact_size(egui::vec2(width, h), egui::Sense::click());
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, h), egui::Sense::click());
         if let Some(tex) = self.thumb(version_id, page) {
             ui.painter().image(
                 tex.id(),
@@ -6752,16 +6213,24 @@ impl App {
             ui.painter().rect_filled(rect, 0.0, HOVER_BG);
         }
         if current {
-            ui.painter()
-                .rect_stroke(rect, 0.0, egui::Stroke::new(1.5, ACCENT), egui::StrokeKind::Middle);
+            ui.painter().rect_stroke(
+                rect,
+                0.0,
+                egui::Stroke::new(1.5, ACCENT),
+                egui::StrokeKind::Middle,
+            );
         } else if resp.hovered() {
             // hover outline sits in the selected-fill tier (#2E2F36),
             // not the text gray — a #9E9E9E stroke reads as a bright
             // white line against the dark panels.
-            ui.painter()
-                .rect_stroke(rect, 0.0, egui::Stroke::new(1.0, FIELD_BORDER), egui::StrokeKind::Middle);
+            ui.painter().rect_stroke(
+                rect,
+                0.0,
+                egui::Stroke::new(1.0, FIELD_BORDER),
+                egui::StrokeKind::Middle,
+            );
         }
-        resp.clicked()
+        resp
     }
 
     /// Switch one index entry to a specific version: picking the latest
@@ -7005,7 +6474,10 @@ impl App {
                     "id": item_id, "title": title,
                     "source_index_id": "", "submitted_by": "",
                 }),
-                deck: None,
+                pages: Vec::new(),
+                selected_page: None,
+                view: DeckView::Thumbnails,
+                preview_open: false,
                 closed: false,
             }));
         }
@@ -7018,14 +6490,17 @@ impl App {
         self.showroom.stack.pop_to(0);
         self.showroom.stack.push(SrFrame::Deck(DeckState {
             item: item.clone(),
-            deck: None,
+            pages: Vec::new(),
+            selected_page: None,
+            view: DeckView::Thumbnails,
+            preview_open: false,
             closed: false,
         }));
         let src = s(item, "source_index_id");
         if !src.is_empty() {
             if let Ok(v) = self.call("GET", &format!("/v1/indexes/{src}"), None) {
                 if let SrFrame::Deck(d) = self.showroom.stack.top_mut() {
-                    d.deck = Some(v);
+                    d.pages = showroom_pages(&v);
                 }
             }
         }
@@ -7133,6 +6608,18 @@ impl App {
         name: &'static str,
         bytes: &'static [u8],
     ) -> bool {
+        self.tool_slot_sized(ui, active, label, name, bytes, 26.0).clicked()
+    }
+
+    fn tool_slot_sized(
+        &mut self,
+        ui: &mut egui::Ui,
+        active: bool,
+        label: &str,
+        name: &'static str,
+        bytes: &'static [u8],
+        height: f32,
+    ) -> egui::Response {
         let tex_id = self.tex_icon(ui, name, bytes);
         let visuals = |fill: egui::Color32, icon: egui::Color32| {
             craft_ui::buttons::ButtonVisuals {
@@ -7149,7 +6636,7 @@ impl App {
             corner_radius: egui::CornerRadius::same(6),
             focus_stroke: egui::Stroke::new(1.0, ACCENT),
         };
-        let resp = craft_ui::buttons::IconButton::new(label, egui::vec2(28.0, 26.0), &style)
+        let resp = craft_ui::buttons::IconButton::new(label, egui::vec2(28.0, height), &style)
             .selected(active)
             .show(ui, |ui, rect, icon_tint| {
                 let icon_rect =
@@ -7161,7 +6648,7 @@ impl App {
                     icon_tint,
                 );
             });
-        resp.on_hover_text(label).clicked()
+        resp.on_hover_text(label)
     }
 
     /// Panel-footer icon button: 28×28 craft-ui IconButton with a
@@ -7200,34 +6687,6 @@ impl App {
                 );
             });
         resp.on_hover_text(label).clicked()
-    }
-
-    /// Bottom tool strip of a folder panel (the framework's panel
-    /// footer): a #26262B hairline over a 30px strip holding the one
-    /// action every folder panel shares — new folder at the root,
-    /// through the same FolderEdit state as the tree's context menu.
-    fn nav_footer(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
-        ui.painter().hline(
-            rect.x_range(),
-            rect.min.y + 0.5,
-            egui::Stroke::new(1.0, SEPARATOR),
-        );
-        let inner = egui::Rect::from_min_max(
-            egui::pos2(rect.min.x + 14.0, rect.min.y + 10.0),
-            egui::pos2(rect.max.x - 14.0, rect.max.y - 12.0),
-        );
-        let mut fui = ui.new_child(egui::UiBuilder::new().max_rect(inner));
-        fui.set_clip_rect(inner.intersect(ui.clip_rect()));
-        fui.horizontal_centered(|ui| {
-            if self.small_icon_button(ui, "folder-plus", *ICON_FOLDER_PLUS, tr("新建文件夹")) {
-                self.folder_edit = Some(FolderEdit {
-                    target: None,
-                    parent: None,
-                    text: "新文件夹".into(),
-                });
-                self.folder_edit_focus = true;
-            }
-        });
     }
 
     /// PDF export for the showroom deck on screen (Q21): asks the
@@ -7273,21 +6732,30 @@ impl App {
     /// in entry order; clicking a page opens the large preview.
     fn showroom_deck(&mut self, ui: &mut egui::Ui, st: &mut DeckState) {
         let item = st.item.clone();
-        // Header (James 2026-11-15): deck title on the left; the
-        // actions as IconPark icons at the top-right — 开始演示 /
-        // 导出 / 缓存到本地 in light gray, 返回 in red. No text buttons
-        // here, and the old top-left "‹ 返回" text entry is gone (back
-        // is the red icon). The 分享 icon is gone (2026-11-23 ruling:
-        // sharing is export-only at this stage; the permissioned
-        // in-server share flow returns with the organization phase).
-        let mut go_back = false;
+        let preview_open = st.preview_open;
+        let return_label = if preview_open {
+            "稿件详情"
+        } else {
+            "演示厅"
+        };
+        let current_label = if preview_open {
+            "单页预览"
+        } else {
+            "稿件详情"
+        };
+        if crumb_bar(ui, &[return_label, current_label]) == Some(0) {
+            if preview_open {
+                st.preview_open = false;
+            } else {
+                st.closed = true;
+            }
+            return;
+        }
+        ui.add_space(8.0);
         let mut act: Option<&'static str> = None;
         let mut pdf_act: Option<(&'static str, Option<usize>)> = None;
         let cache_key = format!("sr_{}", s(&item, "id"));
-        let already_cached = self
-            .cache_entries
-            .iter()
-            .any(|e| s(e, "key") == cache_key);
+        let already_cached = self.cache_entries.iter().any(|e| s(e, "key") == cache_key);
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new(s(&item, "title"))
@@ -7297,13 +6765,6 @@ impl App {
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
-                // right_to_left: the first button added sits at the far right.
-                if self.icon_button(ui, "icon-back", *ICON_BACK, "返回") {
-                    go_back = true;
-                }
-                // 缓存到本地 sits between 导出 and 返回 (James: fifth
-                // icon); an already-cached entry weakens the glyph and
-                // says so in the tooltip.
                 let (cache_label, cache_tint) = if already_cached {
                     ("已缓存（点击更新缓存）", egui::Color32::from_gray(150))
                 } else {
@@ -7326,10 +6787,6 @@ impl App {
                 }
             });
         });
-        if go_back {
-            st.closed = true;
-            return;
-        }
         let src_name = self
             .indexes
             .iter()
@@ -7339,8 +6796,10 @@ impl App {
         ui.label(
             egui::RichText::new(format!(
                 "{} · {}",
-                if src_name.is_empty() {
+                if s(&item, "source_index_id").is_empty() {
                     "个人组装".to_string()
+                } else if src_name.is_empty() {
+                    "来源索引".to_string()
                 } else {
                     format!("来源索引 {src_name}")
                 },
@@ -7371,7 +6830,7 @@ impl App {
         ui.add_space(8.0);
         match act {
             Some("play") => {
-                self.start_present_from_deck(ui);
+                self.start_presentation(ui, &item, &st.pages);
             }
             Some("export") => {
                 match self.call(
@@ -7395,270 +6854,406 @@ impl App {
                     Err(e) => self.msg = format!("导出失败：{e}"),
                 }
             }
-            Some("cache") => {
-                // Identical flow to the showroom card's 缓存到本地 text
-                // action: export the source index (personal) and hand
-                // the bytes to cache_deck, which enforces the server
-                // cache policy (allowed / capacity) before writing.
-                let src = s(&item, "source_index_id");
-                if src.is_empty() {
-                    self.msg = "该条目暂不支持缓存到本地".into();
-                } else {
-                    let title = s(&item, "title");
-                    match self.call(
-                        "POST",
-                        &format!("/v1/indexes/{src}/export"),
-                        Some(json!({ "branch": "main", "kind": "personal" })),
-                    ) {
-                        Ok(v) => {
-                            if let Some(data) =
-                                v.get("data_base64").and_then(|x| x.as_str())
-                            {
-                                if let Ok(bytes) = b64d(data) {
-                                    let pages = i(&v, "page_count");
-                                    self.cache_deck(&cache_key, &title, &bytes, pages);
-                                }
-                            }
-                        }
-                        Err(e) => self.msg = format!("缓存失败：{e}"),
-                    }
-                }
-            }
+            Some("cache") => self.cache_showroom_deck(&item),
             _ => {}
         }
         if let Some((form, page)) = pdf_act {
             self.export_showroom_pdf(&item, form, page);
         }
+        ui.add_space(8.0);
+        self.showroom_deck_pages(ui, st, &item);
+    }
+
+    fn showroom_deck_pages(&mut self, ui: &mut egui::Ui, st: &mut DeckState, item: &Value) {
+        if st.pages.is_empty() {
+            ui.label(egui::RichText::new("该稿件暂无可查看的页面").color(TEXT_WEAK));
+            return;
+        }
+        if st.preview_open {
+            self.showroom_page_preview(ui, st, item);
+            return;
+        }
+        ui.horizontal(|ui| {
+            if let Some(view) = segmented(
+                ui,
+                &["逐页缩略图", "讲稿"],
+                usize::from(st.view == DeckView::Notes),
+                SegStyle::Soft,
+            ) {
+                st.view = if view == 1 {
+                    DeckView::Notes
+                } else {
+                    DeckView::Thumbnails
+                };
+            }
+            ui.label(egui::RichText::new(format!("{} 页", st.pages.len())).color(TEXT_WEAK));
+            if ui
+                .add_enabled(st.selected_page.is_some(), egui::Button::new("预览所选页"))
+                .clicked()
+            {
+                st.preview_open = true;
+            }
+        });
         ui.add_space(10.0);
-        match &st.deck {
-            Some(deck) => {
-                let resolved = deck
-                    .get("resolved_entries")
-                    .and_then(|r| r.as_array())
-                    .cloned()
-                    .unwrap_or_default();
-                // Flatten to a page list, then lay out in explicit rows:
-                // horizontal_wrapped proved unreliable inside this
-                // nested scroll area (pages ran off the right edge).
-                let mut pages: Vec<(String, usize, usize)> = Vec::new();
-                for re in &resolved {
-                    let ver = re.get("resolved").cloned().unwrap_or(Value::Null);
-                    if !ver.is_object() {
-                        continue;
-                    }
-                    let vid = s(&ver, "id");
-                    let total = i(&ver, "page_count");
-                    for p in 0..total {
-                        pages.push((vid.clone(), p as usize, pages.len() + 1));
-                    }
-                }
-                // Page grid (prototype .deck-pages): fluid
-                // columns, min 212px wide, 12px gaps.
-                let avail = ui.available_width();
-                let per_row = ((avail + 12.0) / 224.0).floor().max(1.0) as usize;
-                let page_w = (avail + 12.0) / per_row as f32 - 12.0;
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
-                    for row in pages.chunks(per_row) {
-                        ui.horizontal(|ui| {
-                            for (vid, p, n) in row {
+        egui::ScrollArea::vertical()
+            .id_salt((item["id"].as_str(), st.view == DeckView::Notes))
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
+                let mut open = false;
+                if st.view == DeckView::Notes {
+                    for (index, page) in st.pages.iter().enumerate() {
+                        let width = ui.available_width();
+                        card_frame().show(ui, |ui| {
+                            ui.set_min_width((width - 26.0).max(0.0));
+                            ui.horizontal_top(|ui| {
+                                let response = self.showroom_page_thumbnail(
+                                    ui,
+                                    page,
+                                    180.0,
+                                    st.selected_page == Some(index),
+                                );
+                                if response.clicked() {
+                                    st.selected_page = Some(index);
+                                    open = response.double_clicked();
+                                }
                                 ui.vertical(|ui| {
-                                    if self.thumb_button(ui, vid, *p, page_w, false) {
-                                        self.overlays.push(Overlay::PagePreview { version_id: vid.clone(), page: *p, global: *n - 1, item: item.clone() });
+                                    ui.label(
+                                        egui::RichText::new(format!("第 {} 页", index + 1))
+                                            .strong(),
+                                    );
+                                    ui.label(if page.note.is_empty() {
+                                        "暂无讲稿"
+                                    } else {
+                                        &page.note
+                                    });
+                                });
+                            });
+                        });
+                    }
+                } else {
+                    let (columns, width) = showroom_columns(ui, 212.0);
+                    for (row_index, row) in st.pages.chunks(columns).enumerate() {
+                        ui.horizontal_top(|ui| {
+                            for (column, page) in row.iter().enumerate() {
+                                let index = row_index * columns + column;
+                                ui.vertical(|ui| {
+                                    let response = self.showroom_page_thumbnail(
+                                        ui,
+                                        page,
+                                        width,
+                                        st.selected_page == Some(index),
+                                    );
+                                    if response.clicked() {
+                                        st.selected_page = Some(index);
+                                        open = response.double_clicked();
                                     }
                                     ui.label(
-                                        egui::RichText::new(format!("第 {n} 页"))
+                                        egui::RichText::new(format!("第 {} 页", index + 1))
                                             .size(11.0)
                                             .color(TEXT_FAINT),
                                     );
                                 });
                             }
                         });
-                        ui.add_space(8.0);
                     }
-                });
+                }
+                if open {
+                    st.preview_open = true;
+                }
+            });
+    }
+
+    fn showroom_page_thumbnail(
+        &mut self,
+        ui: &mut egui::Ui,
+        page: &ShowroomPage,
+        width: f32,
+        selected: bool,
+    ) -> egui::Response {
+        self.thumb_response(ui, &page.version_id, page.slot, width, selected)
+            .on_hover_text("单击选定，双击预览")
+    }
+
+    fn showroom_page_preview(&mut self, ui: &mut egui::Ui, st: &mut DeckState, item: &Value) {
+        let last = st.pages.len() - 1;
+        let mut index = st.selected_page.unwrap_or(0).min(last);
+        if ui.input(|input| input.key_pressed(egui::Key::ArrowLeft)) {
+            index = index.saturating_sub(1);
+        }
+        if ui.input(|input| input.key_pressed(egui::Key::ArrowRight)) {
+            index = (index + 1).min(last);
+        }
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(index > 0, egui::Button::new("上一页"))
+                .clicked()
+            {
+                index -= 1;
             }
-            None => {
-                ui.add_space(60.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(
-                        egui::RichText::new("该条目暂不支持逐页查看")
-                            .size(13.0)
-                            .color(TEXT_WEAK),
+            if ui
+                .add_enabled(index < last, egui::Button::new("下一页"))
+                .clicked()
+            {
+                index += 1;
+            }
+            ui.label(format!("{} / {}", index + 1, st.pages.len()));
+            if ui.small_button("导出本页 PDF").clicked() {
+                self.export_showroom_pdf(item, "slides", Some(index));
+            }
+        });
+        st.selected_page = Some(index);
+        let page = &st.pages[index];
+        ui.add_space(10.0);
+        let width = ui
+            .available_width()
+            .min(ui.available_height().max(240.0) * 16.0 / 9.0 * 0.8);
+        egui::ScrollArea::vertical()
+            .id_salt("showroom-page-preview")
+            .show(ui, |ui| {
+                self.thumb_ui(ui, &page.version_id, page.slot, width);
+                if !page.note.is_empty() {
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new("讲稿").strong());
+                    ui.label(&page.note);
+                }
+            });
+    }
+
+    fn back_from_showroom_detail(&mut self) {
+        if let SrFrame::Deck(st) = self.showroom.stack.top_mut() {
+            if st.preview_open {
+                st.preview_open = false;
+            } else {
+                self.showroom.stack.pop();
+            }
+        }
+    }
+
+    fn cache_showroom_deck(&mut self, item: &Value) {
+        let source = s(item, "source_index_id");
+        if source.is_empty() {
+            self.msg = "该条目暂不支持缓存到本地".into();
+            return;
+        }
+        match self.call(
+            "POST",
+            &format!("/v1/indexes/{source}/export"),
+            Some(json!({ "branch": "main", "kind": "personal" })),
+        ) {
+            Ok(data) => {
+                if let Ok(bytes) = b64d(&s(&data, "data_base64")) {
+                    self.cache_deck(
+                        &format!("sr_{}", s(item, "id")),
+                        &s(item, "title"),
+                        &bytes,
+                        i(&data, "page_count"),
                     );
-                });
+                }
             }
+            Err(e) => self.msg = format!("缓存失败：{e}"),
         }
     }
 
     fn library_view(&mut self, ui: &mut egui::Ui) {
-        ui.label(egui::RichText::new("我的收藏").strong());
-        if self.library_refs.is_empty() {
-            ui.label(egui::RichText::new("暂无收藏。从收到的分享里保存进来。").weak());
-        }
-        for e in self.library_refs.clone() {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(s(&e, "title")).strong());
-                let folder = s(&e, "folder");
-                if !folder.is_empty() {
-                    ui.label(egui::RichText::new(folder).small().weak());
-                }
-                if s(&e, "item_kind") == "showroom" {
-                    if ui.small_button("看整稿").clicked() {
-                        self.open_deck_for_ref("showroom", &s(&e, "item_id"), &s(&e, "title"));
-                    }
-                    if ui.small_button("导出 PPT").clicked() {
-                        let item_id = s(&e, "item_id");
-                        let title = s(&e, "title");
-                        if let Some(path) = rfd::FileDialog::new()
-                            .set_file_name(format!("{title}.pptx"))
-                            .save_file()
-                        {
-                            match self.call(
-                                "POST",
-                                &format!("/v1/showroom/{item_id}/export"),
-                                Some(json!({ "kind": "personal" })),
-                            ) {
-                                Ok(v) => {
-                                    if let Some(data) =
-                                        v.get("data_base64").and_then(|x| x.as_str())
-                                    {
-                                        if let Ok(bytes) = b64d(data) {
-                                            let _ = std::fs::write(&path, bytes);
-                                            self.msg = "已导出".into();
+        let section = self.showroom.library_view;
+        egui::ScrollArea::vertical()
+            .id_salt("showroom-library")
+            .show(ui, |ui| {
+                if section == 0 || section == 1 {
+                    ui.heading("收藏");
+                    self.showroom_cards(
+                        ui,
+                        &self.library_refs.clone(),
+                        "暂无收藏",
+                        |app, ui, e, width| {
+                            let cover = app.showroom_cover(&s(e, "item_id"));
+                            app.showroom_card(ui, width, &s(e, "title"), &cover, |app, ui| {
+                                let folder = s(&e, "folder");
+                                if !folder.is_empty() {
+                                    ui.label(egui::RichText::new(folder).small().weak());
+                                }
+                                if s(&e, "item_kind") == "showroom" {
+                                    if ui.small_button("看整稿").clicked() {
+                                        app.open_deck_for_ref(
+                                            "showroom",
+                                            &s(&e, "item_id"),
+                                            &s(&e, "title"),
+                                        );
+                                    }
+                                    if ui.small_button("导出 PPT").clicked() {
+                                        let item_id = s(&e, "item_id");
+                                        let title = s(&e, "title");
+                                        if let Some(path) = rfd::FileDialog::new()
+                                            .set_file_name(format!("{title}.pptx"))
+                                            .save_file()
+                                        {
+                                            match app.call(
+                                                "POST",
+                                                &format!("/v1/showroom/{item_id}/export"),
+                                                Some(json!({ "kind": "personal" })),
+                                            ) {
+                                                Ok(v) => {
+                                                    if let Some(data) = v
+                                                        .get("data_base64")
+                                                        .and_then(|x| x.as_str())
+                                                    {
+                                                        if let Ok(bytes) = b64d(data) {
+                                                            let _ = std::fs::write(&path, bytes);
+                                                            app.msg = "已导出".into();
+                                                        }
+                                                    }
+                                                }
+                                                Err(e2) => app.msg = format!("导出失败：{e2}"),
+                                            }
                                         }
                                     }
                                 }
-                                Err(e2) => self.msg = format!("导出失败：{e2}"),
-                            }
-                        }
-                    }
-                }
-                if ui.small_button("移除").clicked() {
-                    let lid = s(&e, "id");
-                    match self.call(
-                        "POST",
-                        &format!("/v1/library/{lid}/delete"),
-                        Some(json!({})),
-                    ) {
-                        Ok(_) => {
-                            self.msg = "已移除".into();
-                            self.refresh_all();
-                        }
-                        Err(e2) => self.msg = format!("移除失败：{e2}"),
-                    }
-                }
-            });
-        }
-        ui.separator();
-        ui.label(egui::RichText::new("本地缓存（离线可用）").strong());
-        if self.cache_entries.is_empty() {
-            ui.label(egui::RichText::new("暂无缓存。在广场或我的组装里点「缓存到本地」。").weak());
-        }
-        for e in self.cache_entries.clone() {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(s(&e, "title")).strong());
-                ui.label(format!(
-                    "{} 页 · {}",
-                    i(&e, "page_count"),
-                    fmt_time(i(&e, "cached_ms"))
-                ));
-                let key = s(&e, "key");
-                if ui.button("打开").clicked() {
-                    self.open_cache(&key);
-                }
-                if ui.button("移除缓存").clicked() {
-                    self.remove_cache(&key);
-                }
-            });
-        }
-        ui.separator();
-        ui.label(egui::RichText::new("我的组装").strong());
-        if self.my_assemblies.is_empty() {
-            ui.label(egui::RichText::new("暂无组装").weak());
-        }
-        for a in self.my_assemblies.clone() {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(s(&a, "name")).strong());
-                ui.label(format!(
-                    "{} 个条目 · {}",
-                    i(&a, "entry_count"),
-                    fmt_time(i(&a, "created_ms"))
-                ));
-                if ui.button("缓存到本地").clicked() {
-                    let aid = s(&a, "id");
-                    let name = s(&a, "name");
-                    match self.call(
-                        "POST",
-                        &format!("/v1/assemblies/{aid}/export"),
-                        Some(json!({ "kind": "personal" })),
-                    ) {
-                        Ok(v) => {
-                            if let Some(data) = v.get("data_base64").and_then(|x| x.as_str()) {
-                                if let Ok(bytes) = b64d(data) {
-                                    let pages = i(&v, "page_count");
-                                    self.cache_deck(&aid, &name, &bytes, pages);
+                                if ui.small_button("移除").clicked() {
+                                    let lid = s(&e, "id");
+                                    match app.call(
+                                        "POST",
+                                        &format!("/v1/library/{lid}/delete"),
+                                        Some(json!({})),
+                                    ) {
+                                        Ok(_) => {
+                                            app.msg = "已移除".into();
+                                            app.refresh_all();
+                                        }
+                                        Err(e2) => app.msg = format!("移除失败：{e2}"),
+                                    }
                                 }
-                            }
-                        }
-                        Err(e) => self.msg = format!("缓存失败：{e}"),
-                    }
+                            });
+                        },
+                    );
+                }
+                if section == 0 || section == 2 {
+                    ui.heading("本地缓存");
+                    self.showroom_cards(
+                        ui,
+                        &self.cache_entries.clone(),
+                        "暂无缓存",
+                        |app, ui, e, width| {
+                            app.showroom_card(ui, width, &s(e, "title"), "", |app, ui| {
+                                ui.label(format!(
+                                    "{} 页 · {}",
+                                    i(&e, "page_count"),
+                                    fmt_time(i(&e, "cached_ms"))
+                                ));
+                                let key = s(&e, "key");
+                                if ui.button("打开").clicked() {
+                                    app.open_cache(&key);
+                                }
+                                if ui.button("移除缓存").clicked() {
+                                    app.remove_cache(&key);
+                                }
+                            });
+                        },
+                    );
+                }
+                if section == 0 || section == 3 {
+                    ui.heading("我的组装");
+                    self.showroom_cards(
+                        ui,
+                        &self.my_assemblies.clone(),
+                        "暂无组装",
+                        |app, ui, a, width| {
+                            app.showroom_card(ui, width, &s(a, "name"), "", |app, ui| {
+                                ui.label(format!(
+                                    "{} 个条目 · {}",
+                                    i(&a, "entry_count"),
+                                    fmt_time(i(&a, "created_ms"))
+                                ));
+                                if ui.button("缓存到本地").clicked() {
+                                    let aid = s(&a, "id");
+                                    let name = s(&a, "name");
+                                    match app.call(
+                                        "POST",
+                                        &format!("/v1/assemblies/{aid}/export"),
+                                        Some(json!({ "kind": "personal" })),
+                                    ) {
+                                        Ok(v) => {
+                                            if let Some(data) =
+                                                v.get("data_base64").and_then(|x| x.as_str())
+                                            {
+                                                if let Ok(bytes) = b64d(data) {
+                                                    let pages = i(&v, "page_count");
+                                                    app.cache_deck(&aid, &name, &bytes, pages);
+                                                }
+                                            }
+                                        }
+                                        Err(e) => app.msg = format!("缓存失败：{e}"),
+                                    }
+                                }
+                            });
+                        },
+                    );
                 }
             });
-        }
     }
 
-    /// Permissioned in-server sharing (send to a user / dept /
-    /// group via /v1/shares). OFFLINE at this stage (user ruling
-    /// 2026-11-23: sharing is export-only for now; publish-style
-    /// sharing returns with the organization phase). The panel and
-    /// its server calls are retained untouched for that phase —
-    /// every entry point that opened it has been removed, so this
-    /// is currently unreachable.
-    #[allow(dead_code)]
     fn inbox_view(&mut self, ui: &mut egui::Ui) {
-        if self.inbox.is_empty() {
-            ui.label(egui::RichText::new("暂无收到的分享").weak());
-            return;
-        }
-        for sh in self.inbox.clone() {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(s(&sh, "title")).strong());
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{} · {}",
-                        s(&sh, "from_name"),
-                        fmt_time(i(&sh, "created_ms"))
-                    ))
-                    .small()
-                    .weak(),
+        let items = self
+            .inbox
+            .iter()
+            .filter(|item| Self::share_matches_source(item, self.showroom.share_source))
+            .cloned()
+            .collect::<Vec<_>>();
+        egui::ScrollArea::vertical()
+            .id_salt("showroom-inbox")
+            .show(ui, |ui| {
+                self.showroom_cards(
+                    ui,
+                    &items,
+                    "这个来源下暂时没有分享。",
+                    Self::showroom_shared_card,
                 );
-                if s(&sh, "item_kind") == "showroom" {
-                    if ui.small_button("看整稿").clicked() {
-                        self.open_deck_for_ref(
-                            "showroom",
-                            &s(&sh, "item_id"),
-                            &s(&sh, "title"),
-                        );
-                    }
+            });
+    }
+
+    fn showroom_shared_card(&mut self, ui: &mut egui::Ui, item: &Value, width: f32) {
+        let title = s(item, "title");
+        let id = s(item, "item_id");
+        let cover = self.showroom_cover(&id);
+        let saved = item["in_library"] == true
+            || self
+                .library_refs
+                .iter()
+                .any(|entry| entry["item_id"] == item["item_id"]);
+        let cover_response = self.showroom_card(ui, width, &title, &cover, |app, ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} · {}",
+                    s(item, "from_name"),
+                    fmt_time(i(item, "created_ms"))
+                ))
+                .small()
+                .weak(),
+            );
+            ui.horizontal_wrapped(|ui| {
+                if item["item_kind"] == "showroom" && ui.small_button("打开详情").clicked() {
+                    app.open_deck_for_ref("showroom", &id, &title);
                 }
-                if sh.get("in_library").and_then(|v| v.as_bool()) == Some(true) {
-                    ui.label(egui::RichText::new("已在我的库").weak());
+                if saved {
+                    ui.label(egui::RichText::new("已在我的库").small().weak());
                 } else if ui.small_button("保存到我的库").clicked() {
-                    let sid = s(&sh, "id");
-                    match self.call(
-                        "POST",
-                        &format!("/v1/shares/{sid}/accept"),
-                        Some(json!({})),
-                    ) {
+                    let sid = s(item, "id");
+                    match app.call("POST", &format!("/v1/shares/{sid}/accept"), Some(json!({}))) {
                         Ok(_) => {
-                            self.msg = "已保存到我的库".into();
-                            self.refresh_all();
+                            app.msg = "已保存到我的库".into();
+                            app.refresh_all();
                         }
-                        Err(e) => self.msg = format!("保存失败：{e}"),
+                        Err(e) => app.msg = format!("保存失败：{e}"),
                     }
                 }
             });
+        });
+        let response = ui.interact(
+            cover_response,
+            ui.scope_id().with(("share", s(item, "id"))),
+            egui::Sense::click(),
+        );
+        if response.double_clicked() && item["item_kind"] == "showroom" {
+            self.open_deck_for_ref("showroom", &id, &title);
         }
     }
 
@@ -7691,8 +7286,13 @@ impl App {
             .and_then(|u| u.as_array())
             .cloned()
             .unwrap_or_default();
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for space in self.group_spaces.clone() {
+        let Some(space) = self.active_showroom_group().cloned() else {
+            ui.label(egui::RichText::new("还没加入任何群组").weak());
+            return;
+        };
+        egui::ScrollArea::vertical()
+            .id_salt("showroom-groups")
+            .show(ui, |ui| {
                 let g = space.get("group").cloned().unwrap_or(json!({}));
                 let gid = s(&g, "id");
                 ui.label(
@@ -7713,7 +7313,11 @@ impl App {
                             .join("、")
                     })
                     .unwrap_or_default();
-                ui.label(egui::RichText::new(format!("成员：{members}")).small().weak());
+                ui.label(
+                    egui::RichText::new(format!("成员：{members}"))
+                        .small()
+                        .weak(),
+                );
                 // owner can add members
                 if s(&g, "owner_id") == self.my_id {
                     ui.horizontal(|ui| {
@@ -7756,126 +7360,37 @@ impl App {
                         }
                     });
                 }
-                if let Some(items) = space.get("items").and_then(|v| v.as_array()) {
-                    if items.is_empty() {
-                        ui.label(egui::RichText::new("暂无分享到本组的内容").weak());
-                    }
-                    for it in items {
-                        ui.horizontal(|ui| {
-                            ui.label(s(it, "title"));
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "{} · {}",
-                                    s(it, "from_name"),
-                                    fmt_time(i(it, "created_ms"))
-                                ))
-                                .small()
-                                .weak(),
-                            );
-                            if s(it, "item_kind") == "showroom" {
-                                if ui.small_button("看整稿").clicked() {
-                                    self.open_deck_for_ref(
-                                        "showroom",
-                                        &s(it, "item_id"),
-                                        &s(it, "title"),
-                                    );
-                                }
-                            }
-                            if ui.small_button("保存到我的库").clicked() {
-                                let sid = s(it, "id");
-                                match self.call(
-                                    "POST",
-                                    &format!("/v1/shares/{sid}/accept"),
-                                    Some(json!({})),
-                                ) {
-                                    Ok(_) => {
-                                        self.msg = "已保存到我的库".into();
-                                        self.refresh_all();
-                                    }
-                                    Err(e) => self.msg = format!("保存失败：{e}"),
-                                }
-                            }
-                        });
-                    }
-                }
-                ui.separator();
-            }
-            if self.group_spaces.is_empty() {
-                ui.label(egui::RichText::new("还没加入任何群组").weak());
-            }
-        });
+                ui.add_space(12.0);
+                ui.heading("群组共享空间");
+                let items = space["items"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                self.showroom_cards(
+                    ui,
+                    items,
+                    "暂无分享到本组的内容",
+                    Self::showroom_shared_card,
+                );
+            });
     }
 
-    /// Showroom navigation frame body: the four zones over the
-    /// folder tree — the page's existing left column, unchanged,
-    /// drawn on its chrome fill inside the dock frame.
-    fn sr_nav_body(&mut self, ui: &mut egui::Ui) {
-        let rect = ui.max_rect();
-        ui.painter().rect_filled(rect, 0.0, PANEL_BG);
-        let (content_rect, footer_rect) = nav_split(rect);
-        let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(content_rect));
-        cui.set_clip_rect(content_rect.intersect(ui.clip_rect()));
-        {
-            let ui = &mut cui;
-            // The four zones live at the top of the left column as
-            // the prototype's .show-seg: a 2x2 grid of segment
-            // buttons (--panel2 fill, 1px --line border, 6px
-            // radius, 26px min height, 5px gaps); the selected
-            // zone takes the accent-soft fill + accent border +
-            // accent text. The folder tree sits below them.
-            let zones: &[(&str, &str)] = &[
-                ("plaza", "广场"),
-                ("library", "我的库"),
-                ("inbox", "收到的分享"),
-                ("groups", "群组空间"),
-            ];
-            let seg_w = (ui.available_width() - 5.0) / 2.0;
-            for pair in zones.chunks(2) {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 5.0;
-                    for (zone, label) in pair {
-                        let active = self.showroom.zone == *zone;
-                        let btn = egui::Button::new(
-                            egui::RichText::new(*label)
-                                .size(12.5)
-                                .color(if active { ACCENT } else { TEXT_WEAK }),
-                        )
-                        .fill(if active { ACCENT_SOFT } else { BTN_BG })
-                        .stroke(egui::Stroke::new(
-                            1.0,
-                            if active { ACCENT } else { SEPARATOR },
-                        ))
-                        .corner_radius(egui::CornerRadius::same(6))
-                        .min_size(egui::vec2(seg_w, 26.0));
-                        if ui.add(btn).clicked() && !active {
-                            self.showroom.zone = zone.to_string();
-                            // switching zones leaves any open deck
-                            self.showroom.stack.pop_to(0);
-                        }
-                    }
-                });
-                ui.add_space(5.0);
-            }
-            ui.add_space(9.0);
-            ui.separator();
-            ui.add_space(6.0);
-            let mut sel = self.showroom.folder.clone();
-            self.folder_tree(ui, &mut sel);
-            self.showroom.folder = sel;
-        }
-        self.nav_footer(ui, footer_rect);
-    }
-
-    /// Showroom main frame body: the wall / deck view, unchanged.
+    /// Showroom content slot, including the optional review queue.
     fn sr_main_body(&mut self, ui: &mut egui::Ui) {
+        if self.showroom.zone == "plaza"
+            && matches!(self.showroom.stack.top(), SrFrame::Wall)
+            && self.role() == "super"
+            && !self.showroom_pending.is_empty()
+        {
+            let review_height = ui.available_height() * 0.28;
+            egui::Panel::bottom("showroom_review")
+                .exact_size(review_height)
+                .show(ui, |ui| self.sr_review_body(ui));
+        }
         body_frame().show(ui, |ui| self.showroom_body(ui));
     }
 
-    /// Review queue frame body (super admins): the queue that used
-    /// to sit under the showroom wall, now in the framework's bottom
-    /// frame. Panes are stripless (prototype form), so the frame
-    /// carries its own in-body heading; rows and actions are the
-    /// same.
+    /// Review queue below the showroom wall for super admins.
     fn sr_review_body(&mut self, ui: &mut egui::Ui) {
         egui::Frame::NONE
             .fill(APP_BG)
@@ -8387,33 +7902,30 @@ impl App {
         // Frame-state take-out, same pattern as content/index.
         // The deck view carries its own header (title + icon
         // actions); no "演示厅" heading above it (James 2026-11-15).
-        let mut frame = self.showroom.stack.replace_top(SrFrame::Wall);
-        let closed = match &mut frame {
-            SrFrame::Deck(st) => {
-                self.showroom_deck(ui, st);
-                st.closed
+        if matches!(self.showroom.stack.top(), SrFrame::Wall) {
+            self.showroom_wall(ui);
+            return;
+        }
+        if let SrFrame::Deck(mut deck) = self.showroom.stack.replace_top(SrFrame::Wall) {
+            self.showroom_deck(ui, &mut deck);
+            if deck.closed {
+                self.showroom.stack.pop();
+            } else {
+                self.showroom.stack.replace_top(SrFrame::Deck(deck));
             }
-            SrFrame::Wall => {
-                self.showroom_wall(ui);
-                false
-            }
-        };
-        if closed {
-            self.showroom.stack.pop();
-        } else {
-            self.showroom.stack.replace_top(frame);
         }
     }
 
     /// The zone wall (root frame body): the plaza card grid, or
     /// the library / inbox / groups sub-view for the zone.
     fn showroom_wall(&mut self, ui: &mut egui::Ui) {
-        ui.label(
-            egui::RichText::new(tr("演示厅"))
-                .strong()
-                .size(18.0)
-                .color(TEXT_MAIN),
-        );
+        let title = match self.showroom.zone.as_str() {
+            "library" => "我的",
+            "inbox" => "分享",
+            "groups" => "群组",
+            _ => "公共",
+        };
+        ui.heading(title);
         ui.add_space(6.0);
         if self.deep_source == Some(Page::Home) {
             ui.horizontal(|ui| {
@@ -8444,173 +7956,181 @@ impl App {
             self.groups_view(ui);
             return;
         }
-        ui.add_space(6.0);
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
-            // Card grid (prototype .show-grid): fluid columns,
-            // min 216px wide, 12px gaps — no oversized fixed cards.
-            let avail = ui.available_width();
-            let per_row = ((avail + 12.0) / 228.0).floor().max(1.0);
-            let card_w = (avail + 12.0) / per_row - 12.0;
-            let cover_h = card_w * 9.0 / 16.0;
-            let card_h = cover_h + 118.0;
+        let items = self
+            .showroom_live
+            .iter()
+            .filter(|item| {
+                self.folder_filter_ok(
+                    &self.showroom.folder,
+                    &self.index_folder_of(&s(item, "source_index_id")),
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        egui::ScrollArea::vertical()
+            .id_salt("showroom-plaza")
+            .show(ui, |ui| {
+                self.showroom_cards(
+                    ui,
+                    &items,
+                    "这个目录下暂时没有符合的演示稿。",
+                    Self::showroom_plaza_card,
+                );
+            });
+    }
+
+    fn showroom_plaza_card(&mut self, ui: &mut egui::Ui, item: &Value, width: f32) {
+        let id = s(item, "id");
+        let title = s(item, "title");
+        let cover = self.showroom_cover(&id);
+        let selected = self.showroom.selected_card.as_deref() == Some(id.as_str());
+        let cover_rect = self.showroom_card(ui, width, &title, &cover, |app, ui| {
+            let intro = s(item, "intro");
+            if !intro.is_empty() {
+                ui.add(egui::Label::new(egui::RichText::new(intro).small().weak()).truncate());
+            }
             ui.horizontal_wrapped(|ui| {
-                for item in self.showroom_live.clone() {
-                    if !self.folder_filter_ok(
-                        &self.showroom.folder.clone(),
-                        &self.index_folder_of(&s(&item, "source_index_id")),
-                    ) {
-                        continue;
-                    }
-                    let outer = ui.allocate_ui(egui::vec2(card_w, card_h), |ui| {
-                        // allocate_ui inherits the wrapped horizontal layout;
-                        // card content must flow top-down
-                        ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
-                        card_frame_flush().show(ui, |ui| {
-                            ui.set_min_size(egui::vec2(card_w, card_h));
-                            let src0 = s(&item, "source_index_id");
-                            let cover = self
-                                .index_covers
-                                .get(&src0)
-                                .cloned()
-                                .unwrap_or_default();
-                            if !cover.is_empty() {
-                                self.thumb_ui(ui, &cover, 0, card_w);
-                            } else {
-                                ui.allocate_space(egui::vec2(card_w, cover_h));
-                            }
-                            egui::Frame::NONE
-                                .inner_margin(egui::Margin {
-                                    left: 12,
-                                    right: 12,
-                                    top: 10,
-                                    bottom: 11,
-                                })
-                                .show(ui, |ui| {
-                            // the grid's 16px spacing must not leak in here
-                            ui.spacing_mut().item_spacing = egui::vec2(8.0, 5.0);
-                            ui.label(
-                                egui::RichText::new(s(&item, "title")).strong().size(13.0).color(TEXT_MAIN),
-                            );
-                            ui.add_space(3.0);
-                            let intro = s(&item, "intro");
-                            if !intro.is_empty() {
-                                ui.label(
-                                    egui::RichText::new(intro).size(11.5).color(TEXT_WEAK),
-                                );
-                                ui.add_space(3.0);
-                            }
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "{} · {}",
-                                    s(&item, "submitted_by"),
-                                    fmt_time(i(&item, "created_ms"))
-                                ))
-                                .size(11.0)
-                                .color(TEXT_FAINT),
-                            );
-                            ui.add_space(6.0);
-                            ui.horizontal(|ui| {
-                                if text_action(ui, "开始演示", ACCENT, 13.0) {
-                                    self.open_showroom_deck(&item);
-                                    self.start_present_from_deck(ui);
-                                }
-                                let my_name = self
-                                    .user
-                                    .as_ref()
-                                    .map(|u| s(u, "display_name"))
-                                    .unwrap_or_default();
-                                if self.role() == "super"
-                                    || (!my_name.is_empty()
-                                        && my_name == s(&item, "submitted_by"))
-                                {
-                                    if text_action(ui, "删除", BADGE_BAD_FG, 13.0) {
-                                        self.trash_add("showroom", &s(&item, "id"));
-                                    }
-                                }
-                            let src = s(&item, "source_index_id");
-                            if !src.is_empty() {
-                                if text_action(ui, "缓存到本地", TEXT_MAIN, 13.0) {
-                                    let title = s(&item, "title");
-                                    let key = format!("sr_{}", s(&item, "id"));
-                                    match self.call(
-                                        "POST",
-                                        &format!("/v1/indexes/{src}/export"),
-                                        Some(json!({ "branch": "main", "kind": "personal" })),
-                                    ) {
-                                        Ok(v) => {
-                                            if let Some(data) =
-                                                v.get("data_base64").and_then(|x| x.as_str())
-                                            {
-                                                if let Ok(bytes) = b64d(data) {
-                                                    let pages = i(&v, "page_count");
-                                                    self.cache_deck(&key, &title, &bytes, pages);
-                                                }
-                                            }
-                                        }
-                                        Err(e) => self.msg = format!("缓存失败：{e}"),
-                                    }
-                                }
-                            }
-                            });
-                            });
-                        });
-                        });
-                    });
-                    // double-click on the cover opens the whole-deck
-                    // page view (H); the action row below keeps its own
-                    // clicks (the interact only covers the cover area)
-                    let cover_rect = egui::Rect::from_min_size(
-                        outer.response.rect.min,
-                        egui::vec2(card_w, cover_h),
-                    );
-                    let click = ui.interact(
-                        cover_rect,
-                        egui::Id::new(("sr_card", s(&item, "id"))),
-                        egui::Sense::click(),
-                    );
-                    if click.double_clicked() {
-                        self.open_showroom_deck(&item);
+                if ui.small_button("打开详情").clicked() {
+                    app.open_showroom_deck(item);
+                }
+                if ui.small_button("开始演示").clicked() {
+                    app.open_showroom_deck(item);
+                    app.start_present_from_deck(ui);
+                }
+                if !s(item, "source_index_id").is_empty() {
+                    let key = format!("sr_{id}");
+                    let cached = app.cache_entries.iter().any(|entry| entry["key"] == key);
+                    let label = if cached {
+                        "已缓存（点击更新缓存）"
+                    } else {
+                        "缓存到本地"
+                    };
+                    if app.tool_slot(ui, cached, label, "icon-download", *ICON_DOWNLOAD) {
+                        app.cache_showroom_deck(item);
                     }
                 }
-                if self.showroom_live.is_empty() {
-                    ui.add_space(90.0);
-                    ui.vertical_centered(|ui| {
-                        ui.label(egui::RichText::new("暂无内容").size(16.0));
-                        ui.label(
-                            egui::RichText::new("从索引页把成稿推送到演示厅")
-                                .color(TEXT_WEAK),
-                        );
-                    });
+                if app.role() == "super"
+                    || app
+                        .user
+                        .as_ref()
+                        .is_some_and(|u| s(u, "display_name") == s(item, "submitted_by"))
+                {
+                    if text_action(ui, "删除", BADGE_BAD_FG, 12.0) {
+                        app.trash_add("showroom", &id);
+                    }
                 }
             });
         });
-        // NOTE: there is deliberately no "submit to showroom" form here
-        // any more (James 2026-11-15): pushing to the showroom happens
-        // from the index detail （推送到演示厅）, which feeds the same
-        // review queue — rendered in its own dock frame (sr_review_body).
+        let response = ui
+            .interact(
+                cover_rect,
+                ui.scope_id().with(("plaza", &id)),
+                egui::Sense::click(),
+            )
+            .on_hover_text(format!(
+                "{} · {}",
+                s(item, "submitted_by"),
+                fmt_time(i(item, "created_ms"))
+            ));
+        if selected {
+            ui.painter().rect_stroke(
+                cover_rect,
+                6.0,
+                egui::Stroke::new(2.0, ACCENT),
+                egui::StrokeKind::Inside,
+            );
+        }
+        if response.clicked() {
+            self.showroom.selected_card = Some(id);
+        }
+        if response.double_clicked() {
+            self.open_showroom_deck(item);
+        }
     }
 
-    /// Content folder frame body: the folder tree over the panel
-    /// footer strip.
-    fn ct_nav_body(&mut self, ui: &mut egui::Ui) {
-        let rect = ui.max_rect();
-        ui.painter().rect_filled(rect, 0.0, PANEL_BG);
-        let (content_rect, footer_rect) = nav_split(rect);
-        let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(content_rect));
-        cui.set_clip_rect(content_rect.intersect(ui.clip_rect()));
-        let mut sel = self.content.folder_filter.clone();
-        self.folder_tree(&mut cui, &mut sel);
-        self.content.folder_filter = sel;
-        self.nav_footer(ui, footer_rect);
+    fn showroom_cover(&self, item_id: &str) -> String {
+        let Some(item) = self.showroom_live.iter().find(|item| item["id"] == item_id) else {
+            return String::new();
+        };
+        self.index_covers
+            .get(&s(item, "source_index_id"))
+            .cloned()
+            .unwrap_or_default()
     }
 
-    /// Content main frame body: the maintenance grid, or — with a
-    /// block open — the drill-down (the dock layout swaps to this
-    /// single frame then, as the page behaved before the framework).
-    /// 智能分块导入 (content page action, also the content page's
-    /// toolbar slot): pick a deck, let the server propose blocks,
-    /// then import with the proposal confirmed as-is.
+    fn showroom_cards(
+        &mut self,
+        ui: &mut egui::Ui,
+        items: &[Value],
+        empty: &str,
+        mut card: impl FnMut(&mut Self, &mut egui::Ui, &Value, f32),
+    ) {
+        if items.is_empty() {
+            ui.label(egui::RichText::new(empty).color(TEXT_WEAK));
+            return;
+        }
+        ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
+        let (columns, width) = showroom_columns(ui, 216.0);
+        for row in items.chunks(columns) {
+            ui.horizontal_top(|ui| {
+                for item in row {
+                    card(self, ui, item, (width - 2.0).max(1.0));
+                }
+            });
+        }
+    }
+
+    fn showroom_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        width: f32,
+        title: &str,
+        cover: &str,
+        body: impl FnOnce(&mut Self, &mut egui::Ui),
+    ) -> egui::Rect {
+        ui.vertical(|ui| {
+            card_frame_flush()
+                .show(ui, |ui| {
+                    ui.set_width(width);
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    let cover_rect = ui
+                        .allocate_ui(egui::vec2(width, width * 9.0 / 16.0), |ui| {
+                            if cover.is_empty() {
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(width, width * 9.0 / 16.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().rect_filled(rect, 0.0, HOVER_BG);
+                                ui.painter().text(
+                                    rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "PPT",
+                                    egui::FontId::proportional(17.0),
+                                    TEXT_WEAK,
+                                );
+                            } else {
+                                self.thumb_ui(ui, cover, 0, width);
+                            }
+                        })
+                        .response
+                        .rect;
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::symmetric(12, 10))
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(6.0, 5.0);
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(title).strong().size(13.0))
+                                    .truncate(),
+                            );
+                            body(self, ui);
+                        });
+                    cover_rect
+                })
+                .inner
+        })
+        .inner
+    }
+
     fn act_import_split(&mut self) {
         if !self.need_identity("智能分块导入") {
             return;
@@ -9881,9 +9401,6 @@ impl App {
                 Some(Overlay::AllVersions { entry_pos: _ }) => {
                     self.overlays.pop();
                 }
-                Some(Overlay::PagePreview { .. }) => {
-                    self.overlays.pop();
-                }
                 None => {}
             }
         }
@@ -9907,37 +9424,6 @@ impl App {
     /// full-history Window, now an overlay above the detail frame.
     /// Data comes from the open Detail frame; picking a version
     /// commits through switch_entry_version and closes.
-    /// 大页预览 (drill retrofit): the old sr_preview Window at
-    /// the end of the deck view, now an overlay. Returns false
-    /// when the window was closed.
-    fn page_preview_ui(
-        &mut self,
-        ui: &mut egui::Ui,
-        version_id: &str,
-        page: usize,
-        global: usize,
-        item: &Value,
-    ) -> bool {
-        let mut open = true;
-        let mut export_page = false;
-        egui::Window::new(format!("第 {} 页", global + 1))
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-            .show(ui.ctx(), |ui| {
-                self.thumb_ui(ui, version_id, page, 880.0);
-                ui.add_space(6.0);
-                if ui.small_button("导出本页 PDF").clicked() {
-                    export_page = true;
-                }
-            });
-        if export_page {
-            self.export_showroom_pdf(item, "slides", Some(global));
-        }
-        open
-    }
-
     fn all_versions_ui(&mut self, ui: &mut egui::Ui, entry_pos: usize) -> bool {
         let entries_now = self.current_entries();
         let rid = entries_now
@@ -10010,13 +9496,6 @@ impl App {
     ) -> Option<Overlay> {
         match ov {
             Overlay::Confirm(c) => self.confirm_ui(ui, c),
-            Overlay::PagePreview { version_id, page, global, item } => {
-                if self.page_preview_ui(ui, &version_id, page, global, &item) {
-                    Some(Overlay::PagePreview { version_id, page, global, item })
-                } else {
-                    None
-                }
-            }
             Overlay::AllVersions { entry_pos } => {
                 if self.all_versions_ui(ui, entry_pos) {
                     Some(Overlay::AllVersions { entry_pos })
@@ -10254,57 +9733,30 @@ impl App {
         Some(Overlay::PickTemplate(t))
     }
 
-    /// Built-in presenter (prototype A28): full-screen stage on
-    /// the overlay stack. Pages render through the existing server
-    /// thumbnail pipeline (DeckCraft CLI server-side, LibreOffice
-    /// fallback) — the same textures as the deck grid; local
-    /// DeckCraft rendering is route phase 2. Cached offline decks
-    /// keep the external open (no thumbs without a server).
+    /// Playback uses the same DeckCraft thumbnails as the detail page until
+    /// the DeckCraft playback view is connected.
     fn start_present_from_deck(&mut self, ui: &egui::Ui) {
-        let (detail, deck) = match self.showroom.stack.top() {
-            SrFrame::Deck(d) => (d.item.clone(), d.deck.clone()),
-            _ => return,
-        };
-        let Some(deck) = deck else {
-            self.msg = "演示内容尚未加载".into();
+        let SrFrame::Deck(deck) = self.showroom.stack.top() else {
             return;
         };
-        let resolved = deck
-            .get("resolved_entries")
-            .and_then(|r| r.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let mut pages: Vec<(String, usize)> = Vec::new();
-        let mut scripts: Vec<String> = Vec::new();
-        for re in &resolved {
-            let ver = re.get("resolved").cloned().unwrap_or(Value::Null);
-            if !ver.is_object() {
-                continue;
-            }
-            let vid = s(&ver, "id");
-            let ver_scripts: Vec<String> = ver
-                .get("scripts")
-                .and_then(|x| x.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .map(|t| t.as_str().unwrap_or("").to_string())
-                        .collect()
-                })
-                .unwrap_or_default();
-            let total = i(&ver, "page_count").max(0) as usize;
-            for p in 0..total {
-                pages.push((vid.clone(), p));
-                scripts.push(ver_scripts.get(p).cloned().unwrap_or_default());
-            }
-        }
-        if pages.is_empty() {
+        let item = deck.item.clone();
+        let pages = deck.pages.clone();
+        self.start_presentation(ui, &item, &pages);
+    }
+
+    fn start_presentation(&mut self, ui: &egui::Ui, detail: &Value, deck: &[ShowroomPage]) {
+        if deck.is_empty() {
             self.msg = "没有可放映的页面".into();
             return;
         }
+        let (pages, scripts): (Vec<_>, Vec<_>) = deck
+            .iter()
+            .map(|page| ((page.version_id.clone(), page.slot), page.note.clone()))
+            .unzip();
         ui.ctx()
             .send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
         self.overlays.push(Overlay::Present(PresentState {
-            title: s(&detail, "title"),
+            title: s(detail, "title"),
             pages,
             scripts,
             cur: 0,
@@ -11350,6 +10802,12 @@ impl App {
         if !self.need_identity("新建索引") {
             return;
         }
+        if self.page != Page::Index {
+            self.navigate_to(Page::Index);
+        }
+        if matches!(self.index.stack.top(), IndexFrame::Create(_)) {
+            return;
+        }
         let mut pick: Vec<(String, String, bool)> = Vec::new();
         for item in &self.units {
             let unit = item.get("unit").cloned().unwrap_or(json!({}));
@@ -11374,74 +10832,7 @@ impl App {
         }));
     }
 
-    /// Index folder frame body: the folder tree with ＋ 新建索引
-    /// pinned above the panel footer (the framework's panel
-    /// furniture: content / action / footer strip).
-    fn ix_nav_body(&mut self, ui: &mut egui::Ui) {
-        let rect = ui.max_rect();
-        ui.painter().rect_filled(rect, 0.0, PANEL_BG);
-        let (content_rect, footer_rect) = nav_split(rect);
-        let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(content_rect));
-        cui.set_clip_rect(content_rect.intersect(ui.clip_rect()));
-        {
-            let ui = &mut cui;
-            // folder tree scrolls in the space above; ＋ 新建索引 is
-            // pinned to the bottom of the panel (James 2026-11-15)
-            let panel_h = ui.available_height();
-            egui::ScrollArea::vertical()
-                .max_height((panel_h - 48.0).max(60.0))
-                .show(ui, |ui| {
-                    let in_detail =
-                        matches!(self.index.stack.top(), IndexFrame::Detail(_));
-                    let detail_folder = match self.index.stack.top() {
-                        IndexFrame::Detail(d) => {
-                            let f = self.index_folder_of(&s(&d.detail, "id"));
-                            if f.is_empty() {
-                                None
-                            } else {
-                                Some(f)
-                            }
-                        }
-                        _ => None,
-                    };
-                    let mut sel = if in_detail {
-                        detail_folder.clone()
-                    } else {
-                        self.index.overview_folder.clone()
-                    };
-                    self.folder_tree(ui, &mut sel);
-                    if in_detail {
-                        if sel != detail_folder {
-                            // picking another folder leaves the open
-                            // index: pop back to the overview frame
-                            self.index.stack.pop_to(0);
-                            self.index.overview_folder = sel;
-                        }
-                    } else {
-                        self.index.overview_folder = sel;
-                    }
-                });
-            ui.add_space(8.0);
-            if ui
-                .add_sized(
-                    [ui.available_width(), 32.0],
-                    egui::Button::new(
-                        egui::RichText::new("＋ 新建索引").color(egui::Color32::WHITE),
-                    )
-                    .fill(ACCENT)
-                    .corner_radius(6),
-                )
-                .clicked()
-            {
-                self.act_new_index();
-            }
-        }
-        self.nav_footer(ui, footer_rect);
-    }
-
-    /// Index main frame body: overview cards, the detail tile wall,
-    /// or — while creating — the create flow (which takes the whole
-    /// body, as before).
+    /// Index content for the overview, detail, or create frame.
     fn ix_main_body(&mut self, ui: &mut egui::Ui) {
         // Frame-state take-out, same pattern as the content page:
         // a placeholder overview frame sits in the taken frame's
@@ -11451,48 +10842,88 @@ impl App {
             .stack
             .replace_top(IndexFrame::Overview(OverviewState::default()));
         let mut outcome: Option<Option<String>> = None;
-        body_frame().show(ui, |ui| match &mut frame {
-            IndexFrame::Create(st) => {
-                self.index_create(ui, st);
-                if st.closed {
-                    outcome = Some(st.open_after.clone());
+        let mut action = None;
+        body_frame()
+            .inner_margin(egui::Margin {
+                left: PAGE_PAD_L as i8,
+                right: 22,
+                top: 12,
+                bottom: 0,
+            })
+            .show(ui, |ui| match &mut frame {
+                IndexFrame::Create(st) => {
+                    self.index_create(ui, st);
+                    if st.closed {
+                        outcome = Some(st.open_after.clone());
+                    }
                 }
-            }
-            IndexFrame::Detail(st) => {
-                let name = self
-                    .indexes
-                    .iter()
-                    .find(|x| s(x, "id") == st.index_id)
-                    .map(|x| s(x, "name"))
-                    .unwrap_or_default();
-                if crumb_bar(ui, &[tr("索引"), &name]) == Some(0) {
-                    st.closed = true;
+                IndexFrame::Detail(st) => {
+                    let name = self
+                        .indexes
+                        .iter()
+                        .find(|x| s(x, "id") == st.index_id)
+                        .map(|x| s(x, "name"))
+                        .unwrap_or_default();
+                    if crumb_bar(ui, &[tr("索引"), &name]) == Some(0) {
+                        st.closed = true;
+                    }
+                    if !st.closed {
+                        self.index_detail(ui, st, &mut action);
+                    }
+                    if st.closed {
+                        outcome = Some(None);
+                    }
                 }
-                self.index_detail(ui, st);
-                if st.closed {
-                    outcome = Some(None);
+                IndexFrame::Overview(ov) => {
+                    if let Some(id) = self.index_overview(ui, ov) {
+                        outcome = Some(Some(id));
+                    }
                 }
-            }
-            IndexFrame::Overview(ov) => {
-                self.index_overview(ui, ov);
-            }
-        });
+            });
+
+        // Put the frame back before dispatching actions that read or reload it.
+        self.index.stack.replace_top(frame);
         match outcome {
             Some(open_after) => {
                 self.index.stack.pop();
                 if let Some(id) = open_after {
-                    self.open_index_detail(&id);
+                    self.open_index_detail_as(&id, "main".into());
                 }
             }
-            None => {
-                self.index.stack.replace_top(frame);
-            }
+            None => match action {
+                Some(IndexDetailAction::Reload) => self.load_index_detail(),
+                Some(IndexDetailAction::ChangeBranch(branch)) => self.change_index_branch(branch),
+                Some(IndexDetailAction::Export(kind)) => {
+                    if let IndexFrame::Detail(st) = self.index.stack.top() {
+                        let index = st.detail.get("index").cloned().unwrap_or_default();
+                        self.export_index_file(&index, kind);
+                    }
+                }
+                Some(IndexDetailAction::Commit(entries, message)) => {
+                    self.commit_entries(entries, message);
+                }
+                Some(IndexDetailAction::Insert(at)) => {
+                    self.pick = Some(PickState::Insert {
+                        index_name: self.current_index_name(),
+                        at,
+                    });
+                    self.close_unit_detail();
+                    self.page = Page::Content;
+                }
+                Some(IndexDetailAction::PickPages(pos, entry, selected)) => {
+                    self.start_pick_pages(pos, &entry, selected);
+                }
+                Some(IndexDetailAction::SwitchVersion(pos, id, semver, is_latest)) => {
+                    self.switch_entry_version(pos, &id, &semver, is_latest);
+                }
+                None => {}
+            },
         }
     }
 
     /// Index overview: standard cards for the indexes living in the
     /// selected folder. Single click selects, double click opens.
-    fn index_overview(&mut self, ui: &mut egui::Ui, ov: &mut OverviewState) {
+    fn index_overview(&mut self, ui: &mut egui::Ui, ov: &mut OverviewState) -> Option<String> {
         let filter = self.index.overview_folder.clone();
         let title = match &filter {
             None => "全部索引".to_string(),
@@ -11521,138 +10952,153 @@ impl App {
             .into_iter()
             .filter(|x| self.folder_filter_ok(&filter, &s(x, "folder_id")))
             .collect();
+        if items.is_empty() {
+            ov.selected = None;
+            ui.label(egui::RichText::new("当前目录没有索引。").color(TEXT_WEAK));
+            return None;
+        }
+        let mut open = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
             // Card grid (prototype .idx-grid): fluid columns,
             // min 236px wide, 12px gaps.
             let avail = ui.available_width();
             let per_row = ((avail + 12.0) / 248.0).floor().max(1.0);
-            let card_w = (avail + 12.0) / per_row - 12.0;
+            let outer_width = ((avail + 12.0) / per_row - 12.0).floor().max(3.0);
+            // egui frames include the border in their outer allocation.
+            let card_w = outer_width - 2.0;
             let cover_h = card_w * 9.0 / 16.0;
-            let card_h = cover_h + 115.0;
-            ui.horizontal_wrapped(|ui| {
-                for x in items {
-                    let xid = s(&x, "id");
-                    let selected = ov.selected.as_deref() == Some(xid.as_str());
-                    // Scope ring colors: the prototype's .std-card
-                    // scope palette (company/ancestor/deptsub/dept/none).
-                    let scope_color = match s(&x, "scope").as_str() {
-                        "company" => egui::Color32::from_rgb(0x3B, 0x82, 0xC4),
-                        "ancestor" => egui::Color32::from_rgb(0x8B, 0x7C, 0xC9),
-                        "dept_sub" => egui::Color32::from_rgb(0x4D, 0xA6, 0x74),
-                        "dept" => egui::Color32::from_rgb(0xD0, 0x8A, 0x3E),
-                        _ => egui::Color32::from_rgb(0x9A, 0xA3, 0x9C),
-                    };
-                    let resp = ui.allocate_ui(egui::vec2(card_w, card_h), |ui| {
-                        ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
-                            egui::Frame::NONE
-                                .fill(CARD_BG)
-                                .corner_radius(6)
-                                .stroke(egui::Stroke::new(1.0, scope_color))
-                                .show(ui, |ui| {
-                                    ui.set_min_size(egui::vec2(card_w, card_h));
-                                    let cover = self
-                                        .index_covers
-                                        .get(&xid)
-                                        .cloned()
-                                        .unwrap_or_default();
-                                    if !cover.is_empty() {
-                                        self.thumb_ui(ui, &cover, 0, card_w);
-                                    } else {
-                                        ui.allocate_space(egui::vec2(card_w, cover_h));
-                                    }
-                                    egui::Frame::NONE
-                                        .inner_margin(egui::Margin {
-                                            left: 12,
-                                            right: 12,
-                                            top: 10,
-                                            bottom: 11,
-                                        })
-                                        .show(ui, |ui| {
-                                            ui.spacing_mut().item_spacing =
-                                                egui::vec2(8.0, 5.0);
-                                            ui.label(
-                                                egui::RichText::new(s(&x, "name"))
-                                                    .strong()
-                                                    .size(13.0),
+            let card_h = cover_h + 70.0;
+            ui.with_layout(
+                egui::Layout::left_to_right(egui::Align::Min).with_main_wrap(true),
+                |ui| {
+                    for x in items {
+                        let xid = s(&x, "id");
+                        let selected = ov.selected.as_deref() == Some(xid.as_str());
+                        // Scope ring colors: the prototype's .std-card
+                        // scope palette (company/ancestor/deptsub/dept/none).
+                        let scope_color = match s(&x, "scope").as_str() {
+                            "company" => egui::Color32::from_rgb(0x3B, 0x82, 0xC4),
+                            "ancestor" => egui::Color32::from_rgb(0x8B, 0x7C, 0xC9),
+                            "dept_sub" => egui::Color32::from_rgb(0x4D, 0xA6, 0x74),
+                            "dept" => egui::Color32::from_rgb(0xD0, 0x8A, 0x3E),
+                            _ => egui::Color32::from_rgb(0x9A, 0xA3, 0x9C),
+                        };
+                        let resp = ui.allocate_ui(egui::vec2(card_w, card_h), |ui| {
+                            ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                                egui::Frame::NONE
+                                    .fill(CARD_BG)
+                                    .corner_radius(6)
+                                    .stroke(egui::Stroke::new(1.0, scope_color))
+                                    .show(ui, |ui| {
+                                        ui.set_min_size(egui::vec2(card_w, card_h));
+                                        ui.set_max_width(card_w);
+                                        ui.spacing_mut().item_spacing.y = 0.0;
+                                        let cover = self
+                                            .index_covers
+                                            .get(&xid)
+                                            .cloned()
+                                            .unwrap_or_default();
+                                        if !cover.is_empty() {
+                                            self.thumb_ui(ui, &cover, 0, card_w);
+                                        } else {
+                                            let (rect, _) = ui.allocate_exact_size(
+                                                egui::vec2(card_w, cover_h),
+                                                egui::Sense::hover(),
                                             );
-                                            ui.add_space(7.0);
-                                            ui.horizontal(|ui| {
-                                                if let Some(tag) =
-                                                    self.index_tags.get(&xid)
-                                                {
-                                                    chip(
-                                                        ui,
-                                                        &format!("V{tag}"),
-                                                        ACCENT_DEEP,
-                                                        CHIP_BLUE_BG,
-                                                    );
-                                                }
-                                                // 主索引 capsule: this index is
-                                                // its home folder's designated
-                                                // main index (spec §3.10).
-                                                let home = s(&x, "folder_id");
-                                                let is_main = !home.is_empty()
-                                                    && self.folders.iter().any(|f| {
-                                                        s(f, "id") == home
-                                                            && s(f, "main_index_id") == xid
-                                                    });
-                                                if is_main {
-                                                    chip(
-                                                        ui,
-                                                        "主索引",
-                                                        ACCENT_DEEP,
-                                                        CHIP_BLUE_BG,
-                                                    );
-                                                }
-                                                match s(&x, "lifecycle").as_str() {
-                                                    "history" => chip(
-                                                        ui,
-                                                        "历史",
-                                                        TEXT_WEAK,
-                                                        CHIP_GRAY_BG,
-                                                    ),
-                                                    "void" => chip(
-                                                        ui,
-                                                        "已作废",
-                                                        ROSE,
-                                                        ROSE_SOFT_BG,
-                                                    ),
-                                                    _ => {}
-                                                }
+                                            ui.painter().rect_filled(rect, 0.0, HOVER_BG);
+                                        }
+                                        egui::Frame::NONE
+                                            .inner_margin(egui::Margin {
+                                                left: 12,
+                                                right: 12,
+                                                top: 10,
+                                                bottom: 11,
+                                            })
+                                            .show(ui, |ui| {
+                                                ui.spacing_mut().item_spacing =
+                                                    egui::vec2(8.0, 5.0);
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(s(&x, "name"))
+                                                            .strong()
+                                                            .size(13.0),
+                                                    )
+                                                    .truncate(),
+                                                );
+                                                ui.horizontal(|ui| {
+                                                    if let Some(tag) = self.index_tags.get(&xid) {
+                                                        chip(
+                                                            ui,
+                                                            &format!("V{tag}"),
+                                                            ACCENT_DEEP,
+                                                            CHIP_BLUE_BG,
+                                                        );
+                                                    }
+                                                    // 主索引 capsule: this index is
+                                                    // its home folder's designated
+                                                    // main index (spec §3.10).
+                                                    let home = s(&x, "folder_id");
+                                                    let is_main = !home.is_empty()
+                                                        && self.folders.iter().any(|f| {
+                                                            s(f, "id") == home
+                                                                && s(f, "main_index_id") == xid
+                                                        });
+                                                    if is_main {
+                                                        chip(
+                                                            ui,
+                                                            "主索引",
+                                                            ACCENT_DEEP,
+                                                            CHIP_BLUE_BG,
+                                                        );
+                                                    }
+                                                    match s(&x, "lifecycle").as_str() {
+                                                        "history" => chip(
+                                                            ui,
+                                                            "历史",
+                                                            TEXT_WEAK,
+                                                            CHIP_GRAY_BG,
+                                                        ),
+                                                        "void" => {
+                                                            chip(ui, "已作废", ROSE, ROSE_SOFT_BG)
+                                                        }
+                                                        _ => {}
+                                                    }
+                                                });
                                             });
-                                            ui.add_space(7.0);
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "{} · {}",
-                                                    s(&x, "maintainer"),
-                                                    fmt_time(i(&x, "created_ms"))
-                                                ))
-                                                .size(11.0)
-                                                .color(TEXT_FAINT),
-                                            );
-                                        });
-                                });
+                                    });
+                            });
                         });
-                    });
-                    let rect = resp.response.rect;
-                    if selected {
-                        ui.painter().rect_stroke(
-                            rect,
-                            6.0,
-                            egui::Stroke::new(2.0, ACCENT),
-                            egui::StrokeKind::Middle,
-                        );
+                        let rect = resp.response.rect;
+                        let click = ui
+                            .interact(rect, ui.id().with(("idx_card", &xid)), egui::Sense::click())
+                            .on_hover_text(format!(
+                                "{} · {}",
+                                s(&x, "maintainer"),
+                                fmt_time(i(&x, "created_ms"))
+                            ));
+                        let stroke = if selected {
+                            Some(egui::Stroke::new(2.0, ACCENT))
+                        } else if click.hovered() || click.has_focus() {
+                            Some(egui::Stroke::new(1.0, FIELD_BORDER))
+                        } else {
+                            None
+                        };
+                        if let Some(stroke) = stroke {
+                            ui.painter()
+                                .rect_stroke(rect, 6.0, stroke, egui::StrokeKind::Inside);
+                        }
+                        if click.clicked() {
+                            ov.selected = Some(xid.clone());
+                        }
+                        if click.double_clicked() {
+                            open = Some(xid);
+                        }
                     }
-                    let click = ui.interact(rect, egui::Id::new(("idx_card", &xid)), egui::Sense::click());
-                    if click.double_clicked() {
-                        self.open_index_detail_as(&xid, "main".to_string());
-                    } else if click.clicked() {
-                        ov.selected = Some(xid.clone());
-                    }
-                }
-            });
+                },
+            );
         });
+        open
     }
 
     fn index_create(&mut self, ui: &mut egui::Ui, st: &mut CreateState) {
@@ -11732,30 +11178,41 @@ impl App {
         st.pick = pick;
     }
 
-    fn index_detail(&mut self, ui: &mut egui::Ui, st: &mut IndexDetailState) {
+    fn index_detail(
+        &mut self,
+        ui: &mut egui::Ui,
+        st: &mut IndexDetailState,
+        action: &mut Option<IndexDetailAction>,
+    ) {
         let detail = st.detail.clone();
         let index = detail.get("index").cloned().unwrap_or(json!({}));
-        let branches = detail.get("branches").and_then(|b| b.as_array()).cloned().unwrap_or_default();
-        let tags = detail.get("tags").and_then(|t| t.as_array()).cloned().unwrap_or_default();
+        let branches = detail
+            .get("branches")
+            .and_then(|b| b.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let tags = detail
+            .get("tags")
+            .and_then(|t| t.as_array())
+            .cloned()
+            .unwrap_or_default();
         ui.horizontal(|ui| {
             ui.heading(s(&index, "name"));
             ui.label(
-                egui::RichText::new(format!(
-                    "· {}",
-                    s(&index, "maintainer")
-                ))
-                .size(11.5)
-                .color(TEXT_WEAK),
+                egui::RichText::new(format!("· {}", s(&index, "maintainer")))
+                    .size(11.5)
+                    .color(TEXT_WEAK),
             );
         });
         ui.add_space(2.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new("分支").size(11.5).color(TEXT_WEAK));
-            let mut branch = if st.branch.is_empty() {
-                "main".to_string()
+            let current_branch = if st.branch.is_empty() {
+                "main"
             } else {
-                st.branch.clone()
+                &st.branch
             };
+            let mut branch = current_branch.to_owned();
             egui::ComboBox::from_id_salt("branch")
                 .width(96.0)
                 .selected_text(branch.clone())
@@ -11766,9 +11223,8 @@ impl App {
                         }
                     }
                 });
-            if branch != st.branch {
-                st.branch = branch;
-                self.load_index_detail();
+            if branch != current_branch {
+                *action = Some(IndexDetailAction::ChangeBranch(branch));
                 return;
             }
             ui.label(egui::RichText::new("版本").size(11.5).color(TEXT_WEAK));
@@ -11801,7 +11257,8 @@ impl App {
                 if !self.need_identity("发布版本") {
                     // Anonymous session: the login popup is open;
                     // the typed tag name stays for after the login.
-                } else { let id = st.index_id.clone();
+                } else {
+                    let id = st.index_id.clone();
                     let r = self.call(
                         "POST",
                         &format!("/v1/indexes/{id}/tags"),
@@ -11810,7 +11267,7 @@ impl App {
                     match r {
                         Ok(_) => {
                             self.msg = "已发布".into();
-                            self.load_index_detail();
+                            *action = Some(IndexDetailAction::Reload);
                         }
                         Err(e) => self.msg = e,
                     }
@@ -11818,13 +11275,13 @@ impl App {
             }
         });
         ui.add_space(2.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.checkbox(&mut st.include_notes, "添加备注");
             if text_action(ui, "导出（个人版）", TEXT_MAIN, 13.0) {
-                self.export_index_file(&index, "personal");
+                *action = Some(IndexDetailAction::Export("personal"));
             }
             if text_action(ui, "导出（公用版）", TEXT_MAIN, 13.0) {
-                self.export_index_file(&index, "company");
+                *action = Some(IndexDetailAction::Export("company"));
             }
             ui.add_space(24.0);
             if text_action(ui, "删除索引", BADGE_BAD_FG, 13.0) {
@@ -11839,31 +11296,26 @@ impl App {
                     .desired_width(110.0)
                     .margin(egui::vec2(8.0, 2.0)),
             );
-            if text_action_enabled(
-                ui,
-                !st.new_branch.is_empty(),
-                "拉分支",
-                TEXT_MAIN,
-                13.0,
-            ) {
+            if text_action_enabled(ui, !st.new_branch.is_empty(), "拉分支", TEXT_MAIN, 13.0) {
                 let id = st.index_id.clone();
-                    let r = self.call(
-                        "POST",
-                        &format!("/v1/indexes/{id}/branches"),
-                        Some(json!({ "name": st.new_branch, "from": st.branch })),
-                    );
-                    match r {
-                        Ok(_) => {
-                            self.msg = "已拉分支".into();
-                            self.load_index_detail();
-                        }
-                        Err(e) => self.msg = e,
+                let r = self.call(
+                    "POST",
+                    &format!("/v1/indexes/{id}/branches"),
+                    Some(json!({ "name": st.new_branch, "from": st.branch })),
+                );
+                match r {
+                    Ok(_) => {
+                        self.msg = "已拉分支".into();
+                        *action = Some(IndexDetailAction::Reload);
                     }
+                    Err(e) => self.msg = e,
+                }
             }
             if text_action(ui, "推送到演示厅", TEXT_MAIN, 13.0) {
                 if !self.need_identity("推送到演示厅") {
                     // Anonymous session: the login popup is open instead.
-                } else { let id = st.index_id.clone();
+                } else {
+                    let id = st.index_id.clone();
                     let r = self.call(
                         "POST",
                         "/v1/showroom",
@@ -11882,13 +11334,23 @@ impl App {
         });
         ui.add_space(6.0);
         // entry tile wall: horizontal cards, one per row
-        let entries = self.current_entries();
+        let entries: Vec<Value> = detail
+            .get("resolved_entries")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|row| row.get("entry").cloned())
+            .collect();
         let resolved = detail
             .get("resolved_entries")
             .and_then(|r| r.as_array())
             .cloned()
             .unwrap_or_default();
-        egui::ScrollArea::vertical().show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt(&st.index_id).show(ui, |ui| {
+            let cover_width = if ui.available_width() >= 900.0 { 340.0 } else { 300.0 };
+            let card_content_width = (ui.available_width() - 25.0).max(0.0);
+            let thumb_gap = ui.spacing().item_spacing.x;
+            let small_width = (cover_width - 2.0 * thumb_gap) / 3.0;
             for (pos, re) in resolved.iter().enumerate() {
                 let entry = re.get("entry").cloned().unwrap_or(json!({}));
                 let ver = re.get("resolved").cloned().unwrap_or(Value::Null);
@@ -11899,27 +11361,22 @@ impl App {
                 if pos > 0 {
                     ui.vertical_centered(|ui| {
                         if text_action(ui, "＋ 插入条目", TEXT_WEAK, 13.0) {
-                            // insert happens on the content page (pick
-                            // mode), not in a popup (James 2026-11-15)
-                            self.pick = Some(PickState::Insert {
-                                index_name: self.current_index_name(),
-                                at: pos,
-                            });
-                            self.close_unit_detail();
-                            self.page = Page::Content;
+                            *action = Some(IndexDetailAction::Insert(pos));
                         }
                     });
                 }
                 card_frame_square()
                     .inner_margin(egui::Margin {
-                        left: 16,
-                        right: 16,
-                        top: 10,
-                        bottom: 12,
+                        left: 10,
+                        right: 13,
+                        top: 9,
+                        bottom: 9,
                     })
                     .show(ui, |ui| {
+                    ui.set_min_width(card_content_width);
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
+                            ui.set_width(cover_width);
                             ui.label(
                                 egui::RichText::new(format!("#{}", pos + 1))
                                     .size(11.5)
@@ -11928,40 +11385,21 @@ impl App {
                             if ver.is_object() {
                                 let vid = s(&ver, "id");
                                 let total = i(&ver, "page_count");
-                                // first page large by default; extra pages
-                                // as small thumbs beside it (2 rows x 3)
-                                ui.horizontal(|ui| {
-                                    self.thumb_ui(ui, &vid, 0, 232.0);
-                                    if total > 1 {
-                                        ui.vertical(|ui| {
-                                            for row in 0..2 {
-                                                ui.horizontal(|ui| {
-                                                    for col in 0..3 {
-                                                        let p = 1 + row * 3 + col;
-                                                        if (p as i64) < total {
-                                                            self.thumb_ui(
-                                                                ui,
-                                                                &vid,
-                                                                p,
-                                                                86.0,
-                                                            );
-                                                        }
-                                                    }
-                                                });
-                                            }
-                                        });
-                                    }
-                                });
+                                self.thumb_ui(ui, &vid, 0, cover_width);
+                                if total > 1 {
+                                    ui.horizontal_wrapped(|ui| {
+                                        for page in 1..total.min(7) as usize {
+                                            self.thumb_ui(ui, &vid, page, small_width);
+                                        }
+                                    });
+                                }
                             } else {
                                 ui.label("无版本");
                             }
                         });
                         ui.add_space(6.0);
                         ui.vertical(|ui| {
-                            // top row: name left; policy chip, lock toggle and
-                            // excerpt at the top right; delete is a red ✕ in
-                            // the card's top-right corner
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label(
                                     egui::RichText::new(re.get("unit_name").and_then(|x| x.as_str()).unwrap_or(""))
                                         .strong()
@@ -11982,104 +11420,101 @@ impl App {
                                     .size(11.5)
                                     .color(TEXT_WEAK),
                                 );
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if ui
-                                            .button(
-                                                egui::RichText::new("×")
-                                                    .color(ROSE)
-                                                    .size(17.0)
-                                                    .strong(),
-                                            )
-                                            .clicked()
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                            if ui
+                                .button(
+                                    egui::RichText::new("×")
+                                        .color(ROSE)
+                                        .size(17.0)
+                                        .strong(),
+                                )
+                                .clicked()
+                            {
+                                let mut es = entries.clone();
+                                es.remove(pos);
+                                *action = Some(IndexDetailAction::Commit(es, "删除条目"));
+                                return;
+                            }
+                            if ui
+                                .add_enabled(
+                                    pos + 1 < entries.len(),
+                                    egui::Button::new("↓"),
+                                )
+                                .clicked()
+                            {
+                                let mut es = entries.clone();
+                                es.swap(pos, pos + 1);
+                                *action = Some(IndexDetailAction::Commit(es, "调整顺序"));
+                                return;
+                            }
+                            if ui
+                                .add_enabled(pos > 0, egui::Button::new("↑"))
+                                .clicked()
+                            {
+                                let mut es = entries.clone();
+                                es.swap(pos, pos - 1);
+                                *action = Some(IndexDetailAction::Commit(es, "调整顺序"));
+                                return;
+                            }
+                            if ui.button("选页").clicked() {
+                                // page picking happens on the
+                                // content page (pick mode), not
+                                // inline in the card (James)
+                                let total = i(&ver, "page_count") as usize;
+                                let mut sel = vec![true; total];
+                                if let Some(slots) = entry
+                                    .get("excerpt_slots")
+                                    .and_then(|x| x.as_array())
+                                {
+                                    sel = vec![false; total];
+                                    for sl in slots {
+                                        if let Some(n) = sl
+                                            .as_str()
+                                            .and_then(|x| x.parse::<usize>().ok())
                                         {
-                                            let mut es = entries.clone();
-                                            es.remove(pos);
-                                            self.commit_entries(es, "删除条目");
-                                            return;
-                                        }
-                                        if ui
-                                            .add_enabled(
-                                                pos + 1 < entries.len(),
-                                                egui::Button::new("↓"),
-                                            )
-                                            .clicked()
-                                        {
-                                            let mut es = entries.clone();
-                                            es.swap(pos, pos + 1);
-                                            self.commit_entries(es, "调整顺序");
-                                            return;
-                                        }
-                                        if ui
-                                            .add_enabled(pos > 0, egui::Button::new("↑"))
-                                            .clicked()
-                                        {
-                                            let mut es = entries.clone();
-                                            es.swap(pos, pos - 1);
-                                            self.commit_entries(es, "调整顺序");
-                                            return;
-                                        }
-                                        if ui.button("选页").clicked() {
-                                            // page picking happens on the
-                                            // content page (pick mode), not
-                                            // inline in the card (James)
-                                            let total = i(&ver, "page_count") as usize;
-                                            let mut sel = vec![true; total];
-                                            if let Some(slots) = entry
-                                                .get("excerpt_slots")
-                                                .and_then(|x| x.as_array())
-                                            {
-                                                sel = vec![false; total];
-                                                for sl in slots {
-                                                    if let Some(n) = sl
-                                                        .as_str()
-                                                        .and_then(|x| x.parse::<usize>().ok())
-                                                    {
-                                                        if n < total {
-                                                            sel[n] = true;
-                                                        }
-                                                    }
-                                                }
+                                            if n < total {
+                                                sel[n] = true;
                                             }
-                                            self.start_pick_pages(pos, re, sel);
                                         }
-                                        if locked {
-                                            if ui
-                                                .button(
-                                                    egui::RichText::new("解除锁定")
-                                                        .color(CHIP_GREEN_FG),
-                                                )
-                                                .clicked()
-                                            {
-                                                let mut es = entries.clone();
-                                                es[pos]["policy"] = json!("follow_latest");
-                                                es[pos]["locked_semver"] = Value::Null;
-                                                self.commit_entries(es, "解除锁定");
-                                                return;
-                                            }
-                                            chip(ui, "版本锁定", CHIP_ORANGE_FG, CHIP_ORANGE_BG);
-                                        } else {
-                                            if ui
-                                                .add_enabled(
-                                                    ver.is_object(),
-                                                    egui::Button::new("锁定当前版本"),
-                                                )
-                                                .clicked()
-                                            {
-                                                if ver.is_object() {
-                                                    let mut es = entries.clone();
-                                                    es[pos]["policy"] = json!({ "locked": { "version_id": s(&ver, "id") } });
-                                                    es[pos]["locked_semver"] =
-                                                        json!(s(&ver, "semver"));
-                                                    self.commit_entries(es, "锁定版本");
-                                                    return;
-                                                }
-                                            }
-                                            chip(ui, "跟随最新", CHIP_GREEN_FG, CHIP_GREEN_BG);
-                                        }
-                                    },
-                                );
+                                    }
+                                }
+                                *action = Some(IndexDetailAction::PickPages(pos, re.clone(), sel));
+                            }
+                            if locked {
+                                if ui
+                                    .button(
+                                        egui::RichText::new("解除锁定")
+                                            .color(CHIP_GREEN_FG),
+                                    )
+                                    .clicked()
+                                {
+                                    let mut es = entries.clone();
+                                    es[pos]["policy"] = json!("follow_latest");
+                                    es[pos]["locked_semver"] = Value::Null;
+                                    *action = Some(IndexDetailAction::Commit(es, "解除锁定"));
+                                    return;
+                                }
+                                chip(ui, "版本锁定", CHIP_ORANGE_FG, CHIP_ORANGE_BG);
+                            } else {
+                                if ui
+                                    .add_enabled(
+                                        ver.is_object(),
+                                        egui::Button::new("锁定当前版本"),
+                                    )
+                                    .clicked()
+                                {
+                                    if ver.is_object() {
+                                        let mut es = entries.clone();
+                                        es[pos]["policy"] = json!({ "locked": { "version_id": s(&ver, "id") } });
+                                        es[pos]["locked_semver"] =
+                                            json!(s(&ver, "semver"));
+                                        *action = Some(IndexDetailAction::Commit(es, "锁定版本"));
+                                        return;
+                                    }
+                                }
+                                chip(ui, "跟随最新", CHIP_GREEN_FG, CHIP_GREEN_BG);
+                            }
                             });
                             ui.horizontal(|ui| {
                                 if let Some(slots) =
@@ -12115,12 +11550,10 @@ impl App {
                                             let is_cur = vid == cur_id;
                                             ui.vertical(|ui| {
                                                 if self.thumb_button(ui, &vid, 0, 54.0, is_cur) {
-                                                    self.switch_entry_version(
-                                                        pos,
-                                                        &vid,
-                                                        &s(v, "semver"),
-                                                        vid == latest_id,
-                                                    );
+                                                    let is_latest = vid == latest_id;
+                                                    *action = Some(IndexDetailAction::SwitchVersion(
+                                                        pos, vid, s(v, "semver"), is_latest,
+                                                    ));
                                                 }
                                                 ui.label(
                                                     egui::RichText::new(format!(
@@ -12257,7 +11690,7 @@ impl App {
                                 Ok(_) => {
                                     self.msg = "合并完成".into();
                                     st.merge_preview = None;
-                                    self.load_index_detail();
+                                    *action = Some(IndexDetailAction::Reload);
                                 }
                                 Err(e) => self.msg = format!("合并失败：{e}"),
                             }
@@ -12630,35 +12063,7 @@ impl App {
     }
 
     /// Settings nav frame body: the section list, unchanged.
-    fn st_nav_body(&mut self, ui: &mut egui::Ui) {
-        let sections = self.settings_sections();
-        if self.settings.section >= sections.len() {
-            self.settings.section = 0;
-        }
-        egui::Frame::NONE
-            .fill(PANEL_BG)
-            .inner_margin(egui::Margin {
-                left: 12,
-                right: 12,
-                top: 12,
-                bottom: 14,
-            })
-            .show(ui, |ui| {
-                ui.set_min_size(ui.available_size());
-                ui.spacing_mut().item_spacing.y = 2.0;
-                for (i, name) in sections.iter().enumerate() {
-                    if tree_row(ui, self.settings.section == i, 0.0, None, tr(name), 12.5)
-                        .clicked()
-                    {
-                        self.settings.section = i;
-                    }
-                }
-            });
-    }
-
-    /// Settings main frame body: one section at a time, unchanged —
-    /// the section computation and content are the page's own; only
-    /// the wrapping panel became a dock frame.
+    /// Settings content for the section selected in the sidebar.
     fn st_main_body(&mut self, ui: &mut egui::Ui) {
         // Board layout: left section nav, one section at a time on the
         // right; sections a role may not see are not rendered at all.

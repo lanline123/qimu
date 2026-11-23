@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Step-3 pilot: DeckCraft render vs the server's LibreOffice thumbnail
+"""Step-3 pilot: DeckCraft render vs the historical LibreOffice thumbnail
 pipeline, page by page (component-integration ledger, design/组件接入台账.md).
 
 For each input deck:
-  * LO path  — identical to qimu-server's thumb renderer: soffice
+  * LO path  — matches the original qimu-server renderer: soffice
     --headless --convert-to pdf, then pdftoppm -png -r 55.
   * DC path  — deckcraft-cli render --all --scale 1.0, resized to the LO
     page size for comparison.

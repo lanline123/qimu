@@ -4486,6 +4486,7 @@ dependencies = [
  "qimu-core",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
