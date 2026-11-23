@@ -91,11 +91,10 @@ mod tests {
 
     #[test]
     fn case2_proposal_groups_content_under_openers() {
-        let bytes = std::fs::read(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../../user/files/Case2_Charts_Animation.pptx"
-        ))
-        .expect("case2 deck present");
+        let Some(bytes) = crate::test_fixtures::case2_deck() else {
+            eprintln!("{}", crate::test_fixtures::skip_msg("Case2 deck"));
+            return;
+        };
         let pkg = Package::load(&bytes).unwrap();
         let report = propose_blocks(&pkg).unwrap();
         assert_eq!(report.slide_count, 7);

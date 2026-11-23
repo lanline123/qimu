@@ -3,7 +3,7 @@
 native charts (bar/line/pie), a table, shapes, a picture with an entrance
 animation (hand-injected p:timing), a slide transition, notes on most
 slides, and an embedded video if ffmpeg is available."""
-import subprocess, sys
+import os, subprocess, sys
 from pptx import Presentation
 from pptx.chart.data import ChartData
 from pptx.enum.chart import XL_CHART_TYPE
@@ -11,7 +11,7 @@ from pptx.util import Inches, Pt, Emu
 from pptx.dml.color import RGBColor
 from lxml import etree
 
-OUT = "/home/hatch/workspace/user/files/Case2_Charts_Animation.pptx"
+OUT = os.environ.get("QIMU_CASE2_OUT", "/home/hatch/workspace/user/files/Case2_Charts_Animation.pptx")
 prs = Presentation()
 prs.slide_width = Inches(13.333)
 prs.slide_height = Inches(7.5)

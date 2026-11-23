@@ -15,6 +15,8 @@ pub mod propose;
 pub mod section_link;
 pub mod semver;
 pub mod store;
+#[cfg(test)]
+mod test_fixtures;
 pub mod text;
 pub mod translate;
 

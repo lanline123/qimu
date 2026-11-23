@@ -245,11 +245,10 @@ mod tests {
 
     #[test]
     fn manifest_round_trip() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../../user/files/Redwood_Visit_Revised_4tph_0_6vcr.pptx"
-        );
-        let bytes = std::fs::read(path).expect("redwood deck present");
+        let Some(bytes) = crate::test_fixtures::redwood_deck() else {
+            eprintln!("{}", crate::test_fixtures::skip_msg("Redwood deck"));
+            return;
+        };
         let m = Manifest {
             deck_id: "deck_test".into(),
             kind: "personal".into(),

@@ -163,22 +163,17 @@ mod tests {
     use super::*;
     use crate::pptx::slides;
 
-    fn redwood() -> Package {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../user/files/Redwood_Visit_Revised_4tph_0_6vcr.pptx"
-        );
-        // tests run from the workspace; fall back to the home-relative path
-        let bytes = std::fs::read(path).unwrap_or_else(|_| {
-            std::fs::read("/home/hatch/workspace/user/files/Redwood_Visit_Revised_4tph_0_6vcr.pptx")
-                .expect("redwood deck")
-        });
-        Package::load(&bytes).expect("load deck")
+    fn redwood() -> Option<Package> {
+        let bytes = crate::test_fixtures::redwood_deck()?;
+        Some(Package::load(&bytes).expect("load deck"))
     }
 
     #[test]
     fn substitute_and_missing_and_scrub() {
-        let mut pkg = redwood();
+        let Some(mut pkg) = redwood() else {
+            eprintln!("{}", crate::test_fixtures::skip_msg("Redwood deck"));
+            return;
+        };
         // doctor slide 1's first text run into a template line
         let first = slides(&pkg).expect("slides")[0].part.clone();
         let xml = String::from_utf8_lossy(&pkg.parts[&first]).to_string();

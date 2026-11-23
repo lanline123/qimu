@@ -348,11 +348,10 @@ mod tests {
 
     #[test]
     fn assemble_mixed_order_preserves_slide_xml() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../../user/files/Redwood_Visit_Revised_4tph_0_6vcr.pptx"
-        );
-        let bytes = std::fs::read(path).expect("redwood deck present");
+        let Some(bytes) = crate::test_fixtures::redwood_deck() else {
+            eprintln!("{}", crate::test_fixtures::skip_msg("Redwood deck"));
+            return;
+        };
         let pkg = Package::load(&bytes).unwrap();
         let frags = split(&pkg).unwrap();
         assert_eq!(frags.len(), 17);
@@ -385,11 +384,10 @@ mod debug_tests {
 
     #[test]
     fn nested_assembly_like_server_export() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../../user/files/Redwood_Visit_Revised_4tph_0_6vcr.pptx"
-        );
-        let bytes = std::fs::read(path).unwrap();
+        let Some(bytes) = crate::test_fixtures::redwood_deck() else {
+            eprintln!("{}", crate::test_fixtures::skip_msg("Redwood deck"));
+            return;
+        };
         let pkg = Package::load(&bytes).unwrap();
         let singles = split(&pkg).unwrap();
         // blocks like the server import
@@ -434,8 +432,10 @@ mod debug_charts {
 
     #[test]
     fn case2_charts_survive_split_and_assemble() {
-        let bytes = std::fs::read("/home/hatch/workspace/user/files/Case2_Charts_Animation.pptx")
-            .expect("case2 deck");
+        let Some(bytes) = crate::test_fixtures::case2_deck() else {
+            eprintln!("{}", crate::test_fixtures::skip_msg("Case2 deck"));
+            return;
+        };
         let pkg = Package::load(&bytes).unwrap();
         let singles = split(&pkg).unwrap();
         assert_eq!(singles.len(), 7);
