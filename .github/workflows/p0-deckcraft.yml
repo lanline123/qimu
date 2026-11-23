@@ -1,0 +1,62 @@
+# 启幕 DeckCraft 接入 P0 验证 —— 子模块解析 / craft 基线对齐 / 写节往返探针
+#
+# 手动触发 (workflow_dispatch)。本工作流是 PLAN §6 P0 的验收门:
+#   1. checkout 带子模块 (vendor/deckcraft -> lanline123/deckcraft);
+#   2. 工具链钉 Rust 1.95 (DeckCraft 的 rust-version 下限);
+#   3. 依赖图留档 (cargo tree --duplicates: craft-* 双份即对齐失败证据);
+#   4. 写节往返探针 (qimu-core/tests/deckcraft_section_probe.rs):
+#      绿 = 原生节模式可开 (翻 deckcraft-sections feature);
+#      红 = §8 决策 5 降级 (ManifestOnly) 维持, 失败断言指出断点层;
+#   5. 解析后的 Cargo.lock 作为 artifact 回收 (本包有意不带 lock 改动,
+#      首次运行在此生成, 由主聊回收后补提)。
+#
+# 注意 (落仓须知): 本文件受 GitHub App 权限限制, 无法经 Muse 的
+# GitHub App 推送, 需经 PAT Contents API 或 GitHub 网页端落仓后生效。
+
+name: p0-deckcraft
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Verify submodule checkout
+        run: |
+          test -f vendor/deckcraft/crates/model/src/lib.rs
+          test -f vendor/deckcraft/crates/pptx/src/lib.rs
+          git submodule status
+
+      - name: Install Rust 1.95
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95"
+
+      - name: Dependency graph evidence
+        # Evidence only (never fails the job): after the baseline
+        # alignment, craft-ui / craft-update / craft-i18n must each
+        # appear exactly once in the unified graph.
+        run: |
+          cargo tree --workspace --duplicates | tee duplicates.txt || true
+          grep -E "craft-(ui|update|i18n) v" duplicates.txt && echo "ALIGNMENT SUSPECT: aligned craft crate duplicated" || echo "no aligned-craft duplicates"
+        continue-on-error: true
+
+      - name: Section round-trip probe
+        run: cargo test -p qimu-core --test deckcraft_section_probe -- --nocapture
+
+      - name: qimu-core unit tests (incl. section_link gate)
+        run: cargo test -p qimu-core --lib
+
+      - name: Upload resolved Cargo.lock
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p0-resolved-lock
+          path: |
+            Cargo.lock
+            duplicates.txt
