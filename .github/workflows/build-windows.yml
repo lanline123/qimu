@@ -17,16 +17,26 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      # submodules: vendor/deckcraft (DeckCraft full integration,
+      # PLAN §4 form 1). Harmless before P1 wires the path deps;
+      # required from P1 on.
       - uses: actions/checkout@v4
+        with:
+          submodules: true
 
       - name: Install mingw + NSIS
         run: |
           sudo apt-get update
           sudo apt-get install -y g++-mingw-w64-x86-64 nsis
 
+      # Toolchain pinned to 1.95: DeckCraft declares rust-version
+      # 1.95 (edition 2024 / resolver 3); qimu's own crates stay on
+      # edition 2021 but must compile under the same toolchain once
+      # the workspaces share a build (P0 alignment, PLAN §7 risk 6).
       - name: Install Rust (gnu target)
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: "1.95"
           targets: x86_64-pc-windows-gnu
 
       - name: Optional — embed Alibaba PuHuiTi font
