@@ -1295,14 +1295,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "craft-cfb"
+version = "0.1.0"
+source = "git+https://github.com/storytold/craft-libs?rev=8048f8ef92da80fb3ce5a056d59ca591ee66faf1#8048f8ef92da80fb3ce5a056d59ca591ee66faf1"
+
+[[package]]
+name = "craft-drawingml"
+version = "0.1.0"
+source = "git+https://github.com/storytold/craft-libs?rev=8048f8ef92da80fb3ce5a056d59ca591ee66faf1#8048f8ef92da80fb3ce5a056d59ca591ee66faf1"
+dependencies = [
+ "craft-xml",
+ "kurbo",
+ "log",
+ "serde",
+]
+
+[[package]]
 name = "craft-fonts-build"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=0c144b7d983899d4b5b281046dd03a8b1ab35fbb#0c144b7d983899d4b5b281046dd03a8b1ab35fbb"
+source = "git+https://github.com/storytold/craft-libs?rev=63196e66f3033a6623eb629af95a104d26986725#63196e66f3033a6623eb629af95a104d26986725"
 
 [[package]]
 name = "craft-i18n"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=0c144b7d983899d4b5b281046dd03a8b1ab35fbb#0c144b7d983899d4b5b281046dd03a8b1ab35fbb"
+source = "git+https://github.com/storytold/craft-libs?rev=63196e66f3033a6623eb629af95a104d26986725#63196e66f3033a6623eb629af95a104d26986725"
 dependencies = [
  "fixed_decimal",
  "icu_decimal",
@@ -1320,6 +1336,17 @@ dependencies = [
  "unicode-bidi",
  "windows-registry",
  "writeable",
+]
+
+[[package]]
+name = "craft-opc"
+version = "0.1.0"
+source = "git+https://github.com/storytold/craft-libs?rev=8048f8ef92da80fb3ce5a056d59ca591ee66faf1#8048f8ef92da80fb3ce5a056d59ca591ee66faf1"
+dependencies = [
+ "craft-xml",
+ "craft-zip",
+ "log",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1341,6 +1368,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "craft-pptx"
+version = "0.1.0"
+source = "git+https://github.com/storytold/craft-libs?rev=8048f8ef92da80fb3ce5a056d59ca591ee66faf1#8048f8ef92da80fb3ce5a056d59ca591ee66faf1"
+dependencies = [
+ "craft-drawingml",
+ "craft-opc",
+ "craft-xml",
+ "kurbo",
+ "log",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "craft-stream-codecs"
 version = "0.1.0"
 source = "git+https://github.com/storytold/craft-libs?rev=e2dc681a3#e2dc681a3ad8a47038da2f11ddd2c5e1c0454991"
@@ -1354,7 +1396,7 @@ dependencies = [
 [[package]]
 name = "craft-ui"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=0c144b7d983899d4b5b281046dd03a8b1ab35fbb#0c144b7d983899d4b5b281046dd03a8b1ab35fbb"
+source = "git+https://github.com/storytold/craft-libs?rev=63196e66f3033a6623eb629af95a104d26986725#63196e66f3033a6623eb629af95a104d26986725"
 dependencies = [
  "craft-fonts-build",
  "craft-i18n",
@@ -1375,7 +1417,7 @@ dependencies = [
 [[package]]
 name = "craft-update"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=0c144b7d983899d4b5b281046dd03a8b1ab35fbb#0c144b7d983899d4b5b281046dd03a8b1ab35fbb"
+source = "git+https://github.com/storytold/craft-libs?rev=63196e66f3033a6623eb629af95a104d26986725#63196e66f3033a6623eb629af95a104d26986725"
 dependencies = [
  "chrono",
  "dunce",
@@ -1394,6 +1436,26 @@ dependencies = [
  "verifysign",
  "winreg",
  "winsafe",
+ "zip 9.6.0",
+]
+
+[[package]]
+name = "craft-xml"
+version = "0.1.0"
+source = "git+https://github.com/storytold/craft-libs?rev=8048f8ef92da80fb3ce5a056d59ca591ee66faf1#8048f8ef92da80fb3ce5a056d59ca591ee66faf1"
+dependencies = [
+ "quick-xml 0.41.0",
+ "serde",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "craft-zip"
+version = "0.1.0"
+source = "git+https://github.com/storytold/craft-libs?rev=8048f8ef92da80fb3ce5a056d59ca591ee66faf1#8048f8ef92da80fb3ce5a056d59ca591ee66faf1"
+dependencies = [
+ "flate2",
+ "thiserror 2.0.21",
  "zip 9.6.0",
 ]
 
@@ -1486,6 +1548,50 @@ name = "cursor-icon"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
+
+[[package]]
+name = "deckcraft-color"
+version = "0.19.0"
+dependencies = [
+ "craft-drawingml",
+]
+
+[[package]]
+name = "deckcraft-geom"
+version = "0.19.0"
+dependencies = [
+ "craft-drawingml",
+ "kurbo",
+ "serde",
+]
+
+[[package]]
+name = "deckcraft-model"
+version = "0.19.0"
+dependencies = [
+ "craft-drawingml",
+ "deckcraft-color",
+ "deckcraft-geom",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "unicode-segmentation",
+]
+
+[[package]]
+name = "deckcraft-pptx"
+version = "0.19.0"
+dependencies = [
+ "craft-cfb",
+ "craft-drawingml",
+ "craft-opc",
+ "craft-pptx",
+ "craft-xml",
+ "deckcraft-color",
+ "deckcraft-geom",
+ "deckcraft-model",
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "deflate64"
@@ -3012,6 +3118,7 @@ dependencies = [
  "arrayvec",
  "euclid",
  "polycool",
+ "serde",
  "smallvec",
 ]
 
@@ -4332,6 +4439,8 @@ version = "0.1.0"
 dependencies = [
  "argon2",
  "craft-atomic",
+ "deckcraft-model",
+ "deckcraft-pptx",
  "rand 0.8.8",
  "rusqlite",
  "serde",
@@ -5110,6 +5219,9 @@ name = "smallvec"
 version = "1.16.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "149309498a5f7334b12ddae0cad8aba81ce785fe91755068867e017cf98fee46"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "smithay-client-toolkit"
