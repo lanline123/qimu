@@ -3276,6 +3276,34 @@ impl App {
         raw_call(&self.server, self.token.as_deref(), method, path, body, false)
     }
 
+    /// Working-data call (local-first P1): with the gray switch on,
+    /// the import / units / indexes / folders / trash / search
+    /// paths are served by the in-process local library; anything
+    /// the local dispatcher does not claim — organization surfaces,
+    /// objects that live on the server — falls through to REST
+    /// unchanged. With the switch off this is exactly `call`.
+    fn call_work(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
+        if let Some(local) = &self.local {
+            if let Some(r) = local.dispatch(method, path, body.as_ref()) {
+                return r;
+            }
+        }
+        self.call(method, path, body)
+    }
+
+    /// Identity gate for LOCAL actions (local-first P1, design
+    /// §6.2): an action whose data lands in the local library —
+    /// import, create, paste, folder edits, index work — never
+    /// needs a remote identity, so with the local library open it
+    /// proceeds ungated. Organization actions (submit, review,
+    /// org settings) keep using `need_identity`.
+    fn need_identity_local(&mut self, action: &str) -> bool {
+        if self.local.is_some() {
+            return true;
+        }
+        self.need_identity(action)
+    }
+
     fn do_login(&mut self) {
         self.server = normalize_url(&self.server);
         let r = self.call(
@@ -3864,12 +3892,12 @@ impl App {
         }
     }
 
-    /// Working data from the local library (P0 skeleton: the read
-    /// side; P1 moves the write paths onto the same store). The
-    /// per-index detail pass (covers/tags) still belongs to the REST
-    /// path in this phase.
+    /// Working data from the local library: folders/groups/
+    /// units/indexes reads (P0) plus the per-index detail pass
+    /// (covers/tags) assembled locally (P1 — write paths go through
+    /// the dispatch in `call_work`, not through here).
     fn refresh_local(&mut self) {
-        let Some(local) = &self.local else {
+        let Some(local) = self.local.clone() else {
             return;
         };
         self.folders = local.list_folders();
@@ -3879,6 +3907,36 @@ impl App {
             overview.graphs = None;
         }
         self.indexes = local.list_indexes();
+        // Per-index detail pass (P1): covers and search tags for
+        // local indexes are assembled from the local store,
+        // mirroring the REST loop in refresh_all_rest (which skips
+        // indexes whose tags are already remembered).
+        for x in self.indexes.clone() {
+            let xid = s(&x, "id");
+            if xid.is_empty() || self.index_search_tags.contains_key(&xid) {
+                continue;
+            }
+            if let Some(d) = local.index_detail(&xid, "main") {
+                if self
+                    .index_covers
+                    .get(&xid)
+                    .map(|c| c.is_empty())
+                    .unwrap_or(true)
+                {
+                    if let Some(vid) = d
+                        .get("resolved_entries")
+                        .and_then(|r| r.as_array())
+                        .and_then(|a| a.first())
+                        .and_then(|e| e.get("resolved"))
+                        .and_then(|r| r.get("id"))
+                        .and_then(|v| v.as_str())
+                    {
+                        self.index_covers.insert(xid.clone(), vid.to_string());
+                    }
+                }
+                self.remember_index_tags(&xid, &d);
+            }
+        }
     }
 
     /// Organization surfaces over REST: the org-facing half of the
@@ -4156,7 +4214,7 @@ impl App {
         if let ContentFrame::Wall(w) = self.content.stack.root_mut() {
             w.selected = Some(unit_id.to_string());
         }
-        match self.call("GET", &format!("/v1/units/{unit_id}"), None) {
+        match self.call_work("GET", &format!("/v1/units/{unit_id}"), None) {
             Ok(v) => {
                 let mut st = UnitState::new(unit_id, v.clone());
                 // default the publish target to the unit's first rendition
@@ -4180,7 +4238,7 @@ impl App {
                 }
                 self.load_attachments(unit_id);
                 st.bindings = self
-                    .call("GET", &format!("/v1/units/{unit_id}/page-bindings"), None)
+                    .call_work("GET", &format!("/v1/units/{unit_id}/page-bindings"), None)
                     .ok()
                     .and_then(|b| {
                         b.get("bindings").and_then(|x| x.as_array()).cloned()
@@ -4442,7 +4500,7 @@ impl App {
         } else {
             st.branch.clone()
         };
-        match self.call("GET", &format!("/v1/indexes/{index_id}?branch={}", query_component(&b)), None) {
+        match self.call_work("GET", &format!("/v1/indexes/{index_id}?branch={}", query_component(&b)), None) {
             Ok(v) => st.detail = v,
             Err(e) => {
                 self.msg = format!("打开索引失败：{e}");
@@ -4485,7 +4543,7 @@ impl App {
             ),
             _ => return,
         };
-        match self.call("GET", &format!("/v1/indexes/{id}?branch={}", query_component(&branch)), None) {
+        match self.call_work("GET", &format!("/v1/indexes/{id}?branch={}", query_component(&branch)), None) {
             Ok(v) => {
                 if let IndexFrame::Overview(overview) = self.index.stack.root_mut() {
                     overview.graphs = None;
@@ -4505,7 +4563,7 @@ impl App {
             return;
         };
         let id = st.index_id.clone();
-        match self.call("GET", &format!("/v1/indexes/{id}?branch={}", query_component(&branch)), None) {
+        match self.call_work("GET", &format!("/v1/indexes/{id}?branch={}", query_component(&branch)), None) {
             Ok(detail) => {
                 if let IndexFrame::Detail(st) = self.index.stack.top_mut() {
                     st.branch = branch;
@@ -4548,7 +4606,7 @@ impl App {
         }
         let mut unit_versions: std::collections::HashMap<String, Vec<Value>> = Default::default();
         for uid in seen_units {
-            if let Ok(u) = self.call("GET", &format!("/v1/units/{uid}"), None) {
+            if let Ok(u) = self.call_work("GET", &format!("/v1/units/{uid}"), None) {
                 if let Some(rends) = u.get("renditions").and_then(|r| r.as_array()) {
                     for r in rends {
                         let rid = r.get("rendition").map(|x| s(x, "id")).unwrap_or_default();
@@ -4575,7 +4633,7 @@ impl App {
             d.unit_versions = unit_versions;
         }
         let commits = self
-            .call(
+            .call_work(
                 "GET",
                 &format!("/v1/indexes/{id}/commits?branch={}", query_component(&branch)),
                 None,
@@ -4603,7 +4661,7 @@ impl App {
             ),
             _ => return,
         };
-        let r = self.call(
+        let r = self.call_work(
             "POST",
             &format!("/v1/indexes/{id}/commits"),
             Some(json!({ "branch": branch, "message": message, "entries": entries })),
@@ -4879,10 +4937,10 @@ impl App {
     }
 
     fn create_blank_unit(&mut self) {
-        if !self.need_identity("新建内容块") {
+        if !self.need_identity_local("新建内容块") {
             return;
         }
-        let r = self.call(
+        let r = self.call_work(
             "POST",
             "/v1/units",
             Some(json!({
@@ -4912,7 +4970,7 @@ impl App {
     /// version. QIMU_PASTE_FRAGMENT points at a prepared fragment file
     /// and stands in for the bridge capture in headless verification.
     fn create_unit_from_paste(&mut self) {
-        if !self.need_identity("粘贴新建") {
+        if !self.need_identity_local("粘贴新建") {
             return;
         }
         let frag: Option<std::path::PathBuf> = std::env::var("QIMU_PASTE_FRAGMENT")
@@ -4953,7 +5011,7 @@ impl App {
         name: &str,
         note: &str,
     ) -> Option<String> {
-        let created = self.call(
+        let created = self.call_work(
             "POST",
             "/v1/units",
             Some(json!({
@@ -4979,7 +5037,7 @@ impl App {
             self.msg = "新建失败：服务器未返回内容块".into();
             return None;
         }
-        match self.call(
+        match self.call_work(
             "POST",
             &format!("/v1/units/{uid}/publish"),
             Some(json!({
@@ -5105,7 +5163,7 @@ impl App {
     /// 粘贴：逐页成块 (each clipboard page becomes its own block) or
     /// 整组成块 (all pages become one multi-page block).
     fn clip_paste(&mut self, split_into_blocks: bool) {
-        if !self.need_identity("粘贴") {
+        if !self.need_identity_local("粘贴") {
             return;
         }
         let Some(bytes) = self.clip_source_bytes() else {
@@ -5206,7 +5264,7 @@ impl App {
 
     fn version_fragment_bytes(&mut self, vid: &str) -> Result<Vec<u8>, String> {
         let resp = self
-            .call("GET", &format!("/v1/versions/{vid}/fragment"), None)
+            .call_work("GET", &format!("/v1/versions/{vid}/fragment"), None)
             .map_err(|e| format!("{e}"))?;
         let data = resp
             .get("data_base64")
@@ -5256,7 +5314,7 @@ impl App {
     /// only after the clipboard holds its pages.
     fn clip_copy_units(&mut self, unit_ids: &[String], cut: bool) {
         let what = if cut { "剪切内容块" } else { "复制内容块" };
-        if !self.need_identity(what) {
+        if !self.need_identity_local(what) {
             return;
         }
         if unit_ids.is_empty() {
@@ -5326,7 +5384,7 @@ impl App {
         form: &str,
         lang: &str,
     ) {
-        if !self.need_identity("剪切页面") {
+        if !self.need_identity_local("剪切页面") {
             return;
         }
         let frag = match self.version_fragment_bytes(version_id) {
@@ -5356,7 +5414,7 @@ impl App {
         }
         let rest: Vec<usize> = (0..total).filter(|p| !pages.contains(p)).collect();
         match self.clip_pick_pages(&frag, &rest) {
-            Ok(rest_bytes) => match self.call(
+            Ok(rest_bytes) => match self.call_work(
                 "POST",
                 &format!("/v1/units/{unit_id}/publish"),
                 Some(json!({
@@ -5384,7 +5442,7 @@ impl App {
     /// 组合为新内容块：the selected blocks' pages, in selection
     /// order, assembled into one new block.
     fn clip_combine_units(&mut self, unit_ids: &[String]) {
-        if !self.need_identity("组合") {
+        if !self.need_identity_local("组合") {
             return;
         }
         if unit_ids.len() < 2 {
@@ -5413,7 +5471,7 @@ impl App {
     /// 组合为新索引：one index whose entries are the selected
     /// blocks' lead renditions, in selection order.
     fn clip_combine_index(&mut self, unit_ids: &[String]) {
-        if !self.need_identity("组合为新索引") {
+        if !self.need_identity_local("组合为新索引") {
             return;
         }
         if unit_ids.len() < 2 {
@@ -5440,7 +5498,7 @@ impl App {
             self.unit_name(&unit_ids[0]),
             unit_ids.len()
         );
-        match self.call(
+        match self.call_work(
             "POST",
             "/v1/indexes",
             Some(json!({
@@ -6598,7 +6656,7 @@ impl App {
     }
 
     fn trash_load(&mut self) {
-        match self.call("GET", "/v1/trash", None) {
+        match self.call_work("GET", "/v1/trash", None) {
             Ok(v) => {
                 self.trash.items = v
                     .get("items")
@@ -6620,7 +6678,7 @@ impl App {
     /// Move an object to the trash (soft delete) — the producers:
     /// unit detail, index detail, showroom cards.
     fn trash_add(&mut self, kind: &str, object_id: &str) -> bool {
-        match self.call(
+        match self.call_work(
             "POST",
             "/v1/trash",
             Some(json!({ "kind": kind, "object_id": object_id })),
@@ -6639,7 +6697,7 @@ impl App {
     }
 
     fn trash_restore(&mut self, trash_id: &str) {
-        match self.call("POST", &format!("/v1/trash/{trash_id}/restore"), Some(json!({}))) {
+        match self.call_work("POST", &format!("/v1/trash/{trash_id}/restore"), Some(json!({}))) {
             Ok(_) => {
                 self.msg = "已恢复".into();
                 self.trash.loaded = false;
@@ -6650,7 +6708,7 @@ impl App {
     }
 
     fn trash_purge(&mut self, trash_id: &str) {
-        match self.call("POST", &format!("/v1/trash/{trash_id}/purge"), Some(json!({}))) {
+        match self.call_work("POST", &format!("/v1/trash/{trash_id}/purge"), Some(json!({}))) {
             Ok(_) => {
                 self.msg = "已彻底删除".into();
                 self.trash.loaded = false;
@@ -6882,7 +6940,7 @@ impl App {
                 let mut ok = 0usize;
                 for id in &ids {
                     if self
-                        .call("POST", &format!("/v1/trash/{id}/restore"), Some(json!({})))
+                        .call_work("POST", &format!("/v1/trash/{id}/restore"), Some(json!({})))
                         .is_ok()
                     {
                         ok += 1;
@@ -9713,7 +9771,7 @@ impl App {
     }
 
     fn act_import_split(&mut self) {
-        if !self.need_identity("智能分块导入") {
+        if !self.need_identity_local("智能分块导入") {
             return;
         }
         if let Some(path) = rfd::FileDialog::new()
@@ -9725,7 +9783,7 @@ impl App {
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
-                match self.call(
+                match self.call_work(
                     "POST",
                     "/v1/import/propose",
                     Some(json!({ "data_base64": b64e(&bytes) })),
@@ -9736,7 +9794,7 @@ impl App {
                             .as_array()
                             .map(|arr| arr.iter().map(|b| s(b, "name")).collect())
                             .unwrap_or_default();
-                        let r = self.call(
+                        let r = self.call_work(
                             "POST",
                             "/v1/import",
                             Some(json!({
@@ -9768,7 +9826,7 @@ impl App {
     /// 导入 PPT (content page action, also its toolbar slot): import
     /// a whole deck into the current folder/group.
     fn act_import_ppt(&mut self) {
-        if !self.need_identity("导入 PPT") {
+        if !self.need_identity_local("导入 PPT") {
             return;
         }
         if let Some(path) = rfd::FileDialog::new()
@@ -9780,7 +9838,7 @@ impl App {
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
-                let r = self.call(
+                let r = self.call_work(
                     "POST",
                     "/v1/import",
                     Some(json!({
@@ -9875,7 +9933,7 @@ impl App {
                     .margin(egui::vec2(14.0, 7.0)),
             );
             if resp.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
-                match self.call("GET", &format!("/v1/search?q={}", query_component(&w.search_text)), None) {
+                match self.call_work("GET", &format!("/v1/search?q={}", query_component(&w.search_text)), None) {
                     Ok(v) => w.search_hits = Some(v),
                     Err(e) => self.msg = e,
                 }
@@ -10381,7 +10439,7 @@ impl App {
                                     ui.label(s(v, "note"));
                                 }
                                 if ui.button("下载片段").clicked() {
-                                    if let Ok(resp) = self.call(
+                                    if let Ok(resp) = self.call_work(
                                         "GET",
                                         &format!("/v1/versions/{}/fragment", s(v, "id")),
                                         None,
@@ -10417,7 +10475,7 @@ impl App {
                                     st.scripts_for = Some(s(v, "id"));
                                 }
                                 if s(v, "status") != "recalled" && ui.button("撤回").clicked() {
-                                    let _ = self.call(
+                                    let _ = self.call_work(
                                         "POST",
                                         &format!("/v1/versions/{}/recall", s(v, "id")),
                                         None,
@@ -10702,7 +10760,7 @@ impl App {
                     let uid = st.unit_id.clone();
                     if let Ok(bytes) = std::fs::read(&path) {
                         let bump = ["major", "minor", "patch"][st.publish_bump];
-                        let r = self.call(
+                        let r = self.call_work(
                             "POST",
                             &format!("/v1/units/{uid}/publish"),
                             Some(json!({
@@ -10838,7 +10896,7 @@ impl App {
                                         .clicked()
                                     {
                                         let uid = st.unit_id.clone();
-                                            let _ = self.call(
+                                            let _ = self.call_work(
                                                 "POST",
                                                 &format!("/v1/units/{uid}/page-bindings/{bid}/delete"),
                                                 None,
@@ -10849,7 +10907,7 @@ impl App {
                                 (Some(fs), None) => {
                                     if ui.button("绑定").clicked() {
                                         let uid = st.unit_id.clone();
-                                            let r = self.call(
+                                            let r = self.call_work(
                                                 "POST",
                                                 &format!("/v1/units/{uid}/page-bindings"),
                                                 Some(json!({
@@ -11076,7 +11134,7 @@ impl App {
     }
 
     fn folder_edit_commit(&mut self) {
-        if !self.need_identity("编辑文件夹") {
+        if !self.need_identity_local("编辑文件夹") {
             return;
         }
         let Some(edit) = self.folder_edit.take() else {
@@ -11089,7 +11147,7 @@ impl App {
         }
         match &edit.target {
             Some(id) => {
-                match self.call(
+                match self.call_work(
                     "POST",
                     &format!("/v1/folders/{id}/rename"),
                     Some(json!({ "name": name })),
@@ -11102,7 +11160,7 @@ impl App {
                 }
             }
             None => {
-                match self.call(
+                match self.call_work(
                     "POST",
                     "/v1/folders",
                     Some(json!({ "name": name, "parent_id": edit.parent })),
@@ -11118,7 +11176,7 @@ impl App {
     }
 
     fn reload_folders(&mut self) {
-        if let Ok(v) = self.call("GET", "/v1/folders", None) {
+        if let Ok(v) = self.call_work("GET", "/v1/folders", None) {
             self.folders = v.get("folders").and_then(|f| f.as_array()).cloned().unwrap_or_default();
         }
     }
@@ -11333,7 +11391,7 @@ impl App {
                     let mut ok = 0usize;
                     for id in &ids {
                         if self
-                            .call(
+                            .call_work(
                                 "POST",
                                 &format!("/v1/trash/{id}/purge"),
                                 Some(json!({})),
@@ -11351,7 +11409,7 @@ impl App {
                     self.refresh_all();
                 }
                 ConfirmAction::EmptyTrash => {
-                    match self.call("POST", "/v1/trash/purge-all", Some(json!({}))) {
+                    match self.call_work("POST", "/v1/trash/purge-all", Some(json!({}))) {
                         Ok(_) => {
                             self.msg = "已清空回收站".into();
                             self.trash.stack = NavStack::new(TrashFrame::List(
@@ -11473,7 +11531,7 @@ impl App {
             let mut entries_min: Vec<Value> = Vec::new();
             let mut entries_raw: Vec<Value> = Vec::new();
             if let Ok(detail) =
-                self.call("GET", &format!("/v1/indexes/{}", t.template_id), None)
+                self.call_work("GET", &format!("/v1/indexes/{}", t.template_id), None)
             {
                 if let Some(res) = detail
                     .get("resolved_entries")
@@ -11490,7 +11548,7 @@ impl App {
                     }
                 }
             }
-            let r = self.call(
+            let r = self.call_work(
                 "POST",
                 "/v1/indexes",
                 Some(json!({
@@ -11504,7 +11562,7 @@ impl App {
                 Ok(v) => {
                     let new_id = s(&v, "id");
                     if !entries_raw.is_empty() {
-                        let _ = self.call(
+                        let _ = self.call_work(
                             "POST",
                             &format!("/v1/indexes/{new_id}/commits"),
                             Some(json!({
@@ -12380,7 +12438,7 @@ impl App {
                 });
             });
         if do_delete {
-            match self.call("DELETE", &format!("/v1/folders/{id}"), None) {
+            match self.call_work("DELETE", &format!("/v1/folders/{id}"), None) {
                 Ok(_) => {
                     self.msg = "已删除文件夹".into();
                     if self.content.folder_filter.as_deref() == Some(id.as_str()) {
@@ -12597,7 +12655,7 @@ impl App {
     /// slot): enter the create flow with the pick list primed from
     /// every unit's renditions.
     fn act_new_index(&mut self) {
-        if !self.need_identity("新建索引") {
+        if !self.need_identity_local("新建索引") {
             return;
         }
         if self.page != Page::Index {
@@ -12924,7 +12982,7 @@ impl App {
                 if entries.is_empty() {
                     self.msg = "至少选一个内容块".into();
                 } else {
-                    let r = self.call(
+                    let r = self.call_work(
                         "POST",
                         "/v1/indexes",
                         Some(json!({
@@ -13041,12 +13099,12 @@ impl App {
             let enter = (version.has_focus() || version.lost_focus())
                 && ui.input(|input| input.key_pressed(egui::Key::Enter));
             if publish || (enter && !st.tag_name.trim().is_empty()) {
-                if !self.need_identity("发布版本") {
+                if !self.need_identity_local("发布版本") {
                     // Anonymous session: the login popup is open;
                     // the typed tag name stays for after the login.
                 } else {
                     let id = st.index_id.clone();
-                    let r = self.call(
+                    let r = self.call_work(
                         "POST",
                         &format!("/v1/indexes/{id}/tags"),
                         Some(json!({ "branch": st.branch, "name": st.tag_name.trim() })),
@@ -13080,7 +13138,7 @@ impl App {
             );
             if text_action_enabled(ui, !st.new_branch.is_empty(), "拉分支", palette_color(TEXT_MAIN), 13.0) {
                 let id = st.index_id.clone();
-                let r = self.call(
+                let r = self.call_work(
                     "POST",
                     &format!("/v1/indexes/{id}/branches"),
                     Some(json!({ "name": st.new_branch, "from": st.branch })),
@@ -13381,7 +13439,7 @@ impl App {
                 let id = st.index_id.clone();
                 let into = st.branch.clone();
                 let from = st.merge_from.clone();
-                match self.call(
+                match self.call_work(
                     "POST",
                     &format!("/v1/indexes/{id}/merge/preview"),
                     Some(json!({ "from": from, "into": into })),
@@ -13464,7 +13522,7 @@ impl App {
                         .iter()
                         .map(|(k, v)| (k.clone(), json!(v)))
                         .collect();
-                    let r = self.call(
+                    let r = self.call_work(
                         "POST",
                         &format!("/v1/indexes/{id}/merge"),
                         Some(json!({

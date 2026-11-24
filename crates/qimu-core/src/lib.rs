@@ -7,6 +7,7 @@
 
 pub mod assemble;
 pub mod auth;
+pub mod import;
 pub mod manifest;
 pub mod model;
 pub mod personalize;

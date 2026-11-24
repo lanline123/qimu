@@ -1376,95 +1376,37 @@ async fn import_deck(
     let user = auth(&st, &headers)?;
     need_cap(&st, &user, &req.group_id, "publish")?;
     let bytes = b64d(&req.data_base64)?;
-    let pkg = Package::load(&bytes).map_err(bad)?;
-    let report = pptx::split_reassemble_verify(&pkg).map_err(bad)?;
-    if !report.ok {
-        return Err(bad(format!(
-            "拆分校验未通过，整批导入已回滚: {}",
-            report.structural_errors.join("; ")
-        )));
-    }
-    let singles = pptx::split(&pkg).map_err(bad)?;
-    let stem = req
-        .filename
-        .rsplit('/')
-        .next()
-        .unwrap_or("未命名")
-        .trim_end_matches(".pptx")
-        .trim_end_matches(".PPTX")
-        .to_string();
-    let blocks = req.blocks.unwrap_or_else(|| {
-        vec![ImportBlock {
-            name: stem.clone(),
-            pages: (0..singles.len()).collect(),
-            form: None,
-            lang: None,
-        }]
+    // The orchestration lives in core (Store::import_blocks) since
+    // local-first P1: the desktop client's in-process local library
+    // runs the identical split / verify / commit sequence, so it
+    // exists exactly once. This handler keeps the auth, capability
+    // and transport shape it always had.
+    let blocks = req.blocks.map(|bs| {
+        bs.into_iter()
+            .map(|b| qimu_core::import::ImportBlockSpec {
+                name: b.name,
+                pages: b.pages,
+                form: b.form,
+                lang: b.lang,
+            })
+            .collect()
     });
     let store = st.store.lock().unwrap();
-    let mut created = Vec::new();
-    for block in &blocks {
-        if block.pages.is_empty() {
-            continue;
-        }
-        let frag_pkgs: Vec<Package> = block
-            .pages
-            .iter()
-            .filter_map(|i| singles.get(*i).cloned())
-            .collect();
-        if frag_pkgs.len() != block.pages.len() {
-            return Err(bad("块包含越界页码，整批导入已回滚"));
-        }
-        let is_full_deck = block.pages.len() == singles.len()
-            && block.pages.iter().copied().collect::<Vec<_>>()
-                == (0..singles.len()).collect::<Vec<_>>();
-        let frag = if is_full_deck {
-            pptx::reassemble(&frag_pkgs).map_err(bad)?
-        } else {
-            qimu_core::assemble::assemble(&frag_pkgs).map_err(bad)?
-        };
-        let frag_bytes = frag.to_bytes().map_err(bad)?;
-        let unit = store
-            .create_unit(
-                &block.name,
-                req.folder_id.as_deref(),
-                &req.group_id,
-                &user.display_name,
-                block.lang.as_deref().unwrap_or("zh"),
-                "",
-            )
-            .map_err(bad)?;
-        let rend = store
-            .get_or_create_rendition(
-                &unit.id,
-                block.form.as_deref().unwrap_or("标准"),
-                block.lang.as_deref().unwrap_or("zh"),
-            )
-            .map_err(bad)?;
-        let ver = store
-            .insert_version(
-                &rend.id,
-                SemVer::new(1, 0, 0),
-                unit.current_revision,
-                &user.display_name,
-                "导入",
-                &frag_bytes,
-                "normal",
-            )
-            .map_err(bad)?;
-        created.push(json!({
-            "unit_id": unit.id,
-            "rendition_id": rend.id,
-            "version_id": ver.id,
-            "semver": ver.semver,
-            "pages": ver.page_count,
-        }));
-    }
+    let outcome = store
+        .import_blocks(
+            &req.filename,
+            &bytes,
+            req.folder_id.as_deref(),
+            &req.group_id,
+            &user.display_name,
+            blocks,
+        )
+        .map_err(bad)?;
     Ok(Json(json!({
         "ok": true,
-        "slide_count": report.slide_count,
-        "fingerprints_match": report.fingerprints_match,
-        "units": created,
+        "slide_count": outcome.slide_count,
+        "fingerprints_match": outcome.fingerprints_match,
+        "units": outcome.units,
     })))
 }
 
@@ -2272,99 +2214,14 @@ async fn create_english_index(
     if name.is_empty() {
         return Err(bad("请输入英文版索引名称"));
     }
+    // The derivation lives in core (Store::derive_english_index)
+    // since local-first P1: the desktop client's in-process local
+    // library runs the identical English-version selection, so it
+    // exists exactly once. This handler keeps the auth, capability
+    // and name validation it always had.
     let store = st.store.lock().unwrap();
-    let head = store
-        .branch_head(&id, &req.branch)
-        .map_err(bad)?
-        .ok_or_else(|| bad("当前分支没有可派生的提交"))?;
-    let source = store.get_commit(&head).map_err(bad)?;
-    let mut entries = Vec::with_capacity(source.entries.len());
-    let mut missing = Vec::new();
-    for entry in source.entries {
-        let unit = store.get_unit(&entry.unit_id.0).map_err(bad)?;
-        if !store.can_see_group(&user, &unit.group_id).map_err(bad)? {
-            return Err(bad("没有权限读取索引中的内容块"));
-        }
-        let original = store.get_rendition(&entry.rendition_id.0).map_err(bad)?;
-        if original.unit_id != unit.id {
-            return Err(bad("条目的形态版本不属于该内容块"));
-        }
-        let source_version = store.resolve_entry_version(&entry).map_err(bad)?;
-        let mut selected = None;
-        if lang_code_of(&original.lang)
-            .to_ascii_lowercase()
-            .split(['-', '_'])
-            .next()
-            == Some("en")
-        {
-            selected = match entry.policy {
-                EntryPolicy::FollowLatest => store
-                    .list_versions(&original.id)
-                    .map_err(bad)?
-                    .into_iter()
-                    .find(|version| version.status == "normal"),
-                EntryPolicy::Locked { .. } => {
-                    source_version.filter(|version| version.status == "normal")
-                }
-            };
-        } else {
-            for rendition in store.list_renditions(&unit.id).map_err(bad)? {
-                let lang = lang_code_of(&rendition.lang).to_ascii_lowercase();
-                if rendition.form != original.form || lang.split(['-', '_']).next() != Some("en") {
-                    continue;
-                }
-                let matches_excerpt = |version: &qimu_core::store::VersionRec| {
-                    entry.excerpt_slots.as_ref().is_none_or(|slots| {
-                        source_version.as_ref().is_some_and(|source| {
-                            source.basis_revision == version.basis_revision
-                                && source.page_count == version.page_count
-                                && slots.iter().all(|slot| {
-                                    slot.parse::<usize>()
-                                        .is_ok_and(|slot| slot < version.pages.len())
-                                })
-                        })
-                    })
-                };
-                selected = store
-                    .list_versions(&rendition.id)
-                    .map_err(bad)?
-                    .into_iter()
-                    .find(|version| version.status == "normal" && matches_excerpt(version));
-                if selected.is_some() {
-                    break;
-                }
-            }
-        }
-        if let Some(version) = selected {
-            entries.push(IndexEntry {
-                rendition_id: Id(version.rendition_id),
-                policy: EntryPolicy::Locked {
-                    version_id: Id(version.id),
-                },
-                locked_semver: Some(version.semver),
-                ..entry
-            });
-        } else {
-            missing.push(unit.name);
-        }
-    }
-    if !missing.is_empty() {
-        missing.sort();
-        missing.dedup();
-        return Err(bad(format!(
-            "请先为这些内容块发布同形态的英文版本，并核对摘页：{}",
-            missing.join("、")
-        )));
-    }
     let derived = store
-        .create_english_index(
-            &index,
-            &req.branch,
-            &head,
-            name,
-            &user.display_name,
-            entries,
-        )
+        .derive_english_index(&user, &index, &req.branch, name)
         .map_err(bad)?;
     Ok(Json(json!(derived)))
 }

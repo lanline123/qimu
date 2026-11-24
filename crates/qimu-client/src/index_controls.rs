@@ -325,17 +325,17 @@ impl App {
         }
         let id = &st.index_id;
         let response = match &pending {
-            IndexMoreAction::English(name) => self.call(
+            IndexMoreAction::English(name) => self.call_work(
                 "POST",
                 &format!("/v1/indexes/{id}/english"),
                 Some(json!({ "branch": if st.branch.is_empty() { "main" } else { &st.branch }, "name": name.trim() })),
             ),
-            IndexMoreAction::Move(folder) => self.call(
+            IndexMoreAction::Move(folder) => self.call_work(
                 "POST",
                 &format!("/v1/indexes/{id}/folder"),
                 Some(json!({ "folder_id": folder })),
             ),
-            IndexMoreAction::History => self.call(
+            IndexMoreAction::History => self.call_work(
                 "POST",
                 &format!("/v1/indexes/{id}/lifecycle"),
                 Some(json!({ "lifecycle": "history" })),

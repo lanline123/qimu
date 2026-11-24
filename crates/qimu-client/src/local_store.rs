@@ -12,11 +12,13 @@
 //! zero migration. With the switch off nothing here runs and the
 //! client behaves exactly as before.
 //!
-//! Scope of this phase: the store handle, the library-root resolution,
-//! the seeded machine owner + default group, and the JSON adapter
+//! Scope: the store handle, the library-root resolution, the
+//! seeded machine owner + default group, and the JSON adapter
 //! layer that feeds the UI the same `Value` shapes the REST list
-//! endpoints return. Write paths still go over REST until P1/P2 flip
-//! them over one by one.
+//! endpoints return. P1 adds the working-data write face: the
+//! `dispatch` router below serves the import / units / indexes /
+//! folders / trash / search REST paths from this library, so in
+//! local mode working data is written here, in-process.
 
 use qimu_core::manifest::{Binding, Manifest, SourceRef};
 use qimu_core::pptx::{self, Package};
@@ -312,32 +314,15 @@ impl LocalStore {
     }
 
     /// GET /v1/units shape: the server's `unit_json` wrapper —
-    /// `{unit, renditions: [{rendition, latest, versions: []}]}`.
+    /// `{unit, renditions: [{rendition, latest, versions}]}`.
+    /// (The REST list endpoint leaves `versions` empty and only
+    /// its detail endpoint fills it; the local face fills it in
+    /// both — P1 — because the version strips read it from the
+    /// list data.)
     pub fn list_units(&self) -> Vec<Value> {
         let store = self.store.lock().unwrap();
         let units = store.list_units(None).unwrap_or_default();
-        let mut out = Vec::new();
-        for u in &units {
-            let mut rends = Vec::new();
-            if let Ok(list) = store.list_renditions(&u.id) {
-                for r in &list {
-                    let latest = store.latest_version(&r.id).ok().flatten();
-                    rends.push(json!({
-                        "rendition": serde_json::to_value(r).unwrap_or(Value::Null),
-                        "latest": serde_json::to_value(latest).unwrap_or(Value::Null),
-                        "versions": [],
-                    }));
-                }
-            }
-            let mut obj = serde_json::Map::new();
-            obj.insert(
-                "unit".into(),
-                serde_json::to_value(u).unwrap_or(Value::Null),
-            );
-            obj.insert("renditions".into(), Value::Array(rends));
-            out.push(Value::Object(obj));
-        }
-        out
+        units.iter().map(|u| unit_json(&store, u)).collect()
     }
 
     /// The version's fragment PPTX bytes from the local CAS (the
@@ -524,6 +509,637 @@ impl LocalStore {
             store.list_indexes(None).map(|v| v.len()).unwrap_or(0),
         )
     }
+
+    /// The index detail the REST `GET /v1/indexes/{id}` returns for
+    /// a named session — `{index, branches, tags, head,
+    /// resolved_entries}` — assembled from the local store (the
+    /// guest entry funnel does not exist locally: the library is
+    /// the owner's own). None when the index is not in this
+    /// library. Used by the refresh per-index pass and by the
+    /// working-data dispatcher below.
+    pub fn index_detail(&self, id: &str, branch: &str) -> Option<Value> {
+        let store = self.store.lock().unwrap();
+        let index = store.get_index(id).ok()?;
+        let branches = store.list_branches(id).unwrap_or_default();
+        let tags = store.list_tags(id).unwrap_or_default();
+        let head = store
+            .branch_head(id, branch)
+            .ok()
+            .flatten()
+            .and_then(|cid| store.get_commit(&cid).ok());
+        let entries = head.as_ref().map(|c| resolved_entries(&store, c));
+        Some(json!({
+            "index": serde_json::to_value(&index).unwrap_or(Value::Null),
+            "branches": branches,
+            "tags": serde_json::to_value(&tags).unwrap_or(Value::Null),
+            "head": serde_json::to_value(&head).unwrap_or(Value::Null),
+            "resolved_entries": entries,
+        }))
+    }
+
+    /// Working-data dispatcher (local-first P1): serves the REST
+    /// paths whose data is working data — import, units, indexes,
+    /// folders, trash, search — from this local library, with the
+    /// exact response shapes and error strings the server handlers
+    /// produce (they are thin shells over the same core calls; the
+    /// capability checks they add are vacuous for the library's
+    /// seeded super owner). Returns None for anything else —
+    /// organization surfaces, and the few objects that live on the
+    /// server even in local mode (showroom trash rows) — so the
+    /// caller falls through to REST unchanged.
+    pub fn dispatch(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Option<Result<Value, String>> {
+        let (p, q) = match path.split_once('?') {
+            Some((p, q)) => (p, q),
+            None => (path, ""),
+        };
+        let seg: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+        let body = body.cloned().unwrap_or(Value::Null);
+        // The route match runs in a closure so its arms can use `?`
+        // over the core calls; routes this face does not own — and
+        // the server-owned objects above — surface as the UNHANDLED
+        // sentinel and become None (REST fallthrough) below.
+        let r = (|| -> Result<Value, String> {
+            match (method, seg.as_slice()) {
+                // ---- import ----
+                ("POST", ["v1", "import", "propose"]) => {
+                    let bytes = b64_field(&body, "data_base64")?;
+                    let pkg = qimu_core::pptx::Package::load(&bytes)?;
+                    let report = qimu_core::propose::propose_blocks(&pkg)?;
+                    Ok(serde_json::to_value(&report).unwrap_or_default())
+                }
+                ("POST", ["v1", "import"]) => {
+                    let bytes = b64_field(&body, "data_base64")?;
+                    let blocks = body.get("blocks").and_then(|b| b.as_array()).map(|arr| {
+                        arr.iter()
+                            .map(|b| qimu_core::import::ImportBlockSpec {
+                                name: str_field(b, "name").unwrap_or_default(),
+                                pages: b
+                                    .get("pages")
+                                    .and_then(|v| v.as_array())
+                                    .map(|a| {
+                                        a.iter()
+                                            .filter_map(|x| x.as_u64().map(|n| n as usize))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default(),
+                                form: str_field(b, "form"),
+                                lang: str_field(b, "lang"),
+                            })
+                            .collect()
+                    });
+                    let store = self.store.lock().unwrap();
+                    let outcome = store.import_blocks(
+                        &str_field(&body, "filename").unwrap_or_default(),
+                        &bytes,
+                        opt_str_field(&body, "folder_id"),
+                        &str_field(&body, "group_id").unwrap_or_default(),
+                        &self.owner.display_name,
+                        blocks,
+                    )?;
+                    Ok(json!({
+                        "ok": true,
+                        "slide_count": outcome.slide_count,
+                        "fingerprints_match": outcome.fingerprints_match,
+                        "units": outcome.units,
+                    }))
+                }
+                // ---- units ----
+                ("POST", ["v1", "units"]) => {
+                    let store = self.store.lock().unwrap();
+                    let u = store.create_unit(
+                        &str_field(&body, "name").unwrap_or_default(),
+                        opt_str_field(&body, "folder_id"),
+                        &str_field(&body, "group_id").unwrap_or_default(),
+                        &str_field(&body, "maintainer")
+                            .unwrap_or_else(|| self.owner.display_name.clone()),
+                        &str_field(&body, "lead_lang").unwrap_or_else(|| "zh".to_string()),
+                        &str_field(&body, "description").unwrap_or_default(),
+                    )?;
+                    Ok(serde_json::to_value(&u).unwrap_or(Value::Null))
+                }
+                ("GET", ["v1", "units", id]) => {
+                    let store = self.store.lock().unwrap();
+                    let unit = store.get_unit(id).map_err(|_| NOT_FOUND.to_string())?;
+                    Ok(unit_json(&store, &unit))
+                }
+                ("POST", ["v1", "units", id, "publish"]) => {
+                    let store = self.store.lock().unwrap();
+                    let unit = store.get_unit(id).map_err(|_| NOT_FOUND.to_string())?;
+                    let frag = b64_field(&body, "data_base64")?;
+                    // sanity: it must be a valid PPTX fragment
+                    qimu_core::pptx::Package::load(&frag)?;
+                    let basis = if body
+                        .get("new_revision")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                    {
+                        store.bump_unit_revision(id)?
+                    } else {
+                        unit.current_revision
+                    };
+                    let rend = store.get_or_create_rendition(
+                        id,
+                        &str_field(&body, "form").unwrap_or_else(|| "标准".to_string()),
+                        &str_field(&body, "lang").unwrap_or_else(|| "zh".to_string()),
+                    )?;
+                    let latest = store.latest_version(&rend.id)?;
+                    let inc = match str_field(&body, "bump").as_deref() {
+                        Some("major") => qimu_core::Increment::Major,
+                        Some("patch") => qimu_core::Increment::Patch,
+                        _ => qimu_core::Increment::Minor,
+                    };
+                    let next = match latest {
+                        Some(v) => qimu_core::SemVer::parse(&v.semver)?.bumped(inc),
+                        None => qimu_core::SemVer::new(1, 0, 0),
+                    };
+                    let ver = store.insert_version(
+                        &rend.id,
+                        next,
+                        basis,
+                        &self.owner.display_name,
+                        &str_field(&body, "note").unwrap_or_default(),
+                        &frag,
+                        &str_field(&body, "status").unwrap_or_else(|| "normal".to_string()),
+                    )?;
+                    Ok(serde_json::to_value(&ver).unwrap_or(Value::Null))
+                }
+                ("GET", ["v1", "units", id, "page-bindings"]) => {
+                    let store = self.store.lock().unwrap();
+                    store.get_unit(id).map_err(|_| NOT_FOUND.to_string())?;
+                    let bindings = store.list_page_bindings(id)?;
+                    Ok(json!({ "bindings": bindings }))
+                }
+                ("POST", ["v1", "units", id, "page-bindings"]) => {
+                    let store = self.store.lock().unwrap();
+                    store.get_unit(id).map_err(|_| NOT_FOUND.to_string())?;
+                    let b = store.add_page_binding(
+                        id,
+                        &str_field(&body, "from_version_id").unwrap_or_default(),
+                        body.get("from_slot").and_then(|v| v.as_i64()).unwrap_or(0),
+                        &str_field(&body, "to_version_id").unwrap_or_default(),
+                        body.get("to_slot").and_then(|v| v.as_i64()).unwrap_or(0),
+                        &str_field(&body, "kind").unwrap_or_else(|| "manual".to_string()),
+                        &self.owner.display_name,
+                    )?;
+                    Ok(serde_json::to_value(&b).unwrap_or(Value::Null))
+                }
+                ("POST", ["v1", "units", id, "page-bindings", bid, "delete"]) => {
+                    let store = self.store.lock().unwrap();
+                    store.get_unit(id).map_err(|_| NOT_FOUND.to_string())?;
+                    store.delete_page_binding(id, bid)?;
+                    Ok(json!({ "ok": true }))
+                }
+                // ---- versions (working-data reads/writes) ----
+                ("GET", ["v1", "versions", id, "fragment"]) => {
+                    let store = self.store.lock().unwrap();
+                    let ver = store.get_version(id).map_err(|_| NOT_FOUND.to_string())?;
+                    let bytes = store.file_get(&ver.fragment_hash)?;
+                    Ok(json!({
+                        "version": serde_json::to_value(&ver).unwrap_or(Value::Null),
+                        "data_base64": crate::b64e(&bytes),
+                    }))
+                }
+                ("POST", ["v1", "versions", id, "recall"]) => {
+                    let store = self.store.lock().unwrap();
+                    store.get_version(id).map_err(|_| NOT_FOUND.to_string())?;
+                    store.set_version_status(id, "recalled")?;
+                    Ok(json!({ "ok": true }))
+                }
+                // ---- folders ----
+                ("GET", ["v1", "folders"]) => {
+                    let store = self.store.lock().unwrap();
+                    let folders = store.list_folders().map(values_of).unwrap_or_default();
+                    Ok(json!({ "folders": folders }))
+                }
+                ("POST", ["v1", "folders"]) => {
+                    let store = self.store.lock().unwrap();
+                    let f = store.create_folder(
+                        &str_field(&body, "name").unwrap_or_default(),
+                        opt_str_field(&body, "parent_id"),
+                    )?;
+                    Ok(serde_json::to_value(&f).unwrap_or(Value::Null))
+                }
+                ("POST", ["v1", "folders", id, "rename"]) => {
+                    let store = self.store.lock().unwrap();
+                    store.rename_folder(id, &str_field(&body, "name").unwrap_or_default())?;
+                    Ok(json!({ "ok": true }))
+                }
+                ("DELETE", ["v1", "folders", id]) => {
+                    let store = self.store.lock().unwrap();
+                    store.delete_folder(id)?;
+                    Ok(json!({ "ok": true }))
+                }
+                // ---- trash ----
+                ("GET", ["v1", "trash"]) => {
+                    let store = self.store.lock().unwrap();
+                    let rows = store.trash_list()?;
+                    let mut items = Vec::new();
+                    for row in rows {
+                        let (cover, pages) = trash_cover(&store, &row);
+                        let mut v = serde_json::to_value(&row).unwrap_or(Value::Null);
+                        v["cover_version_id"] = json!(cover);
+                        v["page_count"] = json!(pages);
+                        items.push(v);
+                    }
+                    Ok(json!({ "items": items }))
+                }
+                ("POST", ["v1", "trash"]) => {
+                    let kind = str_field(&body, "kind").unwrap_or_default();
+                    let object_id = str_field(&body, "object_id").unwrap_or_default();
+                    if kind == "showroom" {
+                        // Showroom items live on the organization
+                        // server even in local mode; their trash
+                        // rows are the server's, not this library's.
+                        return Err(UNHANDLED.to_string());
+                    }
+                    let store = self.store.lock().unwrap();
+                    let (title, origin) = match kind.as_str() {
+                        "index" => {
+                            let idx = store
+                                .get_index(&object_id)
+                                .map_err(|_| NOT_FOUND.to_string())?;
+                            (
+                                idx.name.clone(),
+                                trash_origin(&store, idx.folder_id.as_deref(), "索引页"),
+                            )
+                        }
+                        "unit" => {
+                            let unit = store
+                                .get_unit(&object_id)
+                                .map_err(|_| NOT_FOUND.to_string())?;
+                            (
+                                unit.name.clone(),
+                                trash_origin(&store, unit.folder_id.as_deref(), "内容页"),
+                            )
+                        }
+                        _ => return Err("unknown trash kind".to_string()),
+                    };
+                    let rec = store.trash_add(
+                        &kind,
+                        &object_id,
+                        &title,
+                        &origin,
+                        &self.owner.display_name,
+                    )?;
+                    Ok(serde_json::to_value(&rec).unwrap_or(Value::Null))
+                }
+                ("POST", ["v1", "trash", "purge-all"]) => {
+                    let store = self.store.lock().unwrap();
+                    let rows = store.trash_list()?;
+                    let mut purged = 0usize;
+                    for row in rows {
+                        if store.trash_purge(&row.id).is_ok() {
+                            purged += 1;
+                        }
+                    }
+                    Ok(json!({ "purged": purged }))
+                }
+                ("POST", ["v1", "trash", id, "restore"]) => {
+                    let store = self.store.lock().unwrap();
+                    if store.trash_get(id).is_err() {
+                        // Not one of this library's rows — an
+                        // organization row the server owns.
+                        return Err(UNHANDLED.to_string());
+                    }
+                    let rec = store.trash_restore(id)?;
+                    Ok(serde_json::to_value(&rec).unwrap_or(Value::Null))
+                }
+                ("POST", ["v1", "trash", id, "purge"]) => {
+                    let store = self.store.lock().unwrap();
+                    if store.trash_get(id).is_err() {
+                        return Err(UNHANDLED.to_string());
+                    }
+                    let rec = store.trash_purge(id)?;
+                    Ok(serde_json::to_value(&rec).unwrap_or(Value::Null))
+                }
+                // ---- search ----
+                ("GET", ["v1", "search"]) => {
+                    let query = query_param(q, "q").unwrap_or_default();
+                    let store = self.store.lock().unwrap();
+                    let hits = store.search(&query, None)?;
+                    let out: Vec<Value> = hits
+                        .iter()
+                        .map(|(u, v)| json!({ "unit": u, "version": v }))
+                        .collect();
+                    Ok(json!({ "hits": out }))
+                }
+                // ---- indexes ----
+                ("GET", ["v1", "indexes", id]) => {
+                    let branch = query_param(q, "branch").unwrap_or_else(|| "main".to_string());
+                    match self.index_detail(id, &branch) {
+                        Some(d) => Ok(d),
+                        None => Err(NOT_FOUND.to_string()),
+                    }
+                }
+                ("GET", ["v1", "indexes", id, "commits"]) => {
+                    let branch = query_param(q, "branch").unwrap_or_else(|| "main".to_string());
+                    let store = self.store.lock().unwrap();
+                    let commits = store.list_commits(id, &branch)?;
+                    Ok(json!({ "commits": commits }))
+                }
+                ("POST", ["v1", "indexes"]) => {
+                    let entries: Vec<qimu_core::model::IndexEntry> = body
+                        .get("entries")
+                        .and_then(|e| e.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .map(|e| qimu_core::model::IndexEntry {
+                                    unit_id: qimu_core::model::Id(
+                                        str_field(e, "unit_id").unwrap_or_default(),
+                                    ),
+                                    rendition_id: qimu_core::model::Id(
+                                        str_field(e, "rendition_id").unwrap_or_default(),
+                                    ),
+                                    policy: qimu_core::model::EntryPolicy::FollowLatest,
+                                    locked_semver: None,
+                                    excerpt_slots: None,
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let store = self.store.lock().unwrap();
+                    let idx = store.create_index(
+                        &str_field(&body, "name").unwrap_or_default(),
+                        opt_str_field(&body, "folder_id"),
+                        &str_field(&body, "group_id").unwrap_or_default(),
+                        &self.owner.display_name,
+                        &str_field(&body, "scope").unwrap_or_else(|| "company".to_string()),
+                        entries,
+                    )?;
+                    Ok(serde_json::to_value(&idx).unwrap_or(Value::Null))
+                }
+                ("POST", ["v1", "indexes", id, "commits"]) => {
+                    let entries: Vec<qimu_core::model::IndexEntry> = serde_json::from_value(
+                        body.get("entries").cloned().unwrap_or(json!([])),
+                    )
+                    .map_err(|e| e.to_string())?;
+                    let store = self.store.lock().unwrap();
+                    let c = store.create_commit(
+                        id,
+                        &str_field(&body, "branch").unwrap_or_else(|| "main".to_string()),
+                        &self.owner.display_name,
+                        &str_field(&body, "message").unwrap_or_default(),
+                        entries,
+                    )?;
+                    Ok(serde_json::to_value(&c).unwrap_or(Value::Null))
+                }
+                ("POST", ["v1", "indexes", id, "tags"]) => {
+                    let store = self.store.lock().unwrap();
+                    let t = store.create_tag(
+                        id,
+                        &str_field(&body, "branch").unwrap_or_else(|| "main".to_string()),
+                        &str_field(&body, "name").unwrap_or_default(),
+                    )?;
+                    Ok(serde_json::to_value(&t).unwrap_or(Value::Null))
+                }
+                ("POST", ["v1", "indexes", id, "branches"]) => {
+                    let store = self.store.lock().unwrap();
+                    store.create_branch(
+                        id,
+                        &str_field(&body, "name").unwrap_or_default(),
+                        &str_field(&body, "from").unwrap_or_else(|| "main".to_string()),
+                    )?;
+                    Ok(json!({ "ok": true }))
+                }
+                ("POST", ["v1", "indexes", id, "merge", "preview"]) => {
+                    let store = self.store.lock().unwrap();
+                    let p = store.preview_merge(
+                        id,
+                        &str_field(&body, "from").unwrap_or_default(),
+                        &str_field(&body, "into").unwrap_or_else(|| "main".to_string()),
+                    )?;
+                    Ok(serde_json::to_value(&p).unwrap_or(Value::Null))
+                }
+                ("POST", ["v1", "indexes", id, "merge"]) => {
+                    let resolutions: std::collections::HashMap<String, String> = body
+                        .get("resolutions")
+                        .and_then(|r| r.as_object())
+                        .map(|m| {
+                            m.iter()
+                                .filter_map(|(k, v)| {
+                                    v.as_str().map(|s| (k.clone(), s.to_string()))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let store = self.store.lock().unwrap();
+                    let c = store.execute_merge(
+                        id,
+                        &str_field(&body, "from").unwrap_or_default(),
+                        &str_field(&body, "into").unwrap_or_else(|| "main".to_string()),
+                        &self.owner.display_name,
+                        &resolutions,
+                    )?;
+                    Ok(json!({ "commit": c }))
+                }
+                ("POST", ["v1", "indexes", id, "folder"]) => {
+                    let store = self.store.lock().unwrap();
+                    store.move_index_to_folder(id, opt_str_field(&body, "folder_id"))?;
+                    Ok(json!({ "ok": true }))
+                }
+                ("POST", ["v1", "indexes", id, "lifecycle"]) => {
+                    let store = self.store.lock().unwrap();
+                    store.set_index_lifecycle(
+                        id,
+                        &str_field(&body, "lifecycle").unwrap_or_default(),
+                    )?;
+                    Ok(json!({ "ok": true }))
+                }
+                ("POST", ["v1", "indexes", id, "english"]) => {
+                    let store = self.store.lock().unwrap();
+                    let index = store.get_index(id).map_err(|_| NOT_FOUND.to_string())?;
+                    let name = str_field(&body, "name").unwrap_or_default();
+                    let name = name.trim();
+                    if name.is_empty() {
+                        return Err("请输入英文版索引名称".to_string());
+                    }
+                    let branch =
+                        str_field(&body, "branch").unwrap_or_else(|| "main".to_string());
+                    let derived =
+                        store.derive_english_index(&self.owner, &index, &branch, name)?;
+                    Ok(serde_json::to_value(&derived).unwrap_or(Value::Null))
+                }
+                _ => Err(UNHANDLED.to_string()),
+            }
+        })();
+        match r {
+            Err(e) if e == UNHANDLED => None,
+            other => Some(other),
+        }
+    }
+}
+
+/// Sentinel for "the local face does not own this call" inside
+/// the dispatcher closure — a control-character prefix makes a
+/// collision with a real core error message impossible.
+const UNHANDLED: &str = "\u{0}qimu-local-unhandled";
+
+/// The server's 404 message, verbatim — the local face surfaces
+/// the same string the REST path puts in the `error` field.
+const NOT_FOUND: &str = "不存在";
+
+/// A string field of a request body (`None` when absent or not a
+/// string).
+fn str_field(body: &Value, key: &str) -> Option<String> {
+    body.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+}
+
+/// A nullable string field: JSON null and absence both read as
+/// `None`, a string as `Some`.
+fn opt_str_field<'a>(body: &'a Value, key: &str) -> Option<&'a str> {
+    body.get(key).and_then(|v| v.as_str())
+}
+
+/// Decode a base64 body field, with the server handler's error
+/// wording.
+fn b64_field(body: &Value, key: &str) -> Result<Vec<u8>, String> {
+    let s = str_field(body, key).unwrap_or_default();
+    crate::b64d(&s).map_err(|e| format!("base64 解码失败: {e}"))
+}
+
+/// The `unit_json` wrapper of the server, over an already-locked
+/// store: `{unit, renditions: [{rendition, latest, versions}]}`.
+/// The REST list endpoint sends `versions: []` and only the detail
+/// endpoint fills it; the local face fills it in both (P1 — the
+/// wall and detail version strips read it from the list data).
+fn unit_json(store: &Store, unit: &qimu_core::store::UnitRec) -> Value {
+    let mut rends = Vec::new();
+    if let Ok(list) = store.list_renditions(&unit.id) {
+        for r in &list {
+            let versions = store.list_versions(&r.id).unwrap_or_default();
+            let latest = store.latest_version(&r.id).ok().flatten();
+            rends.push(json!({
+                "rendition": serde_json::to_value(r).unwrap_or(Value::Null),
+                "latest": serde_json::to_value(latest).unwrap_or(Value::Null),
+                "versions": serde_json::to_value(versions).unwrap_or(Value::Null),
+            }));
+        }
+    }
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "unit".into(),
+        serde_json::to_value(unit).unwrap_or(Value::Null),
+    );
+    obj.insert("renditions".into(), Value::Array(rends));
+    Value::Object(obj)
+}
+
+/// One commit's entries with their resolved versions — the
+/// server's `resolved_entries` helper, over an already-locked
+/// store.
+fn resolved_entries(store: &Store, commit: &qimu_core::store::CommitRec) -> Vec<Value> {
+    commit
+        .entries
+        .iter()
+        .map(|e| {
+            let unit = store.get_unit(&e.unit_id.0).ok();
+            let rend = store.get_rendition(&e.rendition_id.0).ok();
+            let resolved = store.resolve_entry_version(e).ok().flatten();
+            let locked_id = match &e.policy {
+                qimu_core::model::EntryPolicy::Locked { version_id } => {
+                    Some(version_id.0.clone())
+                }
+                _ => None,
+            };
+            let substituted = match (&locked_id, &resolved) {
+                (Some(lid), Some(v)) => &v.id != lid,
+                _ => false,
+            };
+            json!({
+                "entry": e,
+                "unit_name": unit.map(|u| u.name),
+                "form": rend.as_ref().map(|r| r.form.clone()),
+                "lang": rend.as_ref().map(|r| r.lang.clone()),
+                "resolved": resolved,
+                "substituted": substituted,
+            })
+        })
+        .collect()
+}
+
+/// Origin label for a move-to-trash (the server's `trash_origin`):
+/// the home folder's name, or the surface fallback.
+fn trash_origin(store: &Store, folder_id: Option<&str>, fallback: &str) -> String {
+    match folder_id {
+        Some(fid) => store
+            .list_folders()
+            .ok()
+            .and_then(|fs| fs.into_iter().find(|f| f.id == fid))
+            .map(|f| f.name)
+            .unwrap_or_else(|| fallback.to_string()),
+        None => fallback.to_string(),
+    }
+}
+
+/// Cover for a trash row (the server's `trash_cover`): the version
+/// whose first page represents the object (unit → latest version
+/// of its first rendition; index → first resolved entry of the
+/// main branch head), plus its page count.
+fn trash_cover(
+    store: &Store,
+    row: &qimu_core::store::TrashRec,
+) -> (Option<String>, i64) {
+    let ver = match row.kind.as_str() {
+        "unit" => store
+            .list_renditions(&row.object_id)
+            .ok()
+            .and_then(|rs| rs.into_iter().next())
+            .and_then(|r| store.latest_version(&r.id).ok().flatten()),
+        "index" => store
+            .branch_head(&row.object_id, "main")
+            .ok()
+            .flatten()
+            .and_then(|cid| store.get_commit(&cid).ok())
+            .and_then(|c| c.entries.into_iter().next())
+            .and_then(|e| store.resolve_entry_version(&e).ok().flatten()),
+        _ => None,
+    };
+    match ver {
+        Some(v) => (Some(v.id), v.page_count),
+        None => (None, 0),
+    }
+}
+
+/// One query parameter of a request path, percent-decoded (the
+/// client's `query_component` encodes everything outside
+/// `[A-Za-z0-9-._~]` as %XX, so a literal '+' is data, never a
+/// space).
+fn query_param(query: &str, key: &str) -> Option<String> {
+    query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == key).then(|| percent_decode(v))
+    })
+}
+
+fn percent_decode(s: &str) -> String {
+    fn hex(c: u8) -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    }
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 impl Drop for LocalStore {
