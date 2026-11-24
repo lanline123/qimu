@@ -6837,7 +6837,13 @@ impl App {
                     if sess.presenter_before.is_none() {
                         sess.presenter_before = v
                             .get("ui")
-                            .and_then(|u| u.get("presenter_view"))
+                            // UiState is #[serde(rename_all = "camelCase")]:
+                            // the wire key is presenterView; keep the
+                            // snake_case spelling as a fallback.
+                            .and_then(|u| {
+                                u.get("presenterView")
+                                    .or_else(|| u.get("presenter_view"))
+                            })
                             .and_then(|x| x.as_bool());
                     }
                     sess.file = path.to_path_buf();
@@ -6869,7 +6875,13 @@ impl App {
                 Some((ctl, v)) => {
                     let presenter_before = v
                         .get("ui")
-                        .and_then(|u| u.get("presenter_view"))
+                        // UiState is #[serde(rename_all = "camelCase")]:
+                        // the wire key is presenterView; keep the
+                        // snake_case spelling as a fallback.
+                        .and_then(|u| {
+                            u.get("presenterView")
+                                .or_else(|| u.get("presenter_view"))
+                        })
                         .and_then(|x| x.as_bool());
                     self.dc = Some(DcSession {
                         child,
