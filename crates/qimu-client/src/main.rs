@@ -2604,6 +2604,15 @@ struct App {
     user: Option<Value>,
     conns: Vec<Conn>,
     active: Option<usize>,
+    /// Reachability latch (audit issue 4): set by the REST call
+    /// layer when a request to the active server fails at
+    /// transport level, cleared by the next call the server
+    /// answers (any HTTP response — success or business error)
+    /// and whenever the connection context is re-mirrored. The
+    /// session status in `conns` is deliberately NOT rewritten:
+    /// a transient outage must not discard a still-valid
+    /// session, and nothing revalidates one periodically.
+    org_unreachable: std::cell::Cell<bool>,
     add_url: String,
     add_name: String,
     add_user: String,
@@ -3080,17 +3089,37 @@ fn issue_guest_token(url: &str) -> Option<String> {
         .map(|t| t.to_string())
 }
 
+/// Why a REST call failed, in the one distinction the client
+/// acts on (audit issue 4): `Http` — the server answered with a
+/// status, so the box is reachable and the error is a business
+/// verdict; `Transport` — the request never landed (connect /
+/// DNS / timeout), so the box is unreachable right now. The
+/// carried string is byte-identical to the error `raw_call`
+/// has always returned.
+enum CallFail {
+    Http(String),
+    Transport(String),
+}
+
+impl CallFail {
+    fn into_string(self) -> String {
+        match self {
+            CallFail::Http(s) | CallFail::Transport(s) => s,
+        }
+    }
+}
+
 /// One HTTP call against an explicit server/token (App::call delegates
 /// here with the active connection). `short_timeout` is for session
 /// validation probes, where a dead server must not stall startup.
-fn raw_call(
+fn raw_call_k(
     url: &str,
     token: Option<&str>,
     method: &str,
     path: &str,
     body: Option<Value>,
     short_timeout: bool,
-) -> Result<Value, String> {
+) -> Result<Value, CallFail> {
     let full = format!("{}{}", normalize_url(url), path);
     let mut req = if short_timeout {
         let agent = ureq::AgentBuilder::new()
@@ -3121,20 +3150,35 @@ fn raw_call(
         None => req.call(),
     };
     match resp {
-        Ok(r) => r.into_json::<Value>().map_err(|e| e.to_string()),
+        Ok(r) => r.into_json::<Value>().map_err(|e| CallFail::Http(e.to_string())),
         Err(ureq::Error::Status(_, r)) => {
             let text = r.into_string().unwrap_or_default();
-            Err(serde_json::from_str::<Value>(&text)
+            Err(CallFail::Http(serde_json::from_str::<Value>(&text)
                 .ok()
                 .and_then(|v| {
                     v.get("error")
                         .and_then(|e| e.as_str())
                         .map(|s| s.to_string())
                 })
-                .unwrap_or(text))
+                .unwrap_or(text)))
         }
-        Err(e) => Err(format!("请求失败: {e}")),
+        Err(e) => Err(CallFail::Transport(format!("请求失败: {e}"))),
     }
+}
+
+/// The string-error shape every other caller of the REST layer
+/// (validation probes, guest issuance, server-name fetch) was
+/// written against; `raw_call_k` is the kind-carrying form and
+/// `App::call` uses it to feed the reachability latch.
+fn raw_call(
+    url: &str,
+    token: Option<&str>,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+    short_timeout: bool,
+) -> Result<Value, String> {
+    raw_call_k(url, token, method, path, body, short_timeout).map_err(CallFail::into_string)
 }
 
 /// LAN discovery: broadcast QIMU_DISCOVER_V1 on UDP 8731 and collect the
@@ -3205,6 +3249,7 @@ impl App {
             user: None,
             conns: vec![],
             active: None,
+            org_unreachable: std::cell::Cell::new(false),
             add_url: String::new(),
             add_name: String::new(),
             add_user: String::new(),
@@ -3470,14 +3515,27 @@ impl App {
     }
 
     fn call(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
-        raw_call(
+        // Reachability latch (audit issue 4): every call against
+        // the active server feeds `org_unreachable` — a transport
+        // failure marks the server unreachable, so `org_online`
+        // turns false at once instead of trusting a stale
+        // session status; any answered call (success or business
+        // error) proves reachability and clears the mark. The
+        // error strings callers see are unchanged.
+        let r = raw_call_k(
             &self.server,
             self.token.as_deref(),
             method,
             path,
             body,
             false,
-        )
+        );
+        match &r {
+            Ok(_) => self.org_unreachable.set(false),
+            Err(CallFail::Http(_)) => self.org_unreachable.set(false),
+            Err(CallFail::Transport(_)) => self.org_unreachable.set(true),
+        }
+        r.map_err(CallFail::into_string)
     }
 
     /// Working-data call (local-first P1/P4): the working-data
@@ -3591,6 +3649,10 @@ impl App {
     /// Mirror the active connection into the working fields every API
     /// call reads (self.server / self.token / self.username).
     fn sync_from_active(&mut self) {
+        // Re-mirroring follows a fresh validation (activate /
+        // restore / server switch): the reachability latch
+        // starts clean for the new context (audit issue 4).
+        self.org_unreachable.set(false);
         if let Some(i) = self.active {
             if let Some(c) = self.conns.get(i) {
                 self.server = c.url.clone();
@@ -3890,6 +3952,13 @@ impl App {
         self.server = url;
         self.token = issued;
         self.user = None;
+        // This entry mirrors the connection by hand instead of
+        // routing through sync_from_active, so it clears the
+        // reachability latch itself (audit issues 3+4): the
+        // probes above just proved this server answers, and the
+        // new guest context must not inherit the previous
+        // connection's unreachable mark.
+        self.org_unreachable.set(false);
         self.persist_conns();
         // A different identity context than whatever was on screen:
         // drop the previous context's server data, then load the
@@ -8287,13 +8356,20 @@ impl App {
     /// `sync_from_active` mirrors the token on. Anything else (no
     /// active connection, a failed probe, a logged-out session)
     /// means the showroom's server-backed walls cannot be reached
-    /// right now.
+    /// right now. The reachability latch (`org_unreachable`,
+    /// audit issue 4) is the second conjunct: a session that was
+    /// live but whose server has stopped answering is offline.
     fn org_online(&self) -> bool {
-        self.active
-            .and_then(|i| self.conns.get(i))
-            .is_some_and(|c| {
-                matches!(c.status, ConnStatus::Connected | ConnStatus::Anonymous)
-            })
+        // The session status says who we are; the reachability
+        // latch says whether the server has answered lately
+        // (audit issue 4). Both must hold.
+        !self.org_unreachable.get()
+            && self
+                .active
+                .and_then(|i| self.conns.get(i))
+                .is_some_and(|c| {
+                    matches!(c.status, ConnStatus::Connected | ConnStatus::Anonymous)
+                })
     }
 
     fn require_org_online(&mut self, action: &str) -> bool {
@@ -9795,7 +9871,7 @@ impl App {
                                         }
                                     }
                                 }
-                                if ui.small_button("移除").clicked() {
+                                if ui.small_button("移除").clicked() && app.require_org_online("移除") {
                                     let lid = s(&e, "id");
                                     match app.call(
                                         "POST",
@@ -9983,6 +10059,7 @@ impl App {
                     egui::Button::new("建组"),
                 )
                 .clicked()
+                && self.require_org_online("新建群组")
             {
                 let name = self.new_team_name.clone();
                 match self.call("POST", "/v1/custom-groups", Some(json!({ "name": name }))) {
@@ -10060,6 +10137,7 @@ impl App {
                                 egui::Button::new("加成员").small(),
                             )
                             .clicked()
+                            && self.require_org_online("添加成员")
                         {
                             let pick = self.team_member_pick.clone();
                             match self.call(
@@ -15934,6 +16012,7 @@ impl App {
                                         egui::Button::new("添加"),
                                     )
                                     .clicked()
+                                    && self.require_org_online("添加部门")
                                 {
                                     match self.call(
                                         "POST",
@@ -15988,6 +16067,7 @@ impl App {
                                         egui::Button::new("创建账号"),
                                     )
                                     .clicked()
+                                    && self.require_org_online("创建账号")
                                 {
                                     match self.call(
                                         "POST",
@@ -16024,6 +16104,7 @@ impl App {
                                         egui::Button::new("添加"),
                                     )
                                     .clicked()
+                                    && self.require_org_online("添加内容组")
                                 {
                                     match self.call(
                                         "POST",
@@ -16112,6 +16193,7 @@ impl App {
                                         egui::Button::new("添加授权"),
                                     )
                                     .clicked()
+                                    && self.require_org_online("添加授权")
                                 {
                                     match self.call(
                                         "POST",
@@ -16161,6 +16243,7 @@ impl App {
                                     .corner_radius(6),
                                 )
                                 .clicked()
+                                && self.require_org_online("保存公司资料")
                             {
                                 let fields: Value = json!(self.settings.company);
                                 match self.call(
@@ -16180,7 +16263,7 @@ impl App {
                                     [300.0, 26.0],
                                     egui::TextEdit::singleline(&mut self.settings.languages_text),
                                 );
-                                if ui.button("保存").clicked() {
+                                if ui.button("保存").clicked() && self.require_org_online("保存内容语言") {
                                     let langs: Vec<String> = self
                                         .settings
                                         .languages_text
@@ -16279,6 +16362,7 @@ impl App {
                                     .corner_radius(6),
                                 )
                                 .clicked()
+                                && self.require_org_online("保存 AI 设置")
                             {
                                 let mut body = json!({
                                     "provider": self.settings.ai_provider,
@@ -16306,7 +16390,7 @@ impl App {
                                 egui::TextEdit::multiline(&mut self.settings.glossary_text),
                             );
                             ui.add_space(8.0);
-                            if ui.button("保存术语表").clicked() {
+                            if ui.button("保存术语表").clicked() && self.require_org_online("保存术语表") {
                                 let pairs: Vec<Value> = self
                                     .settings
                                     .glossary_text
@@ -16355,7 +16439,7 @@ impl App {
                                 ui.checkbox(&mut allowed, "允许离线缓存");
                                 ui.label("容量上限（MB）");
                                 ui.add(egui::DragValue::new(&mut max_mb).range(10..=100000));
-                                if ui.button("保存策略").clicked() {
+                                if ui.button("保存策略").clicked() && self.require_org_online("保存缓存策略") {
                                     match self.call(
                                         "PUT",
                                         "/v1/settings/cache-policy",

@@ -362,6 +362,15 @@ impl App {
             return;
         }
         if submit {
+            // Execution-point re-check (audit issue 4): the
+            // dialog may have been opened while online and the
+            // network dropped since — the open-time gate in
+            // open_share_dialog is not enough. On a failed check
+            // the dialog stays open with its draft intact.
+            if !self.require_org_online("分享给…") {
+                self.share_dialog = Some(state);
+                return;
+            }
             let target_kind = match state.mode {
                 ShareMode::Person => "user",
                 ShareMode::Department => "dept",
@@ -476,6 +485,14 @@ impl App {
             return;
         }
         if submit {
+            // Execution-point re-check (audit issue 4), same as
+            // the share dialog: confirm-time, not open-time. On a
+            // failed check the dialog stays open with its draft
+            // intact.
+            if !self.require_org_online("保存到我的库") {
+                self.pull_dialog = Some(state);
+                return;
+            }
             let folder = if state.new_folder.trim().is_empty() {
                 state.folder.clone()
             } else {
