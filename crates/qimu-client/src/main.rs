@@ -6774,11 +6774,12 @@ impl App {
     }
 
     /// Jump a showroom item into DeckCraft (present handoff stages
-    /// 1–2). Returns false only when no DeckCraft desktop app is
-    /// available on this machine — the caller then falls back to the
-    /// pre-handoff path. Export failures are reported here and count
-    /// as handled: permission refusals arrive as export errors, so a
-    /// refused item never jumps (contract §2.2).
+    /// 1–2). When no DeckCraft desktop app is available on this
+    /// machine, the user is prompted to install DeckCraft separately
+    /// (ruling 2026-11-24) and the jump counts as handled. Export
+    /// failures are reported here and count as handled: permission
+    /// refusals arrive as export errors, so a refused item never
+    /// jumps (contract §2.2).
     fn present_via_deckcraft(
         &mut self,
         item_id: &str,
@@ -6787,7 +6788,12 @@ impl App {
         from: usize,
     ) -> bool {
         if deckcraft_app_path().is_none() {
-            return false;
+            // User ruling 2026-11-24: the client installer does not
+            // bundle DeckCraft; when a jump finds no DeckCraft on this
+            // machine, prompt the user to install it separately
+            // instead of silently falling back to the built-in player.
+            self.msg = "未检测到 DeckCraft 桌面应用：播放、普通视图和演示者视图由 DeckCraft 提供，请先安装 DeckCraft 后再试".into();
+            return true;
         }
         match self.export_for_present(item_id) {
             Ok((path, page_count)) => {
@@ -6826,7 +6832,7 @@ impl App {
     /// because it is a persisted DeckCraft preference.
     fn dc_jump(&mut self, path: &std::path::Path, title: &str, mode: DcMode, from: usize) {
         let Some(bin) = deckcraft_app_path() else {
-            self.msg = "未找到 DeckCraft 桌面应用".into();
+            self.msg = "未检测到 DeckCraft 桌面应用：播放、普通视图和演示者视图由 DeckCraft 提供，请先安装 DeckCraft 后再试".into();
             return;
         };
         // Reuse probe: a fresh connection + inspect on the managed port.
