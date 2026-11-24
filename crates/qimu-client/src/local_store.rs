@@ -28,32 +28,454 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-/// Library root resolution (design §6.2, same conventions as
-/// `cache_dir()`): the `library_dir` client setting wins; then an
-/// explicit `QIMU_DATA_DIR` (the data dir the bundled server would
-/// use — naming the same store keeps takeover exact); then an
-/// existing bundled-server library beside the executable (recognized
-/// by its `qimu.db`, so an empty probe-created folder does not divert
-/// the library into a possibly read-only install dir); finally
-/// `~/.qimu/library`.
+/// Library root resolution (design §6.2, extended by the
+/// library-discovery line, user ruling 2026-11-25): the bootstrap
+/// config's `data_dir` wins (see `read_bootstrap`); then the legacy
+/// `library_dir` client setting; then an explicit `QIMU_DATA_DIR`
+/// (the data dir the bundled server would use — naming the same
+/// store keeps takeover exact); finally the standard directory
+/// `~/.qimu/library`, with a first-run discovery step in front of
+/// it: when the standard directory holds no content yet, libraries
+/// left behind by older versions in their historical locations are
+/// probed and the fullest one is relocated (copied, then verified)
+/// into the standard directory, so an upgrade no longer opens onto
+/// a blank library while the user's data sits in an old install
+/// dir. The whole resolution runs once per process.
 pub fn library_dir() -> PathBuf {
+    library_resolution().dir
+}
+
+/// The standard library directory: the default root a fresh
+/// install uses and the target old libraries are relocated into.
+pub fn standard_library_dir() -> PathBuf {
+    crate::qimu_home().join("library")
+}
+
+// ---------------------------------------------------------------------------
+// Bootstrap config (user ruling 2026-11-25): a small standalone file
+// at `~/.qimu/bootstrap.json` — inside the per-user qimu home, which
+// no installer creates, moves or removes (the NSIS packages manage
+// only their install dir + registry keys), so the file is found no
+// matter where the app is installed or where the library itself
+// lives. It records where the library is (`data_dir`) and what to
+// do with a relocated old library (`old_library_policy`). A missing
+// or corrupt file is not an error: it reads as "no config" and the
+// discovery flow runs.
+
+/// What happens to the source of a verified relocation once the new
+/// library is live (settings-selectable; stored in the bootstrap
+/// config because that file is what governs library placement).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OldLibraryPolicy {
+    /// Ask the user (the default when never set).
+    Ask,
+    /// Delete the source without asking.
+    Delete,
+    /// Keep the source untouched.
+    Keep,
+}
+
+impl OldLibraryPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            OldLibraryPolicy::Ask => "ask",
+            OldLibraryPolicy::Delete => "delete",
+            OldLibraryPolicy::Keep => "keep",
+        }
+    }
+
+    fn parse(s: &str) -> OldLibraryPolicy {
+        match s {
+            "delete" => OldLibraryPolicy::Delete,
+            "keep" => OldLibraryPolicy::Keep,
+            _ => OldLibraryPolicy::Ask,
+        }
+    }
+}
+
+/// The bootstrap config's contents; absent fields read as `None`.
+#[derive(Clone, Default)]
+pub struct Bootstrap {
+    pub data_dir: Option<String>,
+    pub old_library_policy: Option<OldLibraryPolicy>,
+}
+
+impl Bootstrap {
+    /// The effective disposition policy: `Ask` until set otherwise.
+    pub fn policy(&self) -> OldLibraryPolicy {
+        self.old_library_policy.unwrap_or(OldLibraryPolicy::Ask)
+    }
+}
+
+pub fn bootstrap_path() -> PathBuf {
+    crate::qimu_home().join("bootstrap.json")
+}
+
+pub fn read_bootstrap() -> Bootstrap {
+    let Ok(text) = std::fs::read_to_string(bootstrap_path()) else {
+        return Bootstrap::default();
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+        // Corrupt config: behave as if there were none (discovery
+        // runs); the file is left in place until a relocation or a
+        // settings change writes a fresh one.
+        return Bootstrap::default();
+    };
+    Bootstrap {
+        data_dir: v
+            .get("data_dir")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
+        old_library_policy: v
+            .get("old_library_policy")
+            .and_then(|x| x.as_str())
+            .map(OldLibraryPolicy::parse),
+    }
+}
+
+pub fn write_bootstrap(b: &Bootstrap) {
+    let mut obj = serde_json::Map::new();
+    if let Some(d) = &b.data_dir {
+        obj.insert("data_dir".to_string(), json!(d));
+    }
+    if let Some(p) = &b.old_library_policy {
+        obj.insert("old_library_policy".to_string(), json!(p.as_str()));
+    }
+    let dir = crate::qimu_home();
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = craft_atomic::atomic_write(
+        &dir.join("bootstrap.json"),
+        serde_json::to_string_pretty(&Value::Object(obj))
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Library probing + relocation. Probing is strictly read-only: it
+// opens `qimu.db` with SQLITE_OPEN_READ_ONLY and never goes through
+// `Store::open` (which creates tables, seeds the owner and runs
+// backfills — a probe must not mutate the library it inspects).
+
+/// Core content counts of a library: (content blocks, versions,
+/// indexes). The verification currency of every relocation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct LibraryCounts {
+    pub units: usize,
+    pub versions: usize,
+    pub indexes: usize,
+}
+
+impl LibraryCounts {
+    pub fn has_content(&self) -> bool {
+        self.units + self.versions + self.indexes > 0
+    }
+
+    /// "Fullest library" ranking key: blocks first, then versions,
+    /// then indexes; the caller breaks remaining ties by the
+    /// database file's modification time.
+    fn rank(&self) -> (usize, usize, usize) {
+        (self.units, self.versions, self.indexes)
+    }
+}
+
+/// Recognize a library at `dir` and count its core content. A
+/// directory is a qimu library when it holds a `qimu.db` that opens
+/// as SQLite and carries the core tables (`units`, `versions`,
+/// `indexes_tbl`). `None` for anything else — including a database
+/// a crashed writer left a hot journal on (a read-only open refuses
+/// it); such a candidate is skipped, never forced.
+pub fn probe_library(dir: &std::path::Path) -> Option<LibraryCounts> {
+    let db = dir.join("qimu.db");
+    if !db.is_file() {
+        return None;
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        &db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .ok()?;
+    let tables: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' \
+             AND name IN ('units','versions','indexes_tbl')",
+            [],
+            |r| r.get(0),
+        )
+        .ok()?;
+    if tables < 3 {
+        return None;
+    }
+    let count = |t: &str| -> Option<i64> {
+        conn.query_row(&format!("SELECT COUNT(*) FROM \"{t}\""), [], |r| r.get(0))
+            .ok()
+    };
+    Some(LibraryCounts {
+        units: count("units")? as usize,
+        versions: count("versions")? as usize,
+        indexes: count("indexes_tbl")? as usize,
+    })
+}
+
+/// Files a relocation never copies: the client advisory lock (a
+/// copied lock would point at a stale pid — and the target must
+/// take its own) and SQLite sidecars (the `.db` file alone carries
+/// the last committed state; a journal/wal belongs to the source's
+/// last writer, not to the copy).
+const COPY_SKIP: [&str; 4] = [
+    "qimu-local.lock",
+    "qimu.db-journal",
+    "qimu.db-wal",
+    "qimu.db-shm",
+];
+
+/// Copy the library at `src` into `dst` and verify the copy by
+/// core counts. The source is never modified. On any failure the
+/// partial copy is removed again (exactly the top-level entries
+/// this call copied, plus `dst` itself when this call created it),
+/// so a half-copied directory is never left behind to be mistaken
+/// for a library.
+pub fn relocate_library(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+) -> Result<LibraryCounts, String> {
+    let src_counts = probe_library(src)
+        .ok_or_else(|| "源目录不是可识别的启幕库（缺少 qimu.db 或核心表）".to_string())?;
+    if src == dst {
+        return Ok(src_counts);
+    }
+    let dst_existed = dst.exists();
+    std::fs::create_dir_all(dst).map_err(|e| format!("无法创建目标目录：{e}"))?;
+    let mut copied: Vec<PathBuf> = Vec::new();
+    let attempt = (|| -> Result<(), String> {
+        let rd = std::fs::read_dir(src).map_err(|e| e.to_string())?;
+        for entry in rd {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let name = entry.file_name();
+            if COPY_SKIP.iter().any(|s| *s == name.to_string_lossy().as_ref()) {
+                continue;
+            }
+            let to = dst.join(&name);
+            let ft = entry.file_type().map_err(|e| e.to_string())?;
+            if ft.is_dir() {
+                crate::copy_dir_recursive(&entry.path(), &to).map_err(|e| e.to_string())?;
+            } else {
+                std::fs::copy(entry.path(), &to).map_err(|e| e.to_string())?;
+            }
+            copied.push(to);
+        }
+        Ok(())
+    })();
+    let verified = attempt.and_then(|()| match probe_library(dst) {
+        Some(c) if c == src_counts => Ok(c),
+        Some(c) => Err(format!(
+            "搬迁后计数不一致（源：{} 内容块 / {} 版本 / {} 索引；目标：{} / {} / {}）",
+            src_counts.units,
+            src_counts.versions,
+            src_counts.indexes,
+            c.units,
+            c.versions,
+            c.indexes
+        )),
+        None => Err("搬迁后目标目录无法识别为启幕库".to_string()),
+    });
+    if verified.is_err() {
+        for p in &copied {
+            if p.is_dir() {
+                let _ = std::fs::remove_dir_all(p);
+            } else {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+        if !dst_existed {
+            let _ = std::fs::remove_dir(dst);
+        }
+    }
+    verified
+}
+
+/// Historical install roots whose `qimu-data` may hold a library an
+/// older version created — every entry is evidenced by this tree:
+/// the current exe-side dir (the server's and the pre-P4 client's
+/// data root: server `data_dir()` resolution + all three NSIS
+/// scripts pre-creating `$INSTDIR\qimu-data`), and the NSIS default
+/// install dirs with their `.onInit` D-drive rewrites —
+/// `启幕-客户端.nsi` (`$PROGRAMFILES64\启幕客户端` /
+/// `D:\Program Files\启幕客户端`), `启幕.nsi`
+/// (`$PROGRAMFILES64\启幕` / `D:\Program Files\启幕`),
+/// `启幕-服务器.nsi` (`$PROGRAMFILES64\启幕服务器` /
+/// `D:\Program Files\启幕服务器`). The standard directory itself is
+/// excluded (it is the relocation target, not a candidate). Note
+/// `D:\Qimu` is deliberately absent: that root belongs to the
+/// offline *cache* (`platform_cache_default`), no version ever
+/// rooted the library there.
+pub fn candidate_library_dirs() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut push = |p: PathBuf| {
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    };
+    push(crate::exe_dir().join("qimu-data"));
+    #[cfg(target_os = "windows")]
+    {
+        let program_files = std::env::var("ProgramFiles")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("C:\\Program Files"));
+        for base in [PathBuf::from("D:\\Program Files"), program_files] {
+            for app in ["启幕客户端", "启幕", "启幕服务器"] {
+                push(base.join(app).join("qimu-data"));
+            }
+        }
+    }
+    let standard = standard_library_dir();
+    out.retain(|p| *p != standard);
+    out
+}
+
+/// Is a live client holding this library? A candidate whose lock
+/// names a still-running pid is skipped by discovery: copying a
+/// database another process is writing could tear the copy (its
+/// counts check would likely catch it, but there is no reason to
+/// race a live writer when the fallback — leaving it alone — is
+/// always safe).
+fn library_in_use(dir: &std::path::Path) -> bool {
+    let lock = dir.join("qimu-local.lock");
+    if !lock.exists() {
+        return false;
+    }
+    match read_lock_pid(&lock) {
+        Some(pid) => pid_alive(pid),
+        None => false,
+    }
+}
+
+/// How the resolved library dir was arrived at (settings display +
+/// the startup disposition hook).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LibraryOrigin {
+    /// The bootstrap config's `data_dir`.
+    Bootstrap,
+    /// The legacy `library_dir` client setting.
+    LegacySetting,
+    /// The `QIMU_DATA_DIR` environment variable.
+    Env,
+    /// The standard directory (already populated, or fresh).
+    Standard,
+    /// An old library was relocated into the standard directory.
+    Migrated,
+    /// Relocation failed; the old library is used in place.
+    FallbackSource,
+}
+
+/// The outcome of the once-per-process library resolution.
+#[derive(Clone)]
+pub struct LibraryResolution {
+    pub dir: PathBuf,
+    pub origin: LibraryOrigin,
+    /// The source of a verified relocation into the standard
+    /// directory — the one directory the disposition policy may
+    /// act on. Never set on the fallback path: there the source
+    /// IS the live library and no policy may delete it.
+    pub migrated_from: Option<PathBuf>,
+}
+
+pub fn library_resolution() -> LibraryResolution {
+    static RES: std::sync::OnceLock<LibraryResolution> = std::sync::OnceLock::new();
+    RES.get_or_init(resolve_library).clone()
+}
+
+fn resolve_library() -> LibraryResolution {
+    let res = |dir: PathBuf, origin: LibraryOrigin, migrated_from: Option<PathBuf>| {
+        LibraryResolution {
+            dir,
+            origin,
+            migrated_from,
+        }
+    };
+    // 1. The bootstrap config wins outright and skips all scanning.
+    //    A configured path that exists as a *file* is invalid and
+    //    falls through to discovery; a not-yet-existing directory is
+    //    valid (a fresh library at the configured place).
+    let boot = read_bootstrap();
+    if let Some(d) = boot.data_dir.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let p = PathBuf::from(d);
+        if !p.exists() || p.is_dir() {
+            return res(p, LibraryOrigin::Bootstrap, None);
+        }
+    }
+    // 2. The legacy client setting (design §6.2 hook; predates the
+    //    bootstrap file, kept so a hand-set value keeps working).
     if let Some(p) = crate::client_settings()
         .get("library_dir")
         .and_then(|v| v.as_str())
         .filter(|s| !s.trim().is_empty())
     {
-        return PathBuf::from(p);
+        return res(PathBuf::from(p), LibraryOrigin::LegacySetting, None);
     }
+    // 3. An explicit QIMU_DATA_DIR.
     if let Ok(d) = std::env::var("QIMU_DATA_DIR") {
         if !d.trim().is_empty() {
-            return PathBuf::from(d);
+            return res(PathBuf::from(d), LibraryOrigin::Env, None);
         }
     }
-    let beside = crate::exe_dir().join("qimu-data");
-    if beside.join("qimu.db").exists() {
-        return beside;
+    // 4. The standard directory — unless it is still empty, in
+    //    which case an older version's library may be waiting in a
+    //    historical location: discover, relocate, verify.
+    let standard = standard_library_dir();
+    if probe_library(&standard).map(|c| c.has_content()).unwrap_or(false) {
+        return res(standard, LibraryOrigin::Standard, None);
     }
-    crate::qimu_home().join("library")
+    let mut best: Option<(LibraryCounts, std::time::SystemTime, PathBuf)> = None;
+    for cand in candidate_library_dirs() {
+        if library_in_use(&cand) {
+            continue;
+        }
+        let Some(c) = probe_library(&cand) else {
+            continue;
+        };
+        if !c.has_content() {
+            continue;
+        }
+        let mtime = std::fs::metadata(cand.join("qimu.db"))
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let better = match &best {
+            None => true,
+            Some((bc, bm, _)) => (c.rank(), mtime) > (bc.rank(), *bm),
+        };
+        if better {
+            best = Some((c, mtime, cand));
+        }
+    }
+    if let Some((_, _, src)) = best {
+        match relocate_library(&src, &standard) {
+            Ok(_) => {
+                write_bootstrap(&Bootstrap {
+                    data_dir: Some(standard.to_string_lossy().into_owned()),
+                    old_library_policy: boot.old_library_policy,
+                });
+                return res(standard, LibraryOrigin::Migrated, Some(src));
+            }
+            Err(e) => {
+                // Fallback: claim the old library in place. It is
+                // now the live library — `migrated_from` stays None
+                // so no disposition policy can ever delete it.
+                eprintln!(
+                    "[qimu] 旧库搬迁失败（{e}），改按原目录打开：{}",
+                    src.display()
+                );
+                write_bootstrap(&Bootstrap {
+                    data_dir: Some(src.to_string_lossy().into_owned()),
+                    old_library_policy: boot.old_library_policy,
+                });
+                return res(src, LibraryOrigin::FallbackSource, None);
+            }
+        }
+    }
+    res(standard, LibraryOrigin::Standard, None)
 }
 
 /// Serialize a record list into the `Vec<Value>` shape the UI consumes

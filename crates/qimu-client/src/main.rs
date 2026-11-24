@@ -2754,6 +2754,10 @@ enum ConfirmAction {
         form: String,
         page: Option<usize>,
     },
+    /// Library discovery (2026-11-25): the post-relocation prompt's
+    /// affirmative answer — delete the source library a verified
+    /// relocation into the standard directory left behind.
+    DeleteOldLibrary(std::path::PathBuf),
 }
 
 /// Showroom page state (drill retrofit): zone + folder filter
@@ -2919,6 +2923,10 @@ struct App {
     disc_rx: Option<std::sync::mpsc::Receiver<Vec<Value>>>,
     disc_scanning: bool,
     cache_dir_input: String,
+    /// Settings 「数据目录」 input (library-discovery line): the
+    /// staged text of the data-directory field; saving runs a
+    /// verified relocation and rewrites the bootstrap config.
+    data_dir_input: String,
     pick: Option<PickState>,
     /// Cross-page deep-jump source (nav ruler 3): set when Home
     /// opens a detail on another page; that page's root then shows
@@ -3722,6 +3730,7 @@ impl App {
             disc_rx: None,
             disc_scanning: false,
             cache_dir_input: cache_dir().to_string_lossy().into_owned(),
+            data_dir_input: local_store::library_dir().to_string_lossy().into_owned(),
             pick: None,
             deep_source: None,
             folder_edit: None,
@@ -3819,6 +3828,47 @@ impl App {
             pull_dialog: None,
             push_dialog: None,
         };
+        // Library discovery (2026-11-25): when this launch relocated
+        // an old library into the standard directory and the new
+        // library opened, apply the stored disposition policy to
+        // the source. The new library being open IS the
+        // re-confirmation the policy requires before any deletion;
+        // when the open failed, nothing is deleted and nothing is
+        // asked. On the relocation-failure fallback there is no
+        // `migrated_from` at all — the source is the live library.
+        if app.local.is_some() {
+            let resolution = local_store::library_resolution();
+            if let Some(src) = &resolution.migrated_from {
+                match local_store::read_bootstrap().policy() {
+                    local_store::OldLibraryPolicy::Delete => {
+                        match std::fs::remove_dir_all(src) {
+                            Ok(()) => eprintln!(
+                                "[qimu] 搬迁后的旧库已按设置（删除）移除：{}",
+                                src.display()
+                            ),
+                            Err(e) => eprintln!(
+                                "[qimu] 搬迁后的旧库删除失败（{e}）：{}",
+                                src.display()
+                            ),
+                        }
+                    }
+                    local_store::OldLibraryPolicy::Ask => {
+                        app.overlays.push(Overlay::Confirm(ConfirmState {
+                            title: "旧库搬迁完成".to_string(),
+                            body: format!(
+                                "已把旧版本的数据目录从 {} 搬到新目录 {}，内容已核对完整，新库已启用。旧目录里的那份库还留着，不影响使用，只是多占一份空间。要现在删除旧库吗？",
+                                src.display(),
+                                resolution.dir.display()
+                            ),
+                            confirm_label: "删除旧库".to_string(),
+                            danger: true,
+                            action: ConfirmAction::DeleteOldLibrary(src.clone()),
+                        }));
+                    }
+                    local_store::OldLibraryPolicy::Keep => {}
+                }
+            }
+        }
         if std::env::var("QIMU_AUTOLOGIN").is_ok() && !app.password.is_empty() {
             app.do_login();
             // Screenshot helper: QIMU_OPEN=index|unit opens the first item's detail.
@@ -14937,6 +14987,17 @@ impl App {
                         Err(e) => self.msg = format!("清空失败：{e}"),
                     }
                 }
+                ConfirmAction::DeleteOldLibrary(path) => {
+                    match std::fs::remove_dir_all(&path) {
+                        Ok(()) => {
+                            self.msg = format!("旧库已删除：{}", path.display());
+                        }
+                        Err(e) => {
+                            self.msg =
+                                format!("旧库删除失败（{e}），旧库仍保留在：{}", path.display());
+                        }
+                    }
+                }
                 ConfirmAction::DiscardPageEdit => {
                     if let Some(pos) = self
                         .overlays
@@ -17826,6 +17887,158 @@ impl App {
                 .size(11.5)
                 .color(palette_color(TEXT_WEAK)),
         );
+        // 数据目录 (library-discovery line, 2026-11-25): where the
+        // local library lives, per the bootstrap config. Saving a
+        // new directory relocates the library with count
+        // verification and rewrites the config; the running process
+        // keeps the library it opened, so the new directory takes
+        // effect on the next launch — stated in the copy below.
+        ui.add_space(12.0);
+        ui.label(
+            egui::RichText::new("数据目录")
+                .strong()
+                .size(14.0)
+                .color(palette_color(TEXT_MAIN)),
+        );
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(
+                "本地库（内容块、索引、页面与演示数据）存放的目录。改选新目录后，软件会把当前库完整复制过去并核对内容，核对通过才写入配置文件；本次运行仍使用当前目录，新目录从下次启动生效。新目录里已有其他启幕库时不会覆盖或合并，保存会被拒绝。",
+            )
+            .size(11.5)
+            .color(palette_color(TEXT_WEAK)),
+        );
+        ui.add_space(4.0);
+        let resolution = local_store::library_resolution();
+        let origin_note = match resolution.origin {
+            local_store::LibraryOrigin::Bootstrap => "来自配置文件",
+            local_store::LibraryOrigin::LegacySetting => "来自既有设置",
+            local_store::LibraryOrigin::Env => "来自环境变量 QIMU_DATA_DIR",
+            local_store::LibraryOrigin::Standard => "标准目录",
+            local_store::LibraryOrigin::Migrated => "本次启动由旧版库搬迁而来",
+            local_store::LibraryOrigin::FallbackSource => "旧库搬迁未成，暂按原目录使用",
+        };
+        let current_root = self
+            .local
+            .as_ref()
+            .map(|l| l.root.display().to_string())
+            .unwrap_or_else(|| resolution.dir.display().to_string());
+        ui.label(
+            egui::RichText::new(format!(
+                "当前生效：{}（{}）；配置文件：{}",
+                current_root,
+                origin_note,
+                local_store::bootstrap_path().display()
+            ))
+            .size(11.5)
+            .color(palette_color(TEXT_WEAK)),
+        );
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.add_sized(
+                [460.0, 30.0],
+                egui::TextEdit::singleline(&mut self.data_dir_input),
+            );
+            if ui.button("选择目录…").clicked() {
+                if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                    self.data_dir_input = p.to_string_lossy().into_owned();
+                }
+            }
+        });
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui.button("保存并搬迁").clicked() {
+                let target = std::path::PathBuf::from(self.data_dir_input.trim());
+                if target.as_os_str().is_empty() {
+                    self.msg = "数据目录不能为空".into();
+                } else {
+                    self.apply_data_dir_change(target);
+                }
+            }
+            if ui.button("恢复默认目录").clicked() {
+                self.apply_data_dir_change(local_store::standard_library_dir());
+            }
+        });
+        // 旧库处置: the post-relocation source disposition policy,
+        // stored in the bootstrap config next to `data_dir`.
+        ui.add_space(12.0);
+        ui.label(
+            egui::RichText::new("旧库处置（升级搬迁后）")
+                .strong()
+                .size(14.0)
+                .color(palette_color(TEXT_MAIN)),
+        );
+        ui.add_space(4.0);
+        let policy = local_store::read_bootstrap().policy();
+        ui.horizontal(|ui| {
+            for (val, label) in [
+                (local_store::OldLibraryPolicy::Ask, "询问"),
+                (local_store::OldLibraryPolicy::Delete, "删除"),
+                (local_store::OldLibraryPolicy::Keep, "不删除"),
+            ] {
+                if ui.radio(policy == val, label).clicked() && policy != val {
+                    let mut b = local_store::read_bootstrap();
+                    b.old_library_policy = Some(val);
+                    local_store::write_bootstrap(&b);
+                    self.msg = format!("旧库处置已设为「{label}」");
+                }
+            }
+        });
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(
+                "升级时旧库被搬到标准目录、且新库核对通过并启用之后，怎么处置原来的旧库：「询问」每次弹窗问你（默认）；「删除」直接删；「不删除」一直保留。搬迁未成功时旧库就是正在使用的库，任何设置下都不会删。",
+            )
+            .size(11.5)
+            .color(palette_color(TEXT_WEAK)),
+        );
+    }
+
+    /// Settings 「保存并搬迁」/「恢复默认目录」 for the data
+    /// directory: copy the running library to `target` with count
+    /// verification, then point the bootstrap config at it. The
+    /// running process keeps the library it opened — the new
+    /// directory takes effect on the next launch.
+    fn apply_data_dir_change(&mut self, target: std::path::PathBuf) {
+        let current = self
+            .local
+            .as_ref()
+            .map(|l| l.root.clone())
+            .unwrap_or_else(local_store::library_dir);
+        if target == current {
+            self.msg = "所选目录就是当前数据目录，无需搬迁".into();
+            return;
+        }
+        if target.starts_with(&current) || current.starts_with(&target) {
+            self.msg = "新目录不能位于当前数据目录之内，也不能包含当前数据目录".into();
+            return;
+        }
+        if target.exists() && !target.is_dir() {
+            self.msg = "所选路径是一个文件，不能用作数据目录".into();
+            return;
+        }
+        if local_store::probe_library(&target)
+            .map(|c| c.has_content())
+            .unwrap_or(false)
+        {
+            self.msg = "新目录里已有另一个启幕库，不会覆盖或合并；请换一个空目录".into();
+            return;
+        }
+        match local_store::relocate_library(&current, &target) {
+            Ok(_) => {
+                let mut b = local_store::read_bootstrap();
+                b.data_dir = Some(target.to_string_lossy().into_owned());
+                local_store::write_bootstrap(&b);
+                self.data_dir_input = target.to_string_lossy().into_owned();
+                self.msg = format!(
+                    "已把当前库搬迁到 {} 并核对通过；本次运行仍使用当前目录，下次启动起从新目录打开",
+                    target.display()
+                );
+            }
+            Err(e) => {
+                self.msg = format!("搬迁失败：{e}；仍在使用当前目录，配置文件未改动");
+            }
+        }
     }
 
     /// Settings nav frame body: the section list, unchanged.

@@ -26,6 +26,11 @@ serde = { version = "1", features = ["derive"] }
 ureq = { version = "2", features = ["json"] }
 base64 = "0.22"
 rfd = "0.15"
+# Same spec as qimu-core's rusqlite: used read-only by the library
+# discovery/relocation code (local_store) to probe candidate library
+# roots (table presence + row counts) without opening a Store —
+# opening one would mutate the probed library (schema, seeds).
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # craft-i18n (storytold/craft-libs@b9c7b69, MIT OR Apache-2.0): the
 # source-keyed localization runtime; catalogs live in locales/*.tsv in
