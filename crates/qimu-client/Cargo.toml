@@ -76,7 +76,7 @@ deckcraft-fonts  = { path = "../../vendor/deckcraft/crates/fonts" }
 deckcraft-text   = { path = "../../vendor/deckcraft/crates/text" }
 # - Still reserved: pdf (T1 export), ui-egui (T2 show hosting).
 # deckcraft-pdf    = { path = "../../vendor/deckcraft/crates/pdf" }
-# deckcraft-ui-egui = { path = "../../vendor/deckcraft/crates/ui-egui" }
+deckcraft-ui-egui = { path = "../../vendor/deckcraft/crates/ui-egui" }
 # ---------------------------------------------------------------------------
 
 # build.rs embeds the brand logo as the Windows executable icon.
