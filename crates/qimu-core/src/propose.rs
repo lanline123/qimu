@@ -4,7 +4,8 @@
 //! the interface is the seam where an AI proposer plugs in later —
 //! proposals are always confirmed by a human before import.
 //!
-//! SECTION WIRING POINT (PLAN §3.3 item 1, §8 decision 5): in BOTH
+//! SECTION WIRING (PLAN §3.3 item 1, §8 decision 5; implemented
+//! via `crate::pptx::deck_sections`): in BOTH
 //! section modes a source deck's real sections are the preferred
 //! split boundaries here (one section = one proposed block, named
 //! after the section) and this heuristic only arbitrates decks
@@ -44,6 +45,30 @@ fn is_section_opener(f: &PageFeat, prev: &PageFeat) -> bool {
 }
 
 pub fn propose_blocks(pkg: &Package) -> Result<ProposalReport, String> {
+    // Real sections are the preferred boundaries (§8 decision 5):
+    // one section = one proposed block, named after the section.
+    // The heuristic below only arbitrates decks without sections.
+    if let Some(spans) = crate::pptx::deck_sections(pkg)? {
+        let slide_count = spans.iter().map(|sp| sp.pages.len()).sum();
+        let blocks = spans
+            .iter()
+            .enumerate()
+            .map(|(i, sp)| BlockProposal {
+                name: if sp.name.trim().is_empty() {
+                    format!("第{}部分", i + 1)
+                } else {
+                    sp.name.clone()
+                },
+                pages: sp.pages.clone(),
+                confidence: 1.0,
+            })
+            .collect();
+        return Ok(ProposalReport {
+            proposer: "section-v1".to_string(),
+            slide_count,
+            blocks,
+        });
+    }
     let slide_refs = crate::pptx::slides(pkg)?;
     let mut feats = Vec::new();
     for s in &slide_refs {

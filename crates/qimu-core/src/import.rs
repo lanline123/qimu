@@ -68,7 +68,11 @@ impl Store {
     /// failed check imports nothing. Each block becomes one content
     /// unit with one rendition and version 1.0.0; the original
     /// whole file is never archived. `blocks = None` imports the
-    /// whole deck as a single block named after the file stem.
+    /// deck without a caller-supplied split: a deck carrying real
+    /// PPT sections splits by section (one section = one block,
+    /// named after the section; slides in no section form one
+    /// block named after the file stem), and a sectionless deck
+    /// imports as a single block named after the file stem.
     /// `author` is the display name recorded as maintainer and
     /// version author (the requesting user over HTTP, the local
     /// library's seeded owner in-process).
@@ -97,14 +101,30 @@ impl Store {
             .trim_end_matches(".pptx")
             .trim_end_matches(".PPTX")
             .to_string();
-        let blocks = blocks.unwrap_or_else(|| {
-            vec![ImportBlockSpec {
-                name: stem.clone(),
-                pages: (0..singles.len()).collect(),
-                form: None,
-                lang: None,
-            }]
-        });
+        let blocks = match blocks {
+            Some(blocks) => blocks,
+            None => match pptx::deck_sections(&pkg)? {
+                Some(spans) => spans
+                    .iter()
+                    .map(|sp| ImportBlockSpec {
+                        name: if sp.name.trim().is_empty() {
+                            stem.clone()
+                        } else {
+                            sp.name.clone()
+                        },
+                        pages: sp.pages.clone(),
+                        form: None,
+                        lang: None,
+                    })
+                    .collect(),
+                None => vec![ImportBlockSpec {
+                    name: stem.clone(),
+                    pages: (0..singles.len()).collect(),
+                    form: None,
+                    lang: None,
+                }],
+            },
+        };
         let mut created = Vec::new();
         for block in &blocks {
             if block.pages.is_empty() {

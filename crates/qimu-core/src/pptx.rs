@@ -287,6 +287,121 @@ pub fn slides(pkg: &Package) -> PptxResult<Vec<SlideRef>> {
     Ok(out)
 }
 
+/// One PowerPoint section of a deck: its name and the 0-based
+/// slide indices that belong to it, in presentation order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SectionSpan {
+    pub name: String,
+    pub pages: Vec<usize>,
+}
+
+/// The deck's real sections (`p14:sectionLst` in
+/// `ppt/presentation.xml`), resolved to slide indices in
+/// presentation order. `Ok(None)` means the deck carries no usable
+/// section list — the common case for decks written by tools that
+/// never create sections — and callers fall back to their
+/// sectionless behaviour.
+///
+/// Slides belonging to no section are grouped into a single span
+/// with an empty name, positioned where its first slide appears;
+/// naming that span is the caller's existing fallback concern (the
+/// file stem in `import_blocks`, the numbered-part fallback in
+/// `propose_blocks`). Structural oddities (unparseable slide ids,
+/// sections referencing slides the deck does not have, a section
+/// list naming no deck slide at all) also degrade to `Ok(None)`
+/// rather than an error: sections are a hint layer, and a deck
+/// that imports fine without them must not start failing over its
+/// section list.
+pub fn deck_sections(pkg: &Package) -> PptxResult<Option<Vec<SectionSpan>>> {
+    let pres = pkg.get_text(PRESENTATION)?;
+    let root = parse_xml(&pres, PRESENTATION)?;
+    // Deck order: the numeric ids of the main sldIdLst.
+    let mut deck_ids: Vec<u32> = Vec::new();
+    if let Some(lst) = root.children(Local("sldIdLst")).next() {
+        for el in lst.children(Local("sldId")) {
+            match el.attr("id").and_then(|v| v.parse::<u32>().ok()) {
+                Some(id) => deck_ids.push(id),
+                None => return Ok(None),
+            }
+        }
+    }
+    if deck_ids.is_empty() {
+        return Ok(None);
+    }
+    // Section definitions, in document order: (name, member ids).
+    let mut defs: Vec<(String, Vec<u32>)> = Vec::new();
+    for ext_lst in root.children(Local("extLst")) {
+        for ext in ext_lst.children(Local("ext")) {
+            for lst in ext.children(Local("sectionLst")) {
+                for sec in lst.children(Local("section")) {
+                    let name = sec.attr("name").unwrap_or_default().to_string();
+                    let mut ids = Vec::new();
+                    if let Some(id_lst) = sec.children(Local("sldIdLst")).next() {
+                        for el in id_lst.children(Local("sldId")) {
+                            if let Some(id) = el.attr("id").and_then(|v| v.parse::<u32>().ok())
+                            {
+                                ids.push(id);
+                            }
+                        }
+                    }
+                    defs.push((name, ids));
+                }
+            }
+        }
+    }
+    if defs.is_empty() {
+        return Ok(None);
+    }
+    // Walk the deck in order, opening each span at its first
+    // slide: one span per section (first definition wins when an
+    // id is listed twice), plus one unnamed span collecting the
+    // slides no section claims.
+    let mut spans: Vec<SectionSpan> = Vec::new();
+    let mut span_of_def: Vec<Option<usize>> = vec![None; defs.len()];
+    let mut loose: Option<usize> = None;
+    let mut any_sectioned = false;
+    for (idx, id) in deck_ids.iter().enumerate() {
+        let owner = defs.iter().position(|(_, ids)| ids.contains(id));
+        match owner {
+            Some(di) => {
+                any_sectioned = true;
+                let si = match span_of_def[di] {
+                    Some(si) => si,
+                    None => {
+                        spans.push(SectionSpan {
+                            name: defs[di].0.clone(),
+                            pages: Vec::new(),
+                        });
+                        let si = spans.len() - 1;
+                        span_of_def[di] = Some(si);
+                        si
+                    }
+                };
+                spans[si].pages.push(idx);
+            }
+            None => {
+                let si = match loose {
+                    Some(si) => si,
+                    None => {
+                        spans.push(SectionSpan {
+                            name: String::new(),
+                            pages: Vec::new(),
+                        });
+                        let si = spans.len() - 1;
+                        loose = Some(si);
+                        si
+                    }
+                };
+                spans[si].pages.push(idx);
+            }
+        }
+    }
+    if !any_sectioned {
+        return Ok(None);
+    }
+    Ok(Some(spans))
+}
+
 /// Per-page fingerprint: slide XML plus its relationship table, so a page
 /// whose media/layout links change is a different page.
 pub fn page_fingerprint(pkg: &Package, slide_part: &str) -> String {
@@ -756,6 +871,35 @@ pub fn set_notes_text(pkg: &mut Package, slide_idx: usize, text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pkg_with_presentation(xml: &str) -> Package {
+        let mut parts = BTreeMap::new();
+        parts.insert(PRESENTATION.to_string(), xml.as_bytes().to_vec());
+        Package { parts }
+    }
+
+    #[test]
+    fn deck_sections_groups_by_section_with_loose_head() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p14="http://schemas.microsoft.com/office/powerpoint/2010/main"><p:sldIdLst><p:sldId id="256" r:id="rId2"/><p:sldId id="257" r:id="rId3"/><p:sldId id="258" r:id="rId4"/><p:sldId id="259" r:id="rId5"/></p:sldIdLst><p:extLst><p:ext uri="{521415D9-36F0-4FBD-ABE6-6ED785790B25}"><p14:sectionLst><p14:section name="Alpha" id="{11111111-1111-1111-1111-111111111111}"><p14:sldIdLst><p14:sldId id="257"/><p14:sldId id="258"/></p14:sldIdLst></p14:section><p14:section name="Beta" id="{22222222-2222-2222-2222-222222222222}"><p14:sldIdLst><p14:sldId id="259"/></p14:sldIdLst></p14:section></p14:sectionLst></p:ext></p:extLst></p:presentation>"#;
+        let pkg = pkg_with_presentation(xml);
+        let spans = deck_sections(&pkg).unwrap().expect("sections present");
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].name, "");
+        assert_eq!(spans[0].pages, vec![0]);
+        assert_eq!(spans[1].name, "Alpha");
+        assert_eq!(spans[1].pages, vec![1, 2]);
+        assert_eq!(spans[2].name, "Beta");
+        assert_eq!(spans[2].pages, vec![3]);
+    }
+
+    #[test]
+    fn deck_sections_none_without_section_list() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="256" r:id="rId2"/></p:sldIdLst></p:presentation>"#;
+        let pkg = pkg_with_presentation(xml);
+        assert_eq!(deck_sections(&pkg).unwrap(), None);
+    }
 
     #[test]
     fn resolve_targets() {
