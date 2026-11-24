@@ -52,6 +52,7 @@ pub(super) enum ChromeIcon {
     Combine,
     BlockSave,
     BlockPublish,
+    Info,
 }
 
 static SVG_ICONS: &[(&str, &[u8])] = &[
@@ -157,6 +158,7 @@ static SVG_ICONS: &[(&str, &[u8])] = &[
         "block-publish",
         include_bytes!("../assets/icons/block-publish.svg"),
     ),
+    ("info", include_bytes!("../assets/icons/info.svg")),
 ];
 static ICONS: std::sync::LazyLock<SvgIconSet> = std::sync::LazyLock::new(|| {
     SvgIconSet::new(
@@ -221,6 +223,7 @@ impl ChromeIcon {
             Self::Combine => "combine",
             Self::BlockSave => "block-save",
             Self::BlockPublish => "block-publish",
+            Self::Info => "info",
         };
         egui::Image::new(ICONS.source(name))
             .fit_to_exact_size(egui::Vec2::splat(size))

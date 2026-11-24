@@ -604,6 +604,20 @@ impl App {
             } else {
                 None
             };
+        // sdInfo target (T5): the same finished-deck targets
+        // the group acts on — the open deck first (with its
+        // loaded page count), else the plaza-selected deck
+        // (not loaded: no page count). No target, no light:
+        // the button greys with the group, exactly as the
+        // prototype's syncBarState rules sdInfo (lit only when
+        // a viewable object exists).
+        let info_target: Option<(Value, Option<usize>)> = match (&item, &pages) {
+            (Some(it), Some(pgs)) => Some((
+                it.clone(),
+                if pgs.is_empty() { None } else { Some(pgs.len()) },
+            )),
+            _ => plaza_item.clone().map(|it| (it, None)),
+        };
         let copy_deck: Option<Value> = item.clone().or(plaza_item);
         // sdClose — the global back button. It keeps its own
         // availability and never follows the group's grey state.
@@ -881,6 +895,28 @@ impl App {
             self.clip_paste(true);
         }
         tool_vsep(ui);
+        // sdInfo — the deck's metadata panel (T5 ruling
+        // 2026-11-24: defined, not deleted). Its slot sits in
+        // the first group beside sdCache: the prototype's
+        // syncBarState pairs sdInfo with the sdPull slot, and
+        // share / cache / info are the group's three
+        // about-this-deck actions. Availability = a finished
+        // deck target exists (open or plaza-selected); the
+        // panel itself is App::open_deck_info.
+        if ChromeIcons
+            .tool(
+                ui,
+                ChromeIcon::Info,
+                "成品信息",
+                info_target.is_some(),
+                false,
+                true,
+            )
+            .clicked()
+        {
+            let (it, pgs) = info_target.clone().unwrap();
+            self.open_deck_info(&it, pgs);
+        }
         // sdCache — the prototype's sdPull slot (T6 ruling
         // 2026-11-24: the slot is 缓存, not 收进我的 — the
         // prototype itself was wrong). Accent-filled while the

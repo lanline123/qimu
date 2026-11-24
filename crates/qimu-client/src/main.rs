@@ -1089,6 +1089,25 @@ fn entry_label(e: &Value) -> String {
     base
 }
 
+/// Visible-scope label for a showroom item's scope value
+/// (org-model DESIGN §2.1 vocabulary). Only `org_public` is
+/// produced this phase; the reserved tiers are mapped too, so
+/// a future scoped item reads truthfully instead of leaking
+/// its storage string. An empty value is missing data ("—");
+/// an unrecognized non-empty value is shown as-is.
+fn scope_label(scope: &str) -> String {
+    match scope {
+        "" => "—".into(),
+        "org_public" => "全组织公开".into(),
+        "private" => "仅自己".into(),
+        _ if scope.starts_with("users:") => "指定成员".into(),
+        _ if scope.starts_with("scoped:") && scope.contains("subtree") => "锚点部门及下级".into(),
+        _ if scope.starts_with("scoped:") && scope.contains("node") => "锚点部门".into(),
+        _ if scope.starts_with("scoped:") => "部门范围".into(),
+        _ => scope.to_string(),
+    }
+}
+
 fn fmt_time(ms: i64) -> String {
     // unix ms -> "YYYY-MM-DD HH:MM" (UTC+8 display for the LAN product)
     let secs = ms / 1000 + 8 * 3600;
@@ -2376,6 +2395,20 @@ enum Overlay {
     PageEdit(PageEditState),
     PickTemplate(PickTemplateState),
     Confirm(ConfirmState),
+    DeckInfo(DeckInfoState),
+}
+
+/// sdInfo (bottom bar, T5 ruling 2026-11-24): a read-only
+/// metadata snapshot of one showroom item, computed at click
+/// time and rendered as an overlay. Display strings are
+/// prebuilt; a field the item does not carry arrives as
+/// "—", never invented.
+struct DeckInfoState {
+    title: String,
+    pages: String,
+    version: String,
+    submitter: String,
+    scope: String,
 }
 
 struct ConfirmState {
@@ -12115,6 +12148,9 @@ impl App {
                 Some(Overlay::AllVersions { entry_pos: _ }) => {
                     self.overlays.pop();
                 }
+                Some(Overlay::DeckInfo(_)) => {
+                    self.overlays.pop();
+                }
                 None => {}
             }
         }
@@ -12221,6 +12257,7 @@ impl App {
                     None
                 }
             }
+            Overlay::DeckInfo(st) => self.deck_info_ui(ui, st),
             Overlay::PickTemplate(t) => self.pick_template_ui(ui, t),
             Overlay::PageEdit(pe) => self.page_edit_ui(ui, screen, pe),
             Overlay::Present(p) => self.present_ui(ui, screen, p),
@@ -12324,6 +12361,112 @@ impl App {
             return None;
         }
         Some(Overlay::Confirm(c))
+    }
+
+    /// sdInfo panel (T5): the four metadata fields of the
+    /// user's definition — page count, version, submitter,
+    /// visible scope — as a read-only overlay in the
+    /// Confirm / AllVersions form (centered Window; closes
+    /// via its X, the close button, or Esc, like its siblings).
+    fn deck_info_ui(&mut self, ui: &mut egui::Ui, st: DeckInfoState) -> Option<Overlay> {
+        let mut open = true;
+        let mut close = false;
+        egui::Window::new(tr("成品信息"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ui.ctx(), |ui| {
+                ui.set_width(340.0);
+                ui.label(
+                    egui::RichText::new(&st.title)
+                        .size(13.5)
+                        .color(palette_color(TEXT_MAIN)),
+                );
+                ui.add_space(8.0);
+                egui::Grid::new("deck_info_grid")
+                    .num_columns(2)
+                    .spacing(egui::vec2(14.0, 5.0))
+                    .show(ui, |ui| {
+                        for (label, value) in [
+                            ("页数", &st.pages),
+                            ("版本", &st.version),
+                            ("提交人", &st.submitter),
+                            ("可见范围", &st.scope),
+                        ] {
+                            ui.label(
+                                egui::RichText::new(tr(label))
+                                    .size(12.5)
+                                    .color(palette_color(TEXT_WEAK)),
+                            );
+                            ui.label(
+                                egui::RichText::new(value.as_str())
+                                    .size(12.5)
+                                    .color(palette_color(TEXT_MAIN)),
+                            );
+                            ui.end_row();
+                        }
+                    });
+                ui.add_space(10.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if btn_default(ui, tr("关闭")).clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if !open || close {
+            return None;
+        }
+        Some(Overlay::DeckInfo(st))
+    }
+
+    /// sdInfo click: snapshot the target item's metadata and
+    /// open the panel. Page count is the open deck's loaded
+    /// page list — a plaza-selected deck has not been loaded
+    /// and the item record carries no page count, so the field
+    /// stays "—" rather than guessing. Version is the item's
+    /// pinned submission commit: its message when the source
+    /// index's detail frame holds the commit list (commits are
+    /// labelled by message in this client), else the commit's
+    /// short id.
+    fn open_deck_info(&mut self, item: &Value, pages: Option<usize>) {
+        let version = {
+            let cid = s(item, "commit_id");
+            if cid.is_empty() {
+                "—".to_string()
+            } else {
+                let mut label = None;
+                if let IndexFrame::Detail(d) = self.index.stack.top() {
+                    if d.index_id == s(item, "source_index_id") {
+                        if let Some(list) =
+                            d.commits.as_ref().and_then(|c| c["commits"].as_array())
+                        {
+                            if let Some(c) = list.iter().find(|c| s(c, "id") == cid) {
+                                let msg = s(c, "message");
+                                if !msg.is_empty() {
+                                    label = Some(msg);
+                                }
+                            }
+                        }
+                    }
+                }
+                label.unwrap_or_else(|| {
+                    format!("提交 {}", cid.chars().take(8).collect::<String>())
+                })
+            }
+        };
+        let submitter = s(item, "submitted_by");
+        self.overlays.push(Overlay::DeckInfo(DeckInfoState {
+            title: s(item, "title"),
+            pages: pages.map(|n| n.to_string()).unwrap_or_else(|| "—".into()),
+            version,
+            submitter: if submitter.is_empty() {
+                "—".into()
+            } else {
+                submitter
+            },
+            scope: scope_label(&s(item, "scope")),
+        }));
     }
 
     fn pick_template_ui(
