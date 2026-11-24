@@ -22,7 +22,7 @@
 
 use qimu_core::manifest::{Binding, Manifest, SourceRef};
 use qimu_core::pptx::{self, Package};
-use qimu_core::store::{Store, UserRec};
+use qimu_core::store::{FolderDeleteMode, Store, UserRec};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -1069,7 +1069,15 @@ impl LocalStore {
                 // ---- folders ----
                 ("GET", ["v1", "folders"]) => {
                     let store = self.store.lock().unwrap();
-                    let folders = store.list_folders().map(values_of).unwrap_or_default();
+                    // ?scope= limits the list to one sidebar tree
+                    // (sidebar isolation); without it the full
+                    // list is served, every row carrying its scope.
+                    let folders = match query_param(q, "scope") {
+                        Some(scope) => store.list_folders_in(&scope),
+                        None => store.list_folders(),
+                    }
+                    .map(values_of)
+                    .unwrap_or_default();
                     Ok(json!({ "folders": folders }))
                 }
                 ("POST", ["v1", "folders"]) => {
@@ -1077,12 +1085,18 @@ impl LocalStore {
                     let f = store.create_folder(
                         &str_field(&body, "name").unwrap_or_default(),
                         opt_str_field(&body, "parent_id"),
+                        opt_str_field(&body, "scope").unwrap_or("showroom"),
                     )?;
                     Ok(serde_json::to_value(&f).unwrap_or(Value::Null))
                 }
                 ("POST", ["v1", "folders", id, "rename"]) => {
                     let store = self.store.lock().unwrap();
                     store.rename_folder(id, &str_field(&body, "name").unwrap_or_default())?;
+                    Ok(json!({ "ok": true }))
+                }
+                ("POST", ["v1", "folders", id, "note"]) => {
+                    let store = self.store.lock().unwrap();
+                    store.set_folder_note(id, &str_field(&body, "note").unwrap_or_default())?;
                     Ok(json!({ "ok": true }))
                 }
                 ("POST", ["v1", "folders", id, "move"]) => {
@@ -1095,9 +1109,42 @@ impl LocalStore {
                     Ok(json!({ "ok": true }))
                 }
                 ("DELETE", ["v1", "folders", id]) => {
+                    // Compatibility face of POST .../delete with
+                    // mode "lift" (see the server route).
                     let store = self.store.lock().unwrap();
-                    store.delete_folder(id)?;
+                    store.delete_folder(id, FolderDeleteMode::Lift, &self.owner.display_name)?;
                     Ok(json!({ "ok": true }))
+                }
+                ("POST", ["v1", "folders", id, "delete"]) => {
+                    // The delete dialog's two shapes (user ruling
+                    // 2026-11-24): "lift" keeps the contents one
+                    // level up; "trash" sends the subtree's
+                    // contents to the trash. Trash rows record the
+                    // owner the same way this face's single-item
+                    // trash path does (display name).
+                    let mode = match str_field(&body, "mode").as_deref() {
+                        Some("lift") => FolderDeleteMode::Lift,
+                        Some("trash") => FolderDeleteMode::Trash,
+                        other => {
+                            return Err(format!(
+                                "unknown delete mode: {}",
+                                other.unwrap_or_default()
+                            ))
+                        }
+                    };
+                    let store = self.store.lock().unwrap();
+                    store.delete_folder(id, mode, &self.owner.display_name)?;
+                    Ok(json!({ "ok": true }))
+                }
+                ("POST", ["v1", "folders", id, "color"]) => {
+                    let store = self.store.lock().unwrap();
+                    store.set_folder_color(id, opt_str_field(&body, "color"))?;
+                    let folder = store
+                        .list_folders()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find(|f| f.id == id);
+                    Ok(serde_json::to_value(&folder).unwrap_or(Value::Null))
                 }
                 // ---- trash ----
                 ("GET", ["v1", "trash"]) => {

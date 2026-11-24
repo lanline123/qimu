@@ -49,6 +49,27 @@ pub struct FolderRec {
     /// spec §3.10. Points at an index whose home folder is this folder.
     #[serde(default)]
     pub main_index_id: Option<String>,
+    /// Sidebar scope: which surface's folder tree this folder
+    /// belongs to (showroom | library | inbox | content | index).
+    /// Sidebar trees are isolated per surface (user ruling
+    /// 2026-11-24): a folder is listed, created under, moved and
+    /// renumbered only inside its own scope. Empty in rows from
+    /// before scoping; Store::open assigns those a scope from
+    /// homing evidence (see backfill_folder_scopes).
+    #[serde(default)]
+    pub scope: String,
+    /// Sidebar folder color (user ruling 2026-11-24): a "#RRGGBB"
+    /// hex string from the client's preset palette, or None for
+    /// the default icon tint. The client dyes the folder's icon
+    /// with it; the folder name keeps its normal color.
+    #[serde(default)]
+    pub color: Option<String>,
+    /// The folder's free-text note （备注）: shown in small type
+    /// beside the folder name on the content page's folder-flow
+    /// view (user ruling 2026-11-24) and edited there in place.
+    /// Empty when the folder carries no note.
+    #[serde(default)]
+    pub note: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -545,7 +566,7 @@ CREATE TABLE IF NOT EXISTS departments(id TEXT PRIMARY KEY, name TEXT NOT NULL, 
 CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, display_name TEXT NOT NULL, password_hash TEXT NOT NULL, dept_id TEXT, role TEXT NOT NULL DEFAULT 'member', disabled INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS user_depts(user_id TEXT NOT NULL, dept_id TEXT NOT NULL, PRIMARY KEY(user_id, dept_id));
 CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, user_id TEXT, created_ms INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'user', client_ip TEXT, last_seen_ms INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE IF NOT EXISTS folders(id TEXT PRIMARY KEY, name TEXT NOT NULL, parent_id TEXT, sort INTEGER NOT NULL DEFAULT 0, main_index_id TEXT);
+CREATE TABLE IF NOT EXISTS folders(id TEXT PRIMARY KEY, name TEXT NOT NULL, parent_id TEXT, sort INTEGER NOT NULL DEFAULT 0, main_index_id TEXT, scope TEXT NOT NULL DEFAULT '', color TEXT, note TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS groups_tbl(id TEXT PRIMARY KEY, name TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS group_grants(id TEXT PRIMARY KEY, group_id TEXT NOT NULL, subject_type TEXT NOT NULL, subject_id TEXT NOT NULL, capability TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS units(id TEXT PRIMARY KEY, name TEXT NOT NULL, folder_id TEXT, group_id TEXT NOT NULL, maintainer TEXT NOT NULL, lead_lang TEXT NOT NULL DEFAULT 'zh', description TEXT NOT NULL DEFAULT '', current_revision INTEGER NOT NULL DEFAULT 1, created_ms INTEGER NOT NULL);
@@ -619,6 +640,9 @@ impl Store {
             ("exports", "manifest_json", "TEXT NOT NULL DEFAULT ''"),
             ("versions", "scripts_json", "TEXT NOT NULL DEFAULT '[]'"),
             ("folders", "main_index_id", "TEXT"),
+            ("folders", "scope", "TEXT NOT NULL DEFAULT ''"),
+            ("folders", "color", "TEXT"),
+            ("folders", "note", "TEXT NOT NULL DEFAULT ''"),
             ("index_branches", "source_index_id", "TEXT"),
             ("index_branches", "source_branch", "TEXT"),
             ("index_branches", "fork_commit_id", "TEXT"),
@@ -646,10 +670,105 @@ impl Store {
                     .map_err(db_err)?;
             }
         }
-        Ok(Store {
+        let store = Store {
             conn,
             root: root.to_path_buf(),
-        })
+        };
+        store.backfill_folder_scopes()?;
+        Ok(store)
+    }
+
+    /// One-time scope assignment for folder rows that predate
+    /// sidebar isolation (scope = ''). Evidence first, over the
+    /// folder's whole subtree: a subtree homing indexes belongs
+    /// to the index tree, one homing content units to the
+    /// content tree; a subtree homing both follows its folder's
+    /// own weight (a designated main index or the majority kind,
+    /// ties to index). A subtree homing nothing is assigned to
+    /// the showroom tree — an empty folder holds no content, so
+    /// nothing is lost whichever tree lists it. Rows are never
+    /// deleted and only '' rows are touched, so a folder ends up
+    /// in exactly one tree.
+    fn backfill_folder_scopes(&self) -> SResult<()> {
+        let folders = self.list_folders()?;
+        if !folders.iter().any(|f| f.scope.is_empty()) {
+            return Ok(());
+        }
+        let homes = |sql: &str| -> SResult<std::collections::HashMap<String, i64>> {
+            let mut stmt = self.conn.prepare(sql).map_err(db_err)?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                })
+                .map_err(db_err)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(db_err)?;
+            Ok(rows.into_iter().collect())
+        };
+        let idx_homes = homes(
+            "SELECT folder_id, COUNT(*) FROM indexes_tbl WHERE folder_id IS NOT NULL GROUP BY folder_id",
+        )?;
+        let unit_homes = homes(
+            "SELECT folder_id, COUNT(*) FROM units WHERE folder_id IS NOT NULL GROUP BY folder_id",
+        )?;
+        let mut children: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for f in &folders {
+            if let Some(p) = &f.parent_id {
+                children.entry(p.clone()).or_default().push(f.id.clone());
+            }
+        }
+        // Subtree homing totals (indexes, units); the depth cap
+        // keeps a broken parent cycle from looping forever.
+        fn subtree_totals(
+            id: &str,
+            children: &std::collections::HashMap<String, Vec<String>>,
+            idx_homes: &std::collections::HashMap<String, i64>,
+            unit_homes: &std::collections::HashMap<String, i64>,
+            depth: usize,
+        ) -> (i64, i64) {
+            let mut totals = (
+                idx_homes.get(id).copied().unwrap_or(0),
+                unit_homes.get(id).copied().unwrap_or(0),
+            );
+            if depth >= 64 {
+                return totals;
+            }
+            if let Some(kids) = children.get(id) {
+                for kid in kids {
+                    let (i, u) =
+                        subtree_totals(kid, children, idx_homes, unit_homes, depth + 1);
+                    totals.0 += i;
+                    totals.1 += u;
+                }
+            }
+            totals
+        }
+        for f in &folders {
+            if !f.scope.is_empty() {
+                continue;
+            }
+            let (i, u) = subtree_totals(&f.id, &children, &idx_homes, &unit_homes, 0);
+            let scope = match (i > 0, u > 0) {
+                (true, false) => "index",
+                (false, true) => "content",
+                (true, true) => {
+                    if f.main_index_id.is_some() || i >= u {
+                        "index"
+                    } else {
+                        "content"
+                    }
+                }
+                (false, false) => "showroom",
+            };
+            self.conn
+                .execute(
+                    "UPDATE folders SET scope=?2 WHERE id=?1 AND scope=''",
+                    params![f.id, scope],
+                )
+                .map_err(db_err)?;
+        }
+        Ok(())
     }
 
     pub fn root(&self) -> &Path {
@@ -1045,18 +1164,39 @@ impl Store {
         Ok(chain)
     }
 
-    pub fn create_folder(&self, name: &str, parent_id: Option<&str>) -> SResult<FolderRec> {
+    pub fn create_folder(
+        &self,
+        name: &str,
+        parent_id: Option<&str>,
+        scope: &str,
+    ) -> SResult<FolderRec> {
         let id = new_id("fld");
+        // A child folder lives in its parent's tree: with a
+        // parent, the scope is always the parent's scope, so a
+        // tree can never grow a branch into another surface's
+        // sidebar (sidebar isolation, user ruling 2026-11-24).
+        let scope = match parent_id {
+            Some(pid) => self
+                .list_folders()?
+                .into_iter()
+                .find(|f| f.id == pid)
+                .map(|f| f.scope)
+                .filter(|sc| !sc.is_empty())
+                .unwrap_or_else(|| scope.to_string()),
+            None => scope.to_string(),
+        };
         let sort: i64 = self
             .conn
-            .query_row("SELECT COALESCE(MAX(sort),0)+1 FROM folders", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT COALESCE(MAX(sort),0)+1 FROM folders WHERE scope=?1",
+                params![scope],
+                |r| r.get(0),
+            )
             .map_err(db_err)?;
         self.conn
             .execute(
-                "INSERT INTO folders(id, name, parent_id, sort) VALUES(?1,?2,?3,?4)",
-                params![id, name, parent_id, sort],
+                "INSERT INTO folders(id, name, parent_id, sort, scope) VALUES(?1,?2,?3,?4,?5)",
+                params![id, name, parent_id, sort, scope],
             )
             .map_err(db_err)?;
         Ok(FolderRec {
@@ -1065,6 +1205,9 @@ impl Store {
             parent_id: parent_id.map(|s| s.to_string()),
             sort,
             main_index_id: None,
+            scope,
+            color: None,
+            note: String::new(),
         })
     }
 
@@ -1072,7 +1215,7 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, name, parent_id, sort, main_index_id FROM folders ORDER BY sort, name",
+                "SELECT id, name, parent_id, sort, main_index_id, scope, color, note FROM folders ORDER BY sort, name",
             )
             .map_err(db_err)?;
         let rows = stmt
@@ -1083,6 +1226,9 @@ impl Store {
                     parent_id: r.get(2)?,
                     sort: r.get(3)?,
                     main_index_id: r.get(4)?,
+                    scope: r.get(5)?,
+                    color: r.get(6)?,
+                    note: r.get(7)?,
                 })
             })
             .map_err(db_err)?
@@ -1091,9 +1237,33 @@ impl Store {
         Ok(rows)
     }
 
+    /// The folders of one sidebar scope, in tree order. The
+    /// folder faces (the server route and the local dispatch)
+    /// serve exactly this when a scope is asked for; the plain
+    /// list_folders stays for id-based internal lookups (trash
+    /// origins, the main-index response), where the caller's
+    /// object already fixes the row.
+    pub fn list_folders_in(&self, scope: &str) -> SResult<Vec<FolderRec>> {
+        Ok(self
+            .list_folders()?
+            .into_iter()
+            .filter(|f| f.scope == scope)
+            .collect())
+    }
+
     pub fn rename_folder(&self, id: &str, name: &str) -> SResult<()> {
         self.conn
             .execute("UPDATE folders SET name=?2 WHERE id=?1", params![id, name])
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Set (or clear, with an empty string) the folder's note
+    /// （备注）. The content page's folder-flow header edits it in
+    /// place; the sidebar tree does not surface it.
+    pub fn set_folder_note(&self, id: &str, note: &str) -> SResult<()> {
+        self.conn
+            .execute("UPDATE folders SET note=?2 WHERE id=?1", params![id, note])
             .map_err(db_err)?;
         Ok(())
     }
@@ -1107,7 +1277,12 @@ impl Store {
     /// list_folders returns and the client's walk reproduces, so
     /// every sibling group's relative order is preserved. Moving
     /// a folder under itself or one of its own descendants is
-    /// refused (it would create a cycle).
+    /// refused (it would create a cycle). The move is confined
+    /// to the folder's own sidebar scope (sidebar isolation,
+    /// user ruling 2026-11-24): a parent or insert point from
+    /// another surface's tree is refused, and the renumber walk
+    /// touches only that scope's folders, so no other tree's
+    /// order changes.
     pub fn move_folder(
         &self,
         id: &str,
@@ -1121,6 +1296,11 @@ impl Store {
         if let Some(p) = new_parent_id {
             if !all.iter().any(|f| f.id == p) {
                 return Err("目标文件夹不存在".into());
+            }
+            if all.iter().find(|f| f.id == p).map(|f| f.scope.as_str())
+                != Some(me.scope.as_str())
+            {
+                return Err("不能把文件夹移动到另一棵目录树下".into());
             }
             // Cycle guard: walk the parent chain up from the
             // proposed parent; meeting the folder itself means the
@@ -1139,11 +1319,19 @@ impl Store {
         if before_id == Some(id) {
             return Ok(()); // dropped in front of itself: no-op
         }
+        if let Some(b) = before_id {
+            if let Some(bf) = all.iter().find(|f| f.id == b) {
+                if bf.scope != me.scope {
+                    return Err("目标位置不在同一棵目录树内".into());
+                }
+            }
+        }
         // Sibling lists keyed by parent id ("" = root), each in
-        // current list order.
+        // current list order — this scope's folders only, so the
+        // renumber below rewrites no other tree's sort values.
         let mut groups: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
-        for f in &all {
+        for f in all.iter().filter(|f| f.scope == me.scope) {
             groups
                 .entry(f.parent_id.clone().unwrap_or_default())
                 .or_default()
@@ -1174,9 +1362,10 @@ impl Store {
         }
         let mut order: Vec<String> = Vec::new();
         walk(&groups, "", &mut order);
-        // Folders unreachable from the root (broken parent chain)
-        // keep their relative order at the end.
-        for f in &all {
+        // Folders unreachable from the root (broken parent chain,
+        // or a pre-isolation parent living in another scope) keep
+        // their relative order at the end.
+        for f in all.iter().filter(|f| f.scope == me.scope) {
             if !order.contains(&f.id) {
                 order.push(f.id.clone());
             }
@@ -1200,29 +1389,185 @@ impl Store {
         Ok(())
     }
 
-    /// Delete a folder only when it is completely empty: no child
-    /// folders, no content units and no indexes homed in it.
-    pub fn delete_folder(&self, id: &str) -> SResult<()> {
-        let count = |sql: &str| -> SResult<i64> {
-            self.conn
-                .query_row(sql, params![id], |r| r.get(0))
-                .map_err(db_err)
-        };
-        if count("SELECT COUNT(*) FROM folders WHERE parent_id=?1")? > 0 {
-            return Err("文件夹下还有子文件夹，不能删除".into());
-        }
-        if count("SELECT COUNT(*) FROM units WHERE folder_id=?1")? > 0 {
-            return Err("文件夹内还有内容块，不能删除".into());
-        }
-        if count("SELECT COUNT(*) FROM indexes_tbl WHERE folder_id=?1")? > 0 {
-            return Err("文件夹内还有索引，不能删除".into());
-        }
+    /// Set (or clear, with None) the folder's sidebar color: a
+    /// "#RRGGBB" hex string from the client's preset palette.
+    pub fn set_folder_color(&self, id: &str, color: Option<&str>) -> SResult<()> {
         let n = self
             .conn
-            .execute("DELETE FROM folders WHERE id=?1", params![id])
+            .execute(
+                "UPDATE folders SET color=?2 WHERE id=?1",
+                params![id, color],
+            )
             .map_err(db_err)?;
         if n == 0 {
             return Err("文件夹不存在".into());
+        }
+        Ok(())
+    }
+
+    /// Delete a folder, in the shape the user picks at delete
+    /// time (user ruling 2026-11-24 — the client always offers
+    /// both):
+    ///
+    /// - Lift: only this folder's row goes away. Its child
+    ///   folders, content units and indexes are re-homed to the
+    ///   folder's parent; for a root folder that means parent_id /
+    ///   folder_id NULL — the root level, which the index page
+    ///   presents as 未分类. Showroom items follow their source
+    ///   index automatically (the plaza homes an item by its
+    ///   index's folder), so nothing else needs to move.
+    /// - Trash: the folder's whole subtree goes. Every content
+    ///   unit and index homed in the subtree, and every showroom
+    ///   item whose source index is homed there, gets a
+    ///   trash_items row (kind / origin follow the single-item
+    ///   trash paths: origin is the home folder's name), then the
+    ///   folder rows themselves are deleted. Trashed objects keep
+    ///   their (now dangling) folder_id, exactly like the trash
+    ///   overlay treats every other field — restoring one brings
+    ///   it back folder-less, visible under 全部 / 未分类.
+    ///
+    /// `deleted_by` lands on the trash rows in Trash mode (the
+    /// server passes the caller's user id, the local store its
+    /// owner's display name — the same values the two faces'
+    /// single-item trash paths record).
+    pub fn delete_folder(
+        &self,
+        id: &str,
+        mode: FolderDeleteMode,
+        deleted_by: &str,
+    ) -> SResult<()> {
+        let all = self.list_folders()?;
+        let Some(me) = all.iter().find(|f| f.id == id) else {
+            return Err("文件夹不存在".into());
+        };
+        let parent = me.parent_id.clone();
+        match mode {
+            FolderDeleteMode::Lift => {
+                let tx = self.conn.unchecked_transaction().map_err(db_err)?;
+                tx.execute(
+                    "UPDATE folders SET parent_id=?2 WHERE parent_id=?1",
+                    params![id, parent],
+                )
+                .map_err(db_err)?;
+                tx.execute(
+                    "UPDATE units SET folder_id=?2 WHERE folder_id=?1",
+                    params![id, parent],
+                )
+                .map_err(db_err)?;
+                tx.execute(
+                    "UPDATE indexes_tbl SET folder_id=?2 WHERE folder_id=?1",
+                    params![id, parent],
+                )
+                .map_err(db_err)?;
+                tx.execute("DELETE FROM folders WHERE id=?1", params![id])
+                    .map_err(db_err)?;
+                tx.commit().map_err(db_err)?;
+            }
+            FolderDeleteMode::Trash => {
+                // The subtree: this folder plus every descendant.
+                let mut subtree: Vec<String> = vec![id.to_string()];
+                let mut grew = true;
+                while grew {
+                    grew = false;
+                    for f in &all {
+                        if let Some(p) = f.parent_id.as_deref() {
+                            if subtree.iter().any(|x| x == p)
+                                && !subtree.iter().any(|x| x == &f.id)
+                            {
+                                subtree.push(f.id.clone());
+                                grew = true;
+                            }
+                        }
+                    }
+                }
+                let folder_name = |fid: &str| -> String {
+                    all.iter()
+                        .find(|f| f.id == fid)
+                        .map(|f| f.name.clone())
+                        .unwrap_or_default()
+                };
+                // Contents, gathered before the transaction:
+                // (kind, object_id, title, origin).
+                let mut contents: Vec<(&str, String, String, String)> = Vec::new();
+                let mut index_ids: Vec<String> = Vec::new();
+                for fid in &subtree {
+                    let mut stmt = self
+                        .conn
+                        .prepare("SELECT id, name FROM units WHERE folder_id=?1")
+                        .map_err(db_err)?;
+                    let units = stmt
+                        .query_map(params![fid], |r| {
+                            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                        })
+                        .map_err(db_err)?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(db_err)?;
+                    drop(stmt);
+                    for (uid, name) in units {
+                        contents.push(("unit", uid, name, folder_name(fid)));
+                    }
+                    let mut stmt = self
+                        .conn
+                        .prepare("SELECT id, name FROM indexes_tbl WHERE folder_id=?1")
+                        .map_err(db_err)?;
+                    let indexes = stmt
+                        .query_map(params![fid], |r| {
+                            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                        })
+                        .map_err(db_err)?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(db_err)?;
+                    drop(stmt);
+                    for (xid, name) in indexes {
+                        contents.push(("index", xid.clone(), name, folder_name(fid)));
+                        index_ids.push(xid);
+                    }
+                }
+                // Showroom items are homed by their source index:
+                // the items of every trashed index go too (their
+                // origin is the index's home folder).
+                for xid in &index_ids {
+                    let origin = self
+                        .get_index(xid)
+                        .ok()
+                        .and_then(|x| x.folder_id)
+                        .map(|fid| folder_name(&fid))
+                        .unwrap_or_else(|| "演示厅".to_string());
+                    let mut stmt = self
+                        .conn
+                        .prepare("SELECT id, title FROM showroom WHERE source_index_id=?1")
+                        .map_err(db_err)?;
+                    let items = stmt
+                        .query_map(params![xid], |r| {
+                            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                        })
+                        .map_err(db_err)?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(db_err)?;
+                    drop(stmt);
+                    for (sid, title) in items {
+                        contents.push(("showroom", sid, title, origin.clone()));
+                    }
+                }
+                let tx = self.conn.unchecked_transaction().map_err(db_err)?;
+                let now = now_ms();
+                for (kind, oid, title, origin) in &contents {
+                    // INSERT OR IGNORE mirrors trash_add's
+                    // idempotence (UNIQUE(kind, object_id)): an
+                    // object already in the trash keeps its
+                    // original row.
+                    tx.execute(
+                        "INSERT OR IGNORE INTO trash_items(id, kind, object_id, title, origin, deleted_by, deleted_ms) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                        params![new_id("trs"), kind, oid, title, origin, deleted_by, now],
+                    )
+                    .map_err(db_err)?;
+                }
+                for fid in &subtree {
+                    tx.execute("DELETE FROM folders WHERE id=?1", params![fid])
+                        .map_err(db_err)?;
+                }
+                tx.commit().map_err(db_err)?;
+            }
         }
         Ok(())
     }
@@ -4022,9 +4367,9 @@ impl Store {
         let _ = admin;
         let g = self.create_group("公司介绍")?;
         self.create_group("技术")?;
-        self.create_folder("公司介绍", None)?;
-        self.create_folder("公司技术", None)?;
-        self.create_folder("公司案例", None)?;
+        self.create_folder("公司介绍", None, "index")?;
+        self.create_folder("公司技术", None, "index")?;
+        self.create_folder("公司案例", None, "index")?;
         self.set_setting(
             "languages",
             &serde_json::json!(["中文", "英语", "日语"]).to_string(),

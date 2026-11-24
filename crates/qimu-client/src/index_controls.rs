@@ -329,7 +329,15 @@ impl App {
                         .selected_text(selected)
                         .show_ui(ui, |ui| {
                             ui.selectable_value(folder, None, tr("未分类"));
-                            for item in &self.folders {
+                            // Index-scope folders only (sidebar
+                            // isolation, user ruling 2026-11-24):
+                            // an index can only home in the index
+                            // page's own tree.
+                            for item in self
+                                .folders
+                                .iter()
+                                .filter(|f| s(*f, "scope") == "index")
+                            {
                                 let id = s(item, "id");
                                 let mut names = vec![s(item, "name")];
                                 let mut parent = item["parent_id"].as_str();

@@ -235,11 +235,41 @@ impl App {
         } else {
             tr("未登录").to_string()
         };
-        let label = ui.painter().layout_no_wrap(
+        let font = egui::FontId::proportional(12.0);
+        let full_label = ui.painter().layout_no_wrap(
             text.clone(),
-            egui::FontId::proportional(12.0),
+            font.clone(),
             palette_color(TEXT_WEAK),
         );
+        // The button hugs its label (10px of padding per side,
+        // the measure the server button below also uses) between
+        // the 92px floor and the 204px cap in the width formula.
+        // A label too wide for the cap is ellipsized to fit
+        // instead of running into the clip rect mid-glyph, and
+        // the hover then carries the full text so a long name
+        // stays readable.
+        let (label, truncated) = if full_label.size().x + 20.0 <= 204.0 {
+            (full_label, false)
+        } else {
+            let mut shown = text.clone();
+            let galley = loop {
+                let candidate = ui.painter().layout_no_wrap(
+                    format!("{shown}…"),
+                    font.clone(),
+                    palette_color(TEXT_WEAK),
+                );
+                if candidate.size().x + 20.0 <= 204.0 || shown.is_empty() {
+                    break candidate;
+                }
+                shown.pop();
+            };
+            (galley, true)
+        };
+        let hover_text = if truncated {
+            text.clone()
+        } else {
+            tr("账户信息").to_string()
+        };
         let rest = ButtonVisuals {
             fill: egui::Color32::TRANSPARENT,
             stroke: egui::Stroke::NONE,
@@ -265,12 +295,15 @@ impl App {
                 ui.painter()
                     .with_clip_rect(rect)
                     .galley_with_override_text_color(
-                        egui::pos2(rect.left() + 10.0, rect.center().y - label.size().y / 2.0),
+                        egui::pos2(
+                            rect.center().x - label.size().x / 2.0,
+                            rect.center().y - label.size().y / 2.0,
+                        ),
                         label.clone(),
                         tint,
                     );
             })
-            .on_hover_text(tr("账户信息"))
+            .on_hover_text(hover_text)
             .clicked()
         {
             self.workspace_controls.server_menu.close();

@@ -1212,18 +1212,28 @@ async fn put_cache_policy(
 
 // ---------------- folders ----------------
 
-async fn folders(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
+async fn folders(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Api<Value> {
     let _ = auth(&st, &headers)?;
     let store = st.store.lock().unwrap();
-    Ok(Json(
-        json!({ "folders": store.list_folders().map_err(bad)? }),
-    ))
+    // ?scope= limits the list to one sidebar tree (sidebar
+    // isolation, user ruling 2026-11-24); without it the full
+    // list is served and every row carries its scope.
+    let list = match q.get("scope") {
+        Some(scope) => store.list_folders_in(scope),
+        None => store.list_folders(),
+    };
+    Ok(Json(json!({ "folders": list.map_err(bad)? })))
 }
 
 #[derive(Deserialize)]
 struct FolderReq {
     name: String,
     parent_id: Option<String>,
+    scope: Option<String>,
 }
 
 async fn create_folder(
@@ -1234,7 +1244,11 @@ async fn create_folder(
     let _ = auth(&st, &headers)?;
     let store = st.store.lock().unwrap();
     Ok(Json(json!(store
-        .create_folder(&req.name, req.parent_id.as_deref())
+        .create_folder(
+            &req.name,
+            req.parent_id.as_deref(),
+            req.scope.as_deref().unwrap_or("showroom"),
+        )
         .map_err(bad)?)))
 }
 
@@ -1252,6 +1266,25 @@ async fn rename_folder(
     let _ = auth(&st, &headers)?;
     let store = st.store.lock().unwrap();
     store.rename_folder(&id, &req.name).map_err(bad)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct NoteReq {
+    note: String,
+}
+
+/// POST /v1/folders/:id/note — set the folder's note （备注）,
+/// edited in place on the content page's folder-flow header.
+async fn set_folder_note(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<NoteReq>,
+) -> Api<Value> {
+    let _ = auth(&st, &headers)?;
+    let store = st.store.lock().unwrap();
+    store.set_folder_note(&id, &req.note).map_err(bad)?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -1279,17 +1312,74 @@ async fn move_folder(
     Ok(Json(json!({ "ok": true })))
 }
 
-/// DELETE /v1/folders/:id — empty folders only (the store refuses
-/// non-empty ones with a specific reason).
+/// DELETE /v1/folders/:id — kept for compatibility; equivalent
+/// to POST /v1/folders/:id/delete with mode "lift" (only the
+/// folder goes away, its contents are lifted to the parent).
 async fn delete_folder(
     State(st): State<St>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let store = st.store.lock().unwrap();
+    store
+        .delete_folder(&id, FolderDeleteMode::Lift, &user.id)
+        .map_err(bad)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct DeleteFolderReq {
+    mode: String,
+}
+
+/// POST /v1/folders/:id/delete — the client's delete dialog
+/// (user ruling 2026-11-24) always offers both shapes:
+/// mode "lift" deletes only the folder (child folders, units
+/// and indexes move up to the folder's parent); mode "trash"
+/// deletes the folder subtree and moves every unit, index and
+/// showroom item homed in it to the trash.
+async fn delete_folder_mode(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<DeleteFolderReq>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let mode = match req.mode.as_str() {
+        "lift" => FolderDeleteMode::Lift,
+        "trash" => FolderDeleteMode::Trash,
+        other => return Err(bad(format!("unknown delete mode: {other}"))),
+    };
+    let store = st.store.lock().unwrap();
+    store.delete_folder(&id, mode, &user.id).map_err(bad)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct FolderColorReq {
+    color: Option<String>,
+}
+
+/// POST /v1/folders/:id/color — set or clear (color: null) the
+/// folder's sidebar color from the client's preset palette.
+async fn set_folder_color(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<FolderColorReq>,
+) -> Api<Value> {
     let _ = auth(&st, &headers)?;
     let store = st.store.lock().unwrap();
-    store.delete_folder(&id).map_err(bad)?;
-    Ok(Json(json!({ "ok": true })))
+    store
+        .set_folder_color(&id, req.color.as_deref())
+        .map_err(bad)?;
+    let folder = store
+        .list_folders()
+        .map_err(bad)?
+        .into_iter()
+        .find(|f| f.id == id);
+    Ok(Json(json!(folder)))
 }
 
 #[derive(Deserialize)]
@@ -4974,8 +5064,11 @@ async fn main() {
         .route("/v1/ai/status", get(get_ai_status))
         .route("/v1/folders", get(folders).post(create_folder))
         .route("/v1/folders/:id/rename", post(rename_folder))
+        .route("/v1/folders/:id/note", post(set_folder_note))
         .route("/v1/folders/:id/move", post(move_folder))
         .route("/v1/folders/:id", delete(delete_folder))
+        .route("/v1/folders/:id/delete", post(delete_folder_mode))
+        .route("/v1/folders/:id/color", post(set_folder_color))
         .route("/v1/folders/:id/main-index", post(set_folder_main_index))
         .route("/v1/units", get(list_units).post(create_unit))
         .route("/v1/units/:id", get(get_unit).patch(patch_unit))

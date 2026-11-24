@@ -72,7 +72,10 @@ impl Store {
     /// PPT sections splits by section (one section = one block,
     /// named after the section; slides in no section form one
     /// block named after the file stem), and a sectionless deck
-    /// imports as a single block named after the file stem.
+    /// splits one block per slide (user ruling 2026-11-24,
+    /// superseding the former single-block whole-deck import),
+    /// each named after the slide's title text, or `第N页` when
+    /// the slide carries no title.
     /// `author` is the display name recorded as maintainer and
     /// version author (the requesting user over HTTP, the local
     /// library's seeded owner in-process).
@@ -117,12 +120,37 @@ impl Store {
                         lang: None,
                     })
                     .collect(),
-                None => vec![ImportBlockSpec {
-                    name: stem.clone(),
-                    pages: (0..singles.len()).collect(),
-                    form: None,
-                    lang: None,
-                }],
+                None => {
+                    // Sectionless deck (user ruling 2026-11-24):
+                    // one block per slide. The block name is the
+                    // slide's title text (the same `slide_title`
+                    // the proposer reads), falling back to the
+                    // numbered-page form when the slide carries
+                    // no title. Naming is best-effort only: a
+                    // slide listing that cannot be read degrades
+                    // every name to the fallback rather than
+                    // failing an import that split fine.
+                    let slide_refs = pptx::slides(&pkg).unwrap_or_default();
+                    (0..singles.len())
+                        .map(|i| {
+                            let title = slide_refs
+                                .get(i)
+                                .and_then(|s| pkg.get_text(&s.part).ok())
+                                .map(|xml| crate::text::slide_title(&xml))
+                                .unwrap_or_default();
+                            ImportBlockSpec {
+                                name: if title.is_empty() || title == "(无标题)" {
+                                    format!("第{}页", i + 1)
+                                } else {
+                                    title
+                                },
+                                pages: vec![i],
+                                form: None,
+                                lang: None,
+                            }
+                        })
+                        .collect()
+                }
             },
         };
         let mut created = Vec::new();

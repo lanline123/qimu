@@ -162,6 +162,40 @@ pub const BTN_BG: egui::Color32 = egui::Color32::from_rgb(0x1D, 0x1D, 0x23);
 /// (rgba(47,107,245,.16); .tree button.active pairs it with accent
 /// text).
 pub const SEL_BG: egui::Color32 = egui::Color32::from_rgba_unmultiplied_const(0x2F, 0x6B, 0xF5, 41);
+/// Preset folder colors (user ruling 2026-11-24): picked from the
+/// client's context menu, stored on the folder as the hex string,
+/// and used to dye the folder's icon (the name keeps its normal
+/// color). The values sit with the accent and the standard
+/// card's scope-edge colors (company blue / ancestor purple /
+/// dept-sub green / dept orange). No entry = the default tint.
+pub const FOLDER_COLORS: [(&str, &str); 7] = [
+    ("红", "#D95F5F"),
+    ("橙", "#D08A3E"),
+    ("黄", "#D9B23A"),
+    ("绿", "#4DA674"),
+    ("青", "#3AA6A0"),
+    ("蓝", "#3B82C4"),
+    ("紫", "#8B7CC9"),
+];
+
+/// A folder's stored color, parsed. Anything unparseable (no
+/// color set, a hand-edited database) falls back to the default
+/// tint.
+fn folder_color_of(f: &Value) -> Option<egui::Color32> {
+    parse_folder_hex(&s(f, "color"))
+}
+
+/// Parse a "#RRGGBB" hex string (the FOLDER_COLORS storage form).
+fn parse_folder_hex(hex: &str) -> Option<egui::Color32> {
+    let hex = hex.strip_prefix('#')?;
+    if hex.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(hex.get(0..2)?, 16).ok()?;
+    let g = u8::from_str_radix(hex.get(2..4)?, 16).ok()?;
+    let b = u8::from_str_radix(hex.get(4..6)?, 16).ok()?;
+    Some(egui::Color32::from_rgb(r, g, b))
+}
 /// Layout tokens: page content inset inside a dock frame — the
 /// prototype's main padding (20px top / 22px sides); the sidebar
 /// column is 268px on every page (.appbody grid).
@@ -439,8 +473,39 @@ fn tree_row(
     label: &str,
     size: f32,
 ) -> egui::Response {
+    tree_row_ex(
+        ui,
+        selected,
+        indent,
+        icon,
+        None,
+        label,
+        size,
+        egui::Sense::click(),
+    )
+}
+
+/// tree_row with an explicit icon tint and sense. Selected rows
+/// always dye BOTH the label and the icon with the accent — the
+/// same color as the primary button's fill (user ruling
+/// 2026-11-24; the prototype's .tree.active pairs the accent-soft
+/// fill with accent text, and SEL_BG's own note says so). At rest
+/// the icon takes `icon_color` when one is given (a folder's
+/// custom color) and the default tint otherwise; the label keeps
+/// its normal color either way.
+#[allow(clippy::too_many_arguments)]
+fn tree_row_ex(
+    ui: &mut egui::Ui,
+    selected: bool,
+    indent: f32,
+    icon: Option<ChromeIcon>,
+    icon_color: Option<egui::Color32>,
+    label: &str,
+    size: f32,
+    sense: egui::Sense,
+) -> egui::Response {
     let width = ui.available_width();
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 28.0), egui::Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 28.0), sense);
     let painter = ui.painter();
     if selected {
         painter.rect_filled(rect, 6.0, palette_color(SEL_BG));
@@ -453,12 +518,17 @@ fn tree_row(
             egui::pos2(tx, rect.center().y - 7.5),
             egui::vec2(15.0, 15.0),
         );
-        icon.image(15.0, palette_color(ICON_TINT)).paint_at(ui, ir);
+        let tint = if selected {
+            palette_color(ACCENT)
+        } else {
+            icon_color.unwrap_or_else(|| palette_color(ICON_TINT))
+        };
+        icon.image(15.0, tint).paint_at(ui, ir);
         tx += 15.0 + 6.0;
     }
     let font = egui::FontId::new(size, egui::FontFamily::Proportional);
     let color = if selected {
-        palette_color(ACCENT_DEEP)
+        palette_color(ACCENT)
     } else {
         palette_color(TEXT_MAIN)
     };
@@ -1223,6 +1293,24 @@ enum ContentFrame {
     Unit(UnitState),
 }
 
+/// Which field of a folder-flow block header is being edited in
+/// place (content page folder flow, user ruling 2026-11-24).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FlowField {
+    Name,
+    Note,
+}
+
+/// One in-place edit on a folder-flow block header: double-click
+/// the folder name or its note to open it; Enter or focus loss
+/// commits, Esc cancels.
+#[derive(Clone)]
+struct FlowEdit {
+    folder_id: String,
+    field: FlowField,
+    text: String,
+}
+
 #[derive(Default)]
 struct WallState {
     search_text: String,
@@ -1233,6 +1321,15 @@ struct WallState {
     /// Ctrl/⌘-click multi-selection (组合 / 剪贴板复制·剪切的前置):
     /// unit ids, in click order. `selected` stays the anchor card.
     multi: Vec<String>,
+    /// Folder-flow header edit currently open on a folder block
+    /// (name or note), if any.
+    flow_edit: Option<FlowEdit>,
+    /// Focus request for the flow header editor's first frame.
+    flow_edit_focus: bool,
+    /// The sidebar folder selection this wall was last scrolled
+    /// to (outer None = never positioned). In the folder-flow
+    /// view the selection is a scroll anchor, never a filter.
+    flow_anchor: Option<Option<String>>,
 }
 
 /// Which header meta field the inline editor is standing in
@@ -2613,6 +2710,15 @@ enum TranslateEvent {
     Done(Result<Value, String>),
 }
 
+/// Terminal event from the import worker thread: the finished
+/// import's user-facing message — Ok is the success wording the
+/// caller's flow computed from the import payload (the UI thread
+/// then refreshes), Err the failure wording. Exactly one event
+/// is sent per import.
+enum ImportEvent {
+    Done(Result<String, String>),
+}
+
 struct App {
     server: String,
     current_server_name: String,
@@ -2647,6 +2753,9 @@ struct App {
     folder_edit: Option<FolderEdit>,
     folder_edit_focus: bool,
     folder_delete_confirm: Option<(String, String)>,
+    /// The folder row currently being pressed (long-press drag
+    /// gate); see FolderPress.
+    folder_press: Option<FolderPress>,
     page: Page,
     /// Five-features surfaces (2026-11-23): the trash and the
     /// approval queue run on drill-down frame stacks; the home
@@ -2729,6 +2838,13 @@ struct App {
     translate_tx: std::sync::mpsc::Sender<TranslateEvent>,
     translate_rx: std::sync::mpsc::Receiver<TranslateEvent>,
     translating: Option<(String, usize, usize)>,
+    /// PPT import: worker channel plus, while an import runs on
+    /// its worker thread, the deck name for the in-progress
+    /// readout. The import itself (base64, parse, split, verify,
+    /// assemble, store) never runs on the UI thread.
+    import_tx: std::sync::mpsc::Sender<ImportEvent>,
+    import_rx: std::sync::mpsc::Receiver<ImportEvent>,
+    importing: Option<String>,
     /// Last /v1/ai/status payload (provider / configured / model) —
     /// drives the "stub placeholder" hint by the translate button.
     ai_status: Option<Value>,
@@ -2964,12 +3080,45 @@ struct FolderEdit {
     target: Option<String>,
     parent: Option<String>,
     text: String,
+    /// Sidebar scope of the surface that opened the editor
+    /// (sidebar isolation, user ruling 2026-11-24): a create
+    /// lands in that surface's tree and no other.
+    scope: String,
 }
 
 /// Drag-and-drop payload for the sidebar folder tree: the id of
 /// the folder being dragged (see `App::folder_tree`).
 #[derive(Clone)]
 struct FolderDrag(String);
+
+/// How long the pointer must rest on a folder row before the row
+/// becomes draggable (user ruling 2026-11-24: a plain press must
+/// never start a drag — "一点就拖" was the old behaviour's bug).
+/// 400ms sits in the usual long-press band (350–450ms): long
+/// enough that clicks and scroll starts never arm a drag, short
+/// enough to feel responsive.
+const FOLDER_LONG_PRESS_SECS: f64 = 0.4;
+
+/// How far the pointer may wander from the press point while the
+/// long-press is still pending. Beyond this the gesture is a
+/// scroll (or a click-drag elsewhere) and the pending press is
+/// cancelled, so the sidebar keeps scrolling exactly as before.
+const FOLDER_PRESS_MOVE_TOLERANCE: f32 = 10.0;
+
+/// One in-progress press on a folder row, tracked by
+/// `App::folder_tree`. Created on the primary-press frame;
+/// `armed` flips when the long-press threshold is reached — only
+/// then is the DragAndDrop payload set and the floating row
+/// painted. Cleared on release, on an early move (scroll), or
+/// when the drag is aborted (Escape clears the payload).
+struct FolderPress {
+    id: String,
+    name: String,
+    depth: usize,
+    since: f64,
+    origin: egui::Pos2,
+    armed: bool,
+}
 
 // ---------------- server connections (multi-server) -----------------
 
@@ -3205,6 +3354,27 @@ fn raw_call(
     raw_call_k(url, token, method, path, body, short_timeout).map_err(CallFail::into_string)
 }
 
+/// The worker-thread twin of `App::call_work` (the thumbnail
+/// worker's precedent): local dispatch first, REST fallback via
+/// `raw_call`. The one deliberate difference is the reachability
+/// latch, which is UI-thread state — the import completion path
+/// refreshes on the UI thread and re-feeds the latch there.
+fn work_call_thread(
+    local: &Option<std::sync::Arc<local_store::LocalStore>>,
+    server: &str,
+    token: Option<&str>,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> Result<Value, String> {
+    if let Some(local) = local {
+        if let Some(r) = local.dispatch(method, path, body.as_ref()) {
+            return r;
+        }
+    }
+    raw_call(server, token, method, path, body, false)
+}
+
 /// LAN discovery: broadcast QIMU_DISCOVER_V1 on UDP 8731 and collect the
 /// servers' JSON hellos for ~1.5s (deduped by ip+port).
 fn discover_servers() -> Vec<Value> {
@@ -3263,6 +3433,7 @@ impl App {
         let (pdf_tx, pdf_rx) = std::sync::mpsc::channel();
         let (upd_tx, upd_rx) = std::sync::mpsc::channel();
         let (translate_tx, translate_rx) = std::sync::mpsc::channel();
+        let (import_tx, import_rx) = std::sync::mpsc::channel();
         let (dc_tx, dc_rx) = std::sync::mpsc::channel();
         let mut app = App {
             server: std::env::var("QIMU_SERVER").unwrap_or_else(|_| "http://127.0.0.1:8730".into()),
@@ -3287,6 +3458,7 @@ impl App {
             folder_edit: None,
             folder_edit_focus: false,
             folder_delete_confirm: None,
+            folder_press: None,
             page: match std::env::var("QIMU_PAGE").as_deref() {
                 Ok("showroom") => Page::Showroom,
                 Ok("content") => Page::Content,
@@ -3354,6 +3526,9 @@ impl App {
             translate_tx,
             translate_rx,
             translating: None,
+            import_tx,
+            import_rx,
+            importing: None,
             ai_status: None,
             lang_options: Vec::new(),
             workspace_controls: WorkspaceControls::default(),
@@ -6543,11 +6718,12 @@ impl App {
     /// Open the shared inline editor for a new root folder (the
     /// editor itself renders under the tree's 全部 row, or under
     /// the zone header where the zone has no folder tree).
-    fn sr_new_folder(&mut self) {
+    fn sr_new_folder(&mut self, scope: &str) {
         self.folder_edit = Some(FolderEdit {
             target: None,
             parent: None,
             text: "新文件夹".into(),
+            scope: scope.into(),
         });
         self.folder_edit_focus = true;
     }
@@ -6564,13 +6740,22 @@ impl App {
                 self.showroom.zone = zones[next].to_string();
                 self.showroom.selected_card = None;
                 self.showroom.stack.pop_to(0);
+                // Entering a zone lands on its 全部 selection
+                // (user ruling 2026-11-24); the groups zone has
+                // no 全部 row and keeps its current group.
+                match zones[next] {
+                    "plaza" => self.showroom.folder = None,
+                    "library" => self.showroom.library_view = 0,
+                    "inbox" => self.showroom.share_source = 0,
+                    _ => {}
+                }
             }
         });
         ui.add_space(8.0);
         match self.showroom.zone.as_str() {
             "library" => {
                 if self.sr_header_row(ui, "目录", ChromeIcon::FolderPlus, tr("新建文件夹")) {
-                    self.sr_new_folder();
+                    self.sr_new_folder("library");
                 }
                 if matches!(&self.folder_edit, Some(e) if e.target.is_none() && e.parent.is_none())
                 {
@@ -6607,7 +6792,7 @@ impl App {
             "inbox" => {
                 if self.sr_header_row(ui, "分享来源", ChromeIcon::FolderPlus, tr("新建文件夹"))
                 {
-                    self.sr_new_folder();
+                    self.sr_new_folder("inbox");
                 }
                 for (idx, (label, icon)) in [
                     ("全部", ChromeIcon::Settings),
@@ -6715,10 +6900,10 @@ impl App {
             }
             _ => {
                 if self.sr_header_row(ui, "目录", ChromeIcon::FolderPlus, tr("新建文件夹")) {
-                    self.sr_new_folder();
+                    self.sr_new_folder("showroom");
                 }
                 let mut selected = self.showroom.folder.clone();
-                self.folder_tree(ui, &mut selected, false);
+                self.folder_tree(ui, &mut selected, false, "showroom");
                 if selected != self.showroom.folder {
                     self.showroom.stack.pop_to(0);
                     self.showroom.selected_card = None;
@@ -6748,10 +6933,10 @@ impl App {
         // end (user ruling 2026-11-24, correcting the same-day
         // removal): the button moved here from the tree's 全部 row.
         if self.sr_header_row(ui, "目录", ChromeIcon::FolderPlus, tr("新建文件夹")) {
-            self.sr_new_folder();
+            self.sr_new_folder("content");
         }
         let mut selected = self.content.folder_filter.clone();
-        self.folder_tree(ui, &mut selected, false);
+        self.folder_tree(ui, &mut selected, false, "content");
         if self.content.folder_filter != selected
             && self.pick.is_none()
             && self.content.stack.depth() > 1
@@ -6765,7 +6950,7 @@ impl App {
         // 目录 header row, same pattern as the other folder-tree
         // sidebars (user ruling 2026-11-24).
         if self.sr_header_row(ui, "目录", ChromeIcon::FolderPlus, tr("新建文件夹")) {
-            self.sr_new_folder();
+            self.sr_new_folder("index");
         }
         let (in_detail, mut selected) = match self.index.stack.top() {
             IndexFrame::Detail(detail) => {
@@ -6778,7 +6963,7 @@ impl App {
             _ => (false, self.index.overview_folder.clone()),
         };
         let previous = selected.clone();
-        self.folder_tree(ui, &mut selected, true);
+        self.folder_tree(ui, &mut selected, true, "index");
         if in_detail && selected != previous {
             self.index.stack.pop_to(0);
         }
@@ -7977,6 +8162,25 @@ impl eframe::App for App {
                 }
             }
             ctx.request_repaint();
+        }
+        // Collect a finished import (worker thread — the import
+        // never runs on the UI thread; see act_import_ppt).
+        while let Ok(ev) = self.import_rx.try_recv() {
+            self.importing = None;
+            match ev {
+                ImportEvent::Done(Ok(m)) => {
+                    self.msg = m;
+                    self.refresh_all();
+                }
+                ImportEvent::Done(Err(m)) => self.msg = m,
+            }
+            ctx.request_repaint();
+        }
+        if self.importing.is_some() {
+            // Keep the frame loop ticking while an import runs so
+            // its completion is collected promptly (and the window
+            // visibly stays alive) even with no user input.
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
         // Collect a finished LAN discovery scan, if one is running.
         if self.disc_rx.is_some() {
@@ -9191,6 +9395,22 @@ impl App {
                 ChromeIcons.paint(ui, icon, rect.center(), 15.0, icon_tint);
             });
         resp.on_hover_text(label)
+    }
+
+    /// Toolbar placeholder slot: a tool whose feature is not
+    /// built yet, rendered in the tool row's disabled form
+    /// (muted glyph at half strength, no fill, no click) with a
+    /// hover tooltip that says so — the toolbar counterpart of
+    /// shell.rs's deckbar_placeholder, at tool-slot geometry
+    /// (28x26, 15px glyph). Painted by hand rather than through
+    /// a disabled scope because a disabled scope swallows
+    /// hover and the tooltip must still work.
+    fn tool_slot_placeholder(&mut self, ui: &mut egui::Ui, label: &str, icon: ChromeIcon) {
+        let (rect, resp) =
+            ui.allocate_exact_size(egui::vec2(28.0, 26.0), egui::Sense::hover());
+        let glyph = palette_color(TEXT_WEAK).gamma_multiply(0.5);
+        ChromeIcons.paint(ui, icon, rect.center(), 15.0, glyph);
+        resp.on_hover_text(label);
     }
 
     /// Panel-footer icon button: 28×28 craft-ui IconButton with a
@@ -10567,6 +10787,7 @@ impl App {
         if goto_showroom {
             self.page = Page::Showroom;
             self.showroom.zone = "plaza".into();
+            self.showroom.folder = None;
         }
     }
 
@@ -11085,14 +11306,9 @@ impl App {
     /// The zone wall (root frame body): the plaza card grid, or
     /// the library / inbox / groups sub-view for the zone.
     fn showroom_wall(&mut self, ui: &mut egui::Ui) {
-        let title = match self.showroom.zone.as_str() {
-            "library" => "我的",
-            "inbox" => "分享",
-            "groups" => "群组",
-            _ => "公共",
-        };
-        ui.heading(title);
-        ui.add_space(6.0);
+        // No zone-name heading here: content areas never display
+        // board/zone names (user ruling 2026-11-24); the sidebar
+        // segmented control already says which zone this is.
         if self.deep_source == Some(Page::Home) {
             ui.horizontal(|ui| {
                 if text_action(ui, "‹ 返回主页", palette_color(ACCENT_DEEP), 13.0) {
@@ -11328,8 +11544,17 @@ impl App {
         })
     }
 
+    /// 智能分块导入 (AI-analysis split). Retained for the
+    /// future AI proposer: since the 2026-11-24 ruling its only
+    /// toolbar slot renders as a greyed placeholder
+    /// (tool_slot_placeholder in shell.rs's Content arm), so
+    /// this has no live caller until the AI feature lands.
     fn act_import_split(&mut self) {
         if !self.need_identity_local("智能分块导入") {
+            return;
+        }
+        if self.importing.is_some() {
+            self.msg = "正在导入，请稍候…".into();
             return;
         }
         if let Some(path) = rfd::FileDialog::new()
@@ -11341,50 +11566,75 @@ impl App {
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
-                match self.call_work(
-                    "POST",
-                    "/v1/import/propose",
-                    Some(json!({ "data_base64": b64e(&bytes) })),
-                ) {
-                    Ok(p) => {
+                let folder_id = self.content.folder_filter.clone();
+                let group_id = self.content.import_group.clone();
+                let (local, server, token, tx) = (
+                    self.local.clone(),
+                    self.server.clone(),
+                    self.token.clone(),
+                    self.import_tx.clone(),
+                );
+                self.importing = Some(name.clone());
+                self.msg = format!("正在导入「{name}」…");
+                // The propose + import sequence runs on a worker
+                // thread (the translation precedent): both calls
+                // parse and rebuild the whole deck, which froze
+                // the interface for the duration when it ran here.
+                std::thread::spawn(move || {
+                    let data = b64e(&bytes);
+                    let done = (|| -> Result<String, String> {
+                        let p = work_call_thread(
+                            &local,
+                            &server,
+                            token.as_deref(),
+                            "POST",
+                            "/v1/import/propose",
+                            Some(json!({ "data_base64": &data })),
+                        )
+                        .map_err(|e| format!("提块失败：{e}"))?;
                         let blocks = p.get("blocks").cloned().unwrap_or(json!([]));
                         let names: Vec<String> = blocks
                             .as_array()
                             .map(|arr| arr.iter().map(|b| s(b, "name")).collect())
                             .unwrap_or_default();
-                        let r = self.call_work(
+                        work_call_thread(
+                            &local,
+                            &server,
+                            token.as_deref(),
                             "POST",
                             "/v1/import",
                             Some(json!({
                                 "filename": name,
-                                "data_base64": b64e(&bytes),
-                                "folder_id": self.content.folder_filter,
-                                "group_id": self.content.import_group,
+                                "data_base64": data,
+                                "folder_id": folder_id,
+                                "group_id": group_id,
                                 "blocks": blocks,
                             })),
-                        );
-                        match r {
-                            Ok(_) => {
-                                self.msg = format!(
-                                    "智能分块导入完成：{} 块（{}）",
-                                    names.len(),
-                                    names.join("、")
-                                );
-                                self.refresh_all();
-                            }
-                            Err(e) => self.msg = format!("导入失败：{e}"),
-                        }
-                    }
-                    Err(e) => self.msg = format!("提块失败：{e}"),
-                }
+                        )
+                        .map_err(|e| format!("导入失败：{e}"))?;
+                        Ok(format!(
+                            "智能分块导入完成：{} 块（{}）",
+                            names.len(),
+                            names.join("、")
+                        ))
+                    })();
+                    let _ = tx.send(ImportEvent::Done(done));
+                });
             }
         }
     }
 
     /// 导入 PPT (content page action, also its toolbar slot): import
-    /// a whole deck into the current folder/group.
+    /// a whole deck into the current folder/group. The import call
+    /// itself runs on a worker thread (see act_import_split); the
+    /// completion event lands in the drain in `ui`, which shows
+    /// the message and refreshes.
     fn act_import_ppt(&mut self) {
         if !self.need_identity_local("导入 PPT") {
+            return;
+        }
+        if self.importing.is_some() {
+            self.msg = "正在导入，请稍候…".into();
             return;
         }
         if let Some(path) = rfd::FileDialog::new()
@@ -11396,26 +11646,39 @@ impl App {
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
-                let r = self.call_work(
-                    "POST",
-                    "/v1/import",
-                    Some(json!({
-                        "filename": name,
-                        "data_base64": b64e(&bytes),
-                        "folder_id": self.content.folder_filter,
-                        "group_id": self.content.import_group,
-                    })),
+                let folder_id = self.content.folder_filter.clone();
+                let group_id = self.content.import_group.clone();
+                let (local, server, token, tx) = (
+                    self.local.clone(),
+                    self.server.clone(),
+                    self.token.clone(),
+                    self.import_tx.clone(),
                 );
-                match r {
-                    Ok(v) => {
-                        self.msg = format!(
+                self.importing = Some(name.clone());
+                self.msg = format!("正在导入「{name}」…");
+                std::thread::spawn(move || {
+                    let r = work_call_thread(
+                        &local,
+                        &server,
+                        token.as_deref(),
+                        "POST",
+                        "/v1/import",
+                        Some(json!({
+                            "filename": name,
+                            "data_base64": b64e(&bytes),
+                            "folder_id": folder_id,
+                            "group_id": group_id,
+                        })),
+                    );
+                    let done = match r {
+                        Ok(v) => Ok(format!(
                             "导入完成：{} 页，校验通过",
                             v.get("slide_count").and_then(|x| x.as_i64()).unwrap_or(0)
-                        );
-                        self.refresh_all();
-                    }
-                    Err(e) => self.msg = format!("导入失败：{e}"),
-                }
+                        )),
+                        Err(e) => Err(format!("导入失败：{e}")),
+                    };
+                    let _ = tx.send(ImportEvent::Done(done));
+                });
             }
         }
     }
@@ -11514,153 +11777,454 @@ impl App {
                 .map(|u| s(u, "display_name"))
                 .unwrap_or_default();
             self.content_clip_bar(ui, w);
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
-                // Card grid (prototype .grid): fluid columns, min
-                // 220px wide, 12px gaps.
-                let avail = ui.available_width();
-                let per_row = ((avail + 12.0) / 232.0).floor().max(1.0);
-                let card_w = (avail + 12.0) / per_row - 12.0;
-                let cover_h = card_w * 9.0 / 16.0;
-                let card_h = cover_h + 89.0;
-                ui.horizontal_wrapped(|ui| {
-                    for item in self.units.clone() {
-                        let unit = item.get("unit").cloned().unwrap_or(json!({}));
-                        if let Some(f) = &self.content.folder_filter {
-                            if unit.get("folder_id").and_then(|x| x.as_str()) != Some(f.as_str()) {
-                                continue;
+            egui::ScrollArea::vertical()
+                .id_salt("content-wall")
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
+                    // Card grid (prototype .grid): fluid columns, min
+                    // 220px wide, 12px gaps.
+                    let avail = ui.available_width();
+                    let per_row = ((avail + 12.0) / 232.0).floor().max(1.0);
+                    let card_w = (avail + 12.0) / per_row - 12.0;
+                    let cover_h = card_w * 9.0 / 16.0;
+                    let card_h = cover_h + 89.0;
+                    // Folder flow (user ruling 2026-11-24): the wall
+                    // does NOT filter to the sidebar's folder any
+                    // more. Every folder renders as one continuous
+                    // block — header row (folder name + its note in
+                    // small type), a rule under the header, then the
+                    // folder's cards — in depth-first tree order;
+                    // a folder with no blocks keeps a one-card-high
+                    // placeholder so its section still shows.
+                    // Folder-less blocks close the flow as one
+                    // untitled group (no fake folder name). The
+                    // sidebar selection only scrolls the matching
+                    // block into view; it stays the create / import
+                    // target folder, never a display filter.
+                    let mut folders = self.folders.clone();
+                    folders.sort_by_key(|f| i(f, "sort"));
+                    fn depth_of(folders: &[Value], f: &Value) -> usize {
+                        let mut d = 0;
+                        let mut cur = s(f, "parent_id");
+                        while !cur.is_empty() && d < 8 {
+                            d += 1;
+                            match folders.iter().find(|x| s(x, "id") == cur) {
+                                Some(p) => cur = s(p, "parent_id"),
+                                None => break,
                             }
                         }
-                        let uid = s(&unit, "id");
-                        let rends = item
-                            .get("renditions")
-                            .and_then(|r| r.as_array())
-                            .cloned()
-                            .unwrap_or_default();
-                        let latest = rends
-                            .first()
-                            .and_then(|r| r.get("latest"))
-                            .cloned()
-                            .unwrap_or(Value::Null);
-                        let title = s(&unit, "name");
-                        let cover = s(&latest, "id");
-                        let outer = self.wall_card(
-                            ui,
-                            WallCard {
-                                width: card_w,
-                                min_height: card_h,
-                                title: &title,
-                                cover: &cover,
-                                selected: w.selected.as_deref() == Some(uid.as_str())
-                                    || w.multi.contains(&uid),
-                                scope: None,
-                                variant: if !my_name.is_empty() && s(&unit, "maintainer") == my_name
-                                {
-                                    CardVariant::Mine
-                                } else {
-                                    CardVariant::Normal
-                                },
-                            },
-                            |app, ui| {
-                                ui.horizontal(|ui| {
-                                    if latest.is_object() {
-                                        chip(
-                                            ui,
-                                            &format!("v{}", s(&latest, "semver")),
-                                            palette_color(ACCENT_DEEP),
-                                            CHIP_BLUE_BG,
-                                        );
-                                        ui.label(
-                                            egui::RichText::new(format!(
-                                                "{} 页",
-                                                i(&latest, "page_count")
-                                            ))
-                                            .small()
-                                            .color(palette_color(TEXT_WEAK)),
-                                        );
-                                    } else {
-                                        ui.label(
-                                            egui::RichText::new("暂无版本")
-                                                .small()
-                                                .color(palette_color(TEXT_WEAK)),
-                                        );
-                                    }
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "{} · {}",
-                                                    app.folder_name(
-                                                        unit.get("folder_id")
-                                                            .and_then(|x| x.as_str())
-                                                            .unwrap_or("")
-                                                    ),
-                                                    s(&unit, "maintainer")
-                                                ))
-                                                .small()
-                                                .color(palette_color(TEXT_WEAK)),
-                                            );
-                                        },
-                                    );
-                                });
-                                if matches!(app.pick, Some(PickState::Insert { .. })) {
-                                    ui.add_space(8.0);
-                                    if ui
-                                        .add_sized(
-                                            [72.0, 28.0],
-                                            egui::Button::new(
-                                                egui::RichText::new("插入")
-                                                    .size(13.0)
-                                                    .color(egui::Color32::WHITE),
-                                            )
-                                            .fill(ACCENT)
-                                            .corner_radius(6),
-                                        )
-                                        .clicked()
-                                    {
-                                        app.insert_pick_unit(&item);
-                                    }
-                                }
-                            },
-                        );
-                        // Click handling rides on an explicit interact over
-                        // the card rect: allocate_ui's own response carries no
-                        // click sense, which is why double-click never fired
-                        // (James 2026-11-15). Single click selects, double
-                        // click opens the maintenance drill-down — the same
-                        // contract as the web prototype.
-                        let click = ui.interact(
-                            outer.response.rect,
-                            egui::Id::unique(("unit_card", &uid)),
-                            egui::Sense::click(),
-                        );
-                        if click.double_clicked() {
-                            if self.pick.is_none() {
-                                self.open_unit_detail(&uid);
+                        d
+                    }
+                    let mut ordered: Vec<Value> = Vec::new();
+                    fn walk(folders: &[Value], parent: &str, out: &mut Vec<Value>) {
+                        for f in folders {
+                            if s(f, "parent_id") == parent {
+                                out.push(f.clone());
+                                let id = s(f, "id");
+                                walk(folders, &id, out);
                             }
-                        } else if click.clicked() {
-                            // Ctrl/⌘-click toggles the card in the
-                            // multi-selection （组合 / 剪贴板的前置）;
-                            // a plain click stays the single selection.
-                            let multi_key = ui
-                                .ctx()
-                                .input(|inp| inp.modifiers.command || inp.modifiers.ctrl);
-                            if multi_key {
-                                if let Some(pos) = w.multi.iter().position(|u| u == &uid) {
-                                    w.multi.remove(pos);
-                                } else {
-                                    w.multi.push(uid.clone());
-                                }
-                            }
-                            w.selected = Some(uid.clone());
                         }
                     }
-                    // No grid-end add card (user ruling 2026-11-24):
-                    // the wall shows existing blocks only.
+                    walk(&folders, "", &mut ordered);
+                    for f in &folders {
+                        if !ordered.iter().any(|x| s(x, "id") == s(f, "id")) {
+                            ordered.push(f.clone());
+                        }
+                    }
+                    let all_units = self.units.clone();
+                    let unit_folder = |it: &Value| -> String {
+                        s(&it.get("unit").cloned().unwrap_or(json!({})), "folder_id")
+                    };
+                    // Scroll anchoring: position only when the
+                    // sidebar selection changed since the wall was
+                    // last positioned for it.
+                    let want_anchor = self.content.folder_filter.clone();
+                    let do_scroll = w.flow_anchor.as_ref() != Some(&want_anchor);
+                    if do_scroll && want_anchor.is_none() {
+                        ui.scroll_to_cursor(Some(egui::Align::TOP));
+                    }
+                    let mut first_block = true;
+                    for f in &ordered {
+                        let fid = s(f, "id");
+                        let depth = depth_of(&folders, f);
+                        let items: Vec<Value> = all_units
+                            .iter()
+                            .filter(|it| unit_folder(it) == fid)
+                            .cloned()
+                            .collect();
+                        if !first_block {
+                            ui.add_space(14.0);
+                        }
+                        first_block = false;
+                        self.flow_folder_header(
+                            ui,
+                            w,
+                            f,
+                            depth,
+                            do_scroll && want_anchor.as_deref() == Some(fid.as_str()),
+                        );
+                        if items.is_empty() {
+                            // Empty folder: a one-card-high frame
+                            // where its cards would be (the
+                            // content_add_card placeholder's frame,
+                            // without its actions).
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(card_w, card_h),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().rect_stroke(
+                                rect,
+                                6.0,
+                                egui::Stroke::new(1.0, palette_color(CARD_BORDER)),
+                                egui::StrokeKind::Middle,
+                            );
+                        } else {
+                            ui.horizontal_wrapped(|ui| {
+                                for item in &items {
+                                    self.flow_unit_card(ui, w, item, card_w, card_h, &my_name);
+                                }
+                            });
+                        }
+                        ui.add_space(12.0);
+                    }
+                    // Folder-less blocks (and blocks whose folder
+                    // no longer exists): one untitled card group
+                    // closing the flow.
+                    let root_items: Vec<Value> = all_units
+                        .iter()
+                        .filter(|it| {
+                            let fid = unit_folder(it);
+                            fid.is_empty() || !ordered.iter().any(|f| s(f, "id") == fid)
+                        })
+                        .cloned()
+                        .collect();
+                    if !root_items.is_empty() {
+                        if !first_block {
+                            ui.add_space(14.0);
+                        }
+                        ui.horizontal_wrapped(|ui| {
+                            for item in &root_items {
+                                self.flow_unit_card(ui, w, item, card_w, card_h, &my_name);
+                            }
+                        });
+                    }
+                    if do_scroll {
+                        w.flow_anchor = Some(want_anchor);
+                    }
                 });
-            });
         });
+    }
+
+    /// One folder block header in the content wall's folder flow:
+    /// the folder name on the left (strong; its size steps down
+    /// with tree depth) with the folder's note in small type
+    /// beside it, and a solid rule underneath. Both texts edit in
+    /// place on double-click (FlowEdit). `scroll_here` positions
+    /// this block at the top of the wall (sidebar selection).
+    fn flow_folder_header(
+        &mut self,
+        ui: &mut egui::Ui,
+        w: &mut WallState,
+        f: &Value,
+        depth: usize,
+        scroll_here: bool,
+    ) {
+        let fid = s(f, "id");
+        let name = s(f, "name");
+        let note = s(f, "note");
+        let name_size = match depth {
+            0 => 15.0,
+            1 => 13.5,
+            _ => 12.5,
+        };
+        let editing_name = matches!(
+            &w.flow_edit,
+            Some(e) if e.folder_id == fid && e.field == FlowField::Name
+        );
+        let editing_note = matches!(
+            &w.flow_edit,
+            Some(e) if e.folder_id == fid && e.field == FlowField::Note
+        );
+        let row = ui.horizontal(|ui| {
+            if depth > 0 {
+                ui.add_space(depth as f32 * 16.0);
+            }
+            if editing_name {
+                self.flow_edit_field(ui, w, 240.0);
+            } else {
+                let resp = ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(&name)
+                            .strong()
+                            .size(name_size)
+                            .color(palette_color(TEXT_MAIN)),
+                    )
+                    .sense(egui::Sense::click()),
+                );
+                if resp.double_clicked() {
+                    w.flow_edit = Some(FlowEdit {
+                        folder_id: fid.clone(),
+                        field: FlowField::Name,
+                        text: name.clone(),
+                    });
+                    w.flow_edit_focus = true;
+                }
+            }
+            ui.add_space(4.0);
+            if editing_note {
+                self.flow_edit_field(ui, w, 300.0);
+            } else if note.is_empty() {
+                // An empty note still needs its double-click
+                // target: a faint hint inside the control (a
+                // control placeholder, not a wall empty-state
+                // text — the distinction the 2026-11-24
+                // empty-text ruling keeps).
+                let resp = ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(tr("添加备注"))
+                            .size(12.0)
+                            .color(palette_color(TEXT_WEAK).gamma_multiply(0.55)),
+                    )
+                    .sense(egui::Sense::click()),
+                );
+                if resp.double_clicked() {
+                    w.flow_edit = Some(FlowEdit {
+                        folder_id: fid.clone(),
+                        field: FlowField::Note,
+                        text: String::new(),
+                    });
+                    w.flow_edit_focus = true;
+                }
+            } else {
+                let resp = ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(&note)
+                            .size(12.0)
+                            .color(palette_color(TEXT_WEAK)),
+                    )
+                    .sense(egui::Sense::click()),
+                );
+                if resp.double_clicked() {
+                    w.flow_edit = Some(FlowEdit {
+                        folder_id: fid.clone(),
+                        field: FlowField::Note,
+                        text: note.clone(),
+                    });
+                    w.flow_edit_focus = true;
+                }
+            }
+        });
+        if scroll_here {
+            ui.scroll_to_rect(row.response.rect, Some(egui::Align::TOP));
+        }
+        ui.add_space(6.0);
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+        ui.painter().rect_filled(rect, 0.0, palette_color(SEPARATOR));
+    }
+
+    /// The in-place text field of a folder-flow header edit.
+    /// Losing focus commits (Enter surrenders focus, so it
+    /// commits too — the unit-detail header editor's contract);
+    /// Esc cancels.
+    fn flow_edit_field(&mut self, ui: &mut egui::Ui, w: &mut WallState, width: f32) {
+        let mut commit = false;
+        let mut cancel = false;
+        if let Some(edit) = &mut w.flow_edit {
+            let resp = ui.add_sized([width, 26.0], egui::TextEdit::singleline(&mut edit.text));
+            if w.flow_edit_focus {
+                resp.request_focus();
+                w.flow_edit_focus = false;
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                cancel = true;
+            } else if resp.lost_focus() {
+                commit = true;
+            }
+        }
+        if commit {
+            self.flow_edit_commit(w);
+        }
+        if cancel {
+            w.flow_edit = None;
+        }
+    }
+
+    /// Commit a folder-flow header edit: the name goes through
+    /// the rename endpoint, the note through the note endpoint —
+    /// both served by the core store on the local dispatch and
+    /// the server alike. An emptied name is refused (folder names
+    /// are never blank); an emptied note simply clears the note.
+    fn flow_edit_commit(&mut self, w: &mut WallState) {
+        if !self.need_identity_local("编辑文件夹") {
+            return;
+        }
+        let Some(edit) = w.flow_edit.take() else {
+            return;
+        };
+        match edit.field {
+            FlowField::Name => {
+                let name = edit.text.trim().to_string();
+                if name.is_empty() {
+                    self.msg = "文件夹名不能为空".into();
+                    return;
+                }
+                match self.call_work(
+                    "POST",
+                    &format!("/v1/folders/{}/rename", edit.folder_id),
+                    Some(json!({ "name": name })),
+                ) {
+                    Ok(_) => {
+                        self.msg = "已重命名".into();
+                        self.reload_folders();
+                    }
+                    Err(e) => self.msg = format!("重命名失败：{e}"),
+                }
+            }
+            FlowField::Note => {
+                let note = edit.text.trim().to_string();
+                match self.call_work(
+                    "POST",
+                    &format!("/v1/folders/{}/note", edit.folder_id),
+                    Some(json!({ "note": note })),
+                ) {
+                    Ok(_) => {
+                        self.msg = "已保存备注".into();
+                        self.reload_folders();
+                    }
+                    Err(e) => self.msg = format!("备注保存失败：{e}"),
+                }
+            }
+        }
+    }
+
+    /// One block card inside a folder-flow section (or the
+    /// folder-less tail group): the standard wall card and its
+    /// click contract, unchanged from the filtered wall — single
+    /// click selects, Ctrl/⌘-click toggles the multi-selection,
+    /// double-click opens the block's drill-down.
+    fn flow_unit_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        w: &mut WallState,
+        item: &Value,
+        card_w: f32,
+        card_h: f32,
+        my_name: &str,
+    ) {
+        let unit = item.get("unit").cloned().unwrap_or(json!({}));
+        let uid = s(&unit, "id");
+        let rends = item
+            .get("renditions")
+            .and_then(|r| r.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let latest = rends
+            .first()
+            .and_then(|r| r.get("latest"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let title = s(&unit, "name");
+        let cover = s(&latest, "id");
+        let outer = self.wall_card(
+            ui,
+            WallCard {
+                width: card_w,
+                min_height: card_h,
+                title: &title,
+                cover: &cover,
+                selected: w.selected.as_deref() == Some(uid.as_str()) || w.multi.contains(&uid),
+                scope: None,
+                variant: if !my_name.is_empty() && s(&unit, "maintainer") == my_name {
+                    CardVariant::Mine
+                } else {
+                    CardVariant::Normal
+                },
+            },
+            |app, ui| {
+                ui.horizontal(|ui| {
+                    if latest.is_object() {
+                        chip(
+                            ui,
+                            &format!("v{}", s(&latest, "semver")),
+                            palette_color(ACCENT_DEEP),
+                            CHIP_BLUE_BG,
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("{} 页", i(&latest, "page_count")))
+                                .small()
+                                .color(palette_color(TEXT_WEAK)),
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new("暂无版本")
+                                .small()
+                                .color(palette_color(TEXT_WEAK)),
+                        );
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} · {}",
+                                app.folder_name(
+                                    unit.get("folder_id").and_then(|x| x.as_str()).unwrap_or("")
+                                ),
+                                s(&unit, "maintainer")
+                            ))
+                            .small()
+                            .color(palette_color(TEXT_WEAK)),
+                        );
+                    });
+                });
+                if matches!(app.pick, Some(PickState::Insert { .. })) {
+                    ui.add_space(8.0);
+                    if ui
+                        .add_sized(
+                            [72.0, 28.0],
+                            egui::Button::new(
+                                egui::RichText::new("插入")
+                                    .size(13.0)
+                                    .color(egui::Color32::WHITE),
+                            )
+                            .fill(ACCENT)
+                            .corner_radius(6),
+                        )
+                        .clicked()
+                    {
+                        app.insert_pick_unit(item);
+                    }
+                }
+            },
+        );
+        // Click handling rides on an explicit interact over
+        // the card rect: allocate_ui's own response carries no
+        // click sense, which is why double-click never fired
+        // (James 2026-11-15). Single click selects, double
+        // click opens the maintenance drill-down — the same
+        // contract as the web prototype.
+        let click = ui.interact(
+            outer.response.rect,
+            egui::Id::unique(("unit_card", &uid)),
+            egui::Sense::click(),
+        );
+        if click.double_clicked() {
+            if self.pick.is_none() {
+                self.open_unit_detail(&uid);
+            }
+        } else if click.clicked() {
+            // Ctrl/⌘-click toggles the card in the
+            // multi-selection （组合 / 剪贴板的前置）;
+            // a plain click stays the single selection.
+            let multi_key = ui.ctx().input(|inp| inp.modifiers.command || inp.modifiers.ctrl);
+            if multi_key {
+                if let Some(pos) = w.multi.iter().position(|u| u == &uid) {
+                    w.multi.remove(pos);
+                } else {
+                    w.multi.push(uid.clone());
+                }
+            }
+            w.selected = Some(uid.clone());
+        }
     }
 
     /// Content page · local cache management (prototype #6b
@@ -12660,15 +13224,81 @@ impl App {
     /// lives in the selected folder. `selected` None = 全部. Folder rows
     /// carry a right-click menu （新建子文件夹 / 新建文件夹 / 重命名 / 删除）;
     /// right-clicking the blank area below the tree offers 新建文件夹.
-    fn folder_tree(&mut self, ui: &mut egui::Ui, selected: &mut Option<String>, uncat: bool) {
+    fn folder_tree(
+        &mut self,
+        ui: &mut egui::Ui,
+        selected: &mut Option<String>,
+        uncat: bool,
+        scope: &str,
+    ) {
         ui.spacing_mut().item_spacing.y = 2.0;
         enum Act {
             NewChild(String),
             NewSibling(Option<String>),
             Rename(String, String),
             Delete(String, String),
+            Color(String, Option<String>),
         }
         let mut action: Option<Act> = None;
+        // Long-press gate (user ruling 2026-11-24): a folder drag
+        // starts only after the pointer has rested on the row for
+        // FOLDER_LONG_PRESS_SECS without wandering past
+        // FOLDER_PRESS_MOVE_TOLERANCE. Until then the row is a
+        // plain click target and the sidebar scrolls exactly as
+        // before — the drag state is managed here rather than by
+        // egui's drag detection, which arms on the first few
+        // points of movement (the old "一点就拖"). While a press
+        // is pending we ask for steady repaints so the threshold
+        // still fires with the pointer held perfectly still.
+        enum PressStep {
+            Keep,
+            Cancel,
+            Arm(String),
+        }
+        let step = match &self.folder_press {
+            None => PressStep::Keep,
+            Some(press) => {
+                let (down, pos, now) = ui.input(|i| {
+                    (
+                        i.pointer.primary_down(),
+                        i.pointer.interact_pos().or_else(|| i.pointer.hover_pos()),
+                        i.time,
+                    )
+                });
+                if !down || press.armed {
+                    PressStep::Keep
+                } else if pos.map_or(false, |p| {
+                    p.distance(press.origin) > FOLDER_PRESS_MOVE_TOLERANCE
+                }) {
+                    // The gesture is a scroll, not a press.
+                    PressStep::Cancel
+                } else if now - press.since >= FOLDER_LONG_PRESS_SECS {
+                    PressStep::Arm(press.id.clone())
+                } else {
+                    PressStep::Keep
+                }
+            }
+        };
+        match step {
+            PressStep::Cancel => self.folder_press = None,
+            PressStep::Arm(id) => {
+                if let Some(press) = &mut self.folder_press {
+                    press.armed = true;
+                }
+                *selected = Some(id.clone());
+                egui::DragAndDrop::set_payload(ui.ctx(), FolderDrag(id));
+            }
+            PressStep::Keep => {}
+        }
+        if let Some(press) = &self.folder_press {
+            if press.armed {
+                // Keep the payload warm every frame, the way
+                // dnd_drag_source does for its own drags.
+                egui::DragAndDrop::set_payload(ui.ctx(), FolderDrag(press.id.clone()));
+            }
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(30));
+        }
         let all_icon = ChromeIcon::Settings;
         let width = ui.available_width();
         ui.horizontal(|ui| {
@@ -12696,10 +13326,14 @@ impl App {
                 all_icon,
                 icon_rect.center(),
                 15.0,
-                palette_color(ICON_TINT),
+                if selected_all {
+                    palette_color(ACCENT)
+                } else {
+                    palette_color(ICON_TINT)
+                },
             );
             let text_color = if selected_all {
-                palette_color(ACCENT_DEEP)
+                palette_color(ACCENT)
             } else {
                 palette_color(TEXT_MAIN)
             };
@@ -12739,7 +13373,15 @@ impl App {
                 *selected = Some(String::new());
             }
         }
-        let mut folders = self.folders.clone();
+        // Sidebar isolation (user ruling 2026-11-24): the tree
+        // lists only its own scope's folders; self.folders keeps
+        // the cross-scope union for id-based name lookups.
+        let mut folders: Vec<Value> = self
+            .folders
+            .iter()
+            .filter(|f| s(*f, "scope") == scope)
+            .cloned()
+            .collect();
         folders.sort_by_key(|f| i(f, "sort"));
         // depth-first order by parent chain
         fn depth_of(folders: &[Value], f: &Value) -> usize {
@@ -12778,8 +13420,28 @@ impl App {
         // loop and hover/drop is resolved after it, when every row
         // rect is known. The 全部 and 未分类 rows take no part:
         // they are neither drag sources nor drop targets.
+        //
+        // The payload is managed by hand (set at the long-press
+        // gate, read here) instead of via Ui::dnd_drag_source:
+        // at the pinned egui rev that helper repaints the dragged
+        // body on a Tooltip layer translated by
+        // `pointer_pos - response.rect.center()` — it re-anchors
+        // the row's CENTRE on the pointer, so the row jumps by up
+        // to half its width the moment a drag starts and then
+        // drifts freely in both axes (the user's "文件夹偏移出去
+        // 很远"). Painting the lifted row ourselves (below) keeps
+        // it locked to the sidebar and to vertical motion only.
         let drag_id: Option<String> =
             egui::DragAndDrop::payload::<FolderDrag>(ui.ctx()).map(|p| p.0.clone());
+        // Escape aborts a drag at the plugin level (the payload
+        // is cleared at pass start): mirror that in the press
+        // state so the floating row disappears too.
+        if matches!(&self.folder_press, Some(p) if p.armed)
+            && drag_id.is_none()
+            && ui.input(|i| i.pointer.primary_down())
+        {
+            self.folder_press = None;
+        }
         // True when `start` is `needle` itself or sits inside
         // `needle`'s subtree (walk start's parent chain up).
         let chain_hits = |folders: &[Value], start: &str, needle: &str| -> bool {
@@ -12817,16 +13479,67 @@ impl App {
                 } else {
                     ChromeIcon::Folder
                 };
-                let resp = ui
-                    .dnd_drag_source(
-                        egui::Id::new(("qimu_folder_drag", fid.as_str())),
-                        FolderDrag(fid.clone()),
-                        |ui| tree_row(ui, is_sel, d as f32 * 15.0, Some(ficon), &fname, 12.5),
-                    )
-                    .response;
+                // The row itself is a plain click target (see
+                // the long-press gate at the top): it is NOT a
+                // dnd_drag_source, so clicks and sidebar scrolling
+                // behave exactly like every other tree row.
+                let fcolor = folder_color_of(f);
+                let resp = tree_row_ex(
+                    ui,
+                    is_sel,
+                    d as f32 * 15.0,
+                    Some(ficon),
+                    fcolor,
+                    &fname,
+                    12.5,
+                    egui::Sense::click(),
+                );
+                let is_dragged =
+                    matches!(&self.folder_press, Some(p) if p.armed && p.id == fid);
+                if is_dragged {
+                    // The lifted copy is painted after the loop;
+                    // the row's own slot stays behind, dimmed.
+                    ui.painter().rect_filled(
+                        resp.rect,
+                        6.0,
+                        palette_color(APP_BG).gamma_multiply(0.55),
+                    );
+                }
                 row_rects.push((fid.clone(), fparent.clone(), resp.rect));
+                // A fresh primary press on this row starts the
+                // long-press watch.
+                if self.folder_press.is_none()
+                    && ui.input(|i| {
+                        i.pointer.primary_pressed()
+                            && i.pointer
+                                .interact_pos()
+                                .is_some_and(|p| resp.rect.contains(p))
+                    })
+                {
+                    let origin = ui
+                        .input(|i| i.pointer.interact_pos())
+                        .unwrap_or(resp.rect.center());
+                    let now = ui.input(|i| i.time);
+                    self.folder_press = Some(FolderPress {
+                        id: fid.clone(),
+                        name: fname.clone(),
+                        depth: d,
+                        since: now,
+                        origin,
+                        armed: false,
+                    });
+                }
                 if resp.clicked() {
                     *selected = Some(fid.clone());
+                }
+                if resp.double_clicked() {
+                    // Double-click renames (user ruling
+                    // 2026-11-24) — the same inline editor as the
+                    // context menu's 重命名. Folder rows have no
+                    // other double-click behaviour (the tree is
+                    // always fully expanded), so nothing is
+                    // displaced; the click half still just selects.
+                    action = Some(Act::Rename(fid.clone(), fname.clone()));
                 }
                 let (a, b, c, dd) = (
                     fid.clone(),
@@ -12838,6 +13551,7 @@ impl App {
                     fname.clone(),
                     fid.clone(),
                 );
+                let mut color_pick: Option<Option<String>> = None;
                 resp.context_menu(|ui| {
                     if ui.button("新建子文件夹").clicked() {
                         action = Some(Act::NewChild(a.clone()));
@@ -12851,11 +13565,44 @@ impl App {
                         action = Some(Act::Rename(dd.clone(), c.clone()));
                         ui.close();
                     }
+                    ui.separator();
+                    ui.menu_button("颜色", |ui| {
+                        ui.horizontal(|ui| {
+                            if ui.button("默认").clicked() {
+                                color_pick = Some(None);
+                                ui.close();
+                            }
+                            for (cname, hex) in FOLDER_COLORS {
+                                let col = parse_folder_hex(hex)
+                                    .unwrap_or_else(|| palette_color(ICON_TINT));
+                                let (srect, sresp) = ui.allocate_exact_size(
+                                    egui::vec2(20.0, 20.0),
+                                    egui::Sense::click(),
+                                );
+                                ui.painter().rect_filled(srect, 5.0, col);
+                                if fcolor == Some(col) {
+                                    ui.painter().rect_stroke(
+                                        srect,
+                                        5.0,
+                                        egui::Stroke::new(2.0, palette_color(ACCENT)),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                }
+                                if sresp.on_hover_text(cname).clicked() {
+                                    color_pick = Some(Some(hex.to_string()));
+                                    ui.close();
+                                }
+                            }
+                        });
+                    });
                     if ui.button("删除").clicked() {
                         action = Some(Act::Delete(dd.clone(), c.clone()));
                         ui.close();
                     }
                 });
+                if let Some(cp) = color_pick {
+                    action = Some(Act::Color(dd.clone(), cp));
+                }
             }
             // an inline editor for a NEW child of this folder
             if matches!(&self.folder_edit, Some(e) if e.target.is_none() && e.parent.as_deref() == Some(fid.as_str()))
@@ -12999,12 +13746,82 @@ impl App {
                 }
             }
         }
+        // The lifted row: painted after the drop resolution so
+        // it floats above the tree. Its x and width are locked to
+        // the row's own slot; its y is the slot's y plus the
+        // pointer's vertical travel, clamped to the tree's
+        // extent — it moves only up and down, inside the sidebar.
+        // The lift reads as a soft shadow under an accent-soft,
+        // accent-outlined copy of the row in its selected state.
+        if let Some(press) = &self.folder_press {
+            if press.armed {
+                let slot = row_rects
+                    .iter()
+                    .find(|(id, _, _)| *id == press.id)
+                    .map(|(_, _, r)| *r);
+                let pos = ui.input(|i| {
+                    i.pointer.interact_pos().or_else(|| i.pointer.hover_pos())
+                });
+                if let (Some(slot), Some(pos)) = (slot, pos) {
+                    let top_limit = row_rects
+                        .first()
+                        .map_or(slot.top(), |(_, _, r)| r.top());
+                    let bottom_limit = blank.rect.bottom();
+                    let y = (slot.top() + (pos.y - press.origin.y))
+                        .clamp(top_limit, (bottom_limit - slot.height()).max(top_limit));
+                    let ghost = egui::Rect::from_min_size(
+                        egui::pos2(slot.left(), y),
+                        slot.size(),
+                    );
+                    let painter = ui.painter();
+                    painter.rect_filled(
+                        ghost.translate(egui::vec2(0.0, 3.0)),
+                        6.0,
+                        egui::Color32::from_black_alpha(90),
+                    );
+                    painter.rect_filled(ghost, 6.0, palette_color(APP_BG));
+                    painter.rect_filled(ghost, 6.0, palette_color(SEL_BG));
+                    painter.rect_stroke(
+                        ghost,
+                        6.0,
+                        egui::Stroke::new(1.0, palette_color(ACCENT)),
+                        egui::StrokeKind::Inside,
+                    );
+                    let indent = press.depth as f32 * 15.0;
+                    let ir = egui::Rect::from_min_size(
+                        egui::pos2(ghost.min.x + 10.0 + indent, ghost.center().y - 7.5),
+                        egui::vec2(15.0, 15.0),
+                    );
+                    ChromeIcon::FolderOpen
+                        .image(15.0, palette_color(ACCENT))
+                        .paint_at(ui, ir);
+                    let font = egui::FontId::new(12.5, egui::FontFamily::Proportional);
+                    let galley = painter.layout_no_wrap(
+                        press.name.clone(),
+                        font,
+                        palette_color(ACCENT),
+                    );
+                    let ty = ghost.center().y - galley.size().y / 2.0;
+                    painter.galley(
+                        egui::pos2(ghost.min.x + 31.0 + indent, ty),
+                        galley,
+                        palette_color(ACCENT),
+                    );
+                }
+            }
+        }
+        // The press watch ends with the gesture (the drop above
+        // has already read the payload for this release frame).
+        if !ui.input(|i| i.pointer.primary_down()) {
+            self.folder_press = None;
+        }
         match action {
             Some(Act::NewChild(parent)) => {
                 self.folder_edit = Some(FolderEdit {
                     target: None,
                     parent: Some(parent),
                     text: "新文件夹".into(),
+                    scope: scope.into(),
                 });
                 self.folder_edit_focus = true;
             }
@@ -13013,6 +13830,7 @@ impl App {
                     target: None,
                     parent,
                     text: "新文件夹".into(),
+                    scope: scope.into(),
                 });
                 self.folder_edit_focus = true;
             }
@@ -13021,9 +13839,11 @@ impl App {
                     target: Some(id),
                     parent: None,
                     text: name,
+                    scope: scope.into(),
                 });
                 self.folder_edit_focus = true;
             }
+            Some(Act::Color(id, color)) => self.folder_set_color(&id, color),
             Some(Act::Delete(id, name)) => self.folder_try_delete(&id, &name),
             None => {}
         }
@@ -13088,7 +13908,11 @@ impl App {
                 match self.call_work(
                     "POST",
                     "/v1/folders",
-                    Some(json!({ "name": name, "parent_id": edit.parent })),
+                    Some(json!({
+                        "name": name,
+                        "parent_id": edit.parent,
+                        "scope": edit.scope
+                    })),
                 ) {
                     Ok(_) => {
                         self.msg = "已新建文件夹".into();
@@ -13121,6 +13945,25 @@ impl App {
         }
     }
 
+    /// Set or clear a folder's sidebar color (the context menu's
+    /// 颜色 submenu; None restores the default icon tint).
+    fn folder_set_color(&mut self, id: &str, color: Option<String>) {
+        if !self.need_identity_local("设置文件夹颜色") {
+            return;
+        }
+        match self.call_work(
+            "POST",
+            &format!("/v1/folders/{id}/color"),
+            Some(json!({ "color": color })),
+        ) {
+            Ok(_) => {
+                self.msg = "已设置文件夹颜色".into();
+                self.reload_folders();
+            }
+            Err(e) => self.msg = format!("设置颜色失败：{e}"),
+        }
+    }
+
     fn reload_folders(&mut self) {
         if let Ok(v) = self.call_work("GET", "/v1/folders", None) {
             self.folders = v
@@ -13131,25 +13974,13 @@ impl App {
         }
     }
 
-    /// Delete is only offered after a local non-empty pre-check; the
-    /// server repeats the check and its reason wins on failure.
+    /// Deleting a folder always opens the two-choice dialog
+    /// (user ruling 2026-11-24): 只删除文件夹 (contents lift to
+    /// the parent) or 连同内容移到回收站. There is deliberately
+    /// no non-empty pre-check any more — both shapes are valid
+    /// for empty and non-empty folders alike, and the store
+    /// performs the chosen one atomically.
     fn folder_try_delete(&mut self, id: &str, name: &str) {
-        if self.folders.iter().any(|f| s(f, "parent_id") == id) {
-            self.msg = "文件夹下还有子文件夹，不能删除".into();
-            return;
-        }
-        if self
-            .units
-            .iter()
-            .any(|u| u.get("unit").map(|x| s(x, "folder_id")).unwrap_or_default() == id)
-        {
-            self.msg = "文件夹内还有内容块，不能删除".into();
-            return;
-        }
-        if self.indexes.iter().any(|x| s(x, "folder_id") == id) {
-            self.msg = "文件夹内还有索引，不能删除".into();
-            return;
-        }
         self.folder_delete_confirm = Some((id.to_string(), name.to_string()));
     }
 
@@ -14546,7 +15377,7 @@ impl App {
             return;
         };
         let mut open = true;
-        let mut do_delete = false;
+        let mut mode: Option<&'static str> = None;
         let mut cancel = false;
         egui::Window::new("删除文件夹")
             .open(&mut open)
@@ -14554,21 +15385,35 @@ impl App {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ui.ctx(), |ui| {
-                ui.label(format!("删除文件夹「{name}」？只能删除空文件夹。"));
+                ui.label(format!("删除文件夹「{name}」？"));
+                ui.add_space(6.0);
+                ui.label("只删除文件夹：里面的子文件夹、内容块和索引提升到上一级；顶层文件夹的内容回到根目录（索引回到「未分类」）。");
+                ui.label("连同内容删除：文件夹、子文件夹和里面的全部内容一起移到回收站。");
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button("删除").clicked() {
-                        do_delete = true;
+                    if ui.button("只删除文件夹").clicked() {
+                        mode = Some("lift");
+                    }
+                    if ui.button("连同内容移到回收站").clicked() {
+                        mode = Some("trash");
                     }
                     if ui.button("取消").clicked() {
                         cancel = true;
                     }
                 });
             });
-        if do_delete {
-            match self.call_work("DELETE", &format!("/v1/folders/{id}"), None) {
+        if let Some(mode) = mode {
+            match self.call_work(
+                "POST",
+                &format!("/v1/folders/{id}/delete"),
+                Some(json!({ "mode": mode })),
+            ) {
                 Ok(_) => {
-                    self.msg = "已删除文件夹".into();
+                    self.msg = if mode == "trash" {
+                        "已删除文件夹，内容已移到回收站".into()
+                    } else {
+                        "已删除文件夹".into()
+                    };
                     if self.content.folder_filter.as_deref() == Some(id.as_str()) {
                         self.content.folder_filter = None;
                     }
@@ -14578,12 +15423,15 @@ impl App {
                     if self.index.overview_folder.as_deref() == Some(id.as_str()) {
                         self.index.overview_folder = None;
                     }
-                    self.reload_folders();
+                    // Contents moved (lift) or vanished into the
+                    // trash (trash): the cached unit / index /
+                    // showroom lists are stale either way.
+                    self.refresh_all();
                 }
                 Err(e) => self.msg = format!("删除失败：{e}"),
             }
         }
-        if do_delete || cancel || !open {
+        if mode.is_some() || cancel || !open {
             self.folder_delete_confirm = None;
         }
     }
@@ -14788,6 +15636,11 @@ impl App {
         if !self.need_identity_local("新建索引") {
             return;
         }
+        // Capture the sidebar folder BEFORE entering the page:
+        // entering a board resets its selection to 全部 (user
+        // ruling 2026-11-24), but a create started from inside a
+        // folder keeps that folder as the new index's home.
+        let entry_folder = self.index.overview_folder.clone();
         if self.page != Page::Index {
             self.navigate_to(Page::Index);
         }
@@ -14815,11 +15668,7 @@ impl App {
         // in the index sidebar is an explicit choice and becomes
         // the new index's home; 全部 / 未分类 (None / Some(""))
         // fall through to None — the default home, 未分类.
-        let folder = self
-            .index
-            .overview_folder
-            .clone()
-            .filter(|f| !f.is_empty());
+        let folder = entry_folder.filter(|f| !f.is_empty());
         self.index.stack.push(IndexFrame::Create(CreateState {
             new_group,
             folder,

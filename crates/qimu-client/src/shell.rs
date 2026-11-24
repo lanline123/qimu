@@ -65,6 +65,29 @@ impl App {
         self.page = page;
         self.deep_source = None;
         self.review.jump_source = None;
+        // Entering a board lands on its 全部 selection (user
+        // ruling 2026-11-24): the showroom zones and the two
+        // folder-filtered pages reset their sidebar selection.
+        // Only the selection resets — each page's drill stack
+        // and frame state survive page switches as before, and
+        // returning from a drill-down restores its frame, so
+        // this never fires mid-drill (drill returns pop frames,
+        // they do not navigate). Deep jumps that set self.page
+        // directly carry their own target and are exempt.
+        match page {
+            Page::Showroom => {
+                self.showroom.folder = None;
+                self.showroom.library_view = 0;
+                self.showroom.share_source = 0;
+            }
+            Page::Index => {
+                self.index.overview_folder = None;
+            }
+            Page::Content => {
+                self.content.folder_filter = None;
+            }
+            _ => {}
+        }
     }
 
     fn shell_sidebar(&mut self, ui: &mut egui::Ui) {
@@ -426,10 +449,17 @@ impl App {
                             }
                         }
                         Page::Content => {
-                            if self.tool_slot(ui, false, tr("智能分块导入"), ChromeIcon::Split)
-                            {
-                                self.act_import_split();
-                            }
+                            // 智能分块导入 is the AI-analysis split
+                            // (user ruling 2026-11-24): not wired
+                            // yet, so the slot renders greyed and
+                            // inert until the AI proposer lands.
+                            // act_import_split / propose_blocks
+                            // stay in place for that feature.
+                            self.tool_slot_placeholder(
+                                ui,
+                                tr("智能分块导入（AI 即将上线）"),
+                                ChromeIcon::Split,
+                            );
                             ui.add_space(2.0);
                             if self.tool_slot(ui, false, tr("导入 PPT"), ChromeIcon::Import) {
                                 self.act_import_ppt();
