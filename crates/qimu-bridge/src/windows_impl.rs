@@ -276,4 +276,63 @@ impl PowerPointBridge for WindowsBridge {
         saved?;
         Ok(Some(path))
     }
+
+    /// Clipboard publish route — the mirror of capture. PowerPoint's
+    /// slide clipboard format is its own private serialization, which
+    /// no third party can construct reliably, so PowerPoint itself
+    /// renders it: the fragment is opened in a hidden throwaway
+    /// presentation, all of its slides are copied by PowerPoint, and
+    /// the throwaway is closed without saving. The user's open files
+    /// are never touched. Only a running instance is used (the rule
+    /// for this whole bridge): with no PowerPoint running this
+    /// returns `Ok(false)` and the caller keeps the fragment in the
+    /// in-app clipboard only.
+    /// NOTE: written against the documented object model; like the
+    /// rest of this bridge it has NOT yet run on a real Windows +
+    /// PowerPoint machine (first live check pending). Whether the
+    /// copied slides stay pasteable after the throwaway presentation
+    /// closes is PowerPoint's own clipboard behaviour and is part of
+    /// that first check.
+    fn publish_slides_to_clipboard(
+        &self,
+        fragment_path: &std::path::Path,
+    ) -> Result<bool, String> {
+        let _com = ComGuard::new()?;
+        let app = match active_powerpoint() {
+            Ok(a) => a,
+            Err(_) => return Ok(false),
+        };
+        let presentations = get_obj(&app, "Presentations")?;
+        // Open(FileName, ReadOnly = msoTrue, Untitled = msoFalse,
+        // WithWindow = msoFalse): hidden and read-only, so closing
+        // it can never prompt to save. (msoTrue is -1; this bridge
+        // passes booleans as i32, as in the Add call in capture.)
+        let opened = call(
+            &presentations,
+            "Open",
+            &mut [
+                VARIANT::from(BSTR::from(fragment_path.to_string_lossy().as_ref())),
+                VARIANT::from(-1i32),
+                VARIANT::from(0i32),
+                VARIANT::from(0i32),
+            ],
+        )?;
+        let pres = IDispatch::try_from(&opened)
+            .map_err(|e| format!("打开剪贴板片段失败: {e}"))?;
+        let copied = (|| -> Result<(), String> {
+            let slides = get_obj(&pres, "Slides")?;
+            if get_i32(&slides, "Count").unwrap_or(0) == 0 {
+                return Err("剪贴板片段里没有页面".into());
+            }
+            // Slides.Range() with no argument selects every slide.
+            let range_v = call(&slides, "Range", &mut [])?;
+            let range = IDispatch::try_from(&range_v)
+                .map_err(|e| format!("Slides.Range 不是对象: {e}"))?;
+            call(&range, "Copy", &mut [])?;
+            Ok(())
+        })();
+        let _ = call(&pres, "Close", &mut []);
+        copied?;
+        Ok(true)
+    }
 }

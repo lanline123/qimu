@@ -594,6 +594,50 @@ fn load_cache_index() -> Vec<Value> {
         .unwrap_or_default()
 }
 
+/// The in-app PPT clipboard (PPT 剪贴板): one fragment .pptx — the
+/// same currency as a version fragment — plus a small JSON sidecar
+/// (page count, source label, when it was taken). It lives in the
+/// cache dir, so it survives restarts exactly like the offline
+/// cache; PowerPoint interop is layered on top of it through the
+/// bridge (see `App::clip_store`).
+fn clip_fragment_path() -> std::path::PathBuf {
+    cache_dir().join("ppt-clipboard.pptx")
+}
+
+fn clip_meta_path() -> std::path::PathBuf {
+    cache_dir().join("ppt-clipboard.json")
+}
+
+/// Name for a block born from one clipboard page: the page's first
+/// non-empty text run, trimmed — 未命名内容块 when the page carries
+/// no text at all.
+fn clip_page_name(single: &qimu_core::pptx::Package, idx: usize) -> String {
+    if let Ok(runs) = qimu_core::pptx::slide_text_runs(single, 0) {
+        for run in runs {
+            let t = run.trim();
+            if !t.is_empty() {
+                return t.chars().take(24).collect();
+            }
+        }
+    }
+    let _ = idx;
+    "未命名内容块".to_string()
+}
+
+fn load_clip_meta() -> Option<Value> {
+    if !clip_fragment_path().exists() {
+        return None;
+    }
+    let meta: Value = std::fs::read_to_string(clip_meta_path())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())?;
+    if i(&meta, "pages") > 0 {
+        Some(meta)
+    } else {
+        None
+    }
+}
+
 /// At-rest encryption for the offline cache (§3.17: 静态加密必需）:
 /// AES-256-GCM with a per-machine key kept inside the cache directory
 /// (cache.key), so the key travels with the cache when the user moves it.
@@ -1027,6 +1071,9 @@ struct WallState {
     /// Single-click selection on the wall (the accent ring). The
     /// drill-down itself is the Unit frame, not this field.
     selected: Option<String>,
+    /// Ctrl/⌘-click multi-selection (组合 / 剪贴板复制·剪切的前置):
+    /// unit ids, in click order. `selected` stays the anchor card.
+    multi: Vec<String>,
 }
 
 /// One open content block: its detail payload plus every
@@ -2395,6 +2442,9 @@ struct App {
     new_team_name: String,
     team_member_pick: String,
     cache_entries: Vec<Value>,
+    /// PPT clipboard sidecar meta (see `load_clip_meta`); None while
+    /// the clipboard is empty. The fragment bytes stay on disk.
+    ppt_clip: Option<Value>,
     cache_policy: Value,
     index_covers: std::collections::HashMap<String, String>,
     index_tags: std::collections::HashMap<String, String>,
@@ -2998,6 +3048,7 @@ impl App {
             new_team_name: String::new(),
             team_member_pick: String::new(),
             cache_entries: load_cache_index(),
+            ppt_clip: load_clip_meta(),
             cache_policy: json!({ "allowed": true, "max_mb": 500 }),
             index_covers: std::collections::HashMap::new(),
             index_tags: std::collections::HashMap::new(),
@@ -4709,11 +4760,30 @@ impl App {
             self.msg = "读取粘贴片段失败".into();
             return;
         };
+        if let Some(uid) =
+            self.publish_bytes_as_unit(&bytes, "未命名内容块", "剪贴板粘贴新建")
+        {
+            self.msg = "已粘贴新建内容块".into();
+            self.refresh_all();
+            self.open_unit_detail(&uid);
+        }
+    }
+
+    /// Create a content block from raw PPTX bytes and publish them
+    /// as its first version. Shared by 粘贴新建 and every clipboard
+    /// paste path. Returns the new unit id; failures land in
+    /// `self.msg`.
+    fn publish_bytes_as_unit(
+        &mut self,
+        bytes: &[u8],
+        name: &str,
+        note: &str,
+    ) -> Option<String> {
         let created = self.call(
             "POST",
             "/v1/units",
             Some(json!({
-                "name": "未命名内容块",
+                "name": name,
                 "group_id": self.content.import_group,
                 "folder_id": self.content.folder_filter,
             })),
@@ -4728,33 +4798,545 @@ impl App {
             }
             Err(e) => {
                 self.msg = format!("新建失败：{e}");
-                return;
+                return None;
             }
         };
         if uid.is_empty() {
             self.msg = "新建失败：服务器未返回内容块".into();
-            return;
+            return None;
         }
-        let r = self.call(
+        match self.call(
             "POST",
             &format!("/v1/units/{uid}/publish"),
             Some(json!({
-                "data_base64": b64e(&bytes),
+                "data_base64": b64e(bytes),
                 "form": "标准",
                 "lang": "zh",
                 "bump": "minor",
-                "note": "剪贴板粘贴新建",
+                "note": note,
             })),
-        );
-        match r {
-            Ok(_) => {
-                self.msg = "已粘贴新建内容块".into();
-                self.refresh_all();
-                self.open_unit_detail(&uid);
+        ) {
+            Ok(_) => Some(uid),
+            Err(e) => {
+                self.msg = format!("发布失败：{e}");
+                None
             }
-            Err(e) => self.msg = format!("粘贴发布失败：{e}"),
         }
     }
+
+    // ---------------- PPT clipboard (PPT 剪贴板) ----------------
+    //
+    // The clipboard holds ONE fragment .pptx on disk plus a JSON
+    // sidecar. PowerPoint interop goes through the bridge both ways:
+    // capture (already shipped) reads slides PowerPoint put on the
+    // system clipboard; publish (qimu-bridge) lets PowerPoint itself
+    // render the fragment onto the system clipboard, because its
+    // slide format is a private serialization. Copy/cut always fill
+    // the in-app clipboard; the PowerPoint leg is best-effort and
+    // the status message says honestly whether it happened.
+
+    /// The bottom bar's PPT clipboard chip text; None = chip hidden.
+    fn clip_badge(&self) -> Option<String> {
+        self.ppt_clip
+            .as_ref()
+            .map(|m| format!("PPT 剪贴板 · {} 页", i(m, "pages")))
+    }
+
+    /// Store fragment bytes as the clipboard content. When
+    /// `offer_to_powerpoint` is set, also publish them to the system
+    /// clipboard through the bridge and report the outcome honestly.
+    fn clip_store(&mut self, bytes: &[u8], source: &str, offer_to_powerpoint: bool) {
+        let pkg = match qimu_core::pptx::Package::load(bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                self.msg = format!("复制失败：不是有效的 PPTX 片段（{e}）");
+                return;
+            }
+        };
+        let pages = qimu_core::pptx::slides(&pkg).map(|v| v.len()).unwrap_or(0);
+        if pages == 0 {
+            self.msg = "复制失败：片段里没有页面".into();
+            return;
+        }
+        if std::fs::write(clip_fragment_path(), bytes).is_err() {
+            self.msg = "复制失败：本地剪贴板写入失败".into();
+            return;
+        }
+        let meta = json!({
+            "pages": pages,
+            "source": source,
+            "created_ms": qimu_core::auth::now_ms(),
+        });
+        let _ = std::fs::write(
+            clip_meta_path(),
+            serde_json::to_string(&meta).unwrap_or_default(),
+        );
+        self.ppt_clip = Some(meta);
+        if !offer_to_powerpoint {
+            self.msg = format!("已复制 {pages} 页到 PPT 剪贴板");
+            return;
+        }
+        match qimu_bridge::platform_bridge().publish_slides_to_clipboard(&clip_fragment_path()) {
+            Ok(true) => {
+                self.msg = format!("已复制 {pages} 页到 PPT 剪贴板（可直接粘贴到 PowerPoint）")
+            }
+            Ok(false) => {
+                self.msg =
+                    format!("已复制 {pages} 页到 PPT 剪贴板（PowerPoint 未运行，未同步到系统剪贴板）")
+            }
+            Err(e) => {
+                self.msg = format!("已复制 {pages} 页到 PPT 剪贴板（同步到 PowerPoint 失败：{e}）")
+            }
+        }
+    }
+
+    /// The clipboard bytes, adopting whatever PowerPoint last put on
+    /// the system clipboard when the in-app clipboard is empty (the
+    /// same capture path 粘贴新建 uses).
+    fn clip_source_bytes(&mut self) -> Option<Vec<u8>> {
+        if self.ppt_clip.is_some() {
+            if let Ok(bytes) = std::fs::read(clip_fragment_path()) {
+                return Some(bytes);
+            }
+        }
+        match qimu_bridge::platform_bridge().capture_copied_slides() {
+            Ok(Some(path)) => match std::fs::read(&path) {
+                Ok(bytes) => {
+                    self.clip_store(&bytes, "PowerPoint", false);
+                    Some(bytes)
+                }
+                Err(e) => {
+                    self.msg = format!("读取 PowerPoint 剪贴板失败：{e}");
+                    None
+                }
+            },
+            Ok(None) => {
+                self.msg = "PPT 剪贴板是空的".into();
+                None
+            }
+            Err(e) => {
+                self.msg = format!("读取 PowerPoint 剪贴板失败：{e}");
+                None
+            }
+        }
+    }
+
+    fn clip_clear(&mut self) {
+        let _ = std::fs::remove_file(clip_fragment_path());
+        let _ = std::fs::remove_file(clip_meta_path());
+        self.ppt_clip = None;
+        self.msg = "已清空 PPT 剪贴板".into();
+    }
+
+    /// 粘贴：逐页成块 (each clipboard page becomes its own block) or
+    /// 整组成块 (all pages become one multi-page block).
+    fn clip_paste(&mut self, split_into_blocks: bool) {
+        if !self.need_identity("粘贴") {
+            return;
+        }
+        let Some(bytes) = self.clip_source_bytes() else {
+            return;
+        };
+        let source = self
+            .ppt_clip
+            .as_ref()
+            .map(|m| s(m, "source"))
+            .unwrap_or_default();
+        if split_into_blocks {
+            let pkg = match qimu_core::pptx::Package::load(&bytes) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.msg = format!("粘贴失败：{e}");
+                    return;
+                }
+            };
+            let singles = match qimu_core::pptx::split(&pkg) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.msg = format!("粘贴失败：{e}");
+                    return;
+                }
+            };
+            let mut made = 0usize;
+            for (idx, one) in singles.iter().enumerate() {
+                let name = clip_page_name(one, idx);
+                let Ok(b) = one.to_bytes() else { continue };
+                if self
+                    .publish_bytes_as_unit(&b, &name, "剪贴板逐页成块")
+                    .is_some()
+                {
+                    made += 1;
+                }
+            }
+            self.msg = format!("已逐页成块：新建 {made} 个内容块");
+        } else {
+            let name = if source.is_empty() {
+                "剪贴板内容块".to_string()
+            } else {
+                source.clone()
+            };
+            if self
+                .publish_bytes_as_unit(&bytes, &name, "剪贴板整组成块")
+                .is_some()
+            {
+                self.msg = "已整组成块：新建 1 个内容块".into();
+            }
+        }
+        self.refresh_all();
+    }
+
+    // ---------------- copy / cut sources ----------------
+
+    fn unit_name(&self, uid: &str) -> String {
+        for item in &self.units {
+            if let Some(unit) = item.get("unit") {
+                if s(unit, "id") == uid {
+                    return s(unit, "name");
+                }
+            }
+        }
+        uid.to_string()
+    }
+
+    fn unit_latest_version_id(&self, uid: &str) -> Option<String> {
+        for item in &self.units {
+            let Some(unit) = item.get("unit") else { continue };
+            if s(unit, "id") != uid {
+                continue;
+            }
+            let rends = item.get("renditions")?.as_array()?;
+            let id = s(rends.first()?.get("latest")?, "id");
+            if id.is_empty() {
+                return None;
+            }
+            return Some(id);
+        }
+        None
+    }
+
+    fn unit_lead_rendition(&self, uid: &str) -> Option<String> {
+        for item in &self.units {
+            let Some(unit) = item.get("unit") else { continue };
+            if s(unit, "id") != uid {
+                continue;
+            }
+            let rends = item.get("renditions")?.as_array()?;
+            let id = s(rends.first()?.get("rendition")?, "id");
+            if id.is_empty() {
+                return None;
+            }
+            return Some(id);
+        }
+        None
+    }
+
+    fn version_fragment_bytes(&mut self, vid: &str) -> Result<Vec<u8>, String> {
+        let resp = self
+            .call("GET", &format!("/v1/versions/{vid}/fragment"), None)
+            .map_err(|e| format!("{e}"))?;
+        let data = resp
+            .get("data_base64")
+            .and_then(|x| x.as_str())
+            .ok_or("服务器未返回片段数据")?;
+        b64d(data).map_err(|_| "片段数据损坏".to_string())
+    }
+
+    /// The selected pages of a fragment as one merged fragment:
+    /// split to single-page fragments, then cross-source assemble.
+    fn clip_pick_pages(&self, frag: &[u8], pages: &[usize]) -> Result<Vec<u8>, String> {
+        let pkg = qimu_core::pptx::Package::load(frag)?;
+        let singles = qimu_core::pptx::split(&pkg)?;
+        let mut picked = Vec::new();
+        for &p in pages {
+            match singles.get(p) {
+                Some(one) => picked.push(one.clone()),
+                None => return Err(format!("第 {} 页不存在", p + 1)),
+            }
+        }
+        if picked.is_empty() {
+            return Err("没有选中页面".into());
+        }
+        qimu_core::assemble::assemble(&picked)?.to_bytes()
+    }
+
+    /// All pages of the given blocks, in the given order, as one
+    /// fragment (each block contributes its latest version).
+    fn clip_bytes_from_units(&mut self, unit_ids: &[String]) -> Result<Vec<u8>, String> {
+        let mut singles: Vec<qimu_core::pptx::Package> = Vec::new();
+        for uid in unit_ids {
+            let vid = self
+                .unit_latest_version_id(uid)
+                .ok_or_else(|| format!("「{}」没有可用的版本", self.unit_name(uid)))?;
+            let frag = self.version_fragment_bytes(&vid)?;
+            let pkg = qimu_core::pptx::Package::load(&frag)?;
+            singles.extend(qimu_core::pptx::split(&pkg)?);
+        }
+        if singles.is_empty() {
+            return Err("没有可复制的页面".into());
+        }
+        qimu_core::assemble::assemble(&singles)?.to_bytes()
+    }
+
+    /// 复制到 PPT 剪贴板 / 剪切：whole blocks from the content wall.
+    /// Cut sends each source block to the recycle bin (回收站) —
+    /// only after the clipboard holds its pages.
+    fn clip_copy_units(&mut self, unit_ids: &[String], cut: bool) {
+        let what = if cut { "剪切内容块" } else { "复制内容块" };
+        if !self.need_identity(what) {
+            return;
+        }
+        if unit_ids.is_empty() {
+            self.msg = "先选中内容块".into();
+            return;
+        }
+        let label = if unit_ids.len() == 1 {
+            self.unit_name(&unit_ids[0])
+        } else {
+            format!("{} 个内容块", unit_ids.len())
+        };
+        match self.clip_bytes_from_units(unit_ids) {
+            Ok(bytes) => {
+                self.clip_store(&bytes, &label, true);
+                if cut && self.ppt_clip.is_some() {
+                    for uid in unit_ids {
+                        self.trash_add("unit", uid);
+                    }
+                    self.msg = format!("已剪切 {label}（原内容块已移入回收站）");
+                    self.refresh_all();
+                }
+            }
+            Err(e) => self.msg = format!("{}失败：{e}", if cut { "剪切" } else { "复制" }),
+        }
+    }
+
+    /// Copy a showroom deck (演示厅成品) into the clipboard via its
+    /// personal export — the deck-bar 复制到PPT剪贴板 wiring point.
+    fn clip_copy_deck(&mut self, item: &Value) {
+        let resp = self.call(
+            "POST",
+            &format!("/v1/showroom/{}/export", s(item, "id")),
+            Some(json!({ "kind": "personal", "include_notes": true })),
+        );
+        match resp {
+            Ok(v) => match v.get("data_base64").and_then(|x| x.as_str()) {
+                Some(data) => match b64d(data) {
+                    Ok(bytes) => self.clip_store(&bytes, &s(item, "title"), true),
+                    Err(_) => self.msg = "复制失败：成品数据损坏".into(),
+                },
+                None => self.msg = "复制失败：服务器未返回成品".into(),
+            },
+            Err(e) => self.msg = format!("复制失败：{e}"),
+        }
+    }
+
+    /// Copy selected pages of one version (unit-detail page picking).
+    fn clip_copy_pages(&mut self, version_id: &str, pages: &[usize], source: &str) {
+        match self.version_fragment_bytes(version_id) {
+            Ok(frag) => match self.clip_pick_pages(&frag, pages) {
+                Ok(picked) => self.clip_store(&picked, source, true),
+                Err(e) => self.msg = format!("复制失败：{e}"),
+            },
+            Err(e) => self.msg = format!("复制失败：{e}"),
+        }
+    }
+
+    /// Cut selected pages of a block: the pages land in the
+    /// clipboard first; the remainder is published back to the same
+    /// block as a new version — or, when nothing remains, the block
+    /// goes to the recycle bin instead.
+    fn clip_cut_pages(
+        &mut self,
+        unit_id: &str,
+        version_id: &str,
+        pages: &[usize],
+        form: &str,
+        lang: &str,
+    ) {
+        if !self.need_identity("剪切页面") {
+            return;
+        }
+        let frag = match self.version_fragment_bytes(version_id) {
+            Ok(b) => b,
+            Err(e) => {
+                self.msg = format!("剪切失败：{e}");
+                return;
+            }
+        };
+        let total = qimu_core::pptx::Package::load(&frag)
+            .ok()
+            .and_then(|p| qimu_core::pptx::slides(&p).ok())
+            .map(|v| v.len())
+            .unwrap_or(0);
+        match self.clip_pick_pages(&frag, pages) {
+            Ok(picked) => self.clip_store(&picked, &self.unit_name(unit_id), true),
+            Err(e) => {
+                self.msg = format!("剪切失败：{e}");
+                return;
+            }
+        }
+        if total == 0 || pages.len() >= total {
+            self.trash_add("unit", unit_id);
+            self.msg = "已剪切全部页面（原内容块已移入回收站）".into();
+            self.refresh_all();
+            return;
+        }
+        let rest: Vec<usize> = (0..total).filter(|p| !pages.contains(p)).collect();
+        match self.clip_pick_pages(&frag, &rest) {
+            Ok(rest_bytes) => match self.call(
+                "POST",
+                &format!("/v1/units/{unit_id}/publish"),
+                Some(json!({
+                    "data_base64": b64e(&rest_bytes),
+                    "form": form,
+                    "lang": lang,
+                    "bump": "minor",
+                    "note": "剪切页面",
+                })),
+            ) {
+                Ok(_) => {
+                    self.msg = format!("已剪切 {} 页（原内容块已发布新版本）", pages.len());
+                    self.refresh_all();
+                }
+                Err(e) => {
+                    self.msg = format!("页面已复制到剪贴板，但源块发布新版本失败：{e}")
+                }
+            },
+            Err(e) => self.msg = format!("剪切失败：{e}"),
+        }
+    }
+
+    // ---------------- 组合 (combine) ----------------
+
+    /// 组合为新内容块：the selected blocks' pages, in selection
+    /// order, assembled into one new block.
+    fn clip_combine_units(&mut self, unit_ids: &[String]) {
+        if !self.need_identity("组合") {
+            return;
+        }
+        if unit_ids.len() < 2 {
+            self.msg = "组合需要至少选中 2 个内容块".into();
+            return;
+        }
+        match self.clip_bytes_from_units(unit_ids) {
+            Ok(bytes) => {
+                let name = format!(
+                    "{} 等 {} 个内容块组合",
+                    self.unit_name(&unit_ids[0]),
+                    unit_ids.len()
+                );
+                if self
+                    .publish_bytes_as_unit(&bytes, &name, "组合新建")
+                    .is_some()
+                {
+                    self.msg = format!("已组合为新内容块「{name}」");
+                    self.refresh_all();
+                }
+            }
+            Err(e) => self.msg = format!("组合失败：{e}"),
+        }
+    }
+
+    /// 组合为新索引：one index whose entries are the selected
+    /// blocks' lead renditions, in selection order.
+    fn clip_combine_index(&mut self, unit_ids: &[String]) {
+        if !self.need_identity("组合为新索引") {
+            return;
+        }
+        if unit_ids.len() < 2 {
+            self.msg = "组合为新索引需要至少选中 2 个内容块".into();
+            return;
+        }
+        let mut entries = Vec::new();
+        for uid in unit_ids {
+            match self.unit_lead_rendition(uid) {
+                Some(rid) => entries.push(json!({ "unit_id": uid, "rendition_id": rid })),
+                None => {
+                    self.msg = format!("「{}」没有可用的版本形态", self.unit_name(uid));
+                    return;
+                }
+            }
+        }
+        let group_id = self
+            .groups
+            .first()
+            .map(|g| s(g, "id"))
+            .unwrap_or_default();
+        let name = format!(
+            "{} 等 {} 个内容块索引",
+            self.unit_name(&unit_ids[0]),
+            unit_ids.len()
+        );
+        match self.call(
+            "POST",
+            "/v1/indexes",
+            Some(json!({
+                "name": name,
+                "group_id": group_id,
+                "scope": "company",
+                "entries": entries,
+            })),
+        ) {
+            Ok(_) => {
+                self.msg = format!("已组合为新索引「{name}」");
+                self.refresh_all();
+            }
+            Err(e) => self.msg = format!("组合为新索引失败：{e}"),
+        }
+    }
+
+    /// The content wall's clipboard/combine action strip: visible
+    /// while a multi-selection or clipboard content exists.
+    fn content_clip_bar(&mut self, ui: &mut egui::Ui, w: &mut WallState) {
+        let multi: Vec<String> = w.multi.clone();
+        let clip_pages = self.ppt_clip.as_ref().map(|m| i(m, "pages")).unwrap_or(0);
+        if multi.is_empty() && self.ppt_clip.is_none() {
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
+            if !multi.is_empty() {
+                ui.label(
+                    egui::RichText::new(format!("已选 {} 个内容块", multi.len())).strong(),
+                );
+                if ui.small_button("复制").clicked() {
+                    self.clip_copy_units(&multi, false);
+                }
+                if ui.small_button("剪切").clicked() {
+                    self.clip_copy_units(&multi, true);
+                    w.multi.clear();
+                }
+                if ui.small_button("组合为新内容块").clicked() {
+                    self.clip_combine_units(&multi);
+                    w.multi.clear();
+                }
+                if ui.small_button("组合为新索引").clicked() {
+                    self.clip_combine_index(&multi);
+                    w.multi.clear();
+                }
+                if ui.small_button("清空选择").clicked() {
+                    w.multi.clear();
+                }
+            }
+            if self.ppt_clip.is_some() {
+                if !multi.is_empty() {
+                    ui.separator();
+                }
+                ui.label(
+                    egui::RichText::new(format!("PPT 剪贴板 · {clip_pages} 页")).strong(),
+                );
+                if ui.small_button("逐页成块粘贴").clicked() {
+                    self.clip_paste(true);
+                }
+                if ui.small_button("整组成块粘贴").clicked() {
+                    self.clip_paste(false);
+                }
+                if ui.small_button("清空剪贴板").clicked() {
+                    self.clip_clear();
+                }
+            }
+        });
+        ui.add_space(6.0);
+    }
+
 }
 
 // ---------------- UI ----------------
@@ -8849,6 +9431,7 @@ impl App {
             .as_ref()
             .map(|u| s(u, "display_name"))
             .unwrap_or_default();
+        self.content_clip_bar(ui, w);
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
             // Card grid (prototype .grid): fluid columns, min
@@ -8877,7 +9460,9 @@ impl App {
                     let cover = s(&latest, "id");
                     let outer = self.wall_card(ui, WallCard {
                         width: card_w, min_height: card_h, title: &title, cover: &cover,
-                        selected: w.selected.as_deref() == Some(uid.as_str()), scope: None,
+                        selected: w.selected.as_deref() == Some(uid.as_str())
+                            || w.multi.contains(&uid),
+                        scope: None,
                         variant: if !my_name.is_empty() && s(&unit, "maintainer") == my_name {
                             CardVariant::Mine
                         } else {
@@ -8961,6 +9546,18 @@ impl App {
                             self.open_unit_detail(&uid);
                         }
                     } else if click.clicked() {
+                        // Ctrl/⌘-click toggles the card in the
+                        // multi-selection （组合 / 剪贴板的前置）;
+                        // a plain click stays the single selection.
+                        let multi_key =
+                            ui.ctx().input(|inp| inp.modifiers.command || inp.modifiers.ctrl);
+                        if multi_key {
+                            if let Some(pos) = w.multi.iter().position(|u| u == &uid) {
+                                w.multi.remove(pos);
+                            } else {
+                                w.multi.push(uid.clone());
+                            }
+                        }
                         w.selected = Some(uid.clone());
                     }
                 }

@@ -80,6 +80,24 @@ pub trait PowerPointBridge {
     fn capture_copied_slides(&self) -> Result<Option<std::path::PathBuf>, String> {
         Ok(None)
     }
+
+    /// Publish a fragment's slides onto the system clipboard in
+    /// PowerPoint's own slide format (the reverse of
+    /// `capture_copied_slides`): afterwards the user can paste the
+    /// slides straight into an open PowerPoint deck.
+    ///
+    /// `Ok(false)` means "not published" — no running PowerPoint, or
+    /// the platform has no bridge. The caller's in-app clipboard
+    /// still holds the fragment; only the PowerPoint leg is missing,
+    /// and callers must say so rather than claim interop happened.
+    /// The default implementation reports exactly that; the Windows
+    /// COM implementation overrides it.
+    fn publish_slides_to_clipboard(
+        &self,
+        _fragment_path: &std::path::Path,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
 }
 
 #[cfg(windows)]
