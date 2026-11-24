@@ -352,6 +352,51 @@ fn apply_modern_style(ctx: &egui::Context) {
     ctx.set_global_style(style);
 }
 
+/// Native-dialog frame (component C30): the prototype's <dialog>
+/// surface — --panel fill, 1px --line stroke, 10px radius (the
+/// 18 → 14 → 10 cascade), the shared --shadow token, and
+/// .modal-body's 20px padding on all four sides. The global style
+/// already resolves radius/shadow for the default window frame;
+/// dialogs that draw their own title row (title_bar(false)) pass
+/// this frame explicitly so the surface tier is --panel rather
+/// than the generic window CARD_BG. Shadow values mirror
+/// apply_modern_style's window_shadow per theme.
+fn dlg_frame() -> egui::Frame {
+    let shadow_color = if LIGHT_THEME.get() {
+        egui::Color32::from_rgba_unmultiplied(20, 25, 40, 26)
+    } else {
+        egui::Color32::from_black_alpha(128)
+    };
+    egui::Frame::NONE
+        .fill(palette_color(PANEL_BG))
+        .stroke(egui::Stroke::new(1.0, palette_color(SEPARATOR)))
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(egui::Margin::same(20))
+        .shadow(egui::epaint::Shadow {
+            offset: [0, 14],
+            blur: 34,
+            spread: 0,
+            color: shadow_color,
+        })
+}
+
+/// The ✕ for dialogs that draw their own title row: it keeps the
+/// close path the egui title-bar X used to provide (dismiss, no
+/// action taken). Wire it to the same flag the X fed — the
+/// dialog's cancel/dismissed flag — never to a confirm action.
+fn dlg_close_x(ui: &mut egui::Ui) -> bool {
+    ui.add(
+        egui::Button::new(
+            egui::RichText::new("✕")
+                .size(13.0)
+                .color(palette_color(TEXT_WEAK)),
+        )
+        .frame(false)
+        .min_size(egui::vec2(28.0, 28.0)),
+    )
+    .clicked()
+}
+
 /// The one standard card: a raised dark surface over the --bg
 /// canvas, 1px --line hairline as the only finish, 6px radius
 /// (the final tightening layer puts .std-card and every panel-class
@@ -1437,6 +1482,13 @@ struct UnitState {
     publish_file: Option<std::path::PathBuf>,
     bindings: Vec<Value>,
     selected_rendition: Option<String>,
+    /// The history version the user clicked in the version list
+    /// (views unification, user ruling 2026-11-25): while set, the
+    /// pages wall shows THIS version and the bottom-bar views open
+    /// it — a frozen page sequence — instead of the rendition's
+    /// latest. Cleared by the rendition chips; survives detail
+    /// reloads (reload mutates the frame in place).
+    selected_version: Option<String>,
     selected_page: Option<usize>,
     bind_pick: Option<PageBindingPick>,
     bind_from: String,
@@ -1466,6 +1518,7 @@ impl UnitState {
             publish_file: None,
             bindings: Vec::new(),
             selected_rendition: None,
+            selected_version: None,
             selected_page: None,
             bind_pick: None,
             bind_from: String::new(),
@@ -6798,6 +6851,22 @@ fn btn_danger(ui: &mut egui::Ui, label: &str) -> egui::Response {
     )
 }
 
+/// The weak form, for dialog cancels: no fill, no border — muted
+/// text only (the prototype's transparent ghost tier, .sp-ghost;
+/// the .btn family itself has no ghost form). Min height matches
+/// the .btn row (28) so mixed button rows stay aligned.
+fn btn_weak(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(
+            egui::RichText::new(label)
+                .size(12.5)
+                .color(palette_color(TEXT_WEAK)),
+        )
+        .frame(false)
+        .min_size(egui::vec2(0.0, 28.0)),
+    )
+}
+
 /// Segmented selected-state styles (A6), following the
 /// prototype's own division of labour: Soft is the segctl form
 /// （视图/页签切换 — a --panel2 container, neutral --panel3
@@ -9313,12 +9382,83 @@ impl App {
                 return true;
             }
         };
+        self.open_deck_views_path(title, &path, page_count, mode, from)
+    }
+
+    /// THE unified view opener (views unification, user ruling
+    /// 2026-11-25): the bottom-bar views — 播放 / 普通视图 /
+    /// 演示者视图 — are one action, "open an index", and every
+    /// object kind resolves to deck bytes + a title and lands
+    /// here (a single page is a one-page index, a content block a
+    /// multi-page index, an index an index of blocks, a showroom
+    /// deck a published index, a history version a frozen page
+    /// sequence). The three views are only this entry's mode
+    /// parameter. `start_hosted_show` is the one show engine; the
+    /// external DeckCraft jump stays as the fallback, and a
+    /// machine with neither gets the install prompt. The showroom
+    /// path's discipline is preserved exactly: the start page is
+    /// clamped to the deck, the hosted failure is always
+    /// surfaced, never silent.
+    fn open_deck_views(
+        &mut self,
+        title: &str,
+        bytes: &[u8],
+        page_count: i64,
+        mode: DcMode,
+        from: usize,
+    ) -> bool {
         let from = if page_count > 0 {
             from.min(page_count as usize - 1)
         } else {
             0
         };
-        let hosted_err = match std::fs::read(&path) {
+        let hosted_err = match self.start_hosted_show(title, bytes, mode, from) {
+            Ok(()) => return true,
+            Err(e) => e,
+        };
+        if deckcraft_app_path().is_none() {
+            self.msg = format!(
+                "进程内放映不可用（{hosted_err}），且未检测到 DeckCraft 桌面应用：请先安装 DeckCraft 后再试"
+            );
+            return true;
+        }
+        // The jump needs a file: materialize a disposable copy
+        // under the same present/ directory the showroom export
+        // uses (its sweep collects these too), named by content
+        // stamp so a re-open never reads back a stale deck.
+        let dir = qimu_home().join("present");
+        let path = dir.join(format!("open-{}.pptx", dc_content_stamp(bytes)));
+        if let Err(e) = std::fs::create_dir_all(&dir)
+            .and_then(|()| std::fs::write(&path, bytes))
+        {
+            self.msg = format!("进程内放映不可用（{hosted_err}）；写出 DeckCraft 副本失败：{e}");
+            return true;
+        }
+        self.dc_jump(&path, title, mode, from);
+        if self.msg.contains("已在 DeckCraft") {
+            self.msg = format!("进程内放映不可用（{hosted_err}），已改用 DeckCraft 打开");
+        }
+        true
+    }
+
+    /// The path-fed door of the unified opener: the showroom
+    /// resolver already materialized its deck (export_for_present
+    /// — the pinned export, swept and stamped there), so the jump
+    /// reuses that file instead of writing a second copy.
+    fn open_deck_views_path(
+        &mut self,
+        title: &str,
+        path: &std::path::Path,
+        page_count: i64,
+        mode: DcMode,
+        from: usize,
+    ) -> bool {
+        let from = if page_count > 0 {
+            from.min(page_count as usize - 1)
+        } else {
+            0
+        };
+        let hosted_err = match std::fs::read(path) {
             Ok(bytes) => match self.start_hosted_show(title, &bytes, mode, from) {
                 Ok(()) => return true,
                 Err(e) => e,
@@ -9331,11 +9471,161 @@ impl App {
             );
             return true;
         }
-        self.dc_jump(&path, title, mode, from);
+        self.dc_jump(path, title, mode, from);
         if self.msg.contains("已在 DeckCraft") {
             self.msg = format!("进程内放映不可用（{hosted_err}），已改用 DeckCraft 打开");
         }
         true
+    }
+
+    /// Resolve ONE content-block version — current or a clicked
+    /// history version — to deck bytes and open it in the views
+    /// (views unification, user ruling 2026-11-25). The version
+    /// named by the caller is the version opened: a history
+    /// version never falls back to the rendition's latest. The
+    /// local library assembles it from its page-reference
+    /// sequence with the DB scripts as notes
+    /// (`assemble_version_deck`); a version this library does not
+    /// hold falls back to the REST fragment, with the scripts the
+    /// detail payload already carries written back in-process —
+    /// script saves update the DB only, so a bare fragment could
+    /// otherwise present stale notes.
+    fn present_unit_version(
+        &mut self,
+        title: &str,
+        version: &Value,
+        mode: DcMode,
+        from: usize,
+    ) -> bool {
+        let version_id = s(version, "id");
+        let page_count = i(version, "page_count");
+        let local_outcome = self
+            .local
+            .as_ref()
+            .and_then(|l| l.assemble_version_deck(&version_id));
+        let bytes = match local_outcome {
+            Some(Ok((bytes, _))) => bytes,
+            Some(Err(e)) => {
+                self.msg = format!("演示失败：{e}");
+                return true;
+            }
+            None => {
+                let resp = match self.call_work(
+                    "GET",
+                    &format!("/v1/versions/{version_id}/fragment"),
+                    None,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        self.msg = format!("演示失败：{e}");
+                        return true;
+                    }
+                };
+                let Some(data) = resp.get("data_base64").and_then(|x| x.as_str()) else {
+                    self.msg = "演示失败：片段响应缺少数据".into();
+                    return true;
+                };
+                let Ok(raw) = b64d(data) else {
+                    self.msg = "演示失败：片段数据损坏".into();
+                    return true;
+                };
+                let scripts: Vec<String> = version
+                    .get("scripts")
+                    .and_then(|x| x.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .map(|t| t.as_str().unwrap_or("").to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if scripts.iter().any(|t| !t.is_empty()) {
+                    match qimu_core::pptx::Package::load(&raw) {
+                        Ok(mut pkg) => {
+                            for (slot, script) in scripts.iter().enumerate() {
+                                if !script.is_empty() {
+                                    qimu_core::pptx::set_notes_text(
+                                        &mut pkg,
+                                        slot,
+                                        script,
+                                    );
+                                }
+                            }
+                            pkg.to_bytes().unwrap_or(raw)
+                        }
+                        Err(_) => raw,
+                    }
+                } else {
+                    raw
+                }
+            }
+        };
+        self.open_deck_views(title, &bytes, page_count, mode, from)
+    }
+
+    /// Resolve the open index detail to deck bytes and open it in
+    /// the views (views unification, user ruling 2026-11-25): the
+    /// branch the detail is standing on, at its head commit — the
+    /// same resolution the detail's own export runs. The local
+    /// library assembles in-process without registering an export
+    /// (`assemble_index_deck`); an organization-side index takes
+    /// the REST export path (which does register the export, as
+    /// any export run from the detail does).
+    fn present_index_views(&mut self, mode: DcMode) -> bool {
+        let (index_id, branch, name) = match self.index.stack.top() {
+            IndexFrame::Detail(d) => (
+                d.index_id.clone(),
+                if d.branch.is_empty() {
+                    "main".to_string()
+                } else {
+                    d.branch.clone()
+                },
+                s(&d.detail["index"], "name"),
+            ),
+            _ => return false,
+        };
+        let title = if name.is_empty() {
+            "索引".to_string()
+        } else {
+            name
+        };
+        let local_outcome = self
+            .local
+            .as_ref()
+            .and_then(|l| l.assemble_index_deck(&index_id, &branch));
+        let (bytes, page_count) = match local_outcome {
+            Some(Ok(v)) => v,
+            Some(Err(e)) => {
+                self.msg = format!("演示失败：{e}");
+                return true;
+            }
+            None => {
+                let resp = match self.call_work(
+                    "POST",
+                    &format!("/v1/indexes/{index_id}/export"),
+                    Some(json!({
+                        "branch": branch,
+                        "kind": "personal",
+                        "include_notes": true,
+                    })),
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        self.msg = format!("演示失败：{e}");
+                        return true;
+                    }
+                };
+                let Some(data) = resp.get("data_base64").and_then(|x| x.as_str()) else {
+                    self.msg = "演示失败：导出响应缺少稿件数据".into();
+                    return true;
+                };
+                let Ok(bytes) = b64d(data) else {
+                    self.msg = "演示失败：导出数据损坏".into();
+                    return true;
+                };
+                (bytes, i(&resp, "page_count"))
+            }
+        };
+        self.open_deck_views(&title, &bytes, page_count, mode, 0)
     }
 
     /// Present an already-local deck file (offline cached decks).
@@ -13276,13 +13566,31 @@ impl App {
                         for v in versions {
                             ui.horizontal(|ui| {
                                 let vid = s(v, "id");
-                                let thumb = self.thumb_response(
-                                    ui,
-                                    &vid,
-                                    0,
-                                    96.0,
-                                    st.selected_rendition.as_deref() == Some(s(&rend, "id").as_str()),
-                                );
+                                // Version-row selection (views
+                                // unification, user ruling
+                                // 2026-11-25): a click selects this
+                                // version — the pages wall above
+                                // follows it and the bottom-bar
+                                // views open THIS frozen page
+                                // sequence. The selected rendering
+                                // is the thumb's existing selected
+                                // state; with nothing clicked the
+                                // rows keep their previous
+                                // rendition-level highlight.
+                                let row_selected = match &st.selected_version {
+                                    Some(sv) => *sv == vid,
+                                    None => {
+                                        st.selected_rendition.as_deref()
+                                            == Some(s(&rend, "id").as_str())
+                                    }
+                                };
+                                let thumb = self.thumb_response(ui, &vid, 0, 96.0, row_selected);
+                                if thumb.clicked() {
+                                    st.selected_version = Some(vid.clone());
+                                    st.selected_rendition = Some(s(&rend, "id"));
+                                    st.selected_page = None;
+                                    st.bind_pick = None;
+                                }
                                 if thumb.double_clicked() {
                                     self.open_light(st, v, 0);
                                 }
@@ -14538,19 +14846,46 @@ impl App {
         let mut cancelled = false;
         egui::Window::new(&c.title)
             .open(&mut open)
+            .title_bar(false)
+            .frame(dlg_frame())
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ui.ctx(), |ui| {
+                // Same C30 dialog treatment as the folder-delete
+                // confirm (dlg_frame, in-body 19px title, 13.5
+                // body, 8/14 gaps, weak-form cancel); the content
+                // width stays at this family's established 360 —
+                // its bodies are single sentences. The ✕ feeds
+                // `cancelled`, the old title-bar X's outcome.
                 ui.set_width(360.0);
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width(320.0);
+                        ui.label(
+                            egui::RichText::new(&c.title)
+                                .strong()
+                                .size(19.0)
+                                .color(palette_color(TEXT_MAIN)),
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                        if dlg_close_x(ui) {
+                            cancelled = true;
+                        }
+                    });
+                });
+                ui.add_space(8.0);
                 ui.label(
                     egui::RichText::new(&c.body)
-                        .size(12.5)
+                        .size(13.5)
                         .color(palette_color(TEXT_MAIN)),
                 );
-                ui.add_space(10.0);
+                ui.add_space(14.0);
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
                         let b = if c.danger {
                             btn_danger(ui, &c.confirm_label)
                         } else {
@@ -14559,7 +14894,7 @@ impl App {
                         if b.clicked() {
                             confirmed = true;
                         }
-                        if btn_default(ui, tr("取消")).clicked() {
+                        if btn_weak(ui, tr("取消")).clicked() {
                             cancelled = true;
                         }
                     });
@@ -15799,25 +16134,82 @@ impl App {
         let mut cancel = false;
         egui::Window::new("删除文件夹")
             .open(&mut open)
+            .title_bar(false)
+            .frame(dlg_frame())
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ui.ctx(), |ui| {
-                ui.label(format!("删除文件夹「{name}」？"));
-                ui.add_space(6.0);
-                ui.label("只删除文件夹：里面的子文件夹、内容块和索引提升到上一级；顶层文件夹的内容回到根目录（索引回到「未分类」）。");
-                ui.label("连同内容删除：文件夹、子文件夹和里面的全部内容一起移到回收站。");
-                ui.add_space(8.0);
+                // C30 native-dialog metrics (prototype <dialog> /
+                // bindConfirmDlg): 680 total width = 640 content +
+                // 2×20 frame padding, the title drawn in-body as
+                // the prototype's h2 (19px, folder name in accent),
+                // body copy at 13.5, and the .btn row right-aligned
+                // with an 8px gap. Vertical gaps are explicit
+                // add_space values (item_spacing.y is zeroed) so
+                // they land exactly on the prototype's margins:
+                // title→body 8, paragraph→paragraph 10, body→
+                // buttons 14. The ✕ keeps the old title-bar X's
+                // close path (dismiss via `cancel`, nothing runs).
+                ui.set_width(640.0);
+                ui.spacing_mut().item_spacing.y = 0.0;
                 ui.horizontal(|ui| {
-                    if ui.button("只删除文件夹").clicked() {
-                        mode = Some("lift");
-                    }
-                    if ui.button("连同内容移到回收站").clicked() {
-                        mode = Some("trash");
-                    }
-                    if ui.button("取消").clicked() {
-                        cancel = true;
-                    }
+                    ui.vertical(|ui| {
+                        ui.set_width(600.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            ui.label(
+                                egui::RichText::new("删除文件夹「")
+                                    .strong()
+                                    .size(19.0)
+                                    .color(palette_color(TEXT_MAIN)),
+                            );
+                            ui.label(
+                                egui::RichText::new(&name)
+                                    .strong()
+                                    .size(19.0)
+                                    .color(ACCENT),
+                            );
+                            ui.label(
+                                egui::RichText::new("」？")
+                                    .strong()
+                                    .size(19.0)
+                                    .color(palette_color(TEXT_MAIN)),
+                            );
+                        });
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                        if dlg_close_x(ui) {
+                            cancel = true;
+                        }
+                    });
+                });
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new("只删除文件夹：里面的子文件夹、内容块和索引提升到上一级；顶层文件夹的内容回到根目录（索引回到「未分类」）。")
+                        .size(13.5)
+                        .color(palette_color(TEXT_MAIN)),
+                );
+                ui.add_space(10.0);
+                ui.label(
+                    egui::RichText::new("连同内容删除：文件夹、子文件夹和里面的全部内容一起移到回收站。")
+                        .size(13.5)
+                        .color(palette_color(TEXT_MAIN)),
+                );
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        if btn_danger(ui, "连同内容移到回收站").clicked() {
+                            mode = Some("trash");
+                        }
+                        if btn_default(ui, "只删除文件夹").clicked() {
+                            mode = Some("lift");
+                        }
+                        if btn_weak(ui, "取消").clicked() {
+                            cancel = true;
+                        }
+                    });
                 });
             });
         if let Some(mode) = mode {

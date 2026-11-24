@@ -194,14 +194,25 @@ impl App {
                     .clicked()
                 {
                     st.selected_rendition = Some(item.rendition_id.clone());
+                    st.selected_version = None;
                     st.selected_page = None;
                     st.bind_pick = None;
                 }
             }
         });
+        // The shown version: a history version the user clicked
+        // in the version list below wins over the rendition's
+        // latest (views unification, user ruling 2026-11-25) —
+        // the wall, and with it the bottom-bar views, address
+        // that frozen page sequence. The rendition chips above
+        // clear the pick and return to the latest.
         let Some(selected) = versions
             .iter()
-            .find(|item| item.rendition_id == selected_id)
+            .find(|item| {
+                item.rendition_id == selected_id
+                    && st.selected_version.as_deref() == Some(s(&item.version, "id").as_str())
+            })
+            .or_else(|| versions.iter().find(|item| item.rendition_id == selected_id))
             .cloned()
         else {
             return;

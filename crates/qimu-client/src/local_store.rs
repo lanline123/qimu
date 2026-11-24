@@ -481,6 +481,91 @@ impl LocalStore {
         Some(run())
     }
 
+    /// Assemble ONE content-block version's deck from this library
+    /// (views unification, user ruling 2026-11-25): a version is a
+    /// frozen page sequence — an index of one block — so opening it
+    /// in the bottom-bar views resolves exactly the way
+    /// `assemble_showroom_deck` resolves one entry: the version's
+    /// page-reference sequence supplies the page packages in order
+    /// and its speaker scripts are written back as notes (scripts
+    /// live in the DB and are edited there; the stored fragment is
+    /// never rewritten by a script save, so the notes must come
+    /// from `version.scripts`, never from the fragment alone).
+    ///
+    /// Deliberately NOT an export: no manifest is embedded and no
+    /// personalization runs — the views open the working-data block
+    /// as it stands, placeholders and all, exactly what the page
+    /// editor shows. `None` when the version is not in this
+    /// library; the caller then takes the REST fragment path.
+    pub fn assemble_version_deck(
+        &self,
+        version_id: &str,
+    ) -> Option<Result<(Vec<u8>, i64), String>> {
+        let store = self.store.lock().unwrap();
+        let version = match store.get_version(version_id) {
+            Ok(v) => v,
+            Err(_) => return None,
+        };
+        let run = || -> Result<(Vec<u8>, i64), String> {
+            let singles = store.version_page_packages(&version)?;
+            if singles.is_empty() {
+                return Err("没有可打开的页面".into());
+            }
+            let page_count = singles.len() as i64;
+            let mut assembled = qimu_core::assemble::assemble(&singles)?;
+            for (slot, script) in version.scripts.iter().enumerate() {
+                if !script.is_empty() {
+                    qimu_core::pptx::set_notes_text(&mut assembled, slot, script);
+                }
+            }
+            let deck = assembled.to_bytes()?;
+            Ok((deck, page_count))
+        };
+        Some(run())
+    }
+
+    /// Assemble one local index's deck for the bottom-bar views
+    /// (views unification, user ruling 2026-11-25): the branch head
+    /// commit's entries, resolved and assembled by the very same
+    /// `build_deck_local` the index export dispatch arm runs —
+    /// same follow/locked resolution, same personalization
+    /// verdicts, kind "personal", notes included — but WITHOUT
+    /// registering an export record: opening a view is not an
+    /// export. `None` when the index is not in this library; the
+    /// caller then takes the REST export path.
+    pub fn assemble_index_deck(
+        &self,
+        index_id: &str,
+        branch: &str,
+    ) -> Option<Result<(Vec<u8>, i64), String>> {
+        let store = self.store.lock().unwrap();
+        if store.get_index(index_id).is_err() {
+            return None;
+        }
+        let run = || -> Result<(Vec<u8>, i64), String> {
+            let head = store
+                .branch_head(index_id, branch)?
+                .ok_or_else(|| "分支尚无提交".to_string())?;
+            let commit = store.get_commit(&head)?;
+            let source = SourceRef {
+                index_id: index_id.to_string(),
+                branch: branch.to_string(),
+                commit_id: commit.id.clone(),
+                tag: None,
+            };
+            let (deck, _manifest, page_count) = build_deck_local(
+                &store,
+                &self.owner,
+                &commit.entries,
+                Some(source),
+                "personal",
+                true,
+            )?;
+            Ok((deck, page_count))
+        };
+        Some(run())
+    }
+
     /// Build the P3 submission package for one local index at the
     /// exact published tag shown by the push preview. The preview's
     /// entry/version pins keep follow-latest entries from drifting to
