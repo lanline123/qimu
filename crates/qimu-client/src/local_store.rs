@@ -285,7 +285,7 @@ impl LocalStore {
                 owner,
                 default_group_id: default_group.id,
                 root: root.to_path_buf(),
-                lock_path,
+                lock_path: lock_path.clone(),
             })
         })();
         if opened.is_err() {
