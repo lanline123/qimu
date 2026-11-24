@@ -778,11 +778,6 @@ impl App {
                 );
                 ui.add_space(12.0);
                 if self.workspace_controls.messages.is_empty() {
-                    ui.label(
-                        egui::RichText::new(tr("本次会话暂无消息"))
-                            .size(12.5)
-                            .color(palette_color(TEXT_WEAK)),
-                    );
                     return;
                 }
                 let now = ui.input(|input| input.time);

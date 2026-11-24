@@ -99,16 +99,24 @@ impl App {
                                 self.sidebar_community(ui);
                             });
                     });
+                // Single-button pages size to the button (32px +
+                // the panel's 16px of vertical margin + a breath):
+                // taller boxes left dead space above the community
+                // foot (user ruling 2026-11-24).
                 let action_height = match page {
                     Page::Home => 166.0,
-                    Page::Index => 90.0,
-                    Page::Content => 96.0,
+                    Page::Index => 52.0,
+                    Page::Content => 52.0,
                     Page::Showroom | Page::Trash => 52.0,
                     Page::Messages | Page::Settings => 0.0,
                 };
                 if action_height > 0.0 {
                     egui::Panel::bottom("sidebar_actions")
                         .exact_size(action_height)
+                        // No separator line above the actions block
+                        // (user ruling 2026-11-24, all sidebars): the
+                        // only line here is the community foot's own.
+                        .show_separator_line(false)
                         .frame(
                             egui::Frame::NONE
                                 .fill(palette_color(PANEL_BG))

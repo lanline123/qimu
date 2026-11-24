@@ -52,7 +52,6 @@ impl App {
             return;
         };
         if commits.is_empty() {
-            ui.label(egui::RichText::new("这个分支还没有提交。").color(palette_color(TEXT_WEAK)));
             return;
         }
         let selected = match st.selected_commit.as_deref() {
@@ -146,7 +145,6 @@ impl App {
             .map(Vec::as_slice)
             .unwrap_or_default();
         if tags.is_empty() {
-            ui.label(egui::RichText::new("暂无发布版本。").color(palette_color(TEXT_WEAK)));
             return;
         }
         for tag in tags {
@@ -189,7 +187,6 @@ impl App {
             return;
         };
         if exports.is_empty() {
-            ui.label(egui::RichText::new("暂无导出记录。").color(palette_color(TEXT_WEAK)));
             return;
         }
         for record in exports {

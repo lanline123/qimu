@@ -4904,9 +4904,6 @@ impl App {
             }
         });
         let atts = self.att_cache.get(parent_id).cloned().unwrap_or_default();
-        if atts.is_empty() {
-            ui.label(egui::RichText::new("暂无附件").color(palette_color(TEXT_FAINT)));
-        }
         for att in &atts {
             let filename = s(att, "filename");
             let is_pdf = filename.to_lowercase().ends_with(".pdf");
@@ -6560,18 +6557,63 @@ impl App {
                         .iter()
                         .filter(|item| Self::share_matches_source(item, idx))
                         .count();
-                    if tree_row(
-                        ui,
-                        self.showroom.share_source == idx,
-                        0.0,
-                        Some(icon),
-                        &format!("{label} · {count}"),
-                        12.5,
-                    )
-                    .clicked()
-                    {
+                    // The 全部 row carries the new-folder button at
+                    // its right end, exactly like the folder tree's
+                    // 全部 row (user ruling 2026-11-24: the button
+                    // belongs in the share sidebar too). It opens the
+                    // shared inline editor for a new root folder.
+                    let clicked = if idx == 0 {
+                        let mut clicked = false;
+                        ui.horizontal(|ui| {
+                            let width = ui.available_width();
+                            ui.allocate_ui(
+                                egui::vec2((width - 30.0).max(1.0), 28.0),
+                                |ui| {
+                                    clicked = tree_row(
+                                        ui,
+                                        self.showroom.share_source == idx,
+                                        0.0,
+                                        Some(icon),
+                                        &format!("{label} · {count}"),
+                                        12.5,
+                                    )
+                                    .clicked();
+                                },
+                            );
+                            if self.small_icon_button(
+                                ui,
+                                ChromeIcon::FolderPlus,
+                                tr("新建文件夹"),
+                            ) {
+                                self.folder_edit = Some(FolderEdit {
+                                    target: None,
+                                    parent: None,
+                                    text: "新文件夹".into(),
+                                });
+                                self.folder_edit_focus = true;
+                            }
+                        });
+                        clicked
+                    } else {
+                        tree_row(
+                            ui,
+                            self.showroom.share_source == idx,
+                            0.0,
+                            Some(icon),
+                            &format!("{label} · {count}"),
+                            12.5,
+                        )
+                        .clicked()
+                    };
+                    if clicked {
                         self.showroom.share_source = idx;
                         self.showroom.stack.pop_to(0);
+                    }
+                    if idx == 0
+                        && matches!(&self.folder_edit, Some(e) if e.target.is_none() && e.parent.is_none())
+                    {
+                        self.folder_edit_row(ui, 0.0);
+                        ui.add_space(2.0);
                     }
                 }
             }
@@ -7393,19 +7435,6 @@ impl App {
                     }
                 });
                 ui.add_space(10.0);
-            }
-            if shown.is_empty() {
-                card_frame().show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new(if items.is_empty() {
-                            tr("回收站是空的——删除的内容块和索引会先放进这里，可随时恢复。")
-                        } else {
-                            tr("这个板块暂无已删除项。")
-                        })
-                        .size(12.5)
-                        .color(palette_color(TEXT_WEAK)),
-                    );
-                });
             }
             for t in &shown {
                 let tid = s(t, "id");
@@ -9817,7 +9846,6 @@ impl App {
                     self.showroom_cards(
                         ui,
                         &self.library_refs.clone(),
-                        "暂无收藏",
                         |app, ui, e, width| {
                             let cover = app.showroom_cover(&s(e, "item_id"));
                             app.showroom_card(ui, width, &s(e, "title"), &cover, false, |app, ui| {
@@ -9896,7 +9924,6 @@ impl App {
                     self.showroom_cards(
                         ui,
                         &self.cache_entries.clone(),
-                        "暂无缓存",
                         |app, ui, e, width| {
                             app.showroom_card(ui, width, &s(e, "title"), "", false, |app, ui| {
                                 ui.label(format!(
@@ -9933,7 +9960,6 @@ impl App {
                     self.showroom_cards(
                         ui,
                         &self.my_assemblies.clone(),
-                        "暂无组装",
                         |app, ui, a, width| {
                             app.showroom_card(ui, width, &s(a, "name"), "", false, |app, ui| {
                                 ui.label(format!(
@@ -9982,7 +10008,6 @@ impl App {
                 self.showroom_cards(
                     ui,
                     &items,
-                    "这个来源下暂时没有分享。",
                     Self::showroom_shared_card,
                 );
             });
@@ -10165,7 +10190,6 @@ impl App {
                 self.showroom_cards(
                     ui,
                     items,
-                    "暂无分享到本组的内容",
                     Self::showroom_shared_card,
                 );
             });
@@ -10404,13 +10428,6 @@ impl App {
     fn my_submissions_body(&mut self, ui: &mut egui::Ui) {
         let subs = self.my_submissions.clone();
         if subs.is_empty() {
-            ui.label(
-                egui::RichText::new(tr(
-                    "暂无提交记录。从索引详情提交到演示厅的内容会出现在这里。",
-                ))
-                .size(12.5)
-                .color(palette_color(TEXT_WEAK)),
-            );
             return;
         }
         let mut withdraw: Option<String> = None;
@@ -10555,15 +10572,6 @@ impl App {
         if tab == 0 {
             let pending = self.showroom_pending.clone();
             let subs = self.submissions_pending.clone();
-            if pending.is_empty() && subs.is_empty() {
-                ui.label(
-                    egui::RichText::new(tr(
-                        "暂无待审批的演示成品。新提交会先进入这里，人工通过后才公开展示。",
-                    ))
-                    .size(12.5)
-                    .color(palette_color(TEXT_WEAK)),
-                );
-            }
             let mut approve_sub: Option<String> = None;
             let mut confirm_sub_reject: Option<(String, String)> = None;
             let mut cancel_sub_reject = false;
@@ -10722,13 +10730,6 @@ impl App {
             self.sub_reject = reject_draft;
         } else {
             let records = self.review.records.clone();
-            if records.is_empty() {
-                ui.label(
-                    egui::RichText::new(tr("暂无已处理记录。"))
-                        .size(12.5)
-                        .color(palette_color(TEXT_WEAK)),
-                );
-            }
             for item in &records {
                 let rejected = s(item, "state") == "rejected";
                 standard_card_v(
@@ -11101,7 +11102,6 @@ impl App {
                 self.showroom_cards(
                     ui,
                     &items,
-                    "这个目录下暂时没有符合的演示稿。",
                     Self::showroom_plaza_card,
                 );
             });
@@ -11209,11 +11209,11 @@ impl App {
         &mut self,
         ui: &mut egui::Ui,
         items: &[Value],
-        empty: &str,
         mut card: impl FnMut(&mut Self, &mut egui::Ui, &Value, f32),
     ) {
+        // Empty walls render blank: no placeholder text
+        // (user ruling 2026-11-24).
         if items.is_empty() {
-            ui.label(egui::RichText::new(empty).color(palette_color(TEXT_WEAK)));
             return;
         }
         ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
@@ -11742,11 +11742,6 @@ impl App {
             );
             ui.add_space(14.0);
             if entries.is_empty() {
-                ui.label(
-                    egui::RichText::new(tr("本地还没有缓存任何稿件。"))
-                        .size(12.5)
-                        .color(palette_color(TEXT_WEAK)),
-                );
                 return;
             }
             // 0 open · 1 toggle pin · 2 remove — applied after the
