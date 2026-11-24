@@ -255,9 +255,9 @@ impl Store {
                         .list_versions(&original.id)?
                         .into_iter()
                         .find(|version| version.status == "normal"),
-                    EntryPolicy::Locked { .. } => {
-                        source_version.filter(|version| version.status == "normal")
-                    }
+                    EntryPolicy::Locked { .. } => source_version
+                        .clone()
+                        .filter(|version| version.status == "normal"),
                 };
             } else {
                 for rendition in self.list_renditions(&unit.id)? {
