@@ -83,21 +83,92 @@ pub struct LocalStore {
     lock_path: PathBuf,
 }
 
+/// Read the holder pid from a lock file (line 1). `None` when the
+/// file is missing, unreadable, or carries no parsable pid — e.g. a
+/// lock written by the P0 build, which stored only the pid line.
+fn read_lock_pid(lock_path: &std::path::Path) -> Option<u32> {
+    std::fs::read_to_string(lock_path)
+        .ok()?
+        .lines()
+        .next()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Is `pid` still a live process on this machine? Conservative `true`
+/// when the check itself cannot run — a lock whose holder cannot be
+/// proven dead is never stolen, so the worst case is the old
+/// manual-delete error, never two live clients on one library.
+#[cfg(target_os = "windows")]
+fn pid_alive(pid: u32) -> bool {
+    // tasklist ships in System32 on every Windows; /FO CSV /NH keeps
+    // the output machine-readable across locales — a live holder
+    // yields one CSV row whose second field is the pid, a dead one
+    // yields only the localized INFO line. The `,"{pid}",` needle
+    // cannot match any other field: image names hold no quotes, and
+    // the memory-usage field always carries its " K" suffix.
+    let mut cmd = std::process::Command::new("cmd");
+    cmd.args([
+        "/C",
+        "tasklist",
+        "/FI",
+        &format!("PID eq {pid}"),
+        "/FO",
+        "CSV",
+        "/NH",
+    ])
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::null());
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    match cmd.output() {
+        Ok(out) => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            text.lines().any(|l| l.contains(&format!(",\"{pid}\",")))
+        }
+        Err(_) => true,
+    }
+}
+
+/// Same contract as the Windows half; `kill -0` probes existence
+/// without signalling.
+#[cfg(not(target_os = "windows"))]
+fn pid_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(true)
+}
+
 impl LocalStore {
     /// Open the local library when the gray switch is on; `None` when
     /// it is off (legacy path untouched) or when opening fails (the
     /// reason is printed to stderr; the client keeps running on the
     /// legacy path instead of dying with the library).
     pub fn open_if_enabled() -> Option<LocalStore> {
+        Self::open_if_enabled_detailed().0
+    }
+
+    /// Like `open_if_enabled`, but also returns the failure reason so
+    /// the settings diagnostic can show it instead of only logging
+    /// to stderr (P0 fix: a lock-held failure used to surface only
+    /// as "see the console log").
+    pub fn open_if_enabled_detailed() -> (Option<LocalStore>, Option<String>) {
         if !local_first_enabled() {
-            return None;
+            return (None, None);
         }
         let root = library_dir();
         match Self::open(&root) {
-            Ok(s) => Some(s),
+            Ok(s) => (Some(s), None),
             Err(e) => {
                 eprintln!("[qimu] 本地库打开失败（{}）：{e}", root.display());
-                None
+                (None, Some(e))
             }
         }
     }
@@ -110,22 +181,69 @@ impl LocalStore {
         // against the same root (see restore_connections), so the two
         // processes never hold the same library open together.
         let lock_path = root.join("qimu-local.lock");
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-        {
-            Ok(mut f) => {
-                use std::io::Write;
-                let _ = writeln!(f, "{}", std::process::id());
+        // Advisory lock (design §9 R5, client-side half): one client
+        // process owns a library root at a time. While the gray switch
+        // is on the client also skips spawning the bundled server
+        // against the same root (see restore_connections), so the two
+        // processes never hold the same library open together.
+        //
+        // P0 fix: a lock left behind by a crashed process used to
+        // block every later start until the user deleted it by hand.
+        // The lock now carries the holder pid (line 1) + start time
+        // (line 2); when the file already exists and the recorded
+        // holder is provably dead — or is our own pid, which cannot
+        // be the holder of a pre-existing lock — the stale lock is
+        // removed and acquisition retried (bounded: a live holder
+        // racing us back in still wins, and a stale lock that will
+        // not go away after 3 tries errors out with its path).
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(mut f) => {
+                    use std::io::Write;
+                    let started = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let _ = writeln!(f, "{}\n{started}", std::process::id());
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let holder = read_lock_pid(&lock_path);
+                    let stale = matches!(holder, Some(pid) if pid == std::process::id() || !pid_alive(pid));
+                    if stale {
+                        if attempts < 3 {
+                            eprintln!(
+                                "[qimu] 本地库残留锁已清理（持有者 {:?} 已不在运行）：{}",
+                                holder,
+                                lock_path.display()
+                            );
+                            let _ = std::fs::remove_file(&lock_path);
+                            continue;
+                        }
+                        return Err(format!(
+                            "本地库锁文件残留（持有者已不在运行），但重试后仍未能取得锁（锁文件 {}）；请删除该锁文件后重试",
+                            lock_path.display()
+                        ));
+                    }
+                    return Err(match holder {
+                        Some(pid) => format!(
+                            "本地库已被另一个启幕进程占用（持有者 PID {pid} 仍在运行；锁文件 {}）；若该进程已不在运行，删除该锁文件后重试",
+                            lock_path.display()
+                        ),
+                        None => format!(
+                            "本地库已被另一个启幕进程占用（锁文件 {}，持有者信息不可读）；若确认没有其他启幕在运行，删除该锁文件后重试",
+                            lock_path.display()
+                        ),
+                    });
+                }
+                Err(e) => return Err(e.to_string()),
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(format!(
-                    "本地库已被另一个启幕进程占用（锁文件 {}）；若确认没有其他启幕在运行，删除该锁文件后重试",
-                    lock_path.display()
-                ));
-            }
-            Err(e) => return Err(e.to_string()),
         }
         let opened = (|| -> Result<LocalStore, String> {
             let store = Store::open(root)?;

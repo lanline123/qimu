@@ -2520,6 +2520,11 @@ struct App {
     /// QIMU_LOCAL_FIRST gray switch is on; None on the legacy path,
     /// where behavior is unchanged.
     local: Option<std::sync::Arc<local_store::LocalStore>>,
+    /// P0 fix: why the local library failed to open, if it did —
+    /// shown in the settings diagnostic block (a lock-held failure
+    /// used to surface only as "see the console log"). None when
+    /// the switch is off or the library opened fine.
+    local_open_error: Option<String>,
 }
 
 enum ThumbState {
@@ -3006,7 +3011,8 @@ impl App {
         // any connection is restored — its availability must not
         // depend on the connection state machine. No-op (None)
         // unless the QIMU_LOCAL_FIRST gray switch is on.
-        let local = local_store::LocalStore::open_if_enabled().map(std::sync::Arc::new);
+        let (local, local_open_error) = local_store::LocalStore::open_if_enabled_detailed();
+        let local = local.map(std::sync::Arc::new);
         let (thumb_tx, thumb_rx) = std::sync::mpsc::channel();
         let (pdf_tx, pdf_rx) = std::sync::mpsc::channel();
         let (upd_tx, upd_rx) = std::sync::mpsc::channel();
@@ -3106,6 +3112,7 @@ impl App {
             login_open: false,
             about_open: false,
             local,
+            local_open_error,
         };
         if std::env::var("QIMU_AUTOLOGIN").is_ok() && !app.password.is_empty() {
             app.do_login();
@@ -13679,7 +13686,7 @@ impl App {
         ui.label(
             egui::RichText::new("本地库（本地优先 · 灰度诊断）")
                 .strong()
-                .size(13.0)
+                .size(14.0)
                 .color(palette_color(TEXT_MAIN)),
         );
         ui.add_space(4.0);
@@ -13695,10 +13702,16 @@ impl App {
                     indexes
                 )
             }
-            None if local_store::local_first_enabled() => format!(
-                "开关已开，但本地库打开失败（原因见控制台日志）；库根解析为 {}",
-                local_store::library_dir().display()
-            ),
+            None if local_store::local_first_enabled() => match &self.local_open_error {
+                Some(e) => format!(
+                    "开关已开，但本地库打开失败：{e}（库根 {}）",
+                    local_store::library_dir().display()
+                ),
+                None => format!(
+                    "开关已开，但本地库打开失败（原因见控制台日志）；库根解析为 {}",
+                    local_store::library_dir().display()
+                ),
+            },
             None => format!(
                 "未启用（环境变量 QIMU_LOCAL_FIRST 未开）；库根将解析为 {}",
                 local_store::library_dir().display()
