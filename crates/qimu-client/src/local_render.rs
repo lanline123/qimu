@@ -104,7 +104,21 @@ pub fn local_thumb(
         return std::fs::read(&cache_file).ok();
     }
     let frag = local.version_fragment(version_id)?;
-    render_frag_thumbs(&frag, &cache_dir).ok()?;
+    cached_thumb(&frag, &cache_dir, page)
+}
+
+/// Render one thumbnail page from a fragment byte string into
+/// `cache_dir`, with the same publish discipline as `local_thumb`.
+/// This is the resolver for fragments that live outside the local
+/// library — the offline cache bundle's content blocks (T1 cache
+/// payload: 索引 + 内容块（页面）) — so a cached deck's pages
+/// render with no server and no local-library copy.
+pub fn cached_thumb(frag: &[u8], cache_dir: &Path, page: usize) -> Option<Vec<u8>> {
+    let cache_file = cache_dir.join(format!("{page}.png"));
+    if cache_file.exists() {
+        return std::fs::read(&cache_file).ok();
+    }
+    render_frag_thumbs(frag, cache_dir).ok()?;
     std::fs::read(&cache_file).ok()
 }
 

@@ -7505,6 +7505,7 @@ impl App {
                 // local (org content) or a local failure falls back
                 // to the server fetch below, unchanged.
                 let local = self.local.clone();
+                let bundle = self.cache_bundle_block(version_id);
                 let version_id = version_id.to_string();
                 std::thread::spawn(move || {
                     if let Some(local) = &local {
@@ -7513,6 +7514,24 @@ impl App {
                         {
                             let _ = tx.send((key, Some(bytes)));
                             return;
+                        }
+                    }
+                    // Offline cache bundle (T1): a cached deck's
+                    // blocks render in-process from their cached
+                    // fragments when the server is unreachable.
+                    if let Some((frag_file, thumb_dir)) = &bundle {
+                        let frag = cache_key().and_then(|ck| {
+                            std::fs::read(frag_file)
+                                .ok()
+                                .and_then(|data| decrypt_bytes(&ck, &data))
+                        });
+                        if let Some(frag) = frag {
+                            if let Some(bytes) =
+                                local_render::cached_thumb(&frag, thumb_dir, page)
+                            {
+                                let _ = tx.send((key, Some(bytes)));
+                                return;
+                            }
                         }
                     }
                     let mut req = ureq::get(&url);
@@ -7732,6 +7751,157 @@ impl App {
         }
     }
 
+    /// The full offline cache bundle for one showroom deck (T1
+    /// ruling: 缓存 = 索引 + 内容块（页面）): the assembled deck
+    /// file, the source index's detail JSON, and every resolved
+    /// block's fragment — each AES-256-GCM encrypted exactly like
+    /// the deck-only snapshot, and all of it counted against the
+    /// same administrator capacity policy. The entry records every
+    /// file it owns, so removal and the cache manager's totals
+    /// stay truthful.
+    fn cache_deck_bundle(
+        &mut self,
+        key: &str,
+        title: &str,
+        deck: &[u8],
+        page_count: i64,
+        source_index_id: &str,
+        index_json: &[u8],
+        blocks: &[(String, String, Vec<u8>, i64)],
+    ) {
+        if self.cache_policy.get("allowed").and_then(|v| v.as_bool()) == Some(false) {
+            self.msg = "管理员已关闭离线缓存".into();
+            return;
+        }
+        let total: i64 = deck.len() as i64
+            + index_json.len() as i64
+            + blocks.iter().map(|b| b.2.len() as i64).sum::<i64>();
+        let max_mb = self
+            .cache_policy
+            .get("max_mb")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(500);
+        let used: i64 = self
+            .cache_entries
+            .iter()
+            .filter(|e| s(e, "key") != key)
+            .map(|e| i(e, "bytes"))
+            .sum();
+        if used + total > max_mb * 1024 * 1024 {
+            self.msg = format!("超过管理员设定的缓存容量上限（{max_mb} MB）");
+            return;
+        }
+        let Some(ck) = cache_key() else {
+            self.msg = "无法创建本地缓存密钥".into();
+            return;
+        };
+        let dir = cache_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let safe = |name: &str| -> String {
+            name.chars()
+                .map(|c| {
+                    if c.is_alphanumeric() || c == '-' || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect()
+        };
+        let safe_key = safe(key);
+        let mut write_enc = |name: &str, plain: &[u8]| -> Result<(), String> {
+            let enc = encrypt_bytes(&ck, plain).ok_or_else(|| "缓存加密失败".to_string())?;
+            craft_atomic::atomic_write(&dir.join(name), &enc).map_err(|e| e.to_string())
+        };
+        let deck_file = format!("{safe_key}.pptx.enc");
+        let index_file = format!("{safe_key}.index.enc");
+        let mut block_entries: Vec<Value> = Vec::new();
+        let mut result = write_enc(&deck_file, deck).and_then(|_| write_enc(&index_file, index_json));
+        if result.is_ok() {
+            for (vid, unit_id, frag, pages) in blocks {
+                let file = format!("{safe_key}--{}.frag.enc", safe(vid));
+                match write_enc(&file, frag) {
+                    Ok(_) => block_entries.push(json!({
+                        "version_id": vid,
+                        "unit_id": unit_id,
+                        "file": file,
+                        "bytes": frag.len() as i64,
+                        "page_count": pages,
+                    })),
+                    Err(e) => {
+                        result = Err(e);
+                        break;
+                    }
+                }
+            }
+        }
+        match result {
+            Ok(_) => {
+                self.cache_entries.retain(|e| s(e, "key") != key);
+                self.cache_entries.push(json!({
+                    "key": key,
+                    "title": title,
+                    "page_count": page_count,
+                    "file": deck_file,
+                    "bytes": total,
+                    "enc": true,
+                    "cached_ms": qimu_core::auth::now_ms(),
+                    "source_index_id": source_index_id,
+                    "index_file": index_file,
+                    "blocks": block_entries,
+                }));
+                save_cache_index(&self.cache_entries);
+                self.msg = format!(
+                    "已缓存到本地（加密）：{title}（含索引与 {} 个内容块）",
+                    blocks.len()
+                );
+            }
+            Err(e) => self.msg = format!("缓存失败：{e}"),
+        }
+    }
+
+    /// The cached index detail for a showroom item, when its
+    /// offline bundle carries one (T1 cache payload): this is
+    /// what lets a cached deck's detail — its page list and
+    /// speaker scripts — resolve with no server at all.
+    fn cached_index_detail(&self, item_id: &str) -> Option<Value> {
+        let key = format!("sr_{item_id}");
+        let e = self.cache_entries.iter().find(|e| s(e, "key") == key)?;
+        let file = s(e, "index_file");
+        if file.is_empty() {
+            return None;
+        }
+        let ck = cache_key()?;
+        let data = std::fs::read(cache_dir().join(file)).ok()?;
+        let plain = decrypt_bytes(&ck, &data)?;
+        serde_json::from_slice(&plain).ok()
+    }
+
+    /// A block version's fragment inside an offline cache bundle:
+    /// (encrypted fragment path, thumbnail directory), resolved by
+    /// the background thumbnail thread when neither the local
+    /// library nor the server can serve the version.
+    fn cache_bundle_block(
+        &self,
+        version_id: &str,
+    ) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        for e in &self.cache_entries {
+            if let Some(blocks) = e.get("blocks").and_then(|b| b.as_array()) {
+                for b in blocks {
+                    if s(b, "version_id") == version_id {
+                        let file = s(b, "file");
+                        if file.is_empty() {
+                            continue;
+                        }
+                        let dir = cache_dir();
+                        return Some((dir.join(file), dir.join("thumbs").join(version_id)));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     fn remove_cache(&mut self, key: &str) {
         if let Some(e) = self
             .cache_entries
@@ -7740,6 +7910,19 @@ impl App {
             .cloned()
         {
             let _ = std::fs::remove_file(cache_dir().join(s(&e, "file")));
+            // Bundle pieces (T1 cache payload) go with the deck.
+            let index_file = s(&e, "index_file");
+            if !index_file.is_empty() {
+                let _ = std::fs::remove_file(cache_dir().join(index_file));
+            }
+            if let Some(blocks) = e.get("blocks").and_then(|b| b.as_array()) {
+                for b in blocks {
+                    let f = s(b, "file");
+                    if !f.is_empty() {
+                        let _ = std::fs::remove_file(cache_dir().join(f));
+                    }
+                }
+            }
         }
         self.cache_entries.retain(|e| s(e, "key") != key);
         save_cache_index(&self.cache_entries);
@@ -8204,12 +8387,25 @@ impl App {
             self.open_showroom_deck(&it);
         } else {
             self.showroom.stack.pop_to(0);
+            // Not in the live list (e.g. offline after a restart):
+            // the offline cache bundle still knows this deck's
+            // source index and its pages (T1 cache payload).
+            let src = self
+                .cache_entries
+                .iter()
+                .find(|e| s(e, "key") == format!("sr_{item_id}"))
+                .map(|e| s(e, "source_index_id"))
+                .unwrap_or_default();
+            let pages = self
+                .cached_index_detail(item_id)
+                .map(|v| showroom_pages(&v))
+                .unwrap_or_default();
             self.showroom.stack.push(SrFrame::Deck(DeckState {
                 item: json!({
                     "id": item_id, "title": title,
-                    "source_index_id": "", "submitted_by": "",
+                    "source_index_id": src, "submitted_by": "",
                 }),
-                pages: Vec::new(),
+                pages,
                 selected_page: None,
                 view: DeckView::Thumbnails,
                 preview_open: false,
@@ -8235,6 +8431,15 @@ impl App {
         if !src.is_empty() {
             if let Ok(v) = self.call("GET", &format!("/v1/indexes/{src}"), None) {
                 if let SrFrame::Deck(d) = self.showroom.stack.top_mut() {
+                    d.pages = showroom_pages(&v);
+                }
+            }
+        }
+        // Offline: the deck's cache bundle carries the index, so
+        // its pages (and their speaker scripts) still resolve.
+        if let SrFrame::Deck(d) = self.showroom.stack.top_mut() {
+            if d.pages.is_empty() {
+                if let Some(v) = self.cached_index_detail(&s(item, "id")) {
                     d.pages = showroom_pages(&v);
                 }
             }
@@ -8589,6 +8794,16 @@ impl App {
         let mut pdf_act: Option<(&'static str, Option<usize>)> = None;
         let cache_key = format!("sr_{}", s(&item, "id"));
         let already_cached = self.cache_entries.iter().any(|e| s(e, "key") == cache_key);
+        // T1 transforming button (user rulings 2026-11-24 16:09 and
+        // 16:10): this header's save/cache control is ONE button —
+        // 保存到我的库 while the deck is not in my library, 缓存
+        // once it is, 已缓存（点击更新缓存）in the accent fill once
+        // cached. It never greys out: there is no disabled
+        // "already saved" state.
+        let in_library = self
+            .library_refs
+            .iter()
+            .any(|e| s(e, "item_kind") == "showroom" && s(e, "item_id") == s(&item, "id"));
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new(s(&item, "title"))
@@ -8598,17 +8813,15 @@ impl App {
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
-                let (cache_label, cache_tint) = if already_cached {
-                    ("已缓存（点击更新缓存）", palette_color(TEXT_WEAK))
-                } else {
-                    ("缓存到本地", palette_color(ICON_TINT))
-                };
-                if self.icon_button_tinted(
-                    ui,
-                    ChromeIcon::Download,
-                    cache_label,
-                    cache_tint,
-                ) {
+                if !in_library {
+                    if btn_default(ui, "保存到我的库").clicked() {
+                        act = Some("save");
+                    }
+                } else if already_cached {
+                    if btn_primary(ui, "已缓存（点击更新缓存）").clicked() {
+                        act = Some("cache");
+                    }
+                } else if btn_default(ui, "缓存").clicked() {
                     act = Some("cache");
                 }
                 if self.icon_button(ui, ChromeIcon::Export, "导出") {
@@ -8705,6 +8918,7 @@ impl App {
                 }
             }
             Some("export") => self.export_showroom_pptx(&item),
+            Some("save") => self.save_showroom_to_library(&item),
             Some("cache") => self.cache_showroom_deck(&item),
             _ => {}
         }
@@ -8880,28 +9094,125 @@ impl App {
         }
     }
 
+    /// 保存到我的库 for the deck in the detail header (T1): the
+    /// action is saving someone else's shared content into my
+    /// library. When the deck reached me as an inbox share, the
+    /// save IS accepting that share — the very op the inbox
+    /// card's 保存到我的库 button calls. Otherwise (plaza, group
+    /// space) the library endpoint creates the same entry under
+    /// the showroom access gate. Either way the result is the
+    /// library entry the header's saved state reads.
+    fn save_showroom_to_library(&mut self, item: &Value) {
+        let item_id = s(item, "id");
+        if let Some(share) = self
+            .inbox
+            .iter()
+            .find(|sh| s(sh, "item_kind") == "showroom" && s(sh, "item_id") == item_id)
+            .cloned()
+        {
+            let sid = s(&share, "id");
+            match self.call("POST", &format!("/v1/shares/{sid}/accept"), Some(json!({}))) {
+                Ok(_) => {
+                    self.msg = "已保存到我的库".into();
+                    self.refresh_all();
+                }
+                Err(e) => self.msg = format!("保存失败：{e}"),
+            }
+            return;
+        }
+        match self.call(
+            "POST",
+            "/v1/library",
+            Some(json!({ "item_kind": "showroom", "item_id": item_id })),
+        ) {
+            Ok(_) => {
+                self.msg = "已保存到我的库".into();
+                self.refresh_all();
+            }
+            Err(e) => self.msg = format!("保存失败：{e}"),
+        }
+    }
+
+    /// The index half of a showroom cache bundle: the source
+    /// index's detail JSON plus each distinct resolved block
+    /// version's fragment bytes (version id, unit id, bytes, page
+    /// count). None when any fetch fails — the caller then caches
+    /// the assembled deck only, rather than failing the cache.
+    fn fetch_cache_bundle(
+        &mut self,
+        source_index_id: &str,
+    ) -> Option<(Vec<u8>, Vec<(String, String, Vec<u8>, i64)>)> {
+        let detail = self
+            .call("GET", &format!("/v1/indexes/{source_index_id}"), None)
+            .ok()?;
+        let mut seen: Vec<String> = Vec::new();
+        let mut blocks = Vec::new();
+        for entry in detail["resolved_entries"].as_array()?.iter() {
+            let version = &entry["resolved"];
+            let vid = s(version, "id");
+            if vid.is_empty() || seen.contains(&vid) {
+                continue;
+            }
+            seen.push(vid.clone());
+            let frag = self
+                .call("GET", &format!("/v1/versions/{vid}/fragment"), None)
+                .ok()?;
+            let bytes = b64d(&s(&frag, "data_base64")).ok()?;
+            blocks.push((
+                vid,
+                s(&entry["entry"], "unit_id"),
+                bytes,
+                i(version, "page_count"),
+            ));
+        }
+        if blocks.is_empty() {
+            return None;
+        }
+        let detail_bytes = serde_json::to_vec(&detail).ok()?;
+        Some((detail_bytes, blocks))
+    }
+
     fn cache_showroom_deck(&mut self, item: &Value) {
         let source = s(item, "source_index_id");
         if source.is_empty() {
             self.msg = "该条目暂不支持缓存到本地".into();
             return;
         }
-        match self.call(
+        let data = match self.call(
             "POST",
             &format!("/v1/indexes/{source}/export"),
             Some(json!({ "branch": "main", "kind": "personal" })),
         ) {
-            Ok(data) => {
-                if let Ok(bytes) = b64d(&s(&data, "data_base64")) {
-                    self.cache_deck(
-                        &format!("sr_{}", s(item, "id")),
-                        &s(item, "title"),
-                        &bytes,
-                        i(&data, "page_count"),
-                    );
-                }
+            Ok(d) => d,
+            Err(e) => {
+                self.msg = format!("缓存失败：{e}");
+                return;
             }
-            Err(e) => self.msg = format!("缓存失败：{e}"),
+        };
+        let Ok(bytes) = b64d(&s(&data, "data_base64")) else {
+            self.msg = "缓存失败：导出数据损坏".into();
+            return;
+        };
+        // 缓存 = 索引 + 内容块（页面）(the user's definition, T1):
+        // the assembled deck alone is not the cache — the bundle
+        // also carries the source index and its blocks, so the
+        // cached deck opens and drills down offline.
+        match self.fetch_cache_bundle(&source) {
+            Some((index_json, blocks)) => self.cache_deck_bundle(
+                &format!("sr_{}", s(item, "id")),
+                &s(item, "title"),
+                &bytes,
+                i(&data, "page_count"),
+                &source,
+                &index_json,
+                &blocks,
+            ),
+            None => self.cache_deck(
+                &format!("sr_{}", s(item, "id")),
+                &s(item, "title"),
+                &bytes,
+                i(&data, "page_count"),
+            ),
         }
     }
 
@@ -8993,6 +9304,19 @@ impl App {
                                 let key = s(&e, "key");
                                 if ui.button("打开").clicked() {
                                     app.open_cache(&key);
+                                }
+                                if !s(&e, "index_file").is_empty()
+                                    && ui.button("打开详情").clicked()
+                                {
+                                    let item_id =
+                                        key.strip_prefix("sr_").unwrap_or("").to_string();
+                                    if !item_id.is_empty() {
+                                        app.open_deck_for_ref(
+                                            "showroom",
+                                            &item_id,
+                                            &s(&e, "title"),
+                                        );
+                                    }
                                 }
                                 if ui.button("移除缓存").clicked() {
                                     app.remove_cache(&key);
@@ -10444,10 +10768,19 @@ impl App {
                                         );
                                         ui.label(
                                             egui::RichText::new(format!(
-                                                "{} 页 · {:.1} MB · 缓存于 {}",
+                                                "{} 页 · {:.1} MB · 缓存于 {}{}",
                                                 i(e, "page_count"),
                                                 i(e, "bytes") as f64 / 1_048_576.0,
-                                                fmt_time(i(e, "cached_ms"))
+                                                fmt_time(i(e, "cached_ms")),
+                                                match e
+                                                    .get("blocks")
+                                                    .and_then(|b| b.as_array())
+                                                {
+                                                    Some(b) if !b.is_empty() => {
+                                                        format!(" · {} 个内容块", b.len())
+                                                    }
+                                                    _ => String::new(),
+                                                }
                                             ))
                                             .size(11.5)
                                             .color(palette_color(TEXT_WEAK)),

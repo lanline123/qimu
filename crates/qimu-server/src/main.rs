@@ -3648,6 +3648,57 @@ async fn accept_share(
     Ok(Json(json!({ "library_id": lib_id })))
 }
 
+#[derive(Deserialize)]
+struct SaveLibraryReq {
+    item_kind: String, // showroom only, for now
+    item_id: String,
+    folder: Option<String>,
+}
+
+/// Save a showroom item into my library — the same library entry
+/// the share-accept path creates, for items that reached me
+/// through the plaza or a group space rather than an inbox share
+/// (the deck detail's 保存到我的库 button). The access gate is
+/// the showroom access funnel, identical to share creation and
+/// item export: anything I may open, I may save. Idempotent —
+/// an existing entry is returned unchanged.
+async fn save_to_library(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Json(req): Json<SaveLibraryReq>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    if req.item_kind != "showroom" {
+        return Err(bad("item_kind 只能是 showroom"));
+    }
+    let store = st.store.lock().unwrap();
+    let item = store
+        .get_showroom(&req.item_id)
+        .map_err(bad)?
+        .ok_or_else(|| not_found())?;
+    if !store.showroom_item_access(&user, &item).map_err(bad)? {
+        return Err(forbidden());
+    }
+    if let Some(e) = store
+        .list_library(&user.id)
+        .map_err(bad)?
+        .iter()
+        .find(|e| e["item_kind"] == "showroom" && e["item_id"] == req.item_id)
+    {
+        return Ok(Json(json!({ "library_id": e["id"] })));
+    }
+    let lib_id = store
+        .add_library_entry(
+            &user.id,
+            "showroom",
+            &item.id,
+            &item.title,
+            req.folder.as_deref().unwrap_or(""),
+        )
+        .map_err(bad)?;
+    Ok(Json(json!({ "library_id": lib_id })))
+}
+
 async fn list_library(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
     let user = auth(&st, &headers)?;
     let store = st.store.lock().unwrap();
@@ -4242,7 +4293,7 @@ async fn main() {
         .route("/v1/shares/inbox", get(list_inbox))
         .route("/v1/shares/:id/accept", post(accept_share))
         .route("/v1/group-space", get(group_space))
-        .route("/v1/library", get(list_library))
+        .route("/v1/library", get(list_library).post(save_to_library))
         .route("/v1/library/:id/delete", post(remove_library_entry))
         .route("/v1/assemblies", get(list_assemblies).post(create_assembly))
         .route("/v1/assemblies/:id/export", post(export_assembly))
