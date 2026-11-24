@@ -10160,7 +10160,6 @@ impl App {
             .id_salt("showroom-library")
             .show(ui, |ui| {
                 if section == 0 || section == 1 {
-                    ui.heading("收藏");
                     self.showroom_cards(
                         ui,
                         &self.library_refs.clone(),
@@ -10238,7 +10237,9 @@ impl App {
                     );
                 }
                 if section == 0 || section == 2 {
-                    ui.heading("本地缓存");
+                    if section == 0 {
+                        ui.add_space(18.0);
+                    }
                     self.showroom_cards(
                         ui,
                         &self.cache_entries.clone(),
@@ -10274,7 +10275,9 @@ impl App {
                     );
                 }
                 if section == 0 || section == 3 {
-                    ui.heading("我的组装");
+                    if section == 0 {
+                        ui.add_space(18.0);
+                    }
                     self.showroom_cards(
                         ui,
                         &self.my_assemblies.clone(),
@@ -10395,29 +10398,6 @@ impl App {
     }
 
     fn groups_view(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label("新建群组");
-            ui.text_edit_singleline(&mut self.new_team_name);
-            if ui
-                .add_enabled(
-                    !self.new_team_name.trim().is_empty(),
-                    egui::Button::new("建组"),
-                )
-                .clicked()
-                && self.require_org_online("新建群组")
-            {
-                let name = self.new_team_name.clone();
-                match self.call("POST", "/v1/custom-groups", Some(json!({ "name": name }))) {
-                    Ok(_) => {
-                        self.new_team_name.clear();
-                        self.msg = "群组已创建".into();
-                        self.refresh_all();
-                    }
-                    Err(e) => self.msg = format!("建组失败：{e}"),
-                }
-            }
-        });
-        ui.add_space(6.0);
         let users = self
             .org
             .get("users")
@@ -10425,7 +10405,6 @@ impl App {
             .cloned()
             .unwrap_or_default();
         let Some(space) = self.active_showroom_group().cloned() else {
-            ui.label(egui::RichText::new("还没加入任何群组").weak());
             return;
         };
         egui::ScrollArea::vertical()
@@ -10500,7 +10479,6 @@ impl App {
                     });
                 }
                 ui.add_space(12.0);
-                ui.heading("群组共享空间");
                 let items = space["items"]
                     .as_array()
                     .map(Vec::as_slice)
@@ -15638,16 +15616,6 @@ impl App {
         action: &mut Option<IndexDetailAction>,
     ) -> Option<String> {
         let filter = self.index.overview_folder.clone();
-        let title = match &filter {
-            None => "全部索引".to_string(),
-            Some(fid) if fid.is_empty() => "未分类".to_string(),
-            Some(fid) => self
-                .folders
-                .iter()
-                .find(|f| s(f, "id") == *fid)
-                .map(|f| s(f, "name"))
-                .unwrap_or_else(|| "索引".into()),
-        };
         ui.add_space(2.0);
         if self.deep_source == Some(Page::Home) {
             ui.horizontal(|ui| {
@@ -15658,8 +15626,7 @@ impl App {
             });
             ui.add_space(6.0);
         }
-        ui.label(egui::RichText::new(title).size(18.0).strong());
-        ui.add_space(14.0);
+        ui.add_space(8.0);
         let items: Vec<Value> = self
             .indexes
             .iter()
@@ -15718,7 +15685,8 @@ impl App {
                     groups.push((folder, vec![item]));
                 }
             }
-            for (folder, mut group) in groups {
+            let mut first_group = true;
+            for (_folder, mut group) in groups {
                 group.sort_by_key(|item| {
                     let id = s(item, "id");
                     let folder_id = s(item, "folder_id");
@@ -15726,19 +15694,11 @@ impl App {
                         s(folder, "id") == folder_id && s(folder, "main_index_id") == id
                     })
                 });
-                let active = group
-                    .iter()
-                    .filter(|item| item["lifecycle"] != "history")
-                    .count();
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(folder).size(14.0).strong());
-                    ui.label(
-                        egui::RichText::new(format!("使用中 {active} 份"))
-                            .size(11.5)
-                            .color(palette_color(TEXT_WEAK)),
-                    );
-                });
-                ui.add_space(4.0);
+                if first_group {
+                    first_group = false;
+                } else {
+                    ui.add_space(10.0);
+                }
                 ui.with_layout(
                     egui::Layout::left_to_right(egui::Align::Min).with_main_wrap(true),
                     |ui| {
