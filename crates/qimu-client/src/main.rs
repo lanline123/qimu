@@ -8445,11 +8445,23 @@ impl App {
         }
         // Offline: the deck's cache bundle carries the index, so
         // its pages (and their speaker scripts) still resolve.
-        if let SrFrame::Deck(d) = self.showroom.stack.top_mut() {
-            if d.pages.is_empty() {
-                if let Some(v) = self.cached_index_detail(&s(item, "id")) {
-                    d.pages = showroom_pages(&v);
-                }
+        // The cache lookup borrows `self`, so it runs before the
+        // mutable borrow of the deck frame; it stays gated on the
+        // same condition, read through the immutable `top()`: the
+        // top frame is a deck whose pages are still empty.
+        let pages_empty = match self.showroom.stack.top() {
+            SrFrame::Deck(d) => d.pages.is_empty(),
+            _ => false,
+        };
+        let cached_pages = if pages_empty {
+            self.cached_index_detail(&s(item, "id"))
+                .map(|v| showroom_pages(&v))
+        } else {
+            None
+        };
+        if let Some(pages) = cached_pages {
+            if let SrFrame::Deck(d) = self.showroom.stack.top_mut() {
+                d.pages = pages;
             }
         }
     }
@@ -10586,7 +10598,7 @@ impl App {
                 fmt_time(i(item, "created_ms"))
             ));
         if response.clicked() {
-            self.showroom.selected_card = Some(id);
+            self.showroom.selected_card = Some(id.clone());
         }
         if response.double_clicked()
             && (self.org_online() || self.sr_bundle_cached(&id))
