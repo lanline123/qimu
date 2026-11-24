@@ -6926,7 +6926,7 @@ impl App {
             TrashFrame::List(state) => state.filter,
             TrashFrame::Preview(_) => usize::MAX,
         };
-        for (filter, (kind, label, icon)) in [
+        for (filter, kind, label, icon) in [
             (0, "", "全部", ChromeIcon::Settings),
             (3, "showroom", "演示", ChromeIcon::Showroom),
             (1, "index", "索引", ChromeIcon::Index),
