@@ -36,8 +36,4 @@ upload 的源文件带全幅 alpha mask（栅格器不渲染），已去 mask �
 
 处理方式：按 IconPark 官方「线性（outline）」主题约定重新着色——描边改目标色、
 填充置空（play 的三角保留实心以保证小尺寸可读性）；play/share/export/download 用
-#F2F2F2，back 用 #E5534B。着色后的 SVG 与 96×96 预渲染 PNG 一并存于本目录。
-
-客户端内嵌的是同名 `.png.b64`（PNG 的 base64 文本），不是 PNG 原文件：
-GitHub 快照推送通道只传 UTF-8 文本，二进制直传会被有损转码损坏。改了某个
-PNG 后必须同步再生其 b64：`base64 -w0 <name>.png > <name>.png.b64`。
+#F2F2F2，back 用 #E5534B。客户端内嵌 SVG，并按控件尺寸和显示缩放倍率加载。主导航、索引工具栏、主题/消息与演示视图的 SVG 来自本仓库的 HTML 原型。

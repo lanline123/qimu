@@ -163,7 +163,7 @@ impl App {
         let can_merge = editor
             && matches!(self.index.stack.top(), IndexFrame::Detail(st)
             if st.detail["branches"].as_array().is_some_and(|branches| branches.len() > 1));
-        let icons = self.chrome_icons(ui);
+        let icons = ChromeIcons;
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let more = icons.tool(ui, ChromeIcon::More, "更多操作", editor, false, true);
             let mut selected = None;

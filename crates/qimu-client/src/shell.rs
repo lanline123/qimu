@@ -25,16 +25,17 @@ impl Page {
         }
     }
 
-    pub(super) fn icon(self) -> (&'static str, &'static [u8]) {
+    pub(super) fn icon(self) -> ChromeIcon {
         match self {
-            Self::Home => ("nav-home", *ICON_NAV_HOME),
-            Self::Showroom => ("nav-show", *ICON_NAV_SHOW),
-            Self::Index => ("nav-index", *ICON_NAV_INDEX),
-            Self::Content => ("nav-content", *ICON_NAV_CONTENT),
-            Self::Trash => ("nav-trash", *ICON_NAV_TRASH),
-            Self::Settings => ("all-application", *ICON_ALL_APPS),
+            Self::Home => ChromeIcon::Home,
+            Self::Showroom => ChromeIcon::Showroom,
+            Self::Index => ChromeIcon::Index,
+            Self::Content => ChromeIcon::Content,
+            Self::Trash => ChromeIcon::Trash,
+            Self::Settings => ChromeIcon::Settings,
         }
     }
+
 }
 
 impl App {
@@ -135,7 +136,7 @@ impl App {
         let can_add_folder = matches!(page, Page::Content | Page::Index)
             || (page == Page::Showroom && self.showroom.zone == "plaza");
         if can_add_folder
-            && self.small_icon_button(ui, "folder-plus", *ICON_FOLDER_PLUS, tr("新建文件夹"))
+            && self.small_icon_button(ui, ChromeIcon::FolderPlus, tr("新建文件夹"))
         {
             self.folder_edit = Some(FolderEdit {
                 target: None,
@@ -145,7 +146,7 @@ impl App {
             self.folder_edit_focus = true;
         }
         if page == Page::Trash
-            && btn_ghost_enabled(
+            && btn_default_enabled(
                 ui,
                 self.token.is_some() && !self.trash.items.is_empty(),
                 tr("清空回收站"),
@@ -236,7 +237,7 @@ impl App {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         self.workspace_preferences(ui);
                         if self.user.is_some() {
-                            if self.tool_slot(ui, false, tr("退出"), "power", *ICON_POWER) {
+                            if self.tool_slot(ui, false, tr("退出"), ChromeIcon::Power) {
                                 self.logout();
                             }
                         } else if ui
@@ -332,15 +333,7 @@ impl App {
                 ui.horizontal_centered(|ui| {
                     ui.spacing_mut().item_spacing.x = 3.0;
                     for page in Page::ALL {
-                        let (icon, bytes) = page.icon();
-                        let tab = self.tool_slot_sized(
-                            ui,
-                            self.page == page,
-                            tr(page.label()),
-                            icon,
-                            bytes,
-                            28.0,
-                        );
+                        let tab = ChromeIcons.tool(ui, page.icon(), page.label(), true, self.page == page, false);
                         if page == Page::Index && tab.double_clicked() {
                             self.index.stack.pop_to(0);
                         }
@@ -356,7 +349,7 @@ impl App {
                     // content imports, index creates.
                     match self.page {
                         Page::Showroom => {
-                            if self.tool_slot(ui, false, tr("刷新"), "refresh", *ICON_REFRESH) {
+                            if self.tool_slot(ui, false, tr("刷新"), ChromeIcon::Refresh) {
                                 if self.user.is_some() {
                                     self.refresh_all();
                                 } else {
@@ -365,12 +358,12 @@ impl App {
                             }
                         }
                         Page::Content => {
-                            if self.tool_slot(ui, false, tr("智能分块导入"), "split", *ICON_SPLIT)
+                            if self.tool_slot(ui, false, tr("智能分块导入"), ChromeIcon::Split)
                             {
                                 self.act_import_split();
                             }
                             ui.add_space(2.0);
-                            if self.tool_slot(ui, false, tr("导入 PPT"), "upload", *ICON_UPLOAD) {
+                            if self.tool_slot(ui, false, tr("导入 PPT"), ChromeIcon::Import) {
                                 self.act_import_ppt();
                             }
                             ui.add_space(2.0);
@@ -378,14 +371,13 @@ impl App {
                                 ui,
                                 false,
                                 tr("粘贴新建"),
-                                "clipboard",
-                                *ICON_CLIPBOARD,
+                                ChromeIcon::Clipboard,
                             ) {
                                 self.create_unit_from_paste();
                             }
                         }
                         Page::Index => {
-                            if self.tool_slot(ui, false, tr("新建索引"), "doc-add", *ICON_DOC_ADD)
+                            if self.tool_slot(ui, false, tr("新建索引"), ChromeIcon::NewIndex)
                             {
                                 self.act_new_index();
                             }
@@ -450,7 +442,7 @@ impl App {
                     if self.page == Page::Showroom
                         && matches!(self.showroom.stack.top(), SrFrame::Deck(_))
                     {
-                        if self.tool_slot(ui, false, "返回上一层", "icon-back", *ICON_BACK) {
+                        if self.tool_slot(ui, false, "返回上一层", ChromeIcon::Back) {
                             self.back_from_showroom_detail();
                         }
                     }

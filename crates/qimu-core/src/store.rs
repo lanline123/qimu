@@ -1346,6 +1346,22 @@ impl Store {
         fragment: &[u8],
         status: &str,
     ) -> SResult<VersionRec> {
+        self.insert_version_with_scripts(
+            rendition_id, semver, basis_revision, author, note, fragment, status, None,
+        )
+    }
+
+    pub fn insert_version_with_scripts(
+        &self,
+        rendition_id: &str,
+        semver: SemVer,
+        basis_revision: i64,
+        author: &str,
+        note: &str,
+        fragment: &[u8],
+        status: &str,
+        scripts_override: Option<&[String]>,
+    ) -> SResult<VersionRec> {
         let pkg = Package::load(fragment)?;
         let slide_refs = crate::pptx::slides(&pkg)?;
         let mut pages = Vec::new();
@@ -1359,6 +1375,12 @@ impl Store {
             });
             texts.push(slide_full_text(&xml));
             scripts.push(crate::text::notes_text(&pkg, &s.part));
+        }
+        if let Some(override_notes) = scripts_override {
+            if override_notes.len() != pages.len() {
+                return Err("讲稿数量与页面数量不匹配".into());
+            }
+            scripts = override_notes.to_vec();
         }
         let hash = self.file_put(fragment)?;
         let id = new_id("ver");

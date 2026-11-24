@@ -199,7 +199,7 @@ impl App {
 
     pub(super) fn workspace_preferences(&mut self, ui: &mut egui::Ui) {
         use craft_ui::buttons::{ButtonVisuals, IconButton, IconButtonStyle};
-        let icons = self.chrome_icons(ui);
+        let icons = ChromeIcons;
         let rest = ButtonVisuals {
             fill: egui::Color32::TRANSPARENT,
             stroke: egui::Stroke::NONE,

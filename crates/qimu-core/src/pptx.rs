@@ -18,6 +18,13 @@
 //! (page count, per-page fingerprints, structural integrity). A failed
 //! check must roll back the whole import.
 
+mod editor_extended;
+pub use editor_extended::{append_blank_slides, editor_preset_allowed, NewSlideElement};
+use editor_extended::{
+    add_element, add_picture_relationship, change_preset, group_inner_span, line_color,
+    replace_element_fill, reset_run_style, set_line_color, span_at, valid_rgb,
+};
+
 use craft_xml::{El, Local, Node};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -859,9 +866,7 @@ pub fn replace_slide_text_runs(
 // and lines sit where, and how their text is styled. This section is
 // the read/write pair for that model, in the same string-scanning
 // style as the rest of this file (no XML DOM in the workspace).
-// Elements nested inside a group are not listed individually — the
-// group itself is one element (kind "group"), matching what the
-// editor can meaningfully move/resize as a unit.
+// Group members retain their ordering and coordinate space.
 
 /// Direct formatting of one text run, as the editor exposes it: font
 /// size in points, bold, and an "RRGGBB" color. `None` = the run
@@ -898,8 +903,13 @@ pub struct SlideElement {
     pub cx: i64,
     pub cy: i64,
     pub rot: i64,
+    pub flip_h: bool,
+    pub flip_v: bool,
     pub has_xfrm: bool,
     pub geom: Option<String>,
+    pub line_color: Option<String>,
+    pub group_view: Option<[i64; 4]>,
+    pub children: Vec<SlideElement>,
     pub media: Option<String>,
     pub paras: Vec<ElPara>,
 }
@@ -1110,8 +1120,8 @@ fn picture_media(pkg: &Package, slide_part: &str, block: &str) -> Option<String>
     Some(resolve_target(slide_part, &rel.target))
 }
 
-fn parse_element(pkg: &Package, slide_part: &str, tag: &str, block: &str) -> SlideElement {
-    let paras = parse_paras(block);
+fn parse_element(pkg: &Package, slide_part: &str, tag: &str, block: &str, depth: usize) -> SlideElement {
+    let paras = if tag == "p:grpSp" { Vec::new() } else { parse_paras(block) };
     let geom = find_tag_attr(block, "<a:prstGeom", "prst");
     let kind = match tag {
         "p:pic" => "picture",
@@ -1140,7 +1150,28 @@ fn parse_element(pkg: &Package, slide_part: &str, tag: &str, block: &str) -> Sli
     } else {
         None
     };
+    let children = if kind == "group" && depth < 32 {
+        group_inner_span(block).map(|(inside, end)| {
+            let inner = &block[inside..end];
+            child_spans(inner, &EL_TAGS).into_iter().map(|(tag, a, b)| {
+                parse_element(pkg, slide_part, &tag, &inner[a..b], depth + 1)
+            }).collect()
+        }).unwrap_or_default()
+    } else { Vec::new() };
+    let group_view = (kind == "group").then(|| [
+        parse_i64(find_tag_attr(block, "<a:chOff", "x")),
+        parse_i64(find_tag_attr(block, "<a:chOff", "y")),
+        parse_i64(find_tag_attr(block, "<a:chExt", "cx")),
+        parse_i64(find_tag_attr(block, "<a:chExt", "cy")),
+    ]);
+    let xfrm = find_tag_text(block, "<a:xfrm").or_else(|| find_tag_text(block, "<p:xfrm")).unwrap_or("");
+    let flag = |name| matches!(attr(xfrm, name), Some("1" | "true"));
     SlideElement {
+        flip_h: flag("flipH"),
+        flip_v: flag("flipV"),
+        line_color: (kind == "line").then(|| line_color(block)).flatten(),
+        group_view,
+        children,
         kind,
         name: find_tag_attr(block, "<p:cNvPr", "name").unwrap_or_default(),
         x,
@@ -1186,7 +1217,7 @@ pub fn slide_elements(pkg: &Package, slide_idx: usize) -> PptxResult<Vec<SlideEl
     let inner = &xml[ts..te];
     let mut out = Vec::new();
     for (tag, s, e) in child_spans(inner, &EL_TAGS) {
-        out.push(parse_element(pkg, &sref.part, &tag, &inner[s..e]));
+        out.push(parse_element(pkg, &sref.part, &tag, &inner[s..e], 0));
     }
     Ok(out)
 }
@@ -1214,14 +1245,11 @@ pub enum SlideOp {
     Move { el: usize, x: i64, y: i64 },
     Resize { el: usize, cx: i64, cy: i64 },
     ReplacePic { el: usize, bytes: Vec<u8>, ext: String },
-}
-
-fn element_span(xml: &str, el: usize) -> Option<(usize, usize)> {
-    let (ts, te) = sp_tree_inner(xml)?;
-    let inner = &xml[ts..te];
-    child_spans(inner, &EL_TAGS)
-        .get(el)
-        .map(|(_, s, e)| (ts + s, ts + e))
+    ResetStyle { el: usize, para: usize, run: usize },
+    LineColor { el: usize, color: String },
+    Preset { el: usize, preset: String },
+    AddElement(NewSlideElement),
+    InGroup { parents: Vec<usize>, op: Box<SlideOp> },
 }
 
 /// Rewrite (or insert) attribute `name` on the tag starting at
@@ -1318,22 +1346,8 @@ fn style_run_block(rb: &str, sz: Option<f32>, b: Option<bool>, color: Option<Str
             }
             if let Some(c) = &color {
                 let fill = format!("<a:solidFill><a:srgbClr val=\"{c}\"/></a:solidFill>");
-                // Re-locate rPr after the attribute edits.
-                let rp_start = out.find("<a:rPr").unwrap();
-                let (_, _, tag_end, _, sc) = next_tag(&out, rp_start).unwrap();
-                if sc {
-                    // Expand `<a:rPr .../>` into a paired element.
-                    let open = format!("{}>{}", &out[rp_start..tag_end - 2], fill);
-                    out = format!("{}{}</a:rPr>{}", &out[..rp_start], open, &out[tag_end..]);
-                } else if let Some(sf) = out[rp_start..].find("<a:srgbClr") {
-                    out = set_tag_attr(&out, rp_start + sf, "val", c);
-                } else {
-                    out = format!(
-                        "{}{}{}",
-                        &out[..tag_end],
-                        fill,
-                        &out[tag_end..]
-                    );
+                if let Some(updated) = replace_element_fill(&out, rp_start, "a:rPr", &fill) {
+                    out = updated;
                 }
             }
         }
@@ -1542,67 +1556,17 @@ fn ensure_content_type(pkg: &mut Package, ext: &str) {
     pkg.parts.insert(CONTENT_TYPES.to_string(), out.into_bytes());
 }
 
-/// Repoint a picture element at a freshly stored media part. The new
-/// part is named by content hash, so identical replacements converge
-/// and no existing part is ever mutated in place. Returns false when
-/// the element has no resolvable image relationship.
+/// Replace only this picture's embed reference; other uses of the old relationship remain intact.
 fn op_replace_pic(
-    pkg: &mut Package,
-    slide_part: &str,
-    xml: &str,
-    el: usize,
-    bytes: &[u8],
-    ext: &str,
-) -> bool {
-    let Some((s, e)) = element_span(xml, el) else {
-        return false;
-    };
-    let block = &xml[s..e];
-    let Some(rs) = block.find("r:embed=\"") else {
-        return false;
-    };
-    let rid_start = rs + "r:embed=\"".len();
-    let Some(re) = block[rid_start..].find('"') else {
-        return false;
-    };
-    let rid = block[rid_start..rid_start + re].to_string();
-    let (dir, file) = match slide_part.rsplit_once('/') {
-        Some(v) => v,
-        None => return false,
-    };
-    let rels_part = format!("{dir}/_rels/{file}.rels");
-    let Ok(rels_xml) = pkg.get_text(&rels_part) else {
-        return false;
-    };
-    if !parse_rels(&rels_xml).iter().any(|r| r.id == rid) {
-        return false;
+    pkg: &mut Package, slide_part: &str, block: &str, bytes: &[u8], ext: &str,
+) -> PptxResult<Option<String>> {
+    let Some(blip) = find_tag_text(block, "<a:blip") else { return Ok(None) };
+    if attr(blip, "r:embed").is_none() {
+        return Ok(None);
     }
-    let mut h = Sha256::new();
-    h.update(bytes);
-    let hex = format!("{:x}", h.finalize());
-    let part = format!("ppt/media/qimu_{}.{}", &hex[..16], ext);
-    if !pkg.parts.contains_key(&part) {
-        pkg.parts.insert(part.clone(), bytes.to_vec());
-    }
-    ensure_content_type(pkg, ext);
-    // Rewrite the relationship target to the new part.
-    let mut new_rels = rels_xml.clone();
-    let mut pos = 0usize;
-    while let Some((name, ts, te, _, _)) = next_tag(&new_rels, pos) {
-        pos = te;
-        if name == "Relationship"
-            && attr(&new_rels[ts..te], "Id") == Some(rid.as_str())
-        {
-            let file_name = part.rsplit('/').next().unwrap_or(&part);
-            new_rels = set_tag_attr(&new_rels, ts, "Target", &format!("../media/{file_name}"));
-            break;
-        }
-    }
-    if new_rels == rels_xml {
-        return false;
-    }
-    pkg.parts.insert(rels_part, new_rels.into_bytes());
-    true
+    let start = block.find(blip).ok_or("找不到图片节点")?;
+    let id = add_picture_relationship(pkg, slide_part, bytes, ext)?;
+    Ok(Some(set_tag_attr(block, start, "r:embed", &id)))
 }
 
 /// Apply a batch of element operations to one slide of the package.
@@ -1622,51 +1586,75 @@ pub fn apply_slide_ops(
     let part = sref.part.clone();
     let mut xml = pkg.get_text(&part)?;
     let mut applied = 0usize;
-    for op in ops {
+    for command in ops {
+        let (parents, op) = match command {
+            SlideOp::InGroup { parents, op } => (parents.as_slice(), op.as_ref()),
+            op => (&[][..], op),
+        };
+        let span = |el| span_at(&xml, parents, el);
+        let edit_element = |el, edit: &dyn Fn(&str) -> Option<String>| {
+            span(el).and_then(|(a,b)| edit(&xml[a..b]).map(|new| splice(&xml, (a,b), &new)))
+        };
         let next: Option<String> = match op {
+            SlideOp::InGroup { .. } => return Err("不要嵌套组合操作封装".into()),
+            SlideOp::AddElement(el) => {
+                if !parents.is_empty() { return Err("新增元素只能放在页面根层".into()); }
+                Some(add_element(pkg, &part, &xml, el)?)
+            }
+            SlideOp::ResetStyle { el, para, run } => edit_element(*el, &|block| reset_run_style(block, *para, *run)),
+            SlideOp::Preset { el, preset } => edit_element(*el, &|block| change_preset(block, preset)),
+            SlideOp::LineColor { el, color } => {
+                if !valid_rgb(color) { return Err("线条颜色必须为 RRGGBB".into()); }
+                edit_element(*el, &|block| set_line_color(block, color))
+            }
             SlideOp::ReplacePic { el, bytes, ext } => {
-                if op_replace_pic(pkg, &part, &xml, *el, bytes, ext) {
-                    applied += 1;
+                if let Some((a, b)) = span(*el) {
+                    op_replace_pic(pkg, &part, &xml[a..b], bytes, ext)?
+                        .map(|block| splice(&xml, (a, b), &block))
+                } else {
+                    None
                 }
-                continue;
             }
             SlideOp::SetText { el, para, run, text } => {
-                element_span(&xml, *el).and_then(|(s, e)| {
+                span(*el).and_then(|(s, e)| {
                     op_set_text(&xml[s..e], *para, *run, text)
                         .map(|nb| splice(&xml, (s, e), &nb))
                 })
             }
             SlideOp::SetStyle { el, para, run, sz, b, color } => {
-                element_span(&xml, *el).and_then(|(s, e)| {
+                if color.as_deref().is_some_and(|color| !valid_rgb(color)) {
+                    return Err("文本颜色必须为 RRGGBB".into());
+                }
+                span(*el).and_then(|(s, e)| {
                     op_set_style(&xml[s..e], *para, *run, *sz, *b, color.clone())
                         .map(|nb| splice(&xml, (s, e), &nb))
                 })
             }
             SlideOp::AddPara { el, after, text } => {
-                element_span(&xml, *el).and_then(|(s, e)| {
+                span(*el).and_then(|(s, e)| {
                     op_add_para(&xml[s..e], *after, text).map(|nb| splice(&xml, (s, e), &nb))
                 })
             }
             SlideOp::DeletePara { el, para } => {
-                element_span(&xml, *el).and_then(|(s, e)| {
+                span(*el).and_then(|(s, e)| {
                     op_delete_para(&xml[s..e], *para).map(|nb| splice(&xml, (s, e), &nb))
                 })
             }
             SlideOp::AddRun { el, para, text } => {
-                element_span(&xml, *el).and_then(|(s, e)| {
+                span(*el).and_then(|(s, e)| {
                     op_add_run(&xml[s..e], *para, text).map(|nb| splice(&xml, (s, e), &nb))
                 })
             }
             SlideOp::DeleteRun { el, para, run } => {
-                element_span(&xml, *el).and_then(|(s, e)| {
+                span(*el).and_then(|(s, e)| {
                     op_delete_run(&xml[s..e], *para, *run).map(|nb| splice(&xml, (s, e), &nb))
                 })
             }
-            SlideOp::Move { el, x, y } => element_span(&xml, *el).and_then(|(s, e)| {
+            SlideOp::Move { el, x, y } => span(*el).and_then(|(s, e)| {
                 op_move_resize(&xml[s..e], Some((*x, *y)), None)
                     .map(|nb| splice(&xml, (s, e), &nb))
             }),
-            SlideOp::Resize { el, cx, cy } => element_span(&xml, *el).and_then(|(s, e)| {
+            SlideOp::Resize { el, cx, cy } => span(*el).and_then(|(s, e)| {
                 op_move_resize(&xml[s..e], None, Some((*cx, *cy)))
                     .map(|nb| splice(&xml, (s, e), &nb))
             }),

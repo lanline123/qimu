@@ -3265,7 +3265,12 @@ struct PageRunEdit {
 
 #[derive(Deserialize)]
 struct EditPagesReq {
+    #[serde(default)]
     edits: Vec<PageRunEdit>,
+    #[serde(default)]
+    added_pages: usize,
+    preview_page: Option<usize>,
+    scripts: Option<Vec<String>>,
     /// v2 element operations (visual editor): text/style per run,
     /// paragraph & run insertion/deletion, element move/resize and
     /// picture replacement. Applied after the legacy run edits.
@@ -3286,6 +3291,10 @@ struct PageOpReq {
     kind: String,
     page: usize,
     el: usize,
+    #[serde(default)]
+    parents: Vec<usize>,
+    preset: Option<String>,
+    element_kind: Option<String>,
     para: Option<usize>,
     run: Option<usize>,
     text: Option<String>,
@@ -3335,13 +3344,15 @@ async fn edit_version_pages(
         (ver, rend, unit, bytes)
     };
     need_cap(&st, &user, &unit.group_id, "publish")?;
-    // Picture replacements: decode and store the new images through
-    // the file layer first (content-addressed, like every other
-    // fragment), keeping the decoded bytes for the package surgery.
+    if req.ops.len() > 20_000 || req.edits.len() > 20_000 {
+        return Err(bad("编辑操作过多"));
+    }
     let mut pic_bytes: std::collections::HashMap<usize, (Vec<u8>, String)> =
         std::collections::HashMap::new();
     for (i, op) in req.ops.iter().enumerate() {
-        if op.kind != "replace_pic" {
+        let needs_picture = op.kind == "replace_pic"
+            || (op.kind == "add_element" && op.element_kind.as_deref() == Some("picture"));
+        if !needs_picture {
             continue;
         }
         let b64 = op
@@ -3358,13 +3369,10 @@ async fn edit_version_pages(
             Some(_) => return Err(bad("图片扩展名与实际格式不一致")),
             None => sniffed.to_string(),
         };
-        {
-            let store = st.store.lock().unwrap();
-            store.file_put(&bytes).map_err(bad)?;
-        }
         pic_bytes.insert(i, (bytes, ext));
     }
     let mut pkg = Package::load(&bytes).map_err(bad)?;
+    pptx::append_blank_slides(&mut pkg, req.added_pages).map_err(bad)?;
     // Group the flat edit list by page and apply run replacements.
     let mut by_page: std::collections::BTreeMap<usize, Vec<(usize, String)>> =
         std::collections::BTreeMap::new();
@@ -3374,7 +3382,7 @@ async fn edit_version_pages(
             .or_default()
             .push((e.run, e.text.clone()));
     }
-    let mut applied = 0usize;
+    let mut applied = req.added_pages;
     for (page, edits) in &by_page {
         applied += pptx::replace_slide_text_runs(&mut pkg, *page, edits).map_err(bad)?;
     }
@@ -3427,6 +3435,27 @@ async fn edit_version_pages(
                 cx: op.cx.unwrap_or(0),
                 cy: op.cy.unwrap_or(0),
             },
+            "reset_style" => pptx::SlideOp::ResetStyle {
+                el: op.el, para: op.para.unwrap_or(0), run: op.run.unwrap_or(0),
+            },
+            "line_color" => pptx::SlideOp::LineColor {
+                el: op.el, color: op.color.clone().ok_or_else(|| bad("缺少线条颜色"))?,
+            },
+            "preset" => {
+                let preset = op.preset.clone().filter(|preset| pptx::editor_preset_allowed(preset))
+                    .ok_or_else(|| bad("未知的形状预设"))?;
+                pptx::SlideOp::Preset { el: op.el, preset }
+            }
+            "add_element" => pptx::SlideOp::AddElement(pptx::NewSlideElement {
+                kind: op.element_kind.clone().ok_or_else(|| bad("缺少元素类型"))?,
+                preset: op.preset.clone(),
+                text: op.text.clone().unwrap_or_default(),
+                x: op.x.unwrap_or(0),
+                y: op.y.unwrap_or(0),
+                cx: op.cx.unwrap_or(0),
+                cy: op.cy.unwrap_or(0),
+                picture: pic_bytes.remove(&i),
+            }),
             "replace_pic" => {
                 let (bytes, ext) = pic_bytes
                     .get(&i)
@@ -3436,14 +3465,40 @@ async fn edit_version_pages(
             }
             other => return Err(bad(format!("未知编辑操作 {other}"))),
         };
+        if op.parents.len() > 32 {
+            return Err(bad("组合层级过深"));
+        }
+        let sop = if op.parents.is_empty() {
+            sop
+        } else {
+            pptx::SlideOp::InGroup { parents: op.parents.clone(), op: Box::new(sop) }
+        };
         ops_by_page.entry(op.page).or_default().push(sop);
     }
     for (page, ops) in &ops_by_page {
         applied += pptx::apply_slide_ops(&mut pkg, *page, ops).map_err(bad)?;
     }
+    if let Some(page) = req.preview_page {
+        if page >= pptx::slides(&pkg).map_err(bad)?.len() {
+            return Err(bad("预览页超出范围"));
+        }
+        let rendered = tokio::task::spawn_blocking(move || render_page_edit_preview(&pkg, page))
+            .await.map_err(|error| bad(error.to_string()))?.map_err(bad)?;
+        return Ok(Json(json!({ "data_base64": b64e(&rendered) })));
+    }
     if applied == 0 {
         return Err(bad("没有可应用的修改"));
     }
+    let pages = pptx::slides(&pkg).map_err(bad)?.len();
+    let scripts = match req.scripts {
+        Some(scripts) if scripts.len() != pages => return Err(bad("讲稿数量与页面数量不匹配")),
+        Some(scripts) => scripts,
+        None => {
+            let mut scripts = ver.scripts;
+            scripts.resize(pages, String::new());
+            scripts
+        }
+    };
     let frag = pkg.to_bytes().map_err(bad)?;
     let store = st.store.lock().unwrap();
     let basis = if req.new_revision.unwrap_or(false) {
@@ -3461,9 +3516,8 @@ async fn edit_version_pages(
         Some(v) => SemVer::parse(&v.semver).map_err(bad)?.bumped(inc),
         None => SemVer::new(1, 0, 0),
     };
-    let _ = ver;
     let new_ver = store
-        .insert_version(
+        .insert_version_with_scripts(
             &rend.id,
             next,
             basis,
@@ -3471,9 +3525,28 @@ async fn edit_version_pages(
             req.note.as_deref().unwrap_or(""),
             &frag,
             "normal",
+            Some(&scripts),
         )
         .map_err(bad)?;
     Ok(Json(json!({ "version": new_ver })))
+}
+
+fn render_page_edit_preview(pkg: &Package, page: usize) -> Result<Vec<u8>, String> {
+    let work = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let input = work.path().join("edit.pptx");
+    let image = work.path().join("stage.png");
+    std::fs::write(&input, pkg.to_bytes()?).map_err(|error| error.to_string())?;
+    let output = std::process::Command::new(deckcraft_cli_bin())
+        .arg("render")
+        .arg(&input)
+        .args(["--slide", &page.to_string(), "--scale", "1", "--edit"])
+        .arg(&image)
+        .output()
+        .map_err(|error| format!("启动 DeckCraft 预览失败：{error}"))?;
+    if !output.status.success() {
+        return Err(format!("DeckCraft 预览失败：{}", String::from_utf8_lossy(&output.stderr)));
+    }
+    std::fs::read(image).map_err(|error| error.to_string())
 }
 
 // ---------------- custom groups / shares / library (§3.17, §7.7) ----------------

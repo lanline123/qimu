@@ -9,6 +9,9 @@ mod index_controls;
 mod index_lineage;
 mod index_history;
 mod shell;
+mod page_editor;
+
+use page_editor::*;
 mod workspace_controls;
 
 use chrome_icons::{ChromeIcon, ChromeIcons};
@@ -324,12 +327,6 @@ fn card_frame_square() -> egui::Frame {
     card_frame().corner_radius(egui::CornerRadius::same(6))
 }
 
-/// Flush variant (no inner margin) for cover-first cards: the cover
-/// image runs edge to edge, the body adds its own padding.
-fn card_frame_flush() -> egui::Frame {
-    card_frame().inner_margin(egui::Margin::same(0))
-}
-
 /// Small tinted pill for statuses (version policy, excerpt, version no).
 /// Painted manually with an exact-size allocation: a Frame here inherits
 /// whatever layout surrounds it and stretches/wraps unpredictably.
@@ -411,7 +408,7 @@ fn tree_row(
     ui: &mut egui::Ui,
     selected: bool,
     indent: f32,
-    icon: Option<egui::TextureId>,
+    icon: Option<ChromeIcon>,
     label: &str,
     size: f32,
 ) -> egui::Response {
@@ -425,17 +422,12 @@ fn tree_row(
         painter.rect_filled(rect, 6.0, palette_color(HOVER_BG));
     }
     let mut tx = rect.min.x + 10.0 + indent;
-    if let Some(tex) = icon {
+    if let Some(icon) = icon {
         let ir = egui::Rect::from_min_size(
             egui::pos2(tx, rect.center().y - 7.5),
             egui::vec2(15.0, 15.0),
         );
-        painter.image(
-            tex,
-            ir,
-            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
-            palette_color(ICON_TINT),
-        );
+        icon.image(15.0, palette_color(ICON_TINT)).paint_at(ui, ir);
         tx += 15.0 + 6.0;
     }
     let font = egui::FontId::new(size, egui::FontFamily::Proportional);
@@ -773,24 +765,12 @@ fn dc_content_stamp(bytes: &[u8]) -> String {
     format!("{:08x}", (h ^ (h >> 32)) as u32)
 }
 
-/// The auto-quit preference: present.json beside servers.json in
-/// qimu_home(); default true (a finished show closes DeckCraft and
-/// hands the user back to the deck frame they left).
+/// Device-local preference. Preserve explicit choices from the old settings file.
 fn load_dc_auto_quit() -> bool {
-    std::fs::read_to_string(qimu_home().join("present.json"))
-        .ok()
-        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-        .and_then(|v| v.get("auto_quit").and_then(|x| x.as_bool()))
-        .unwrap_or(true)
-}
-
-fn save_dc_auto_quit(on: bool) {
-    let dir = qimu_home();
-    let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::write(
-        dir.join("present.json"),
-        serde_json::to_string(&json!({ "auto_quit": on })).unwrap_or_default(),
-    );
+    client_settings()["deckcraft_auto_quit"].as_bool().or_else(|| {
+        let text = std::fs::read_to_string(qimu_home().join("present.json")).ok()?;
+        serde_json::from_str::<Value>(&text).ok()?["auto_quit"].as_bool()
+    }).unwrap_or(false)
 }
 
 /// One JSON-lines control connection to a DeckCraft instance.
@@ -1446,8 +1426,9 @@ struct PresentState {
 
 /// Working copy of one text run in the v2 element editor (mirrors
 /// core's ElRun; style fields are `None` when the run inherits).
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Default, PartialEq)]
 struct RunWork {
+    reset_style: bool,
     text: String,
     sz: Option<f32>,
     b: Option<bool>,
@@ -1465,6 +1446,13 @@ struct ParaWork {
 /// stored through the server's content-addressed file layer.
 #[derive(Clone, PartialEq)]
 struct ElWork {
+    path: Vec<usize>,
+    preset: Option<String>,
+    line_color: Option<String>,
+    group_view: Option<[i64; 4]>,
+    rot: i64,
+    flip_h: bool,
+    flip_v: bool,
     kind: String,
     name: String,
     x: i64,
@@ -1480,11 +1468,12 @@ struct ElWork {
 /// An in-progress stage drag (move or resize), anchored at the
 /// pointer position and the element geometry when the drag started,
 /// so per-frame updates never accumulate drift.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy)]
 struct ElDrag {
     el: usize,
     resize: bool,
     start_pos: egui::Pos2,
+    transform: StageTransform,
     x: i64,
     y: i64,
     cx: i64,
@@ -1509,6 +1498,7 @@ fn el_kind_label(kind: &str) -> &str {
 /// this overlay's working state.
 #[derive(Clone, PartialEq)]
 struct EditSnapshot {
+    page_count: usize,
     work: std::collections::HashMap<usize, Vec<String>>,
     elems: std::collections::HashMap<usize, Vec<ElWork>>,
     scripts: Vec<String>,
@@ -1529,6 +1519,7 @@ fn elwork_from_json(v: &Value) -> ElWork {
                                 .map(|r| {
                                     let st = r.get("style").cloned().unwrap_or(json!({}));
                                     RunWork {
+                                        reset_style: false,
                                         text: s(r, "text"),
                                         sz: st
                                             .get("sz")
@@ -1548,7 +1539,18 @@ fn elwork_from_json(v: &Value) -> ElWork {
                 .collect()
         })
         .unwrap_or_default();
+    let group_view = v["group_view"].as_array().and_then(|numbers| {
+        let coords: Vec<_> = numbers.iter().filter_map(Value::as_i64).collect();
+        coords.try_into().ok()
+    });
     ElWork {
+        path: Vec::new(),
+        preset: v["geom"].as_str().map(str::to_owned),
+        line_color: v["line_color"].as_str().map(str::to_owned),
+        group_view,
+        rot: i(v, "rot"),
+        flip_h: v["flip_h"] == true,
+        flip_v: v["flip_v"] == true,
         kind: s(v, "kind"),
         name: s(v, "name"),
         x: i(v, "x") as i64,
@@ -1586,10 +1588,7 @@ fn color32_hex(c: egui::Color32) -> String {
     format!("{:02X}{:02X}{:02X}", c.r(), c.g(), c.b())
 }
 
-/// Diff-style op for one run whose working style differs from base.
-/// Only fields that are set in the working copy are sent — clearing
-/// an explicit style back to "inherited" is not expressible in the
-/// op set (the run keeps its last explicit value).
+/// Send changed direct formatting. Reset removes the three editable overrides.
 fn push_style_op(
     out: &mut Vec<Value>,
     page: usize,
@@ -1599,6 +1598,11 @@ fn push_style_op(
     wr: &RunWork,
     br: &RunWork,
 ) {
+    if wr.reset_style && !br.reset_style {
+        out.push(json!({"kind": "reset_style", "page": page, "el": el, "para": para, "run": run}));
+        push_full_style_op(out, page, el, para, run, wr);
+        return;
+    }
     let mut op = json!({"kind": "set_style", "page": page, "el": el, "para": para, "run": run});
     let mut any = false;
     if wr.sz != br.sz {
@@ -1660,6 +1664,7 @@ struct PageEditState {
     unit_name: String,
     semver: String,
     page_count: usize,
+    original_page_count: usize,
     page: usize,
     base: std::collections::HashMap<usize, Vec<String>>,
     work: std::collections::HashMap<usize, Vec<String>>,
@@ -1676,6 +1681,8 @@ struct PageEditState {
     slide_cx: i64,
     slide_cy: i64,
     sel: Option<usize>,
+    selection: std::collections::BTreeSet<usize>,
+    preview: EditStagePreview,
     drag: Option<ElDrag>,
     undo: Vec<EditSnapshot>,
     redo: Vec<EditSnapshot>,
@@ -1683,10 +1690,10 @@ struct PageEditState {
 
 impl PageEditState {
     fn dirty(&self) -> bool {
-        if self.scripts != self.scripts_base {
+        if self.added_pages() > 0 || self.scripts != self.scripts_base {
             return true;
         }
-        if self.elems != self.elems_base {
+        if self.elems.iter().any(|(page, list)| self.elems_base.get(page) != Some(list)) {
             return true;
         }
         self.work.iter().any(|(p, runs)| {
@@ -1725,6 +1732,7 @@ impl PageEditState {
     }
     fn snapshot(&self) -> EditSnapshot {
         EditSnapshot {
+            page_count: self.page_count,
             work: self.work.clone(),
             elems: self.elems.clone(),
             scripts: self.scripts.clone(),
@@ -1749,18 +1757,26 @@ impl PageEditState {
         if let Some(snap) = self.undo.pop() {
             let cur = self.snapshot();
             self.redo.push(cur);
+            self.page_count = snap.page_count;
+            self.page = self.page.min(self.page_count.saturating_sub(1));
             self.work = snap.work;
             self.elems = snap.elems;
             self.scripts = snap.scripts;
+            self.select_element(None, false);
+            self.drag = None;
         }
     }
     fn do_redo(&mut self) {
         if let Some(snap) = self.redo.pop() {
             let cur = self.snapshot();
             self.undo.push(cur);
+            self.page_count = snap.page_count;
+            self.page = self.page.min(self.page_count.saturating_sub(1));
             self.work = snap.work;
             self.elems = snap.elems;
             self.scripts = snap.scripts;
+            self.select_element(None, false);
+            self.drag = None;
         }
     }
     /// The v2 save payload: element operations for every page with
@@ -1768,16 +1784,25 @@ impl PageEditState {
     /// (per element: replacement/geometry, run updates, run
     /// deletions descending, run insertions, paragraph deletions
     /// descending, paragraph insertions ascending).
-    fn ops(&self) -> Vec<Value> {
+    fn page_ops(&self, only_page: Option<usize>) -> Vec<Value> {
         let mut out: Vec<Value> = Vec::new();
-        let mut pages: Vec<usize> = self.elems.keys().cloned().collect();
+        let mut pages: Vec<usize> = self.elems.keys().copied()
+            .filter(|&page| only_page.is_none_or(|only| only == page)).collect();
         pages.sort_unstable();
         for p in pages {
-            let (Some(w), Some(b)) = (self.elems.get(&p), self.elems_base.get(&p)) else {
-                continue;
-            };
-            for (ei, (we, be)) in w.iter().zip(b.iter()).enumerate() {
-                if let Some((ext, bytes)) = &we.new_image {
+            let w = &self.elems[&p];
+            let b = self.elems_base.get(&p).map(Vec::as_slice).unwrap_or(&[]);
+            for (index, we) in w.iter().enumerate() {
+                let Some(&ei) = we.path.last() else { continue };
+                let seed;
+                let be = if let Some(base) = b.get(index) {
+                    base
+                } else {
+                    seed = we.seed_insert(p, &mut out);
+                    &seed
+                };
+                let first = out.len();
+                if let Some((ext, bytes)) = we.new_image.as_ref().filter(|_| index < b.len()) {
                     out.push(json!({
                         "kind": "replace_pic", "page": p, "el": ei,
                         "ext": ext, "data_base64": b64e(bytes),
@@ -1794,6 +1819,12 @@ impl PageEditState {
                         "kind": "resize", "page": p, "el": ei,
                         "cx": we.cx, "cy": we.cy,
                     }));
+                }
+                if we.preset != be.preset {
+                    out.push(json!({"kind":"preset", "page":p, "el":ei, "preset":we.preset}));
+                }
+                if we.line_color != be.line_color {
+                    out.push(json!({"kind":"line_color", "page":p, "el":ei, "color":we.line_color}));
                 }
                 let common = we.paras.len().min(be.paras.len());
                 for pi in 0..common {
@@ -1847,6 +1878,11 @@ impl PageEditState {
                             "para": pi, "text": wr.text,
                         }));
                         push_full_style_op(&mut out, p, ei, pi, ri, wr);
+                    }
+                }
+                if !we.parents().is_empty() {
+                    for op in &mut out[first..] {
+                        op["parents"] = json!(we.parents());
                     }
                 }
             }
@@ -1925,7 +1961,8 @@ fn page_edit_inspector(
                 el.name.clone()
             }
         );
-        if ui.selectable_label(pe.sel == Some(idx), label).clicked() {
+        let indent = "　".repeat(el.parents().len());
+        if ui.selectable_label(pe.selection.contains(&idx), format!("{indent}{label}")).clicked() {
             *sel_req = Some(Some(idx));
         }
     }
@@ -1956,6 +1993,9 @@ fn page_edit_inspector(
         .color(palette_color(TEXT_MAIN)),
     );
     ui.add_space(4.0);
+    if !elw.parents().is_empty() {
+        ui.label(egui::RichText::new(tr("组内坐标")).weak());
+    }
     // Geometry (EMU on the wire, millimetres in the panel).
     if elw.has_xfrm {
         if let Some(v) = mm_field(ui, tr("位置 X"), elw.x, want_snapshot) {
@@ -2012,6 +2052,18 @@ fn page_edit_inspector(
             }
         }
         "text" | "shape" => {
+            if let Some(preset) = &mut elw.preset {
+                let label = SHAPE_PRESETS.iter().find(|(key, _)| key == preset).map(|(_, label)| tr(label)).unwrap_or(preset);
+                egui::ComboBox::from_id_salt(("shape-preset", sel))
+                    .selected_text(label.to_owned())
+                    .show_ui(ui, |ui| {
+                        for (key, label) in SHAPE_PRESETS {
+                            if ui.selectable_value(preset, (*key).into(), tr(label)).changed() {
+                                *want_snapshot = true;
+                            }
+                        }
+                    });
+            }
             let para_count = elw.paras.len();
             let mut del_para_req: Option<usize> = None;
             for (pi, para) in elw.paras.iter_mut().enumerate() {
@@ -2023,6 +2075,7 @@ fn page_edit_inspector(
                     );
                     if ui.small_button(tr("＋文本")).clicked() {
                         para.runs.push(RunWork {
+                            reset_style: false,
                             text: tr("新文本").to_string(),
                             sz: None,
                             b: None,
@@ -2097,6 +2150,13 @@ fn page_edit_inspector(
                             run.color = Some(color32_hex(cc));
                             *want_snapshot = true;
                         }
+                        if ui.small_button(tr("重置样式")).clicked() {
+                            run.sz = None;
+                            run.b = None;
+                            run.color = None;
+                            run.reset_style = true;
+                            *want_snapshot = true;
+                        }
                     });
                 }
                 if let Some(ri) = del_run_req {
@@ -2109,6 +2169,7 @@ fn page_edit_inspector(
             if ui.button(tr("＋ 加一段")).clicked() {
                 elw.paras.push(ParaWork {
                     runs: vec![RunWork {
+                        reset_style: false,
                         text: tr("新文本").to_string(),
                         sz: None,
                         b: None,
@@ -2119,11 +2180,14 @@ fn page_edit_inspector(
             }
         }
         "line" => {
-            ui.label(
-                egui::RichText::new(tr("线条：可移动与缩放；改色与线宽暂不支持。"))
-                    .size(11.5)
-                    .color(palette_color(TEXT_FAINT)),
-            );
+            ui.horizontal(|ui| {
+                ui.label(tr("线条颜色"));
+                let mut color = elw.line_color.as_deref().map(hex_color32).unwrap_or(egui::Color32::DARK_GRAY);
+                if ui.color_edit_button_srgba(&mut color).changed() {
+                    elw.line_color = Some(color32_hex(color));
+                    *want_snapshot = true;
+                }
+            });
         }
         "graphic" => {
             ui.label(
@@ -2133,11 +2197,7 @@ fn page_edit_inspector(
             );
         }
         "group" => {
-            ui.label(
-                egui::RichText::new(tr("组合：可整体移动与缩放；组内元素单独编辑暂不支持。"))
-                    .size(11.5)
-                    .color(palette_color(TEXT_FAINT)),
-            );
+            ui.label(egui::RichText::new(tr("在上方展开的层级列表中选择组内元素。")).weak());
         }
         _ => {}
     }
@@ -2543,11 +2603,6 @@ fn tr(source: &str) -> &str {
     i18n.from_code(code).map_or(source, |lang| i18n.t(lang, source))
 }
 
-// The icons are embedded as base64 text (assets/icons/*.png.b64), not as
-// raw PNG bytes: the GitHub snapshot push path transports UTF-8 text
-// only, and a lossy round-trip would corrupt embedded binaries. The
-// *.png files remain the sources — after changing one, regenerate its
-// .b64 (`base64 -w0 <name>.png > <name>.png.b64`; see assets/icons/README.md).
 fn icon_png(b64: &str) -> &'static [u8] {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64.trim())
@@ -2555,72 +2610,8 @@ fn icon_png(b64: &str) -> &'static [u8] {
     Box::leak(bytes.into_boxed_slice())
 }
 
-static ICON_PLAY: std::sync::LazyLock<&'static [u8]> =
-    std::sync::LazyLock::new(|| icon_png(include_str!("../assets/icons/play.png.b64")));
-// Retained for the organization phase: the share entries that used
-// this glyph are offline at the export-only sharing stage.
-#[allow(dead_code)]
-static ICON_SHARE: std::sync::LazyLock<&'static [u8]> =
-    std::sync::LazyLock::new(|| icon_png(include_str!("../assets/icons/share.png.b64")));
-static ICON_EXPORT: std::sync::LazyLock<&'static [u8]> =
-    std::sync::LazyLock::new(|| icon_png(include_str!("../assets/icons/export.png.b64")));
-static ICON_DOWNLOAD: std::sync::LazyLock<&'static [u8]> =
-    std::sync::LazyLock::new(|| icon_png(include_str!("../assets/icons/download.png.b64")));
-static ICON_BACK: std::sync::LazyLock<&'static [u8]> =
-    std::sync::LazyLock::new(|| icon_png(include_str!("../assets/icons/back.png.b64")));
-/// Shell icons, second batch (IconPark; inventory and sources in
-/// `assets/icons/README.md`): white glyphs colored by tint at draw
-/// time — toolbar slots, showroom zones, folder rows, panel footer.
-static ICON_NAV_HOME: std::sync::LazyLock<&'static [u8]> =
-    std::sync::LazyLock::new(|| icon_png(include_str!("../assets/icons/nav-home.png.b64")));
-static ICON_NAV_SHOW: std::sync::LazyLock<&'static [u8]> =
-    std::sync::LazyLock::new(|| icon_png(include_str!("../assets/icons/nav-show.png.b64")));
-static ICON_NAV_INDEX: std::sync::LazyLock<&'static [u8]> =
-    std::sync::LazyLock::new(|| icon_png(include_str!("../assets/icons/nav-index.png.b64")));
-static ICON_NAV_CONTENT: std::sync::LazyLock<&'static [u8]> =
-    std::sync::LazyLock::new(|| icon_png(include_str!("../assets/icons/nav-content.png.b64")));
-static ICON_NAV_TRASH: std::sync::LazyLock<&'static [u8]> =
-    std::sync::LazyLock::new(|| icon_png(include_str!("../assets/icons/nav-trash.png.b64")));
-static ICON_HOME: std::sync::LazyLock<&'static [u8]> =
-    std::sync::LazyLock::new(|| icon_png(include_str!("../assets/icons/home.png.b64")));
-static ICON_REFRESH: std::sync::LazyLock<&'static [u8]> =
-    std::sync::LazyLock::new(|| icon_png(include_str!("../assets/icons/refresh.png.b64")));
-static ICON_POWER: std::sync::LazyLock<&'static [u8]> =
-    std::sync::LazyLock::new(|| icon_png(include_str!("../assets/icons/power.png.b64")));
-static ICON_GLOBE: std::sync::LazyLock<&'static [u8]> =
-    std::sync::LazyLock::new(|| icon_png(include_str!("../assets/icons/globe.png.b64")));
-static ICON_BOOKSHELF: std::sync::LazyLock<&'static [u8]> = std::sync::LazyLock::new(|| {
-    icon_png(include_str!("../assets/icons/bookshelf.png.b64"))
-});
-static ICON_INBOX: std::sync::LazyLock<&'static [u8]> =
-    std::sync::LazyLock::new(|| icon_png(include_str!("../assets/icons/inbox.png.b64")));
-static ICON_PEOPLES2: std::sync::LazyLock<&'static [u8]> = std::sync::LazyLock::new(|| {
-    icon_png(include_str!("../assets/icons/peoples-two.png.b64"))
-});
-static ICON_FOLDER: std::sync::LazyLock<&'static [u8]> = std::sync::LazyLock::new(|| {
-    icon_png(include_str!("../assets/icons/folder-close.png.b64"))
-});
-static ICON_FOLDER_OPEN: std::sync::LazyLock<&'static [u8]> = std::sync::LazyLock::new(|| {
-    icon_png(include_str!("../assets/icons/folder-open.png.b64"))
-});
-static ICON_ALL_APPS: std::sync::LazyLock<&'static [u8]> = std::sync::LazyLock::new(|| {
-    icon_png(include_str!("../assets/icons/all-application.png.b64"))
-});
-static ICON_FOLDER_PLUS: std::sync::LazyLock<&'static [u8]> = std::sync::LazyLock::new(|| {
-    icon_png(include_str!("../assets/icons/folder-plus.png.b64"))
-});
-static ICON_SPLIT: std::sync::LazyLock<&'static [u8]> =
-    std::sync::LazyLock::new(|| icon_png(include_str!("../assets/icons/split.png.b64")));
-static ICON_UPLOAD: std::sync::LazyLock<&'static [u8]> =
-    std::sync::LazyLock::new(|| icon_png(include_str!("../assets/icons/upload.png.b64")));
-static ICON_CLIPBOARD: std::sync::LazyLock<&'static [u8]> = std::sync::LazyLock::new(|| {
-    icon_png(include_str!("../assets/icons/clipboard.png.b64"))
-});
-static ICON_DOC_ADD: std::sync::LazyLock<&'static [u8]> =
-    std::sync::LazyLock::new(|| icon_png(include_str!("../assets/icons/doc-add.png.b64")));
-
 /// The brand logo (blue Q ribbon), extracted from the product
-/// prototype's top bar and stored as base64 text like the icons
+/// prototype's top bar and stored as base64 text
 /// (assets/logo.png.b64). Drives the shell / login / about image,
 /// the runtime window icon (app_icon) and — via build.rs — the
 /// executable's embedded icon.
@@ -2941,6 +2932,7 @@ fn spawn_local_server(exe: &std::path::Path) -> bool {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        egui_extras::install_image_loaders(&cc.egui_ctx);
         install_system_fonts(&cc.egui_ctx);
         init_i18n();
         apply_modern_style(&cc.egui_ctx);
@@ -4850,39 +4842,20 @@ fn recent_items() -> Vec<Value> {
         .unwrap_or_default()
 }
 
-/// === First-tier shared components (component re-audit 2026-11-23) ==
-/// The prototype's shared components, extracted with the client's
-/// existing rendering as the baseline: extraction must not change
-/// what existing surfaces draw, so Btn's Primary/Default delegate
-/// to the phase-1 buttons below with identical parameters, and the
-/// legacy per-view inline cards stay untouched until their pages
-/// migrate. New surfaces are written with these components only.
-
-/// Btn (A5) — the button system: Primary / Default / Ghost / Danger.
+/// Prototype primary, default and danger controls.
 fn btn_primary(ui: &mut egui::Ui, label: &str) -> egui::Response {
     q_primary_button(ui, label)
 }
 
 fn btn_default(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    q_ghost_button(ui, label)
+    btn_default_enabled(ui, true, label)
 }
 
-fn btn_ghost(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    ui.add(
-        egui::Button::new(egui::RichText::new(label).size(12.5).color(palette_color(TEXT_MAIN)))
-            .fill(egui::Color32::TRANSPARENT)
-            .stroke(egui::Stroke::new(1.0, palette_color(FIELD_BORDER)))
-            .corner_radius(6)
-            .min_size(egui::vec2(0.0, 28.0)),
-    )
-}
-
-fn btn_ghost_enabled(ui: &mut egui::Ui, enabled: bool, label: &str) -> egui::Response {
+fn btn_default_enabled(ui: &mut egui::Ui, enabled: bool, label: &str) -> egui::Response {
     ui.add_enabled(
         enabled,
         egui::Button::new(egui::RichText::new(label).size(12.5).color(palette_color(TEXT_MAIN)))
-            .fill(egui::Color32::TRANSPARENT)
-            .stroke(egui::Stroke::new(1.0, palette_color(FIELD_BORDER)))
+            .fill(palette_color(BTN_BG))
             .corner_radius(6)
             .min_size(egui::vec2(0.0, 28.0)),
     )
@@ -5001,15 +4974,38 @@ fn dashed_rule(ui: &mut egui::Ui) {
 /// row, meta row (below the dashed rule), sub row, action row. The
 /// caller fills the slots in order inside the closure. `selected`
 /// draws the accent outline (the prototype's selected state).
-fn std_card(ui: &mut egui::Ui, selected: bool, add: impl FnOnce(&mut egui::Ui)) {
-    let frame = if selected {
-        card_frame().stroke(egui::Stroke::new(1.5, ACCENT))
-    } else {
-        card_frame()
-    };
+fn standard_card<R>(
+    ui: &mut egui::Ui,
+    selected: bool,
+    scope: Option<egui::Color32>,
+    flush: bool,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<R> {
+    let mut frame = card_frame();
+    if flush {
+        frame = frame.inner_margin(0);
+    }
+    if selected {
+        frame = frame.stroke(egui::Stroke::new(1.5, ACCENT));
+    } else if let Some(color) = scope {
+        frame = frame.stroke(egui::Stroke::new(1.0, color));
+    }
     frame.show(ui, |ui| {
-        ui.vertical(|ui| add(ui));
-    });
+        ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), add).inner
+    })
+}
+
+fn std_card(ui: &mut egui::Ui, selected: bool, add: impl FnOnce(&mut egui::Ui)) {
+    standard_card(ui, selected, None, false, add);
+}
+
+struct WallCard<'a> {
+    width: f32,
+    min_height: f32,
+    title: &'a str,
+    cover: &'a str,
+    selected: bool,
+    scope: Option<egui::Color32>,
 }
 
 /// The meta slot of a StdCard: content below the dashed rule.
@@ -5080,15 +5076,6 @@ fn q_primary_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     )
 }
 
-fn q_ghost_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    ui.add(
-        egui::Button::new(egui::RichText::new(label).size(12.5).color(palette_color(TEXT_MAIN)))
-            .fill(palette_color(BTN_BG))
-            .corner_radius(6)
-            .min_size(egui::vec2(0.0, 28.0)),
-    )
-}
-
 /// Segmented pills: returns the newly selected index when changed.
 fn q_seg_pills(ui: &mut egui::Ui, labels: &[&str], selected: usize) -> Option<usize> {
     let mut changed = None;
@@ -5114,10 +5101,7 @@ fn q_seg_pills(ui: &mut egui::Ui, labels: &[&str], selected: usize) -> Option<us
 impl App {
     fn home_nav_body(&mut self, ui: &mut egui::Ui) {
         for page in [Page::Showroom, Page::Index, Page::Content] {
-            let (name, icon) = page.icon();
-            let texture = self.tex_icon(ui, name, icon);
-            let image = egui::Image::new((texture, egui::vec2(16.0, 16.0)))
-                .tint(palette_color(ICON_TINT));
+            let image = page.icon().image(16.0, palette_color(ICON_TINT));
             let button = egui::Button::image_and_text(image, tr(page.label()))
                 .fill(palette_color(HOVER_BG))
                 .stroke(egui::Stroke::new(1.0, palette_color(FIELD_BORDER)));
@@ -5358,16 +5342,16 @@ impl App {
                     };
                     let card_width = ((width + 12.0) / columns as f32 - 12.0).floor();
                     let actions = [
-                        ("new", "新建索引", "icon-doc-add", *ICON_DOC_ADD),
-                        ("sample", "打开示例项目", "nav-show", *ICON_NAV_SHOW),
-                        ("import", "导入素材…", "icon-upload", *ICON_UPLOAD),
-                        ("template", "从模板新建", "icon-all-apps", *ICON_ALL_APPS),
+                        ("new", "新建索引", ChromeIcon::NewIndex),
+                        ("sample", "打开示例项目", ChromeIcon::Showroom),
+                        ("import", "导入素材…", ChromeIcon::Import),
+                        ("template", "从模板新建", ChromeIcon::Settings),
                     ];
                     ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
                     for row in actions.chunks(columns) {
                         ui.horizontal(|ui| {
-                            for &(key, label, name, icon) in row {
-                                if self.home_action_card(ui, card_width, name, icon, tr(label)) {
+                            for &(key, label, icon) in row {
+                                if self.home_action_card(ui, card_width, icon, tr(label)) {
                                     action = Some(key);
                                 }
                             }
@@ -5488,11 +5472,9 @@ impl App {
         &mut self,
         ui: &mut egui::Ui,
         width: f32,
-        name: &'static str,
-        bytes: &'static [u8],
+        icon: ChromeIcon,
         label: &str,
     ) -> bool {
-        let tex = self.tex_icon(ui, name, bytes);
         let (rect, resp) =
             ui.allocate_exact_size(egui::vec2(width, 66.0), egui::Sense::click());
         let painter = ui.painter();
@@ -5508,12 +5490,7 @@ impl App {
             egui::pos2(rect.min.x + 16.0, rect.center().y - 11.0),
             egui::vec2(22.0, 22.0),
         );
-        painter.image(
-            tex,
-            ir,
-            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-            palette_color(TEXT_MAIN),
-        );
+        icon.image(22.0, palette_color(TEXT_MAIN)).paint_at(ui, ir);
         let font = egui::FontId::new(13.5, egui::FontFamily::Proportional);
         let g = painter.layout_no_wrap(label.to_string(), font, palette_color(TEXT_MAIN));
         painter.galley(
@@ -5738,7 +5715,7 @@ impl App {
                     .color(palette_color(TEXT_FAINT)),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if btn_ghost(ui, tr("刷新")).clicked() {
+                    if btn_default(ui, tr("刷新")).clicked() {
                         retry = true;
                     }
                 });
@@ -5757,7 +5734,7 @@ impl App {
                     if btn_danger(ui, tr("批量彻底删除")).clicked() {
                         batch = Some("purge");
                     }
-                    if btn_ghost(ui, tr("取消选择")).clicked() {
+                    if btn_default(ui, tr("取消选择")).clicked() {
                         batch = Some("clear");
                     }
                 });
@@ -5833,7 +5810,7 @@ impl App {
                                     restore = Some(tid.clone());
                                 }
                                 if !cover_vid.is_empty()
-                                    && btn_ghost(ui, tr("预览")).clicked()
+                                    && btn_default(ui, tr("预览")).clicked()
                                 {
                                     preview = Some(t.clone());
                                 }
@@ -6073,7 +6050,7 @@ impl App {
             // server (and logging in there) plus the on-device
             // offline cache. Identity-bound sections appear after
             // login, per role, as before.
-            return vec!["服务器", "离线缓存"];
+            return vec!["服务器", "离线缓存", "演示偏好"];
         }
         let role = self.role();
         let mut sections: Vec<&str> = vec!["服务器", "个人资料"];
@@ -6094,6 +6071,7 @@ impl App {
             // policy section above stays super-only.
             sections.push("离线缓存");
         }
+        sections.push("演示偏好");
         sections
     }
 
@@ -6994,11 +6972,10 @@ impl App {
     fn icon_button(
         &mut self,
         ui: &mut egui::Ui,
-        name: &'static str,
-        bytes: &'static [u8],
+        icon: ChromeIcon,
         label: &str,
     ) -> bool {
-        self.icon_button_tinted(ui, name, bytes, label, palette_color(ICON_TINT))
+        self.icon_button_tinted(ui, icon, label, palette_color(ICON_TINT))
     }
 
     /// The brand logo at `size` px (shell tool row, login popup,
@@ -7008,8 +6985,7 @@ impl App {
         ui.image((id, egui::vec2(size, size)));
     }
 
-    /// Cache the logo in full color and control glyphs as white alpha masks
-    /// so the painter can apply the current theme's tint.
+    /// Load the brand PNG into the texture cache once per client.
     fn tex_icon(
         &mut self,
         ui: &egui::Ui,
@@ -7041,12 +7017,10 @@ impl App {
     fn icon_button_tinted(
         &mut self,
         ui: &mut egui::Ui,
-        name: &'static str,
-        bytes: &'static [u8],
+        icon: ChromeIcon,
         label: &str,
         tint: egui::Color32,
     ) -> bool {
-        let tex_id = self.tex_icon(ui, name, bytes);
         // craft-ui's IconButton (storytold/craft-libs) with its native
         // interaction model — hover/pressed/focus painting and the
         // accessibility response come from the component; qimu supplies
@@ -7068,14 +7042,7 @@ impl App {
         };
         let resp = craft_ui::buttons::IconButton::new(label, egui::vec2(30.0, 30.0), &style)
             .show(ui, |ui, rect, icon_tint| {
-                let icon_rect =
-                    egui::Rect::from_center_size(rect.center(), egui::vec2(20.0, 20.0));
-                ui.painter().image(
-                    tex_id,
-                    icon_rect,
-                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
-                    icon_tint,
-                );
+                ChromeIcons.paint(ui, icon, rect.center(), 20.0, icon_tint);
             });
         resp.on_hover_text(label).clicked()
     }
@@ -7091,10 +7058,9 @@ impl App {
         ui: &mut egui::Ui,
         active: bool,
         label: &str,
-        name: &'static str,
-        bytes: &'static [u8],
+        icon: ChromeIcon,
     ) -> bool {
-        self.tool_slot_sized(ui, active, label, name, bytes, 26.0).clicked()
+        self.tool_slot_sized(ui, active, label, icon, 26.0).clicked()
     }
 
     fn tool_slot_sized(
@@ -7102,11 +7068,9 @@ impl App {
         ui: &mut egui::Ui,
         active: bool,
         label: &str,
-        name: &'static str,
-        bytes: &'static [u8],
+        icon: ChromeIcon,
         height: f32,
     ) -> egui::Response {
-        let tex_id = self.tex_icon(ui, name, bytes);
         let visuals = |fill: egui::Color32, icon: egui::Color32| {
             craft_ui::buttons::ButtonVisuals {
                 fill,
@@ -7125,14 +7089,7 @@ impl App {
         let resp = craft_ui::buttons::IconButton::new(label, egui::vec2(28.0, height), &style)
             .selected(active)
             .show(ui, |ui, rect, icon_tint| {
-                let icon_rect =
-                    egui::Rect::from_center_size(rect.center(), egui::vec2(15.0, 15.0));
-                ui.painter().image(
-                    tex_id,
-                    icon_rect,
-                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
-                    icon_tint,
-                );
+                ChromeIcons.paint(ui, icon, rect.center(), 15.0, icon_tint);
             });
         resp.on_hover_text(label)
     }
@@ -7143,11 +7100,9 @@ impl App {
     fn small_icon_button(
         &mut self,
         ui: &mut egui::Ui,
-        name: &'static str,
-        bytes: &'static [u8],
+        icon: ChromeIcon,
         label: &str,
     ) -> bool {
-        let tex_id = self.tex_icon(ui, name, bytes);
         let visuals = |fill: egui::Color32| craft_ui::buttons::ButtonVisuals {
             fill,
             stroke: egui::Stroke::NONE,
@@ -7163,14 +7118,7 @@ impl App {
         };
         let resp = craft_ui::buttons::IconButton::new(label, egui::vec2(28.0, 28.0), &style)
             .show(ui, |ui, rect, icon_tint| {
-                let icon_rect =
-                    egui::Rect::from_center_size(rect.center(), egui::vec2(15.0, 15.0));
-                ui.painter().image(
-                    tex_id,
-                    icon_rect,
-                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
-                    icon_tint,
-                );
+                ChromeIcons.paint(ui, icon, rect.center(), 15.0, icon_tint);
             });
         resp.on_hover_text(label).clicked()
     }
@@ -7258,18 +7206,23 @@ impl App {
                 };
                 if self.icon_button_tinted(
                     ui,
-                    "icon-download",
-                    *ICON_DOWNLOAD,
+                    ChromeIcon::Download,
                     cache_label,
                     cache_tint,
                 ) {
                     act = Some("cache");
                 }
-                if self.icon_button(ui, "icon-export", *ICON_EXPORT, "导出") {
+                if self.icon_button(ui, ChromeIcon::Export, "导出") {
                     act = Some("export");
                 }
-                if self.icon_button(ui, "icon-play", *ICON_PLAY, "开始演示") {
+                if self.icon_button(ui, ChromeIcon::Play, "开始演示") {
                     act = Some("play");
+                }
+                if ChromeIcons.tool(ui, ChromeIcon::Presenter, "演示者视图", true, false, true).clicked() {
+                    act = Some("presenter");
+                }
+                if ChromeIcons.tool(ui, ChromeIcon::Reading, "普通视图", true, false, true).clicked() {
+                    act = Some("reading");
                 }
             });
         });
@@ -7297,17 +7250,6 @@ impl App {
         if text_action(ui, "用系统应用打开", palette_color(TEXT_WEAK), 11.5) {
             self.present_showroom(&s(&item, "id"), &s(&item, "title"));
         }
-        // DeckCraft views (present handoff): the reading view and
-        // the presenter view live in DeckCraft; qimu only exports
-        // (with notes), jumps and takes the return.
-        ui.horizontal(|ui| {
-            if ui.small_button("普通视图（DeckCraft）").clicked() {
-                act = Some("reading");
-            }
-            if ui.small_button("演示者视图（DeckCraft）").clicked() {
-                act = Some("presenter");
-            }
-        });
         // PDF export (Q21): whole deck in the three DeckCraft forms.
         // The single-page variant lives in the page preview window
         // below. Anonymous (guest) sessions take the same path — the
@@ -7418,11 +7360,6 @@ impl App {
                 };
             }
             ui.label(egui::RichText::new(format!("{} 页", st.pages.len())).color(palette_color(TEXT_WEAK)));
-            let mut auto_quit = self.dc_auto_quit;
-            if ui.checkbox(&mut auto_quit, "放映结束自动关闭 DeckCraft").changed() {
-                self.dc_auto_quit = auto_quit;
-                save_dc_auto_quit(auto_quit);
-            }
             if ui
                 .add_enabled(st.selected_page.is_some(), egui::Button::new("预览所选页"))
                 .clicked()
@@ -7603,7 +7540,7 @@ impl App {
                         "暂无收藏",
                         |app, ui, e, width| {
                             let cover = app.showroom_cover(&s(e, "item_id"));
-                            app.showroom_card(ui, width, &s(e, "title"), &cover, |app, ui| {
+                            app.showroom_card(ui, width, &s(e, "title"), &cover, false, |app, ui| {
                                 let folder = s(&e, "folder");
                                 if !folder.is_empty() {
                                     ui.label(egui::RichText::new(folder).small().weak());
@@ -7669,7 +7606,7 @@ impl App {
                         &self.cache_entries.clone(),
                         "暂无缓存",
                         |app, ui, e, width| {
-                            app.showroom_card(ui, width, &s(e, "title"), "", |app, ui| {
+                            app.showroom_card(ui, width, &s(e, "title"), "", false, |app, ui| {
                                 ui.label(format!(
                                     "{} 页 · {}",
                                     i(&e, "page_count"),
@@ -7693,7 +7630,7 @@ impl App {
                         &self.my_assemblies.clone(),
                         "暂无组装",
                         |app, ui, a, width| {
-                            app.showroom_card(ui, width, &s(a, "name"), "", |app, ui| {
+                            app.showroom_card(ui, width, &s(a, "name"), "", false, |app, ui| {
                                 ui.label(format!(
                                     "{} 个条目 · {}",
                                     i(&a, "entry_count"),
@@ -7755,7 +7692,7 @@ impl App {
                 .library_refs
                 .iter()
                 .any(|entry| entry["item_id"] == item["item_id"]);
-        let cover_response = self.showroom_card(ui, width, &title, &cover, |app, ui| {
+        let cover_response = self.showroom_card(ui, width, &title, &cover, false, |app, ui| {
             ui.label(
                 egui::RichText::new(format!(
                     "{} · {}",
@@ -8399,7 +8336,7 @@ impl App {
                         {
                             confirm_reject = true;
                         }
-                        if btn_ghost(ui, tr("取消")).clicked() {
+                        if btn_default(ui, tr("取消")).clicked() {
                             cancel_reject = true;
                         }
                     });
@@ -8520,7 +8457,7 @@ impl App {
         let title = s(item, "title");
         let cover = self.showroom_cover(&id);
         let selected = self.showroom.selected_card.as_deref() == Some(id.as_str());
-        let cover_rect = self.showroom_card(ui, width, &title, &cover, |app, ui| {
+        let cover_rect = self.showroom_card(ui, width, &title, &cover, selected, |app, ui| {
             let intro = s(item, "intro");
             if !intro.is_empty() {
                 ui.add(egui::Label::new(egui::RichText::new(intro).small().weak()).truncate());
@@ -8547,7 +8484,7 @@ impl App {
                     } else {
                         "缓存到本地"
                     };
-                    if app.tool_slot(ui, cached, label, "icon-download", *ICON_DOWNLOAD) {
+                    if app.tool_slot(ui, cached, label, ChromeIcon::Download) {
                         app.cache_showroom_deck(item);
                     }
                 }
@@ -8574,14 +8511,6 @@ impl App {
                 s(item, "submitted_by"),
                 fmt_time(i(item, "created_ms"))
             ));
-        if selected {
-            ui.painter().rect_stroke(
-                cover_rect,
-                6.0,
-                egui::Stroke::new(2.0, ACCENT),
-                egui::StrokeKind::Inside,
-            );
-        }
         if response.clicked() {
             self.showroom.selected_card = Some(id);
         }
@@ -8628,49 +8557,36 @@ impl App {
         width: f32,
         title: &str,
         cover: &str,
+        selected: bool,
         body: impl FnOnce(&mut Self, &mut egui::Ui),
     ) -> egui::Rect {
-        ui.vertical(|ui| {
-            card_frame_flush()
-                .show(ui, |ui| {
-                    ui.set_width(width);
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    let cover_rect = ui
-                        .allocate_ui(egui::vec2(width, width * 9.0 / 16.0), |ui| {
-                            if cover.is_empty() {
-                                let (rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(width, width * 9.0 / 16.0),
-                                    egui::Sense::hover(),
-                                );
-                                ui.painter().rect_filled(rect, 0.0, palette_color(HOVER_BG));
-                                ui.painter().text(
-                                    rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    "PPT",
-                                    egui::FontId::proportional(17.0),
-                                    palette_color(TEXT_WEAK),
-                                );
-                            } else {
-                                self.thumb_ui(ui, cover, 0, width);
-                            }
-                        })
-                        .response
-                        .rect;
-                    egui::Frame::NONE
-                        .inner_margin(egui::Margin::symmetric(12, 10))
-                        .show(ui, |ui| {
-                            ui.spacing_mut().item_spacing = egui::vec2(6.0, 5.0);
-                            ui.add(
-                                egui::Label::new(egui::RichText::new(title).strong().size(13.0))
-                                    .truncate(),
-                            );
-                            body(self, ui);
-                        });
-                    cover_rect
-                })
-                .inner
+        self.wall_card(ui, WallCard { width, min_height: 0.0, title, cover, selected, scope: None }, body).inner
+    }
+
+    fn wall_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        card: WallCard<'_>,
+        body: impl FnOnce(&mut Self, &mut egui::Ui),
+    ) -> egui::InnerResponse<egui::Rect> {
+        standard_card(ui, card.selected, card.scope, true, |ui| {
+            ui.set_width(card.width);
+            ui.set_min_height(card.min_height);
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let cover_rect = ui.allocate_ui(egui::vec2(card.width, card.width * 9.0 / 16.0), |ui| {
+                if card.cover.is_empty() {
+                    slide_cover(ui, None, "", "", "", card.width);
+                } else {
+                    self.thumb_ui(ui, card.cover, 0, card.width);
+                }
+            }).response.rect;
+            egui::Frame::NONE.inner_margin(egui::Margin::symmetric(12, 10)).show(ui, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(8.0, 5.0);
+                ui.add(egui::Label::new(egui::RichText::new(card.title).strong().size(13.0)).truncate());
+                body(self, ui);
+            });
+            cover_rect
         })
-        .inner
     }
 
     fn act_import_split(&mut self) {
@@ -8771,6 +8687,7 @@ impl App {
         // forbid. A placeholder wall frame sits in the taken
         // frame's place meanwhile — it is never rendered; the
         // taken frame is what gets drawn.
+        let depth = self.content.stack.depth();
         let mut frame = self
             .content
             .stack
@@ -8790,12 +8707,22 @@ impl App {
                 false
             }
         };
-        if closed {
-            // Drop the taken frame and pop the placeholder:
-            // the stack is back at the wall.
-            self.content.stack.pop();
-        } else {
-            self.content.stack.replace_top(frame);
+        if matches!(self.content.stack.top(), ContentFrame::Unit(_)) {
+            // Opening from the wall pushed a detail above the placeholder.
+            // Restore the wall itself, including its search and selection.
+            if let ContentFrame::Wall(mut wall) = frame {
+                let root = self.content.stack.root_mut();
+                if let ContentFrame::Wall(placeholder) = root {
+                    wall.selected = placeholder.selected.take().or(wall.selected);
+                }
+                *root = ContentFrame::Wall(wall);
+            }
+        } else if self.content.stack.depth() == depth {
+            if closed {
+                self.content.stack.pop();
+            } else {
+                self.content.stack.replace_top(frame);
+            }
         }
     }
 
@@ -8893,97 +8820,72 @@ impl App {
                         .and_then(|r| r.get("latest"))
                         .cloned()
                         .unwrap_or(Value::Null);
-                    let outer = ui.allocate_ui(egui::vec2(card_w, card_h), |ui| {
-                        let _resp = ui
-                            .with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
-                                card_frame_flush().show(ui, |ui| {
-                            ui.set_min_size(egui::vec2(card_w, card_h));
+                    let title = s(&unit, "name");
+                    let cover = s(&latest, "id");
+                    let outer = self.wall_card(ui, WallCard {
+                        width: card_w, min_height: card_h, title: &title, cover: &cover,
+                        selected: w.selected.as_deref() == Some(uid.as_str()), scope: None,
+                    }, |app, ui| {
+                        ui.horizontal(|ui| {
                             if latest.is_object() {
-                                let vid = s(&latest, "id");
-                                self.thumb_ui(ui, &vid, 0, card_w);
+                                chip(
+                                    ui,
+                                    &format!("v{}", s(&latest, "semver")),
+                                    palette_color(ACCENT_DEEP),
+                                    CHIP_BLUE_BG,
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{} 页",
+                                        i(&latest, "page_count")
+                                    ))
+                                    .small()
+                                    .color(palette_color(TEXT_WEAK)),
+                                );
                             } else {
-                                ui.allocate_space(egui::vec2(card_w, cover_h));
+                                ui.label(
+                                    egui::RichText::new("暂无版本")
+                                        .small()
+                                        .color(palette_color(TEXT_WEAK)),
+                                );
                             }
-                            egui::Frame::NONE
-                                .inner_margin(egui::Margin {
-                                    left: 12,
-                                    right: 12,
-                                    top: 10,
-                                    bottom: 11,
-                                })
-                                .show(ui, |ui| {
-                                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 5.0);
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
                                     ui.label(
-                                        egui::RichText::new(s(&unit, "name"))
-                                            .strong()
-                                            .size(13.0)
-                                            .color(palette_color(TEXT_MAIN)),
+                                        egui::RichText::new(format!(
+                                            "{} · {}",
+                                            app.folder_name(
+                                                unit.get("folder_id")
+                                                    .and_then(|x| x.as_str())
+                                                    .unwrap_or("")
+                                            ),
+                                            s(&unit, "maintainer")
+                                        ))
+                                        .small()
+                                        .color(palette_color(TEXT_WEAK)),
                                     );
-                                    ui.add_space(5.0);
-                                    ui.horizontal(|ui| {
-                                        if latest.is_object() {
-                                            chip(
-                                                ui,
-                                                &format!("v{}", s(&latest, "semver")),
-                                                palette_color(ACCENT_DEEP),
-                                                CHIP_BLUE_BG,
-                                            );
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "{} 页",
-                                                    i(&latest, "page_count")
-                                                ))
-                                                .small()
-                                                .color(palette_color(TEXT_WEAK)),
-                                            );
-                                        } else {
-                                            ui.label(
-                                                egui::RichText::new("暂无版本")
-                                                    .small()
-                                                    .color(palette_color(TEXT_WEAK)),
-                                            );
-                                        }
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                ui.label(
-                                                    egui::RichText::new(format!(
-                                                        "{} · {}",
-                                                        self.folder_name(
-                                                            unit.get("folder_id")
-                                                                .and_then(|x| x.as_str())
-                                                                .unwrap_or("")
-                                                        ),
-                                                        s(&unit, "maintainer")
-                                                    ))
-                                                    .small()
-                                                    .color(palette_color(TEXT_WEAK)),
-                                                );
-                                            },
-                                        );
-                                    });
-                                    if matches!(self.pick, Some(PickState::Insert { .. })) {
-                                        ui.add_space(8.0);
-                                        if ui
-                                            .add_sized(
-                                                [72.0, 28.0],
-                                                egui::Button::new(
-                                                    egui::RichText::new("插入")
-                                                        .size(13.0)
-                                                        .color(egui::Color32::WHITE),
-                                                )
-                                                .fill(ACCENT)
-                                                .corner_radius(6),
-                                            )
-                                            .clicked()
-                                        {
-                                            self.insert_pick_unit(&item);
-                                        }
-                                    }
-                                });
-                                })
-                            })
-                            .inner;
+                                },
+                            );
+                        });
+                        if matches!(app.pick, Some(PickState::Insert { .. })) {
+                            ui.add_space(8.0);
+                            if ui
+                                .add_sized(
+                                    [72.0, 28.0],
+                                    egui::Button::new(
+                                        egui::RichText::new("插入")
+                                            .size(13.0)
+                                            .color(egui::Color32::WHITE),
+                                    )
+                                    .fill(ACCENT)
+                                    .corner_radius(6),
+                                )
+                                .clicked()
+                            {
+                                app.insert_pick_unit(&item);
+                            }
+                        }
                     });
                     // Click handling rides on an explicit interact over
                     // the card rect: allocate_ui's own response carries no
@@ -8993,17 +8895,9 @@ impl App {
                     // contract as the web prototype.
                     let click = ui.interact(
                         outer.response.rect,
-                        egui::Id::new(("unit_card", &uid)),
+                        egui::Id::unique(("unit_card", &uid)),
                         egui::Sense::click(),
                     );
-                    if w.selected.as_deref() == Some(uid.as_str()) {
-                        ui.painter().rect_stroke(
-                            outer.response.rect,
-                            6.0,
-                            egui::Stroke::new(1.5, ACCENT),
-                            egui::StrokeKind::Middle,
-                        );
-                    }
                     if click.double_clicked() {
                         if self.pick.is_none() {
                             self.open_unit_detail(&uid);
@@ -9211,6 +9105,7 @@ impl App {
                                         unit_name: s(&unit, "name"),
                                         semver: s(v, "semver"),
                                         page_count: pages,
+                                        original_page_count: pages,
                                         page: 0,
                                         base: Default::default(),
                                         work: Default::default(),
@@ -9223,6 +9118,8 @@ impl App {
                                         slide_cx: 12192000,
                                         slide_cy: 6858000,
                                         sel: None,
+                                        selection: Default::default(),
+                                        preview: Default::default(),
                                         drag: None,
                                         undo: Vec::new(),
                                         redo: Vec::new(),
@@ -9665,7 +9562,7 @@ impl App {
             Delete(String, String),
         }
         let mut action: Option<Act> = None;
-        let all_icon = self.tex_icon(ui, "all-application", *ICON_ALL_APPS);
+        let all_icon = ChromeIcon::Settings;
         if tree_row(ui, selected.is_none(), 0.0, Some(all_icon), "全部", 12.5).clicked() {
             *selected = None;
         }
@@ -9717,9 +9614,9 @@ impl App {
             } else {
                 let is_sel = selected.as_deref() == Some(fid.as_str());
                 let ficon = if is_sel {
-                    self.tex_icon(ui, "folder-open", *ICON_FOLDER_OPEN)
+                    ChromeIcon::FolderOpen
                 } else {
-                    self.tex_icon(ui, "folder-close", *ICON_FOLDER)
+                    ChromeIcon::Folder
                 };
                 let resp = tree_row(
                     ui,
@@ -10078,7 +9975,7 @@ impl App {
                         if b.clicked() {
                             confirmed = true;
                         }
-                        if btn_ghost(ui, tr("取消")).clicked() {
+                        if btn_default(ui, tr("取消")).clicked() {
                             cancelled = true;
                         }
                     });
@@ -10200,7 +10097,7 @@ impl App {
                         {
                             create = true;
                         }
-                        if btn_ghost(ui, tr("取消")).clicked() {
+                        if btn_default(ui, tr("取消")).clicked() {
                             cancelled = true;
                         }
                     });
@@ -10571,7 +10468,7 @@ impl App {
                     pe.work.insert(page, runs);
                     if let Some(els) = v.get("elements").and_then(|x| x.as_array()) {
                         let list: Vec<ElWork> =
-                            els.iter().map(elwork_from_json).collect();
+                            read_elements(els);
                         pe.elems.insert(page, list.clone());
                         pe.elems_base.insert(page, list);
                         pe.slide_cx = i(&v, "slide_cx");
@@ -10593,13 +10490,16 @@ impl App {
         }
         while pe.scripts.len() < pe.page_count {
             pe.scripts.push(String::new());
-            pe.scripts_base.push(String::new());
         }
         let v2 = pe.elems.contains_key(&pe.page);
         let mut close = false;
         let mut save = false;
         let mut undo_req = false;
         let mut redo_req = false;
+        let mut nav = None;
+        let mut add_page = false;
+        let mut add_element = None;
+        let mut alignment = None;
         // Set when a control gains focus (text/drag fields snapshot
         // on the gain frame, before any character changes) or when
         // the inspector's clone is about to be committed.
@@ -10644,6 +10544,26 @@ impl App {
                         {
                             redo_req = true;
                         }
+                        ui.add_enabled_ui(v2, |ui| {
+                            ui.menu_button(tr("添加元素"), |ui| {
+                                for (kind, label) in [("text", "文本"), ("shape", "形状"), ("line", "线条"), ("picture", "图片")] {
+                                    if ui.button(tr(label)).clicked() {
+                                        add_element = Some(kind);
+                                        ui.close();
+                                    }
+                                }
+                            });
+                        });
+                        ui.add_enabled_ui(pe.can_align(), |ui| {
+                            ui.menu_button(tr("多选对齐"), |ui| {
+                                for (direction, label) in ALIGNMENTS {
+                                    if ui.button(tr(label)).clicked() {
+                                        alignment = Some(*direction);
+                                        ui.close();
+                                    }
+                                }
+                            });
+                        });
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
@@ -10657,30 +10577,35 @@ impl App {
                     ui.add_space(8.0);
                     ui.separator();
                     ui.horizontal_top(|ui| {
-                        // Page rail.
-                        egui::ScrollArea::vertical()
-                            .max_width(124.0)
-                            .show(ui, |ui| {
-                                for pno in 0..pe.page_count {
-                                    if self.thumb_button(
-                                        ui,
-                                        &pe.version_id.clone(),
-                                        pno,
-                                        104.0,
-                                        pno == pe.page,
-                                    ) {
-                                        pe.page = pno;
-                                        pe.sel = None;
-                                        pe.drag = None;
+                        ui.vertical(|ui| {
+                            if btn_default_enabled(ui, pe.added_pages() < 100, tr("＋ 加页")).clicked() {
+                                add_page = true;
+                            }
+                            egui::ScrollArea::vertical()
+                                .id_salt("editor-page-rail")
+                                .max_width(124.0)
+                                .max_height((screen.height() - 176.0).max(132.0))
+                                .show(ui, |ui| {
+                                    for pno in 0..pe.page_count {
+                                        let clicked = if pno < pe.original_page_count {
+                                            self.thumb_button(ui, &pe.version_id, pno, 104.0, pno == pe.page)
+                                        } else {
+                                            ui.add_sized([104.0, 58.0], egui::Button::new(format!("{} {}", tr("第"), pno + 1))
+                                                .selected(pno == pe.page)).clicked()
+                                        };
+                                        if clicked {
+                                            nav = Some(pno);
+                                        }
                                     }
-                                }
-                            });
+                                });
+                        });
                         ui.separator();
                         // Center: the stage with element boxes (v2) or
                         // the v1 thumbnail + flat run editors.
                         if v2 {
                             ui.vertical(|ui| {
                                 self.page_edit_stage(ui, &mut pe);
+                                pe.preview.status(ui);
                                 ui.add_space(8.0);
                                 let hint = match pe.sel.and_then(|s| {
                                     pe.elems
@@ -10696,7 +10621,7 @@ impl App {
                                             el.name.as_str()
                                         }
                                     ),
-                                    None => tr("点选画布上的元素进行编辑；拖动移动，拖右下角改大小。")
+                                    None => tr("点选元素，按住 Ctrl 或 Shift 多选。")
                                         .to_string(),
                                 };
                                 ui.label(
@@ -10759,7 +10684,10 @@ impl App {
                         // speaker notes for both.
                         ui.vertical(|ui| {
                             ui.set_width(if v2 { 308.0 } else { 210.0 });
-                            egui::ScrollArea::vertical().show(ui, |ui| {
+                            egui::ScrollArea::vertical()
+                                .id_salt("editor-inspector")
+                                .max_height((screen.height() - 176.0).max(132.0))
+                                .show(ui, |ui| {
                                 ui.label(
                                     egui::RichText::new(format!(
                                         "{} {} / {} {}",
@@ -10825,9 +10753,7 @@ impl App {
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
                                 ui.add_space(14.0);
-                                let can_save = !pe.legacy_edits().is_empty()
-                                    || !pe.ops().is_empty()
-                                    || pe.scripts != pe.scripts_base;
+                                let can_save = pe.dirty();
                                 if ui
                                     .add_enabled(
                                         can_save,
@@ -10837,7 +10763,7 @@ impl App {
                                 {
                                     save = true;
                                 }
-                                if btn_ghost(ui, tr("取消")).clicked() {
+                                if btn_default(ui, tr("取消")).clicked() {
                                     close = true;
                                 }
                             },
@@ -10877,9 +10803,27 @@ impl App {
                 }
             }
         }
-        if let Some(s) = sel_req {
-            pe.sel = s;
+        if let Some(selection) = sel_req {
+            pe.select_element(selection, ui.input(|input| input.modifiers.command || input.modifiers.ctrl || input.modifiers.shift));
         }
+        if let Some(page) = nav {
+            pe.page = page;
+            pe.select_element(None, false);
+            pe.drag = None;
+        }
+        if add_page {
+            pe.add_page();
+        }
+        if let Some(kind) = add_element {
+            let picture = if kind == "picture" { pick_editor_picture() } else { None };
+            if kind != "picture" || picture.is_some() {
+                pe.add_element(kind, picture);
+            }
+        }
+        if let Some(direction) = alignment {
+            pe.align(direction);
+        }
+        self.update_page_edit_preview(ui.ctx(), &mut pe);
         if undo_req {
             pe.do_undo();
         }
@@ -10901,16 +10845,17 @@ impl App {
         }
         if save {
             let edits = pe.legacy_edits();
-            let ops = pe.ops();
-            let mut target_vid = pe.version_id.clone();
+            let ops = pe.page_ops(None);
             let mut new_semver = String::new();
-            if !edits.is_empty() || !ops.is_empty() {
+            if !edits.is_empty() || !ops.is_empty() || pe.added_pages() > 0 {
                 let bump = ["major", "minor", "patch"][pe.bump];
                 let payload = json!({
                     "edits": edits.iter().map(|(p, r, t)| json!({
                         "page": p, "run": r, "text": t,
                     })).collect::<Vec<_>>(),
                     "ops": ops,
+                    "added_pages": pe.added_pages(),
+                    "scripts": pe.scripts,
                     "bump": bump,
                     "note": pe.note,
                 });
@@ -10921,7 +10866,6 @@ impl App {
                 ) {
                     Ok(v) => {
                         let ver = v.get("version").cloned().unwrap_or(json!({}));
-                        target_vid = s(&ver, "id");
                         new_semver = s(&ver, "semver");
                     }
                     Err(e) => {
@@ -10929,11 +10873,10 @@ impl App {
                         return Some(Overlay::PageEdit(pe));
                     }
                 }
-            }
-            if pe.scripts != pe.scripts_base {
+            } else if pe.scripts != pe.scripts_base {
                 if let Err(e) = self.call(
                     "PUT",
-                    &format!("/v1/versions/{target_vid}/scripts"),
+                    &format!("/v1/versions/{}/scripts", pe.version_id),
                     Some(json!({ "scripts": pe.scripts })),
                 ) {
                     self.msg = format!("讲稿保存失败：{e}");
@@ -10958,148 +10901,89 @@ impl App {
         Some(Overlay::PageEdit(pe))
     }
 
-    /// The v2 editor stage: the rendered slide with one selectable
-    /// box per element. Click selects; dragging a box moves the
-    /// element; dragging its bottom-right handle resizes it. The
-    /// slide image is the server's render of the OPENED version —
-    /// pending edits show as box geometry only, until save.
     fn page_edit_stage(&mut self, ui: &mut egui::Ui, pe: &mut PageEditState) {
         let page = pe.page;
-        let vid = pe.version_id.clone();
-        let scx = pe.slide_cx.max(1) as f32;
-        let scy = pe.slide_cy.max(1) as f32;
-        let w = 620.0f32;
-        let h = w * scy / scx;
-        let (rect, resp) =
-            ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click_and_drag());
-        if let Some(tex) = self.thumb(&vid, page) {
-            ui.painter().image(
-                tex.id(),
-                rect,
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                egui::Color32::WHITE,
-            );
+        let width = (ui.ctx().content_rect().width() - 480.0).clamp(300.0, 850.0);
+        let height = width * pe.slide_cy.max(1) as f32 / pe.slide_cx.max(1) as f32;
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click_and_drag());
+        let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+        let picture = pe.preview.texture(page).or_else(|| {
+            (page < pe.original_page_count).then(|| self.thumb(&pe.version_id, page)).flatten()
+        });
+        if let Some(texture) = picture {
+            painter.image(texture.id(), rect, egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
         } else {
-            ui.painter().rect_filled(rect, 0.0, palette_color(HOVER_BG));
-            ui.painter().text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                format!("第 {} 页", page + 1),
-                egui::FontId::proportional(13.0),
-                palette_color(TEXT_WEAK),
-            );
+            painter.rect_filled(rect, 0.0, if page >= pe.original_page_count { egui::Color32::WHITE } else { palette_color(HOVER_BG) });
         }
-        let k = w / scx; // screen points per EMU
-        let elems = pe.elems.get(&page).cloned().unwrap_or_default();
-        let to_rect = |el: &ElWork| {
-            egui::Rect::from_min_size(
-                rect.min + egui::vec2(el.x as f32 * k, el.y as f32 * k),
-                egui::vec2((el.cx as f32 * k).max(2.0), (el.cy as f32 * k).max(2.0)),
-            )
+        let elements = pe.elems.get(&page).map(Vec::as_slice).unwrap_or(&[]);
+        let scale = width / pe.slide_cx.max(1) as f32;
+        let root = StageTransform {
+            origin: rect.min, x_axis: egui::vec2(scale, 0.0), y_axis: egui::vec2(0.0, scale),
         };
-        for (idx, el) in elems.iter().enumerate() {
-            let r = to_rect(el);
-            let selected = pe.sel == Some(idx);
-            ui.painter().rect_stroke(
-                r,
-                0.0,
-                egui::Stroke::new(
-                    if selected { 1.8 } else { 1.0 },
-                    if selected { ACCENT } else { palette_color(TEXT_FAINT) },
-                ),
-                egui::StrokeKind::Middle,
-            );
-            if selected {
-                let handle = egui::Rect::from_min_size(
-                    r.max - egui::vec2(9.0, 9.0),
-                    egui::vec2(9.0, 9.0),
+        let transforms = stage_transforms(elements, root);
+        let bounds: Vec<_> = elements.iter().zip(&transforms)
+            .map(|(element, transform)| transform.project(element)).collect();
+        let handle = |element: egui::Rect| egui::Rect::from_min_size(
+            element.max - egui::vec2(9.0, 9.0), egui::vec2(9.0, 9.0),
+        );
+        for (index, area) in bounds.iter().copied().enumerate() {
+            let selected = pe.selection.contains(&index);
+            if elements[index].has_xfrm {
+                painter.rect_stroke(
+                    area, 0.0, egui::Stroke::new(
+                        if selected { 1.8 } else { 0.6 },
+                        if selected { ACCENT } else { palette_color(TEXT_FAINT).gamma_multiply(0.55) },
+                    ), egui::StrokeKind::Middle,
                 );
-                ui.painter().rect_filled(handle, 0.0, ACCENT);
-            }
-            if el.new_image.is_some() {
-                ui.painter().text(
-                    r.min + egui::vec2(4.0, 4.0),
-                    egui::Align2::LEFT_TOP,
-                    tr("图片已替换（待保存）"),
-                    egui::FontId::proportional(11.0),
-                    ACCENT,
-                );
-            }
-        }
-        let pointer = resp.interact_pointer_pos();
-        if resp.drag_started() {
-            if let Some(pos) = pointer {
-                let mut target: Option<(usize, bool)> = None;
-                if let Some(si) = pe.sel {
-                    if let Some(el) = elems.get(si) {
-                        let r = to_rect(el);
-                        let handle = egui::Rect::from_min_size(
-                            r.max - egui::vec2(11.0, 11.0),
-                            egui::vec2(11.0, 11.0),
-                        );
-                        if handle.contains(pos) && el.has_xfrm {
-                            target = Some((si, true));
-                        }
-                    }
-                }
-                if target.is_none() {
-                    for (idx, el) in elems.iter().enumerate().rev() {
-                        if to_rect(el).contains(pos) {
-                            pe.sel = Some(idx);
-                            if el.has_xfrm {
-                                target = Some((idx, false));
-                            }
-                            break;
-                        }
-                    }
-                }
-                if let Some((idx, resize)) = target {
-                    let el = &elems[idx];
-                    // Snapshot BEFORE the drag mutates anything.
-                    pe.push_undo();
-                    pe.drag = Some(ElDrag {
-                        el: idx,
-                        resize,
-                        start_pos: pos,
-                        x: el.x,
-                        y: el.y,
-                        cx: el.cx,
-                        cy: el.cy,
-                    });
+                if pe.sel == Some(index) && pe.selection.len() == 1 {
+                    painter.rect_filled(handle(area), 0.0, ACCENT);
                 }
             }
         }
-        if resp.dragged() {
-            if let (Some(d), Some(pos)) = (pe.drag, pointer) {
-                let dx = ((pos.x - d.start_pos.x) / k) as i64;
-                let dy = ((pos.y - d.start_pos.y) / k) as i64;
-                if let Some(list) = pe.elems.get_mut(&page) {
-                    if let Some(el) = list.get_mut(d.el) {
-                        if d.resize {
-                            el.cx = (d.cx + dx).max(20000);
-                            el.cy = (d.cy + dy).max(20000);
-                        } else {
-                            el.x = d.x + dx;
-                            el.y = d.y + dy;
-                        }
+        let Some(pointer) = response.interact_pointer_pos() else {
+            if response.drag_stopped() { pe.drag = None; }
+            return;
+        };
+        let hit = || bounds.iter().enumerate().rev().find(|(index, area)| {
+            elements[*index].has_xfrm && area.contains(pointer)
+        }).map(|(index, _)| index);
+        if response.drag_started() {
+            let resize = pe.sel.filter(|&index| {
+                pe.selection.len() == 1 && bounds.get(index).is_some_and(|area| handle(*area).expand(2.0).contains(pointer))
+            });
+            if let Some(index) = resize.or_else(hit) {
+                let element = &elements[index];
+                let drag = ElDrag {
+                    el: index,
+                    resize: resize.is_some(),
+                    start_pos: pointer,
+                    transform: transforms[index],
+                    x: element.x, y: element.y, cx: element.cx, cy: element.cy,
+                };
+                pe.select_element(Some(index), false);
+                pe.push_undo();
+                pe.drag = Some(drag);
+            }
+        } else if response.clicked() {
+            let extend = ui.input(|input| input.modifiers.command || input.modifiers.ctrl || input.modifiers.shift);
+            pe.select_element(hit(), extend);
+        }
+        if response.dragged() {
+            if let Some(drag) = pe.drag {
+                let delta = drag.transform.world_delta(pointer - drag.start_pos);
+                if let Some(element) = pe.elems.get_mut(&page).and_then(|items| items.get_mut(drag.el)) {
+                    if drag.resize {
+                        element.cx = (drag.cx + delta.x as i64).max(20_000);
+                        element.cy = (drag.cy + delta.y as i64).max(20_000);
+                    } else {
+                        element.x = drag.x + delta.x as i64;
+                        element.y = drag.y + delta.y as i64;
                     }
                 }
             }
         }
-        if resp.drag_stopped() {
+        if response.drag_stopped() {
             pe.drag = None;
-        }
-        if resp.clicked() {
-            if let Some(pos) = pointer {
-                let mut hit = None;
-                for (idx, el) in elems.iter().enumerate().rev() {
-                    if to_rect(el).contains(pos) {
-                        hit = Some(idx);
-                        break;
-                    }
-                }
-                pe.sel = hit;
-            }
         }
     }
 
@@ -11557,102 +11441,61 @@ impl App {
                         let xid = s(&x, "id");
                         let selected = ov.selected.as_deref() == Some(xid.as_str());
                         let scope_color = IndexScope::of(&x).color();
-                        let resp = ui.allocate_ui(egui::vec2(card_w, card_h), |ui| {
-                            ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
-                                egui::Frame::NONE
-                                    .fill(palette_color(CARD_BG))
-                                    .corner_radius(6)
-                                    .stroke(egui::Stroke::new(1.0, scope_color))
-                                    .show(ui, |ui| {
-                                        ui.set_min_size(egui::vec2(card_w, card_h));
-                                        ui.set_max_width(card_w);
-                                        ui.spacing_mut().item_spacing.y = 0.0;
-                                        let cover = self
-                                            .index_covers
-                                            .get(&xid)
-                                            .cloned()
-                                            .unwrap_or_default();
-                                        if !cover.is_empty() {
-                                            self.thumb_ui(ui, &cover, 0, card_w);
-                                        } else {
-                                            let (rect, _) = ui.allocate_exact_size(
-                                                egui::vec2(card_w, cover_h),
-                                                egui::Sense::hover(),
-                                            );
-                                            ui.painter().rect_filled(rect, 0.0, palette_color(HOVER_BG));
-                                        }
-                                        egui::Frame::NONE
-                                            .inner_margin(egui::Margin {
-                                                left: 12,
-                                                right: 12,
-                                                top: 10,
-                                                bottom: 11,
-                                            })
-                                            .show(ui, |ui| {
-                                                ui.spacing_mut().item_spacing =
-                                                    egui::vec2(8.0, 5.0);
-                                                ui.add(
-                                                    egui::Label::new(
-                                                        egui::RichText::new(s(&x, "name"))
-                                                            .strong()
-                                                            .size(13.0),
-                                                    )
-                                                    .truncate(),
-                                                );
-                                                ui.horizontal(|ui| {
-                                                    if let Some(tag) = self.index_tags.get(&xid) {
-                                                        chip(
-                                                            ui,
-                                                            &format!("V{tag}"),
-                                                            palette_color(ACCENT_DEEP),
-                                                            CHIP_BLUE_BG,
-                                                        );
-                                                    }
-                                                    // 主索引 capsule: this index is
-                                                    // its home folder's designated
-                                                    // main index (spec §3.10).
-                                                    let home = s(&x, "folder_id");
-                                                    let is_main = !home.is_empty()
-                                                        && self.folders.iter().any(|f| {
-                                                            s(f, "id") == home
-                                                                && s(f, "main_index_id") == xid
-                                                        });
-                                                    if is_main {
-                                                        chip(
-                                                            ui,
-                                                            "主索引",
-                                                            palette_color(ACCENT_DEEP),
-                                                            CHIP_BLUE_BG,
-                                                        );
-                                                    }
-                                                    match s(&x, "lifecycle").as_str() {
-                                                        "history" => chip(
-                                                            ui,
-                                                            "历史",
-                                                            palette_color(TEXT_WEAK),
-                                                            palette_color(CHIP_GRAY_BG),
-                                                        ),
-                                                        "void" => {
-                                                            chip(ui, "已作废", palette_color(ROSE), ROSE_SOFT_BG)
-                                                        }
-                                                        _ => {}
-                                                    }
-                                                });
-                                            });
+                        let title = s(&x, "name");
+                        let cover = self.index_covers.get(&xid).cloned().unwrap_or_default();
+                        let resp = self.wall_card(ui, WallCard {
+                            width: card_w, min_height: card_h, title: &title, cover: &cover, selected,
+                            scope: Some(scope_color),
+                        }, |app, ui| {
+                            ui.horizontal(|ui| {
+                                if let Some(tag) = app.index_tags.get(&xid) {
+                                    chip(
+                                        ui,
+                                        &format!("V{tag}"),
+                                        palette_color(ACCENT_DEEP),
+                                        CHIP_BLUE_BG,
+                                    );
+                                }
+                                // 主索引 capsule: this index is
+                                // its home folder's designated
+                                // main index (spec §3.10).
+                                let home = s(&x, "folder_id");
+                                let is_main = !home.is_empty()
+                                    && app.folders.iter().any(|f| {
+                                        s(f, "id") == home
+                                            && s(f, "main_index_id") == xid
                                     });
+                                if is_main {
+                                    chip(
+                                        ui,
+                                        "主索引",
+                                        palette_color(ACCENT_DEEP),
+                                        CHIP_BLUE_BG,
+                                    );
+                                }
+                                match s(&x, "lifecycle").as_str() {
+                                    "history" => chip(
+                                        ui,
+                                        "历史",
+                                        palette_color(TEXT_WEAK),
+                                        palette_color(CHIP_GRAY_BG),
+                                    ),
+                                    "void" => {
+                                        chip(ui, "已作废", palette_color(ROSE), ROSE_SOFT_BG)
+                                    }
+                                    _ => {}
+                                }
                             });
                         });
                         let rect = resp.response.rect;
                         let click = ui
-                            .interact(rect, ui.id().with(("idx_card", &xid)), egui::Sense::click())
+                            .interact(rect, ui.scope_id().with(("idx_card", &xid)), egui::Sense::click())
                             .on_hover_text(format!(
                                 "{} · {}",
                                 s(&x, "maintainer"),
                                 fmt_time(i(&x, "created_ms"))
                             ));
-                        let stroke = if selected {
-                            Some(egui::Stroke::new(2.0, ACCENT))
-                        } else if click.hovered() || click.has_focus() {
+                        let stroke = if !selected && (click.hovered() || click.has_focus()) {
                             Some(egui::Stroke::new(1.0, palette_color(FIELD_BORDER)))
                         } else {
                             None
@@ -12622,6 +12465,11 @@ impl App {
                         }
                         "离线缓存" => {
                             self.cache_path_ui(ui);
+                        }
+                        "演示偏好" => {
+                            if ui.checkbox(&mut self.dc_auto_quit, tr("放映结束自动关闭 DeckCraft")).changed() {
+                                save_client_settings(json!({ "deckcraft_auto_quit": self.dc_auto_quit }));
+                            }
                         }
                         "审批队列" => {
                             self.review_queue_body(ui);

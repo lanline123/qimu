@@ -1,5 +1,6 @@
-//! Toolbar and menu glyphs from the HTML prototype, stored as a white alpha atlas.
+//! Prototype SVG glyphs shared by navigation, toolbars and presentation controls.
 use super::*;
+use craft_ui::icons::{SvgIconSet, SvgStyle};
 
 #[derive(Clone, Copy)]
 pub(super) enum ChromeIcon {
@@ -14,19 +15,155 @@ pub(super) enum ChromeIcon {
     More,
     Bell,
     Theme,
+    Home,
+    Showroom,
+    Index,
+    Content,
+    Trash,
+    Settings,
+    NewIndex,
+    Import,
+    Reading,
+    Presenter,
+    Play,
+    Export,
+    Download,
+    Back,
+    Refresh,
+    Power,
+    Folder,
+    FolderOpen,
+    FolderPlus,
+    Split,
+    Clipboard,
+}
+
+static SVG_ICONS: &[(&str, &[u8])] = &[
+    (
+        "idx-active",
+        include_bytes!("../assets/icons/idx-active.svg"),
+    ),
+    (
+        "idx-history",
+        include_bytes!("../assets/icons/idx-history.svg"),
+    ),
+    ("idx-all", include_bytes!("../assets/icons/idx-all.svg")),
+    (
+        "idx-directory",
+        include_bytes!("../assets/icons/idx-directory.svg"),
+    ),
+    (
+        "idx-lineage",
+        include_bytes!("../assets/icons/idx-lineage.svg"),
+    ),
+    ("idx-push", include_bytes!("../assets/icons/idx-push.svg")),
+    (
+        "idx-publish",
+        include_bytes!("../assets/icons/idx-publish.svg"),
+    ),
+    ("idx-merge", include_bytes!("../assets/icons/idx-merge.svg")),
+    ("idx-more", include_bytes!("../assets/icons/idx-more.svg")),
+    ("bell", include_bytes!("../assets/icons/bell.svg")),
+    ("theme", include_bytes!("../assets/icons/theme.svg")),
+    ("nav-home", include_bytes!("../assets/icons/nav-home.svg")),
+    ("nav-show", include_bytes!("../assets/icons/nav-show.svg")),
+    ("nav-index", include_bytes!("../assets/icons/nav-index.svg")),
+    (
+        "nav-content",
+        include_bytes!("../assets/icons/nav-content.svg"),
+    ),
+    ("nav-trash", include_bytes!("../assets/icons/nav-trash.svg")),
+    (
+        "all-application",
+        include_bytes!("../assets/icons/all-application.svg"),
+    ),
+    ("doc-add", include_bytes!("../assets/icons/doc-add.svg")),
+    ("upload", include_bytes!("../assets/icons/upload.svg")),
+    (
+        "deck-reading",
+        include_bytes!("../assets/icons/deck-reading.svg"),
+    ),
+    (
+        "deck-presenter",
+        include_bytes!("../assets/icons/deck-presenter.svg"),
+    ),
+    ("play", include_bytes!("../assets/icons/play.svg")),
+    ("export", include_bytes!("../assets/icons/export.svg")),
+    ("download", include_bytes!("../assets/icons/download.svg")),
+    ("back", include_bytes!("../assets/icons/back.svg")),
+    ("refresh", include_bytes!("../assets/icons/refresh.svg")),
+    ("power", include_bytes!("../assets/icons/power.svg")),
+    (
+        "folder-close",
+        include_bytes!("../assets/icons/folder-close.svg"),
+    ),
+    (
+        "folder-open",
+        include_bytes!("../assets/icons/folder-open.svg"),
+    ),
+    (
+        "folder-plus",
+        include_bytes!("../assets/icons/folder-plus.svg"),
+    ),
+    ("split", include_bytes!("../assets/icons/split.svg")),
+    ("clipboard", include_bytes!("../assets/icons/clipboard.svg")),
+];
+static ICONS: std::sync::LazyLock<SvgIconSet> = std::sync::LazyLock::new(|| {
+    SvgIconSet::new(
+        SVG_ICONS,
+        SvgStyle {
+            current_color: "#ffffff",
+            stroke_width: None,
+        },
+        "bytes://qimu/chrome/",
+        "nav-home",
+    )
+});
+
+impl ChromeIcon {
+    pub(super) fn image(self, size: f32, tint: egui::Color32) -> egui::Image<'static> {
+        let name = match self {
+            Self::Active => "idx-active",
+            Self::History => "idx-history",
+            Self::All => "idx-all",
+            Self::Directory => "idx-directory",
+            Self::Lineage => "idx-lineage",
+            Self::Push => "idx-push",
+            Self::Publish => "idx-publish",
+            Self::Merge => "idx-merge",
+            Self::More => "idx-more",
+            Self::Bell => "bell",
+            Self::Theme => "theme",
+            Self::Home => "nav-home",
+            Self::Showroom => "nav-show",
+            Self::Index => "nav-index",
+            Self::Content => "nav-content",
+            Self::Trash => "nav-trash",
+            Self::Settings => "all-application",
+            Self::NewIndex => "doc-add",
+            Self::Import => "upload",
+            Self::Reading => "deck-reading",
+            Self::Presenter => "deck-presenter",
+            Self::Play => "play",
+            Self::Export => "export",
+            Self::Download => "download",
+            Self::Back => "back",
+            Self::Refresh => "refresh",
+            Self::Power => "power",
+            Self::Folder => "folder-close",
+            Self::FolderOpen => "folder-open",
+            Self::FolderPlus => "folder-plus",
+            Self::Split => "split",
+            Self::Clipboard => "clipboard",
+        };
+        egui::Image::new(ICONS.source(name))
+            .fit_to_exact_size(egui::Vec2::splat(size))
+            .tint(tint)
+    }
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct ChromeIcons(egui::TextureId);
-
-impl App {
-    pub(super) fn chrome_icons(&mut self, ui: &egui::Ui) -> ChromeIcons {
-        static ATLAS: std::sync::LazyLock<&[u8]> = std::sync::LazyLock::new(|| {
-            icon_png(include_str!("../assets/icons/chrome-icons.png.b64"))
-        });
-        ChromeIcons(self.tex_icon(ui, "chrome-icons", *ATLAS))
-    }
-}
+pub(super) struct ChromeIcons;
 
 impl ChromeIcons {
     pub(super) fn paint(
@@ -37,16 +174,9 @@ impl ChromeIcons {
         size: f32,
         tint: egui::Color32,
     ) {
-        let tile = icon as usize as f32;
-        let uv = egui::Rect::from_min_max(
-            egui::pos2(tile / 11.0, 0.0),
-            egui::pos2((tile + 1.0) / 11.0, 1.0),
-        );
-        ui.painter().image(
-            self.0,
+        icon.image(size, tint).paint_at(
+            ui,
             egui::Rect::from_center_size(center, egui::Vec2::splat(size)),
-            uv,
-            tint,
         );
     }
 
