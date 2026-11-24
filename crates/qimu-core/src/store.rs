@@ -2816,6 +2816,43 @@ impl Store {
         let _ = std::fs::remove_dir_all(self.submission_staging_dir(id));
     }
 
+    /// The server index (and showroom entry) a submitter's local
+    /// index already landed as, if any. The mapping key is
+    /// (submitter_id, source_index_id): the client-side id is only
+    /// ever trusted together with the submitter who recorded it,
+    /// never resolved on its own. The submissions rows themselves
+    /// are the mapping record — every landed row stamps
+    /// landed_index_id / landed_showroom_id — so no separate
+    /// mapping table exists; the newest landed row wins. Returns
+    /// None when the source never landed, or when the landed index
+    /// has since been deleted or trashed; the caller then lands
+    /// fresh, exactly as a first submission.
+    pub fn landed_source_target(
+        &self,
+        submitter_id: &str,
+        source_index_id: &str,
+    ) -> SResult<Option<(String, Option<String>)>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT landed_index_id, landed_showroom_id FROM submissions WHERE submitter_id=?1 AND source_index_id=?2 AND state='landed' AND landed_index_id IS NOT NULL ORDER BY created_ms DESC, rowid DESC LIMIT 1",
+                params![submitter_id, source_index_id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .optional()
+            .map_err(db_err)?;
+        let Some((index_id, showroom_id)) = row else {
+            return Ok(None);
+        };
+        if self.get_index(&index_id).is_err() {
+            return Ok(None);
+        }
+        if self.trash_find("index", &index_id)?.is_some() {
+            return Ok(None);
+        }
+        Ok(Some((index_id, showroom_id)))
+    }
+
     /// The landing transaction (design §6.3): rebuild a pending
     /// submission's package as organization content — units,
     /// renditions, versions, an index with its pinned commit, and
@@ -2831,7 +2868,13 @@ impl Store {
     /// served without a version row pointing at them). Ids are
     /// re-minted server-side (design §9 R4); a Locked entry
     /// re-locks onto the landed counterpart of the version the
-    /// package resolved for it.
+    /// package resolved for it. Source lineage: when the
+    /// submitter's local index already landed once (see
+    /// `landed_source_target`), the package lands as a new
+    /// commit on that same server index and refreshes its
+    /// single showroom entry — unpinned, so the entry follows
+    /// the index's current main head — instead of minting a
+    /// duplicate index and entry.
     pub fn land_submission(
         &self,
         id: &str,
@@ -3084,26 +3127,58 @@ impl Store {
             } else {
                 "company"
             };
-            let index_id = new_id("idx");
-            self.conn
-                .execute(
-                    "INSERT INTO indexes_tbl(id, name, folder_id, group_id, maintainer, lifecycle, scope, created_ms) VALUES(?1,?2,NULL,?3,?4,'active',?5,?6)",
-                    params![
-                        index_id,
-                        manifest.index_name,
-                        group_id,
-                        sub.submitter_name,
-                        scope,
-                        now_ms()
-                    ],
-                )
-                .map_err(db_err)?;
-            self.conn
-                .execute(
-                    "INSERT INTO index_branches(index_id, name, head_commit) VALUES(?1,'main',NULL)",
-                    params![index_id],
-                )
-                .map_err(db_err)?;
+            // Source lineage: if this submitter's local index
+            // already landed once, reuse its server index — the
+            // package becomes a new commit on its main branch
+            // below — instead of minting a duplicate index. The
+            // index keeps its original group; its name and scope
+            // follow the newly approved package.
+            let prior = match sub.source_index_id.as_deref() {
+                Some(src_id) if !src_id.is_empty() => {
+                    self.landed_source_target(&sub.submitter_id, src_id)?
+                }
+                _ => None,
+            };
+            let index_id = match &prior {
+                Some((existing, _)) => {
+                    self.conn
+                        .execute(
+                            "UPDATE indexes_tbl SET name=?2, scope=?3 WHERE id=?1",
+                            params![existing.as_str(), manifest.index_name, scope],
+                        )
+                        .map_err(db_err)?;
+                    self.conn
+                        .execute(
+                            "INSERT OR IGNORE INTO index_branches(index_id, name, head_commit) VALUES(?1,'main',NULL)",
+                            params![existing.as_str()],
+                        )
+                        .map_err(db_err)?;
+                    existing.clone()
+                }
+                None => {
+                    let index_id = new_id("idx");
+                    self.conn
+                        .execute(
+                            "INSERT INTO indexes_tbl(id, name, folder_id, group_id, maintainer, lifecycle, scope, created_ms) VALUES(?1,?2,NULL,?3,?4,'active',?5,?6)",
+                            params![
+                                index_id,
+                                manifest.index_name,
+                                group_id,
+                                sub.submitter_name,
+                                scope,
+                                now_ms()
+                            ],
+                        )
+                        .map_err(db_err)?;
+                    self.conn
+                        .execute(
+                            "INSERT INTO index_branches(index_id, name, head_commit) VALUES(?1,'main',NULL)",
+                            params![index_id],
+                        )
+                        .map_err(db_err)?;
+                    index_id
+                }
+            };
             let message = if manifest.commit.message.trim().is_empty() {
                 "提交落地"
             } else {
@@ -3113,28 +3188,54 @@ impl Store {
             // branch; it lands as the new index's main head.
             let commit =
                 self.create_commit(&index_id, "main", &sub.submitter_name, message, entries)?;
-            let item = self.insert_showroom(
-                &sub.title,
-                &sub.intro,
-                Some(&index_id),
-                Some(&commit.id),
-                &sub.submitter_name,
-                "live",
-            )?;
+            // One showroom entry per landed source: a repeat
+            // landing refreshes the existing entry and unpins it
+            // (commit_id NULL), so entry resolution follows the
+            // source index's current main head — later commits and
+            // tags on the index show up without a re-push. A first
+            // landing (or an entry deleted since) inserts the
+            // entry pinned to the landed commit, exactly as
+            // before.
+            let prior_entry = prior
+                .as_ref()
+                .and_then(|(_, entry)| entry.clone())
+                .filter(|eid| self.get_showroom(eid).ok().flatten().is_some());
+            let item_id = match &prior_entry {
+                Some(entry_id) => {
+                    self.conn
+                        .execute(
+                            "UPDATE showroom SET title=?2, intro=?3, commit_id=NULL, state='live' WHERE id=?1",
+                            params![entry_id.as_str(), sub.title, sub.intro],
+                        )
+                        .map_err(db_err)?;
+                    entry_id.clone()
+                }
+                None => {
+                    self.insert_showroom(
+                        &sub.title,
+                        &sub.intro,
+                        Some(&index_id),
+                        Some(&commit.id),
+                        &sub.submitter_name,
+                        "live",
+                    )?
+                    .id
+                }
+            };
             let reviewed_ms = now_ms();
             self.conn
                 .execute(
                     "UPDATE showroom SET reviewed_by=?2, reviewed_ms=?3 WHERE id=?1",
-                    params![item.id, reviewer, reviewed_ms],
+                    params![item_id, reviewer, reviewed_ms],
                 )
                 .map_err(db_err)?;
             self.conn
                 .execute(
                     "UPDATE submissions SET state='landed', landed_index_id=?2, landed_showroom_id=?3, reviewed_by=?4, reviewed_ms=?5, review_note='', land_error='' WHERE id=?1",
-                    params![id, index_id, item.id, reviewer, reviewed_ms],
+                    params![id, index_id, item_id, reviewer, reviewed_ms],
                 )
                 .map_err(db_err)?;
-            Ok((index_id, item.id))
+            Ok((index_id, item_id))
         };
         match attempt() {
             Ok(v) => {
