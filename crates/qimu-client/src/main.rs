@@ -2679,6 +2679,7 @@ struct App {
     library_refs: Vec<Value>,
     my_id: String,
     new_team_name: String,
+    team_create_open: bool,
     team_member_pick: String,
     cache_entries: Vec<Value>,
     /// PPT clipboard sidecar meta (see `load_clip_meta`); None while
@@ -3312,6 +3313,7 @@ impl App {
             library_refs: vec![],
             my_id: String::new(),
             new_team_name: String::new(),
+            team_create_open: false,
             team_member_pick: String::new(),
             cache_entries: load_cache_index(),
             ppt_clip: load_clip_meta(),
@@ -6503,6 +6505,44 @@ impl App {
         }
     }
 
+    /// Sidebar zone header (user ruling 2026-11-24): the zone's
+    /// label on the left, its create button at the row's right
+    /// end. Returns true when the button was clicked.
+    fn sr_header_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        label: &str,
+        icon: ChromeIcon,
+        tip: &str,
+    ) -> bool {
+        let mut clicked = false;
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(label)
+                    .size(12.0)
+                    .color(palette_color(TEXT_WEAK)),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.small_icon_button(ui, icon, tip) {
+                    clicked = true;
+                }
+            });
+        });
+        clicked
+    }
+
+    /// Open the shared inline editor for a new root folder (the
+    /// editor itself renders under the tree's 全部 row, or under
+    /// the zone header where the zone has no folder tree).
+    fn sr_new_folder(&mut self) {
+        self.folder_edit = Some(FolderEdit {
+            target: None,
+            parent: None,
+            text: "新文件夹".into(),
+        });
+        self.folder_edit_focus = true;
+    }
+
     fn sr_nav_body(&mut self, ui: &mut egui::Ui) {
         let zones = ["plaza", "library", "inbox", "groups"];
         let active = zones
@@ -6520,11 +6560,14 @@ impl App {
         ui.add_space(8.0);
         match self.showroom.zone.as_str() {
             "library" => {
-                ui.label(
-                    egui::RichText::new("我的目录")
-                        .size(12.0)
-                        .color(palette_color(TEXT_WEAK)),
-                );
+                if self.sr_header_row(ui, "目录", ChromeIcon::FolderPlus, tr("新建文件夹")) {
+                    self.sr_new_folder();
+                }
+                if matches!(&self.folder_edit, Some(e) if e.target.is_none() && e.parent.is_none())
+                {
+                    self.folder_edit_row(ui, 0.0);
+                    ui.add_space(2.0);
+                }
                 // Sidebar tree rows lead with an icon (prototype
                 // .tree blanket rule); the 全部 row reuses the
                 // all-applications glyph folder_tree uses for it.
@@ -6553,11 +6596,10 @@ impl App {
                 }
             }
             "inbox" => {
-                ui.label(
-                    egui::RichText::new("分享来源")
-                        .size(12.0)
-                        .color(palette_color(TEXT_WEAK)),
-                );
+                if self.sr_header_row(ui, "分享来源", ChromeIcon::FolderPlus, tr("新建文件夹"))
+                {
+                    self.sr_new_folder();
+                }
                 for (idx, (label, icon)) in [
                     ("全部", ChromeIcon::Settings),
                     ("个人分享", ChromeIcon::Share),
@@ -6571,54 +6613,18 @@ impl App {
                         .iter()
                         .filter(|item| Self::share_matches_source(item, idx))
                         .count();
-                    // The 全部 row carries the new-folder button at
-                    // its right end, exactly like the folder tree's
-                    // 全部 row (user ruling 2026-11-24: the button
-                    // belongs in the share sidebar too). It opens the
-                    // shared inline editor for a new root folder.
-                    let clicked = if idx == 0 {
-                        let mut clicked = false;
-                        ui.horizontal(|ui| {
-                            let width = ui.available_width();
-                            ui.allocate_ui(
-                                egui::vec2((width - 30.0).max(1.0), 28.0),
-                                |ui| {
-                                    clicked = tree_row(
-                                        ui,
-                                        self.showroom.share_source == idx,
-                                        0.0,
-                                        Some(icon),
-                                        &format!("{label} · {count}"),
-                                        12.5,
-                                    )
-                                    .clicked();
-                                },
-                            );
-                            if self.small_icon_button(
-                                ui,
-                                ChromeIcon::FolderPlus,
-                                tr("新建文件夹"),
-                            ) {
-                                self.folder_edit = Some(FolderEdit {
-                                    target: None,
-                                    parent: None,
-                                    text: "新文件夹".into(),
-                                });
-                                self.folder_edit_focus = true;
-                            }
-                        });
-                        clicked
-                    } else {
-                        tree_row(
-                            ui,
-                            self.showroom.share_source == idx,
-                            0.0,
-                            Some(icon),
-                            &format!("{label} · {count}"),
-                            12.5,
-                        )
-                        .clicked()
-                    };
+                    // The new-folder button lives on the 分享来源
+                    // header row above (user ruling 2026-11-24);
+                    // the rows here are plain source filters.
+                    let clicked = tree_row(
+                        ui,
+                        self.showroom.share_source == idx,
+                        0.0,
+                        Some(icon),
+                        &format!("{label} · {count}"),
+                        12.5,
+                    )
+                    .clicked();
                     if clicked {
                         self.showroom.share_source = idx;
                         self.showroom.stack.pop_to(0);
@@ -6632,11 +6638,46 @@ impl App {
                 }
             }
             "groups" => {
-                ui.label(
-                    egui::RichText::new("群组")
-                        .size(12.0)
-                        .color(palette_color(TEXT_WEAK)),
-                );
+                // The header row's button creates a GROUP (user
+                // ruling 2026-11-24), not a folder; it toggles an
+                // inline name editor under the header that submits
+                // through the same path as the groups view's form.
+                if self.sr_header_row(ui, "群组", ChromeIcon::Directory, tr("新建群组")) {
+                    self.team_create_open = !self.team_create_open;
+                }
+                if self.team_create_open {
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(&mut self.new_team_name);
+                        if ui
+                            .add_enabled(
+                                !self.new_team_name.trim().is_empty(),
+                                egui::Button::new("建组"),
+                            )
+                            .clicked()
+                            && self.require_org_online("新建群组")
+                        {
+                            let name = self.new_team_name.clone();
+                            match self.call(
+                                "POST",
+                                "/v1/custom-groups",
+                                Some(json!({ "name": name })),
+                            ) {
+                                Ok(_) => {
+                                    self.new_team_name.clear();
+                                    self.team_create_open = false;
+                                    self.msg = "群组已创建".into();
+                                    self.refresh_all();
+                                }
+                                Err(e) => self.msg = format!("建组失败：{e}"),
+                            }
+                        }
+                        if ui.button("取消").clicked() {
+                            self.team_create_open = false;
+                            self.new_team_name.clear();
+                        }
+                    });
+                    ui.add_space(2.0);
+                }
                 let active = self
                     .active_showroom_group()
                     .map(|space| s(&space["group"], "id"));
@@ -6664,11 +6705,9 @@ impl App {
                 }
             }
             _ => {
-                ui.label(
-                    egui::RichText::new("公共目录")
-                        .size(12.0)
-                        .color(palette_color(TEXT_WEAK)),
-                );
+                if self.sr_header_row(ui, "目录", ChromeIcon::FolderPlus, tr("新建文件夹")) {
+                    self.sr_new_folder();
+                }
                 let mut selected = self.showroom.folder.clone();
                 self.folder_tree(ui, &mut selected, false);
                 if selected != self.showroom.folder {
@@ -6696,9 +6735,12 @@ impl App {
     }
 
     fn ct_nav_body(&mut self, ui: &mut egui::Ui) {
-        // No 目录 header row and no header add button (user ruling
-        // 2026-11-24): the sidebar starts directly with the folder
-        // tree, whose 全部 row carries the new-folder button.
+        // 目录 header row with the new-folder button at its right
+        // end (user ruling 2026-11-24, correcting the same-day
+        // removal): the button moved here from the tree's 全部 row.
+        if self.sr_header_row(ui, "目录", ChromeIcon::FolderPlus, tr("新建文件夹")) {
+            self.sr_new_folder();
+        }
         let mut selected = self.content.folder_filter.clone();
         self.folder_tree(ui, &mut selected, false);
         if self.content.folder_filter != selected
@@ -6711,6 +6753,11 @@ impl App {
     }
 
     fn ix_nav_body(&mut self, ui: &mut egui::Ui) {
+        // 目录 header row, same pattern as the other folder-tree
+        // sidebars (user ruling 2026-11-24).
+        if self.sr_header_row(ui, "目录", ChromeIcon::FolderPlus, tr("新建文件夹")) {
+            self.sr_new_folder();
+        }
         let (in_detail, mut selected) = match self.index.stack.top() {
             IndexFrame::Detail(detail) => {
                 let folder = self.index_folder_of(&detail.index_id);
@@ -12647,8 +12694,11 @@ impl App {
         ui.horizontal(|ui| {
             ui.set_width(width);
             ui.spacing_mut().item_spacing.x = 0.0;
+            // The 全部 row spans the full width: the new-folder
+            // button moved to the sidebar's 目录 header row (user
+            // ruling 2026-11-24).
             let (rect, response) = ui.allocate_exact_size(
-                egui::vec2((width - 30.0).max(1.0), 28.0),
+                egui::vec2(width.max(1.0), 28.0),
                 egui::Sense::click(),
             );
             let selected_all = selected.is_none();
@@ -12684,9 +12734,8 @@ impl App {
                 *selected = None;
             }
 
-            if self.small_icon_button(ui, ChromeIcon::FolderPlus, tr("新建文件夹")) {
-                action = Some(Act::NewSibling(None));
-            }
+            // (No add button on this row any more — it lives on
+            // the 目录 header row; see the allocation note above.)
         });
         // an inline editor for a NEW root folder sits right under 全部
         if matches!(&self.folder_edit, Some(e) if e.target.is_none() && e.parent.is_none()) {
