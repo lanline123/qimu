@@ -6581,7 +6581,7 @@ impl App {
             (
                 "服务器与组织",
                 &[
-                    ("服务器", ChromeIcon::Power),
+                    ("服务器", ChromeIcon::Globe),
                     ("个人资料", ChromeIcon::Clipboard),
                     ("我的提交", ChromeIcon::Clipboard),
                     ("组织管理", ChromeIcon::Lineage),
@@ -9674,59 +9674,49 @@ impl App {
                                             &s(&e, "title"),
                                         );
                                     }
-                                    if s(&e, "item_kind") == "showroom" {
-                                        if ui.small_button("看整稿").clicked() {
-                                            app.open_deck_for_ref(
-                                                "showroom",
-                                                &s(&e, "item_id"),
-                                                &s(&e, "title"),
-                                            );
-                                        }
-                                        if ui.small_button("导出 PPT").clicked() {
-                                            let item_id = s(&e, "item_id");
-                                            let title = s(&e, "title");
-                                            if let Some(path) = rfd::FileDialog::new()
-                                                .set_file_name(format!("{title}.pptx"))
-                                                .save_file()
-                                            {
-                                                match app.call(
-                                                    "POST",
-                                                    &format!("/v1/showroom/{item_id}/export"),
-                                                    Some(json!({ "kind": "personal" })),
-                                                ) {
-                                                    Ok(v) => {
-                                                        if let Some(data) = v
-                                                            .get("data_base64")
-                                                            .and_then(|x| x.as_str())
-                                                        {
-                                                            if let Ok(bytes) = b64d(data) {
-                                                                let _ =
-                                                                    std::fs::write(&path, bytes);
-                                                                app.msg = "已导出".into();
-                                                            }
+                                    if ui.small_button("导出 PPT").clicked() {
+                                        let item_id = s(&e, "item_id");
+                                        let title = s(&e, "title");
+                                        if let Some(path) = rfd::FileDialog::new()
+                                            .set_file_name(format!("{title}.pptx"))
+                                            .save_file()
+                                        {
+                                            match app.call(
+                                                "POST",
+                                                &format!("/v1/showroom/{item_id}/export"),
+                                                Some(json!({ "kind": "personal" })),
+                                            ) {
+                                                Ok(v) => {
+                                                    if let Some(data) = v
+                                                        .get("data_base64")
+                                                        .and_then(|x| x.as_str())
+                                                    {
+                                                        if let Ok(bytes) = b64d(data) {
+                                                            let _ = std::fs::write(&path, bytes);
+                                                            app.msg = "已导出".into();
                                                         }
                                                     }
-                                                    Err(e2) => app.msg = format!("导出失败：{e2}"),
                                                 }
+                                                Err(e2) => app.msg = format!("导出失败：{e2}"),
                                             }
                                         }
                                     }
-                                    if ui.small_button("移除").clicked() {
-                                        let lid = s(&e, "id");
-                                        match app.call(
-                                            "POST",
-                                            &format!("/v1/library/{lid}/delete"),
-                                            Some(json!({})),
-                                        ) {
-                                            Ok(_) => {
-                                                app.msg = "已移除".into();
-                                                app.refresh_all();
-                                            }
-                                            Err(e2) => app.msg = format!("移除失败：{e2}"),
+                                }
+                                if ui.small_button("移除").clicked() {
+                                    let lid = s(&e, "id");
+                                    match app.call(
+                                        "POST",
+                                        &format!("/v1/library/{lid}/delete"),
+                                        Some(json!({})),
+                                    ) {
+                                        Ok(_) => {
+                                            app.msg = "已移除".into();
+                                            app.refresh_all();
                                         }
+                                        Err(e2) => app.msg = format!("移除失败：{e2}"),
                                     }
-                                },
-                            );
+                                }
+                            });
                         },
                     );
                 }

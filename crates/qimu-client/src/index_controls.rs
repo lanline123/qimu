@@ -236,14 +236,24 @@ impl App {
     /// reference submission for this cycle (design §8.3), as does
     /// the whole action while the local library is closed.
     fn submit_index_to_showroom(&mut self, id: &str, title: &str) {
-        if !self.need_identity("提交到演示厅") {
+        self.push_index_to_showroom(id, title, "", "");
+    }
+
+    pub(super) fn push_index_to_showroom(
+        &mut self,
+        id: &str,
+        title: &str,
+        published_tag_id: &str,
+        note: &str,
+    ) {
+        if !self.need_identity("推送到演示厅") {
             return;
         }
         if let Some(local) = &self.local {
             match local.build_submission_package(id, "main") {
                 Some(Ok(mut body)) => {
                     body["title"] = json!(title);
-                    body["intro"] = json!("");
+                    body["intro"] = json!(note);
                     body["source_index_id"] = json!(id);
                     if let Some(prev) = self.my_submissions.iter().find(|x| {
                         s(x, "source_index_id") == id && s(x, "state") == "rejected"
@@ -266,7 +276,12 @@ impl App {
         self.msg = match self.call(
             "POST",
             "/v1/showroom",
-            Some(json!({ "title": title, "intro": "", "source_index_id": id })),
+            Some(json!({
+                "title": title,
+                "intro": note,
+                "source_index_id": id,
+                "published_tag_id": published_tag_id,
+            })),
         ) {
             Ok(_) => "已提交，等待审核".into(),
             Err(error) => error,

@@ -4170,52 +4170,6 @@ async fn list_library(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
     Ok(Json(json!({ "entries": entries })))
 }
 
-#[derive(Deserialize)]
-struct LibraryReq {
-    item_kind: String,
-    item_id: String,
-    folder: Option<String>,
-}
-
-async fn add_library_entry(
-    State(st): State<St>,
-    headers: HeaderMap,
-    Json(req): Json<LibraryReq>,
-) -> Api<Value> {
-    let user = auth(&st, &headers)?;
-    let store = st.store.lock().unwrap();
-    let title = match req.item_kind.as_str() {
-        "showroom" => {
-            let item = store
-                .get_showroom(&req.item_id)
-                .map_err(bad)?
-                .ok_or_else(|| not_found())?;
-            if !store.showroom_item_access(&user, &item).map_err(bad)? {
-                return Err(forbidden());
-            }
-            item.title
-        }
-        "assembly" => store
-            .list_assemblies(&user.id)
-            .map_err(bad)?
-            .into_iter()
-            .find(|item| item["id"] == req.item_id)
-            .and_then(|item| item["name"].as_str().map(str::to_owned))
-            .ok_or_else(|| not_found())?,
-        _ => return Err(bad("item_kind 只能是 showroom 或 assembly")),
-    };
-    let library_id = store
-        .add_library_entry(
-            &user.id,
-            &req.item_kind,
-            &req.item_id,
-            &title,
-            req.folder.as_deref().unwrap_or("").trim(),
-        )
-        .map_err(bad)?;
-    Ok(Json(json!({ "library_id": library_id })))
-}
-
 async fn remove_library_entry(
     State(st): State<St>,
     headers: HeaderMap,
