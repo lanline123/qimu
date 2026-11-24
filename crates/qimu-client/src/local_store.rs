@@ -1143,7 +1143,7 @@ impl LocalStore {
                         .list_folders()
                         .unwrap_or_default()
                         .into_iter()
-                        .find(|f| f.id == id);
+                        .find(|f| f.id == *id);
                     Ok(serde_json::to_value(&folder).unwrap_or(Value::Null))
                 }
                 // ---- trash ----
