@@ -1098,6 +1098,108 @@ impl Store {
         Ok(())
     }
 
+    /// Move a folder (sidebar drag-and-drop): reparent it and/or
+    /// reorder it among its new siblings. `before_id` names the
+    /// sibling it should sit in front of (None = last among the
+    /// new siblings). Sibling order persists in the single global
+    /// `sort` column: after the move the whole tree is renumbered
+    /// along a depth-first walk, which is exactly the order
+    /// list_folders returns and the client's walk reproduces, so
+    /// every sibling group's relative order is preserved. Moving
+    /// a folder under itself or one of its own descendants is
+    /// refused (it would create a cycle).
+    pub fn move_folder(
+        &self,
+        id: &str,
+        new_parent_id: Option<&str>,
+        before_id: Option<&str>,
+    ) -> SResult<()> {
+        let all = self.list_folders()?;
+        let Some(me) = all.iter().find(|f| f.id == id) else {
+            return Err("文件夹不存在".into());
+        };
+        if let Some(p) = new_parent_id {
+            if !all.iter().any(|f| f.id == p) {
+                return Err("目标文件夹不存在".into());
+            }
+            // Cycle guard: walk the parent chain up from the
+            // proposed parent; meeting the folder itself means the
+            // parent is the folder or one of its descendants.
+            let mut cur = Some(p);
+            while let Some(c) = cur {
+                if c == id {
+                    return Err("不能把文件夹移动到它自己或子文件夹下".into());
+                }
+                cur = all
+                    .iter()
+                    .find(|f| f.id == c)
+                    .and_then(|f| f.parent_id.as_deref());
+            }
+        }
+        if before_id == Some(id) {
+            return Ok(()); // dropped in front of itself: no-op
+        }
+        // Sibling lists keyed by parent id ("" = root), each in
+        // current list order.
+        let mut groups: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for f in &all {
+            groups
+                .entry(f.parent_id.clone().unwrap_or_default())
+                .or_default()
+                .push(f.id.clone());
+        }
+        let old_key = me.parent_id.clone().unwrap_or_default();
+        if let Some(list) = groups.get_mut(&old_key) {
+            list.retain(|x| x != id);
+        }
+        let new_key = new_parent_id.unwrap_or("").to_string();
+        let list = groups.entry(new_key).or_default();
+        let pos = before_id
+            .and_then(|b| list.iter().position(|x| x == b))
+            .unwrap_or(list.len());
+        list.insert(pos, id.to_string());
+        // Depth-first renumber over the regrouped tree.
+        fn walk(
+            groups: &std::collections::HashMap<String, Vec<String>>,
+            parent: &str,
+            out: &mut Vec<String>,
+        ) {
+            if let Some(list) = groups.get(parent) {
+                for fid in list {
+                    out.push(fid.clone());
+                    walk(groups, fid, out);
+                }
+            }
+        }
+        let mut order: Vec<String> = Vec::new();
+        walk(&groups, "", &mut order);
+        // Folders unreachable from the root (broken parent chain)
+        // keep their relative order at the end.
+        for f in &all {
+            if !order.contains(&f.id) {
+                order.push(f.id.clone());
+            }
+        }
+        let tx = self.conn.unchecked_transaction().map_err(db_err)?;
+        if me.parent_id.as_deref() != new_parent_id {
+            tx.execute(
+                "UPDATE folders SET parent_id=?2 WHERE id=?1",
+                params![id, new_parent_id],
+            )
+            .map_err(db_err)?;
+        }
+        for (idx, fid) in order.iter().enumerate() {
+            tx.execute(
+                "UPDATE folders SET sort=?2 WHERE id=?1",
+                params![fid, (idx + 1) as i64],
+            )
+            .map_err(db_err)?;
+        }
+        tx.commit().map_err(db_err)?;
+        Ok(())
+    }
+
     /// Delete a folder only when it is completely empty: no child
     /// folders, no content units and no indexes homed in it.
     pub fn delete_folder(&self, id: &str) -> SResult<()> {

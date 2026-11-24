@@ -2962,6 +2962,11 @@ struct FolderEdit {
     text: String,
 }
 
+/// Drag-and-drop payload for the sidebar folder tree: the id of
+/// the folder being dragged (see `App::folder_tree`).
+#[derive(Clone)]
+struct FolderDrag(String);
+
 // ---------------- server connections (multi-server) -----------------
 
 #[derive(Clone, PartialEq)]
@@ -12759,6 +12764,37 @@ impl App {
                 ordered.push(f.clone());
             }
         }
+        // Drag-and-drop (user ruling 2026-11-24; the prototype tree
+        // behaves the same way): drag a folder ONTO another folder
+        // to make it that folder's child, or into the SEAM between
+        // two rows to insert it at that position among the below
+        // row's siblings. Row geometry is collected during the
+        // loop and hover/drop is resolved after it, when every row
+        // rect is known. The 全部 and 未分类 rows take no part:
+        // they are neither drag sources nor drop targets.
+        let drag_id: Option<String> =
+            egui::DragAndDrop::payload::<FolderDrag>(ui.ctx()).map(|p| p.0.clone());
+        // True when `start` is `needle` itself or sits inside
+        // `needle`'s subtree (walk start's parent chain up).
+        let chain_hits = |folders: &[Value], start: &str, needle: &str| -> bool {
+            let mut cur = start.to_string();
+            for _ in 0..64 {
+                if cur == needle {
+                    return true;
+                }
+                match folders.iter().find(|x| s(x, "id") == cur) {
+                    Some(f) => {
+                        cur = s(f, "parent_id");
+                        if cur.is_empty() {
+                            return false;
+                        }
+                    }
+                    None => return false,
+                }
+            }
+            false
+        };
+        let mut row_rects: Vec<(String, String, egui::Rect)> = Vec::new();
         for f in &ordered {
             let fid = s(f, "id");
             let fname = s(f, "name");
@@ -12775,7 +12811,14 @@ impl App {
                 } else {
                     ChromeIcon::Folder
                 };
-                let resp = tree_row(ui, is_sel, d as f32 * 15.0, Some(ficon), &fname, 12.5);
+                let resp = ui
+                    .dnd_drag_source(
+                        egui::Id::new(("qimu_folder_drag", fid.as_str())),
+                        FolderDrag(fid.clone()),
+                        |ui| tree_row(ui, is_sel, d as f32 * 15.0, Some(ficon), &fname, 12.5),
+                    )
+                    .response;
+                row_rects.push((fid.clone(), fparent.clone(), resp.rect));
                 if resp.clicked() {
                     *selected = Some(fid.clone());
                 }
@@ -12826,6 +12869,130 @@ impl App {
                 ui.close();
             }
         });
+        // Resolve the folder drag against the collected geometry.
+        // The two targets are mutually exclusive by pointer
+        // position: a row's centre band means ONTO (becomes that
+        // folder's child), its edge bands mean the seam next to
+        // that row (same-level insert in front of the below row,
+        // among the below row's siblings). Feedback while
+        // hovering: a thin DASHED frame around the ONTO row; a
+        // horizontal line in the exact middle of the gap between
+        // the two rows for a seam. Drops onto the dragged folder
+        // itself or into its own subtree show no feedback and do
+        // nothing; dropping in front of itself is a no-op.
+        if let (Some(drag), Some(pos)) = (
+            &drag_id,
+            ui.input(|i| i.pointer.interact_pos().or_else(|| i.pointer.hover_pos())),
+        ) {
+            if !row_rects.is_empty() {
+                let first = row_rects[0].2;
+                let last = row_rects[row_rects.len() - 1].2;
+                let in_x = pos.x >= first.left() - 4.0 && pos.x <= first.right() + 4.0;
+                let in_y = pos.y >= first.top() - 6.0 && pos.y <= blank.rect.bottom();
+                if in_x && in_y {
+                    enum Drop {
+                        Onto(usize),
+                        Seam(usize),
+                    }
+                    let mut target: Option<Drop> = None;
+                    if pos.y < first.top() {
+                        target = Some(Drop::Seam(0));
+                    } else if pos.y > last.bottom() {
+                        target = Some(Drop::Seam(row_rects.len()));
+                    } else {
+                        for (idx, (_, _, rect)) in row_rects.iter().enumerate() {
+                            if pos.y >= rect.top() && pos.y <= rect.bottom() {
+                                let rel = (pos.y - rect.top()) / rect.height().max(1.0);
+                                target = Some(if rel < 0.25 {
+                                    Drop::Seam(idx)
+                                } else if rel > 0.75 {
+                                    Drop::Seam(idx + 1)
+                                } else {
+                                    Drop::Onto(idx)
+                                });
+                                break;
+                            }
+                            if pos.y > rect.bottom()
+                                && idx + 1 < row_rects.len()
+                                && pos.y < row_rects[idx + 1].2.top()
+                            {
+                                target = Some(Drop::Seam(idx + 1));
+                                break;
+                            }
+                        }
+                    }
+                    let mut go: Option<(Option<String>, Option<String>)> = None;
+                    match target {
+                        Some(Drop::Onto(idx)) => {
+                            let (tid, _, rect) = &row_rects[idx];
+                            if !chain_hits(&folders, tid, drag) {
+                                let r = rect.shrink(0.5);
+                                let stroke = egui::Stroke::new(1.0, palette_color(ACCENT));
+                                let corners = [
+                                    r.left_top(),
+                                    r.right_top(),
+                                    r.right_bottom(),
+                                    r.left_bottom(),
+                                    r.left_top(),
+                                ];
+                                for shape in
+                                    egui::Shape::dashed_line(&corners, stroke, 5.0, 4.0)
+                                {
+                                    ui.painter().add(shape);
+                                }
+                                go = Some((Some(tid.clone()), None));
+                            }
+                        }
+                        Some(Drop::Seam(idx)) => {
+                            let (parent, before) = if idx < row_rects.len() {
+                                let (bid, bparent, _) = &row_rects[idx];
+                                (bparent.clone(), Some(bid.clone()))
+                            } else {
+                                let (_, lparent, _) = &row_rects[row_rects.len() - 1];
+                                (lparent.clone(), None)
+                            };
+                            let parent_opt = if parent.is_empty() {
+                                None
+                            } else {
+                                Some(parent)
+                            };
+                            let invalid = parent_opt
+                                .as_deref()
+                                .map_or(false, |p| chain_hits(&folders, p, drag));
+                            let noop = before.as_deref() == Some(drag.as_str());
+                            if !invalid && !noop {
+                                // The line sits in the exact middle
+                                // of the gap between the two rows —
+                                // equidistant from the row above and
+                                // the row below.
+                                let y = if idx == 0 {
+                                    first.top() - 1.0
+                                } else if idx >= row_rects.len() {
+                                    last.bottom() + 1.0
+                                } else {
+                                    (row_rects[idx - 1].2.bottom() + row_rects[idx].2.top())
+                                        / 2.0
+                                };
+                                ui.painter().line_segment(
+                                    [
+                                        egui::pos2(first.left() + 4.0, y),
+                                        egui::pos2(first.right() - 4.0, y),
+                                    ],
+                                    egui::Stroke::new(2.0, palette_color(ACCENT)),
+                                );
+                                go = Some((parent_opt, before));
+                            }
+                        }
+                        None => {}
+                    }
+                    if let Some((parent, before)) = go {
+                        if ui.input(|i| i.pointer.any_released()) {
+                            self.folder_drag_move(drag, parent, before);
+                        }
+                    }
+                }
+            }
+        }
         match action {
             Some(Act::NewChild(parent)) => {
                 self.folder_edit = Some(FolderEdit {
@@ -12924,6 +13091,27 @@ impl App {
                     Err(e) => self.msg = format!("新建失败：{e}"),
                 }
             }
+        }
+    }
+
+    /// Drag-and-drop move from the sidebar folder tree: reparent
+    /// and/or reorder through the store's move endpoint (shared by
+    /// the local dispatch and the server REST route), then reload
+    /// the folder list so the tree shows the persisted order.
+    fn folder_drag_move(&mut self, id: &str, parent: Option<String>, before: Option<String>) {
+        if !self.need_identity_local("移动文件夹") {
+            return;
+        }
+        match self.call_work(
+            "POST",
+            &format!("/v1/folders/{id}/move"),
+            Some(json!({ "parent_id": parent, "before_id": before })),
+        ) {
+            Ok(_) => {
+                self.msg = "已移动文件夹".into();
+                self.reload_folders();
+            }
+            Err(e) => self.msg = format!("移动失败：{e}"),
         }
     }
 

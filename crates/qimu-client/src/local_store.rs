@@ -1061,6 +1061,15 @@ impl LocalStore {
                     store.rename_folder(id, &str_field(&body, "name").unwrap_or_default())?;
                     Ok(json!({ "ok": true }))
                 }
+                ("POST", ["v1", "folders", id, "move"]) => {
+                    let store = self.store.lock().unwrap();
+                    store.move_folder(
+                        id,
+                        opt_str_field(&body, "parent_id"),
+                        opt_str_field(&body, "before_id"),
+                    )?;
+                    Ok(json!({ "ok": true }))
+                }
                 ("DELETE", ["v1", "folders", id]) => {
                     let store = self.store.lock().unwrap();
                     store.delete_folder(id)?;

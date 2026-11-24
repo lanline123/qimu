@@ -1255,6 +1255,30 @@ async fn rename_folder(
     Ok(Json(json!({ "ok": true })))
 }
 
+#[derive(Deserialize)]
+struct MoveFolderReq {
+    parent_id: Option<String>,
+    before_id: Option<String>,
+}
+
+/// POST /v1/folders/:id/move — sidebar drag-and-drop: reparent
+/// the folder and/or insert it in front of `before_id` among its
+/// new siblings (before_id null = last). The store refuses moves
+/// into the folder's own subtree.
+async fn move_folder(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<MoveFolderReq>,
+) -> Api<Value> {
+    let _ = auth(&st, &headers)?;
+    let store = st.store.lock().unwrap();
+    store
+        .move_folder(&id, req.parent_id.as_deref(), req.before_id.as_deref())
+        .map_err(bad)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
 /// DELETE /v1/folders/:id — empty folders only (the store refuses
 /// non-empty ones with a specific reason).
 async fn delete_folder(
@@ -4950,6 +4974,7 @@ async fn main() {
         .route("/v1/ai/status", get(get_ai_status))
         .route("/v1/folders", get(folders).post(create_folder))
         .route("/v1/folders/:id/rename", post(rename_folder))
+        .route("/v1/folders/:id/move", post(move_folder))
         .route("/v1/folders/:id", delete(delete_folder))
         .route("/v1/folders/:id/main-index", post(set_folder_main_index))
         .route("/v1/units", get(list_units).post(create_unit))
