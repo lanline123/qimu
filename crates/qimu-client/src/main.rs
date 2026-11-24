@@ -3264,12 +3264,14 @@ impl App {
             folder_edit_focus: false,
             folder_delete_confirm: None,
             page: match std::env::var("QIMU_PAGE").as_deref() {
-                Ok("home") => Page::Home,
+                Ok("showroom") => Page::Showroom,
                 Ok("content") => Page::Content,
                 Ok("index") => Page::Index,
                 Ok("trash") => Page::Trash,
                 Ok("settings") => Page::Settings,
-                _ => Page::Showroom,
+                // Default entry is the home page (user ruling
+                // 2026-11-24); QIMU_PAGE remains a test hook only.
+                _ => Page::Home,
             },
             trash: TrashState::new(),
             review: ReviewState::new(),
