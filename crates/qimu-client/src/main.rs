@@ -102,6 +102,10 @@ pub const CHROME: egui::Color32 = egui::Color32::from_rgb(0x0B, 0x0B, 0x0D);
 pub const APP_BG: egui::Color32 = egui::Color32::from_rgb(0x0B, 0x0B, 0x0D);
 pub const CARD_BG: egui::Color32 = egui::Color32::from_rgb(0x15, 0x15, 0x19);
 pub const CARD_BORDER: egui::Color32 = egui::Color32::from_rgb(0x28, 0x28, 0x30);
+/// 「我维护」 card fill (prototype --mine-bg): the panel bg mixed
+/// 10% toward the accent — #181E2F on the dark theme, mapped to
+/// #EAF0FE on the light theme by palette_color.
+pub const MINE_BG: egui::Color32 = egui::Color32::from_rgb(0x18, 0x1E, 0x2F);
 pub const SEPARATOR: egui::Color32 = egui::Color32::from_rgb(0x28, 0x28, 0x30);
 pub const TEXT_MAIN: egui::Color32 = egui::Color32::WHITE;
 pub const TEXT_WEAK: egui::Color32 = egui::Color32::from_rgb(0xC4, 0xC4, 0xCC);
@@ -300,7 +304,7 @@ fn apply_modern_style(ctx: &egui::Context) {
 /// (the final tightening layer puts .std-card and every panel-class
 /// surface at 6px), NO shadow (the final .std-card rule sets
 /// box-shadow:none) — cover-first layout. Inner margin follows the
-/// final .card-body padding (10px top / 12px sides / 11px bottom).
+/// prototype's .show-body padding (11px top / 12px sides / 12px bottom).
 fn card_frame() -> egui::Frame {
     egui::Frame::NONE
         .fill(palette_color(CARD_BG))
@@ -309,8 +313,8 @@ fn card_frame() -> egui::Frame {
         .inner_margin(egui::Margin {
             left: 12,
             right: 12,
-            top: 10,
-            bottom: 11,
+            top: 11,
+            bottom: 12,
         })
         .shadow(egui::epaint::Shadow {
             offset: [0, 0],
@@ -4981,12 +4985,39 @@ fn standard_card<R>(
     flush: bool,
     add: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::InnerResponse<R> {
+    standard_card_v(ui, selected, scope, flush, CardVariant::Normal, add)
+}
+
+/// Card variants (the prototype's .std-card modifiers): `Mine`
+/// is the 「我维护」 fill (--mine-bg); `Rejected` is the rose 2px
+/// frame a rejected card wears until it is opened. Stroke
+/// priority: selected > rejected > scope colour.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CardVariant {
+    Normal,
+    Mine,
+    Rejected,
+}
+
+fn standard_card_v<R>(
+    ui: &mut egui::Ui,
+    selected: bool,
+    scope: Option<egui::Color32>,
+    flush: bool,
+    variant: CardVariant,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<R> {
     let mut frame = card_frame();
+    if variant == CardVariant::Mine {
+        frame = frame.fill(palette_color(MINE_BG));
+    }
     if flush {
         frame = frame.inner_margin(0);
     }
     if selected {
         frame = frame.stroke(egui::Stroke::new(1.5, ACCENT));
+    } else if variant == CardVariant::Rejected {
+        frame = frame.stroke(egui::Stroke::new(2.0, palette_color(ROSE)));
     } else if let Some(color) = scope {
         frame = frame.stroke(egui::Stroke::new(1.0, color));
     }
@@ -5006,6 +5037,7 @@ struct WallCard<'a> {
     cover: &'a str,
     selected: bool,
     scope: Option<egui::Color32>,
+    variant: CardVariant,
 }
 
 /// The meta slot of a StdCard: content below the dashed rule.
@@ -8103,7 +8135,13 @@ impl App {
             }
             for item in &records {
                 let rejected = s(item, "state") == "rejected";
-                card_frame().show(ui, |ui| {
+                standard_card_v(
+                    ui,
+                    false,
+                    None,
+                    false,
+                    if rejected { CardVariant::Rejected } else { CardVariant::Normal },
+                    |ui| {
                     ui.horizontal(|ui| {
                         ui.label(
                             egui::RichText::new(s(item, "title"))
@@ -8560,7 +8598,7 @@ impl App {
         selected: bool,
         body: impl FnOnce(&mut Self, &mut egui::Ui),
     ) -> egui::Rect {
-        self.wall_card(ui, WallCard { width, min_height: 0.0, title, cover, selected, scope: None }, body).inner
+        self.wall_card(ui, WallCard { width, min_height: 0.0, title, cover, selected, scope: None, variant: CardVariant::Normal }, body).inner
     }
 
     fn wall_card(
@@ -8569,7 +8607,7 @@ impl App {
         card: WallCard<'_>,
         body: impl FnOnce(&mut Self, &mut egui::Ui),
     ) -> egui::InnerResponse<egui::Rect> {
-        standard_card(ui, card.selected, card.scope, true, |ui| {
+        standard_card_v(ui, card.selected, card.scope, true, card.variant, |ui| {
             ui.set_width(card.width);
             ui.set_min_height(card.min_height);
             ui.spacing_mut().item_spacing.y = 0.0;
@@ -8580,7 +8618,9 @@ impl App {
                     self.thumb_ui(ui, card.cover, 0, card.width);
                 }
             }).response.rect;
-            egui::Frame::NONE.inner_margin(egui::Margin::symmetric(12, 10)).show(ui, |ui| {
+            egui::Frame::NONE
+                .inner_margin(egui::Margin { left: 12, right: 12, top: 11, bottom: 12 })
+                .show(ui, |ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(8.0, 5.0);
                 ui.add(egui::Label::new(egui::RichText::new(card.title).strong().size(13.0)).truncate());
                 body(self, ui);
@@ -8796,6 +8836,11 @@ impl App {
             }
             ui.add_space(8.0);
         }
+        let my_name = self
+            .user
+            .as_ref()
+            .map(|u| s(u, "display_name"))
+            .unwrap_or_default();
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
             // Card grid (prototype .grid): fluid columns, min
@@ -8825,6 +8870,11 @@ impl App {
                     let outer = self.wall_card(ui, WallCard {
                         width: card_w, min_height: card_h, title: &title, cover: &cover,
                         selected: w.selected.as_deref() == Some(uid.as_str()), scope: None,
+                        variant: if !my_name.is_empty() && s(&unit, "maintainer") == my_name {
+                            CardVariant::Mine
+                        } else {
+                            CardVariant::Normal
+                        },
                     }, |app, ui| {
                         ui.horizontal(|ui| {
                             if latest.is_object() {
@@ -11422,6 +11472,11 @@ impl App {
             self.index_overview_relationships(ui, ov, &items, action);
             return None;
         }
+        let my_name = self
+            .user
+            .as_ref()
+            .map(|u| s(u, "display_name"))
+            .unwrap_or_default();
         let mut open = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
@@ -11446,6 +11501,11 @@ impl App {
                         let resp = self.wall_card(ui, WallCard {
                             width: card_w, min_height: card_h, title: &title, cover: &cover, selected,
                             scope: Some(scope_color),
+                            variant: if !my_name.is_empty() && s(&x, "maintainer") == my_name {
+                                CardVariant::Mine
+                            } else {
+                                CardVariant::Normal
+                            },
                         }, |app, ui| {
                             ui.horizontal(|ui| {
                                 if let Some(tag) = app.index_tags.get(&xid) {

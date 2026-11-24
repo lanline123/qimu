@@ -38,6 +38,8 @@ pub(super) fn palette_color(dark: egui::Color32) -> egui::Color32 {
         0xfef3c7
     } else if dark == CHIP_BLUE_BG {
         0xdbeafe
+    } else if dark == MINE_BG {
+        0xeaf0fe
     } else if dark == ROSE_SOFT_BG {
         0xffe4e6
     } else if dark == CHIP_GREEN_FG {
