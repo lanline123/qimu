@@ -2608,6 +2608,13 @@ struct App {
     dc_rx: std::sync::mpsc::Receiver<DcEvent>,
     dc_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
     dc_auto_quit: bool,
+    /// T2 (DeckCraft transplant, strategy (b)): the in-process
+    /// hosted show, while one is running. While Some, the eframe
+    /// App forwards logic / raw_input_hook / ui to the guest
+    /// SlideApp and qimu's own UI is not drawn; the guest is
+    /// dropped on the first frame its show has ended, and qimu's
+    /// fonts/visuals are restored (hosted_show::restore_host_ui).
+    hosted: Option<hosted_show::HostedShow>,
     /// Toast state (the framework has no status bar): the message
     /// currently floating and when it appeared, in egui time.
     workspace_controls: WorkspaceControls,
@@ -3212,6 +3219,7 @@ impl App {
             dc_rx,
             dc_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             dc_auto_quit: load_dc_auto_quit(),
+            hosted: None,
             login_open: false,
             about_open: false,
             local,
@@ -7272,7 +7280,42 @@ impl App {
 
 
 impl eframe::App for App {
+    /// T2 frame forwarding, part 1: while a hosted show runs, the
+    /// guest SlideApp's logic drives the frame (show clocks, media
+    /// sync). Inert otherwise — this App was ui-only before T2, and
+    /// the default trait logic is a no-op, so non-hosted behavior
+    /// is unchanged.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(h) = &mut self.hosted {
+            h.logic(ctx);
+        }
+    }
+
+    /// T2 frame forwarding, part 2: the guest's input hook, exactly
+    /// as DeckCraft's own desktop host forwards it.
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        if let Some(h) = &mut self.hosted {
+            h.raw_input_hook(ctx, raw);
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // T2 hosted show: while the guest show is live it owns the
+        // whole window (SlideApp::ui short-circuits to the show, so
+        // no guest editor chrome is drawn either) and qimu's own
+        // UI is not drawn at all. On the first frame the show has
+        // ended, drop the guest and restore qimu's fonts/visuals;
+        // qimu's drill stack was never touched, so the user is back
+        // on the exact frame they left.
+        if let Some(mut h) = self.hosted.take() {
+            if h.ui(ui) {
+                self.hosted = Some(h);
+            } else {
+                hosted_show::HostedShow::restore_host_ui(ui.ctx());
+                self.msg = "放映结束，已回到启幕".into();
+            }
+            return;
+        }
         let ctx = ui.ctx().clone();
         self.frames += 1;
         // Collect finished thumbnail fetches and upload them as textures.
@@ -7737,9 +7780,9 @@ impl App {
         } else {
             stored
         };
-        // Local decks jump into DeckCraft when it is available
-        // (offline presenting is a handoff capability gain); the
-        // system app stays as the fallback.
+        // Local decks present in-process first (T2 hosted
+        // show), then via the external DeckCraft jump; the system
+        // app stays as the final fallback.
         if self.present_local_via_deckcraft(&path, &s(&e, "title")) {
             return;
         }
@@ -7796,13 +7839,61 @@ impl App {
         Ok((path, page_count))
     }
 
-    /// Jump a showroom item into DeckCraft (present handoff stages
-    /// 1–2). When no DeckCraft desktop app is available on this
-    /// machine, the user is prompted to install DeckCraft separately
-    /// (ruling 2026-11-24) and the jump counts as handled. Export
-    /// failures are reported here and count as handled: permission
-    /// refusals arrive as export errors, so a refused item never
-    /// jumps (contract §2.2).
+    /// Start an in-process hosted show (T2, DeckCraft transplant
+    /// strategy (b)) on deck bytes and make it the App's hosted
+    /// guest: from the next frame the eframe App forwards logic /
+    /// raw_input_hook / ui to it until its show ends. The display
+    /// count is NOT injected (D1 final ruling, 2026-11-24 14:24:
+    /// upstream Windows factory behavior — DeckCraft's own Windows
+    /// build never injects it either — so Presenter View opens on
+    /// a single screen too). Load damage is reported in the status
+    /// message instead of degrading silently.
+    fn start_hosted_show(
+        &mut self,
+        title: &str,
+        bytes: &[u8],
+        mode: DcMode,
+        from: usize,
+    ) -> Result<(), String> {
+        let show = hosted_show::HostedShow::start(title, bytes, mode, from, None)?;
+        let d = show.damage;
+        self.hosted = Some(show);
+        let mut msg = match mode {
+            DcMode::Play => format!("已开始演示：{title}"),
+            DcMode::Reading => format!("已打开普通视图：{title}"),
+            DcMode::Presenter => format!("已开始演示：{title}（演示者视图）"),
+        };
+        let mut notes = Vec::new();
+        if d.lost_slides > 0 {
+            notes.push(format!("{} 页未能读取", d.lost_slides));
+        }
+        if d.damaged_media > 0 {
+            notes.push(format!("{} 处媒体损坏", d.damaged_media));
+        }
+        if d.missing_fonts > 0 {
+            notes.push(format!("{} 个字体不可用", d.missing_fonts));
+        }
+        if d.import_warnings > 0 {
+            notes.push(format!("{} 条导入警告", d.import_warnings));
+        }
+        if !notes.is_empty() {
+            msg += &format!("（注意：{}）", notes.join("、"));
+        }
+        self.msg = msg;
+        Ok(())
+    }
+
+    /// Present a showroom item (T2). The export always carries the
+    /// speaker scripts as PPTX notes (`include_notes`, see
+    /// export_for_present) — without them the presenter view has an
+    /// empty notes pane; permission refusals arrive as export
+    /// errors, so a refused item never presents (contract §2.2,
+    /// unchanged). The primary path is the in-process hosted show
+    /// on the exported bytes; when hosting cannot start, the
+    /// external DeckCraft jump (dc_jump) remains as the fallback,
+    /// and when no DeckCraft desktop app is on this machine either,
+    /// the user is prompted to install it (ruling 2026-11-24). The
+    /// hosted failure is always surfaced, never silent.
     fn present_via_deckcraft(
         &mut self,
         item_id: &str,
@@ -7810,38 +7901,58 @@ impl App {
         mode: DcMode,
         from: usize,
     ) -> bool {
-        if deckcraft_app_path().is_none() {
-            // User ruling 2026-11-24: the client installer does not
-            // bundle DeckCraft; when a jump finds no DeckCraft on this
-            // machine, prompt the user to install it separately
-            // instead of silently falling back to the built-in player.
-            self.msg = "未检测到 DeckCraft 桌面应用：播放、普通视图和演示者视图由 DeckCraft 提供，请先安装 DeckCraft 后再试".into();
-            return true;
-        }
-        match self.export_for_present(item_id) {
-            Ok((path, page_count)) => {
-                let from = if page_count > 0 {
-                    from.min(page_count as usize - 1)
-                } else {
-                    0
-                };
-                self.dc_jump(&path, title, mode, from);
-                true
-            }
+        let (path, page_count) = match self.export_for_present(item_id) {
+            Ok(v) => v,
             Err(e) => {
                 self.msg = format!("演示失败：{e}");
-                true
+                return true;
             }
+        };
+        let from = if page_count > 0 {
+            from.min(page_count as usize - 1)
+        } else {
+            0
+        };
+        let hosted_err = match std::fs::read(&path) {
+            Ok(bytes) => match self.start_hosted_show(title, &bytes, mode, from) {
+                Ok(()) => return true,
+                Err(e) => e,
+            },
+            Err(e) => format!("读取导出稿失败：{e}"),
+        };
+        if deckcraft_app_path().is_none() {
+            self.msg = format!(
+                "进程内放映不可用（{hosted_err}），且未检测到 DeckCraft 桌面应用：请先安装 DeckCraft 后再试"
+            );
+            return true;
         }
+        self.dc_jump(&path, title, mode, from);
+        if self.msg.contains("已在 DeckCraft") {
+            self.msg = format!("进程内放映不可用（{hosted_err}），已改用 DeckCraft 打开");
+        }
+        true
     }
 
-    /// Jump an already-local deck file into DeckCraft (offline
-    /// cached decks). Same availability contract as above.
+    /// Present an already-local deck file (offline cached decks).
+    /// Same order as the showroom path: the in-process hosted show
+    /// on the file's bytes first, the external DeckCraft jump as
+    /// fallback. Returns false when neither could take it — the
+    /// caller then opens the file in the system app, as before T2.
     fn present_local_via_deckcraft(&mut self, path: &std::path::Path, title: &str) -> bool {
+        let hosted_err = match std::fs::read(path) {
+            Ok(bytes) => match self.start_hosted_show(title, &bytes, DcMode::Play, 0) {
+                Ok(()) => return true,
+                Err(e) => e,
+            },
+            Err(e) => format!("读取本地稿失败：{e}"),
+        };
         if deckcraft_app_path().is_none() {
             return false;
         }
         self.dc_jump(path, title, DcMode::Play, 0);
+        if self.msg.contains("已在 DeckCraft") {
+            self.msg = format!("进程内放映不可用（{hosted_err}），已改用 DeckCraft 打开");
+        }
         true
     }
 

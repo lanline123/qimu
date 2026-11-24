@@ -1,14 +1,13 @@
 //! T2 SPIKE — in-process hosting of DeckCraft's slide show
 //! (transplant strategy (b): host a `SlideApp`, DeckCraft unchanged).
 //!
-//! Status: spike only. This module is declared in `main.rs` so the
-//! build verifies it compiles against the pinned vendor DeckCraft
-//! (qimu-skin @2c15a1a9), but it has **no call sites**: the three
-//! presentation entries still go through `present_via_deckcraft` /
-//! `dc_jump` (external DeckCraft app + control protocol), which
-//! remains the only live path until T2 productization wires this
-//! shell in behind a fallback switch. Evidence for every claim made
-//! here is in `~/workspace/qimu-transplant-t2-spike/SPIKE.md`.
+//! Status: productized (T2). The three presentation entries go
+//! through `present_via_deckcraft` / `present_local_via_deckcraft`,
+//! which try this shell first on the deck bytes; the external
+//! `dc_jump` path (DeckCraft app + control protocol) remains in the
+//! tree as the fallback when hosting cannot start, and is retired
+//! only in T3. Evidence for every claim made here is in
+//! `~/workspace/qimu-transplant-t2-spike/SPIKE.md`.
 //!
 //! The shell mirrors DeckCraft's own desktop host
 //! (`apps/deckcraft/src/main.rs`: a 20-line `eframe::App` wrapper
@@ -93,8 +92,10 @@ impl HostedShow {
     ///   Windows desktop build effectively runs today).
     /// - `Some(f)` — `f` reports the real connected-display count
     ///   and the upstream gate applies (presenter only when >= 2).
-    /// The spike takes no position on the default; D1 remains the
-    /// user's call after the in-process real-machine test.
+    /// D1 final ruling (user, 2026-11-24 14:24): callers pass
+    /// `None` — the shell does not inject a display count, matching
+    /// upstream's Windows factory behavior, so Presenter View opens
+    /// on a single screen too.
     pub fn start(
         name: &str,
         bytes: &[u8],
