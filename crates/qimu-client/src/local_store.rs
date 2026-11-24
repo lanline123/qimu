@@ -773,6 +773,27 @@ impl LocalStore {
                     let unit = store.get_unit(id).map_err(|_| NOT_FOUND.to_string())?;
                     Ok(unit_json(&store, &unit))
                 }
+                ("PATCH", ["v1", "units", id]) => {
+                    // Header meta edits (rename / intro): mirrors
+                    // the server's patch_unit — absent fields keep
+                    // their values; folder_id keeps the server's
+                    // double-option semantics (absent = keep,
+                    // null = clear, string = set).
+                    let store = self.store.lock().unwrap();
+                    let folder_id = match body.get("folder_id") {
+                        None => None,
+                        Some(Value::Null) => Some(None),
+                        Some(v) => Some(v.as_str()),
+                    };
+                    let u = store.update_unit(
+                        id,
+                        str_field(&body, "name").as_deref(),
+                        folder_id,
+                        str_field(&body, "maintainer").as_deref(),
+                        str_field(&body, "description").as_deref(),
+                    )?;
+                    Ok(serde_json::to_value(&u).unwrap_or(Value::Null))
+                }
                 ("POST", ["v1", "units", id, "publish"]) => {
                     let store = self.store.lock().unwrap();
                     let unit = store.get_unit(id).map_err(|_| NOT_FOUND.to_string())?;

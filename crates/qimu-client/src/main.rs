@@ -1235,6 +1235,14 @@ struct WallState {
     multi: Vec<String>,
 }
 
+/// Which header meta field the inline editor is standing in
+/// for (prototype data-dbl-edit on the detail header).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MetaField {
+    Name,
+    Description,
+}
+
 /// One open content block: its detail payload plus every
 /// detail-period form (publish, per-page language bindings,
 /// scripts editor, AI translation target). Drafts die with the
@@ -1252,6 +1260,10 @@ struct UnitState {
     bind_from: String,
     bind_to: String,
     bind_from_slot: Option<i64>,
+    /// Header meta inline edit: (field, draft text) while the
+    /// title or the intro is being edited in place.
+    meta_edit: Option<(MetaField, String)>,
+    meta_edit_focus: bool,
     scripts_for: Option<String>, // version id whose 讲稿 is being edited
     scripts_edit: Vec<String>,
     translate_to: String,
@@ -1274,6 +1286,8 @@ impl UnitState {
             bind_from: String::new(),
             bind_to: String::new(),
             bind_from_slot: None,
+            meta_edit: None,
+            meta_edit_focus: false,
             scripts_for: None,
             scripts_edit: Vec::new(),
             translate_to: String::new(),
@@ -11808,21 +11822,134 @@ impl App {
         });
     }
 
+    /// Inline header meta editor (prototype data-dbl-edit): a
+    /// single-line field standing in for the header text while
+    /// editing. Focus loss commits (the prototype's focusout
+    /// save); Esc cancels. Empty or unchanged text saves
+    /// nothing, exactly as saveDrillMeta treats it.
+    fn meta_edit_ui(&mut self, ui: &mut egui::Ui, st: &mut UnitState, field: MetaField) {
+        let mut commit = false;
+        let mut cancel = false;
+        if let Some((f, text)) = &mut st.meta_edit {
+            if *f == field {
+                let resp = ui.add(egui::TextEdit::singleline(text).desired_width(360.0));
+                if st.meta_edit_focus {
+                    resp.request_focus();
+                    st.meta_edit_focus = false;
+                }
+                if resp.lost_focus() {
+                    commit = true;
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    cancel = true;
+                }
+            }
+        }
+        if cancel {
+            st.meta_edit = None;
+        } else if commit {
+            self.commit_meta_edit(st);
+        }
+    }
+
+    fn commit_meta_edit(&mut self, st: &mut UnitState) {
+        let Some((field, text)) = st.meta_edit.take() else {
+            return;
+        };
+        let text = text.trim().to_string();
+        let unit = st.detail.get("unit").cloned().unwrap_or(json!({}));
+        let current = match field {
+            MetaField::Name => s(&unit, "name"),
+            MetaField::Description => s(&unit, "description"),
+        };
+        if text.is_empty() || text == current {
+            return;
+        }
+        let body = match field {
+            MetaField::Name => json!({ "name": text }),
+            MetaField::Description => json!({ "description": text }),
+        };
+        let uid = st.unit_id.clone();
+        match self.call_work("PATCH", &format!("/v1/units/{uid}"), Some(body)) {
+            Ok(_) => self.open_unit_detail(&uid),
+            Err(e) => self.msg = format!("保存失败：{e}"),
+        }
+    }
+
+    /// Open the page-level editor overlay for version `v` at
+    /// `page` — the same PageEditState the version rows'
+    /// 编辑页面 button builds, landed on the requested page.
+    fn open_page_editor(&mut self, unit: &Value, v: &Value, page: usize) {
+        let mut scripts: Vec<String> = v
+            .get("scripts")
+            .and_then(|x| x.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|t| t.as_str().unwrap_or("").to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let pages = i(v, "page_count") as usize;
+        while scripts.len() < pages {
+            scripts.push(String::new());
+        }
+        self.overlays.push(Overlay::PageEdit(PageEditState {
+            version_id: s(v, "id"),
+            unit_name: s(unit, "name"),
+            semver: s(v, "semver"),
+            page_count: pages,
+            original_page_count: pages,
+            page,
+            base: Default::default(),
+            work: Default::default(),
+            scripts_base: scripts.clone(),
+            scripts,
+            bump: 1,
+            note: String::new(),
+            elems: Default::default(),
+            elems_base: Default::default(),
+            slide_cx: 12192000,
+            slide_cy: 6858000,
+            sel: None,
+            selection: Default::default(),
+            preview: Default::default(),
+            drag: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
+        }));
+    }
+
     fn unit_detail(&mut self, ui: &mut egui::Ui, st: &mut UnitState) {
         let detail = st.detail.clone();
         let unit = detail.get("unit").cloned().unwrap_or(json!({}));
-        // Breadcrumb (drill-down standard): 内容 › block name, the
+        // Breadcrumb (drill-down standard): 页面 › block name, the
         // root crumb being the way back — this frame was the last
         // one without a crumb bar, headed by a plain back button.
         let unit_name = s(&unit, "name");
-        if crumb_bar(ui, &[tr("内容"), &unit_name]) == Some(0) {
+        if crumb_bar(ui, &[tr("页面"), &unit_name]) == Some(0) {
             st.closed = true;
             self.refresh_all();
             return;
         }
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            ui.heading(s(&unit, "name"));
+            // Title (prototype data-dbl-edit): double-click turns
+            // it into an inline editor; committing PATCHes the
+            // name — a meta change, never a version bump. The
+            // label carries the Heading text size (18px in the
+            // app style) so it reads exactly as the heading did.
+            if matches!(&st.meta_edit, Some((MetaField::Name, _))) {
+                self.meta_edit_ui(ui, st, MetaField::Name);
+            } else {
+                let title = ui.add(
+                    egui::Label::new(egui::RichText::new(s(&unit, "name")).size(18.0))
+                        .sense(egui::Sense::click()),
+                );
+                if title.double_clicked() {
+                    st.meta_edit = Some((MetaField::Name, s(&unit, "name")));
+                    st.meta_edit_focus = true;
+                }
+            }
             ui.label(format!(
                 "内容修订 r{} · 维护人 {}",
                 i(&unit, "current_revision"),
@@ -11836,6 +11963,25 @@ impl App {
                 }
             });
         });
+        // 一句话介绍 (unit.description): the prototype's header
+        // hint line carries it right after the title; here it
+        // sits under the header row, double-click to edit in
+        // place (PATCH description, no version bump).
+        if matches!(&st.meta_edit, Some((MetaField::Description, _))) {
+            self.meta_edit_ui(ui, st, MetaField::Description);
+        } else if !s(&unit, "description").is_empty() {
+            let intro = ui.add(
+                egui::Label::new(
+                    egui::RichText::new(s(&unit, "description"))
+                        .color(palette_color(TEXT_WEAK)),
+                )
+                .sense(egui::Sense::click()),
+            );
+            if intro.double_clicked() {
+                st.meta_edit = Some((MetaField::Description, s(&unit, "description")));
+                st.meta_edit_focus = true;
+            }
+        }
         ui.separator();
         egui::ScrollArea::vertical().show(ui, |ui| {
             // pick-pages mode: the entry's currently resolved version,
@@ -11901,6 +12047,55 @@ impl App {
                 ui.separator();
                 ui.add_space(6.0);
             }
+            // 页面缩略图 (prototype #101's first section): the
+            // current version's pages as a thumb wall — the
+            // first rendition's newest non-recalled version.
+            // A page double-click opens the page editor on
+            // that page (the client's page-level surface; the
+            // version rows' 编辑页面 lands on page 0).
+            if let Some(wall_v) = detail
+                .get("renditions")
+                .and_then(|r| r.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|r| r.get("versions"))
+                .and_then(|v| v.as_array())
+                .and_then(|vs| {
+                    vs.iter()
+                        .find(|v| s(v, "status") != "recalled")
+                        .or_else(|| vs.first())
+                        .cloned()
+                })
+            {
+                let wall_vid = s(&wall_v, "id");
+                ui.label(egui::RichText::new("页面缩略图").strong());
+                ui.add_space(6.0);
+                let pages = i(&wall_v, "page_count") as usize;
+                let titles: Vec<String> = wall_v
+                    .get("pages")
+                    .and_then(|p| p.as_array())
+                    .map(|arr| arr.iter().map(|p| s(p, "title")).collect())
+                    .unwrap_or_default();
+                ui.horizontal_wrapped(|ui| {
+                    for p in 0..pages {
+                        ui.vertical(|ui| {
+                            let resp =
+                                self.thumb_response(ui, &wall_vid, p, 200.0, false);
+                            if resp.double_clicked() {
+                                self.open_page_editor(&unit, &wall_v, p);
+                            }
+                            let caption = titles
+                                .get(p)
+                                .filter(|t| !t.is_empty())
+                                .cloned()
+                                .unwrap_or_else(|| format!("第 {} 页", p + 1));
+                            ui.label(egui::RichText::new(caption).small());
+                        });
+                    }
+                });
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+            }
             if let Some(rends) = detail.get("renditions").and_then(|r| r.as_array()) {
                 for r in rends.clone() {
                     let rend = r.get("rendition").cloned().unwrap_or(json!({}));
@@ -11923,6 +12118,12 @@ impl App {
                                 if s(v, "status") == "recalled" {
                                     ui.label(
                                         egui::RichText::new("已撤回").color(palette_color(ROSE)),
+                                    );
+                                }
+                                if s(v, "status") == "draft" {
+                                    ui.label(
+                                        egui::RichText::new("草稿")
+                                            .color(palette_color(CHIP_ORANGE_FG)),
                                     );
                                 }
                                 if !s(v, "note").is_empty() {
