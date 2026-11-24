@@ -1044,6 +1044,9 @@ enum Page {
 struct ContentState {
     folder_filter: Option<String>,
     import_group: String,
+    /// Content page mode: the local-cache management view
+    /// (prototype #6b) replaces the wall while this is set.
+    cache_open: bool,
     stack: NavStack<ContentFrame>,
 }
 
@@ -1052,6 +1055,7 @@ impl Default for ContentState {
         Self {
             folder_filter: None,
             import_group: String::new(),
+            cache_open: false,
             stack: NavStack::new(ContentFrame::Wall(WallState::default())),
         }
     }
@@ -5835,6 +5839,29 @@ impl App {
     }
 
     fn ct_nav_body(&mut self, ui: &mut egui::Ui) {
+        // Sidebar heading (prototype wall sidebar: 目录 + tree-add).
+        // The add button opens the same inline folder editor the
+        // tree itself uses, parented to the current selection —
+        // a root folder when nothing is selected.
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(tr("目录"))
+                    .size(13.0)
+                    .strong()
+                    .color(palette_color(TEXT_MAIN)),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.small_icon_button(ui, ChromeIcon::FolderPlus, tr("新建目录")) {
+                    self.folder_edit = Some(FolderEdit {
+                        target: None,
+                        parent: self.content.folder_filter.clone(),
+                        text: "新文件夹".into(),
+                    });
+                    self.folder_edit_focus = true;
+                }
+            });
+        });
+        ui.add_space(2.0);
         let mut selected = self.content.folder_filter.clone();
         self.folder_tree(ui, &mut selected);
         if self.content.folder_filter != selected
@@ -5869,9 +5896,175 @@ impl App {
         if self.settings.section >= sections.len() {
             self.settings.section = 0;
         }
-        for (i, name) in sections.iter().enumerate() {
-            if tree_row(ui, self.settings.section == i, 0.0, None, tr(name), 12.5).clicked() {
-                self.settings.section = i;
+        let current = sections[self.settings.section];
+        // Sidebar morphology (prototype settings sidebar): a
+        // 「设置分区」 heading over the sections grouped by the
+        // prototype's categories, every row carrying its icon, and
+        // the approval row showing the live pending count. The
+        // prototype renders a second 「设置目录」 TOC with the same
+        // anchors; in this section-switch layout the nav itself is
+        // the directory, so the two lists are rendered as one.
+        ui.label(
+            egui::RichText::new(tr("设置分区"))
+                .size(13.0)
+                .strong()
+                .color(palette_color(TEXT_MAIN)),
+        );
+        ui.add_space(4.0);
+        let groups: &[(&str, &[(&str, ChromeIcon)])] = &[
+            ("", &[("服务器", ChromeIcon::Power)]),
+            (
+                "个人设置",
+                &[
+                    ("个人资料", ChromeIcon::Clipboard),
+                    ("离线缓存", ChromeIcon::Download),
+                    ("演示偏好", ChromeIcon::Presenter),
+                ],
+            ),
+            (
+                "组织管理",
+                &[
+                    ("组织管理", ChromeIcon::Lineage),
+                    ("内容组与授权", ChromeIcon::Directory),
+                    ("审批队列", ChromeIcon::Active),
+                ],
+            ),
+            (
+                "公司设置",
+                &[
+                    ("公司公共资料", ChromeIcon::Home),
+                    ("内容语言", ChromeIcon::All),
+                    ("AI 翻译", ChromeIcon::Split),
+                    ("离线缓存策略", ChromeIcon::Download),
+                ],
+            ),
+        ];
+        for (caption, items) in groups {
+            let visible: Vec<(&str, ChromeIcon)> = items
+                .iter()
+                .copied()
+                .filter(|(name, _)| sections.iter().any(|x| *x == *name))
+                .collect();
+            if visible.is_empty() {
+                continue;
+            }
+            if !caption.is_empty() {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(tr(caption))
+                        .size(12.0)
+                        .color(palette_color(TEXT_WEAK)),
+                );
+            }
+            for (name, icon) in visible {
+                let resp = tree_row(ui, current == name, 0.0, Some(icon), tr(name), 12.5);
+                if name == "审批队列" {
+                    let pending = self.showroom_pending.len();
+                    if pending > 0 {
+                        // Pending-count pill (prototype .cnt on the
+                        // queue nav item), painted on the row's right
+                        // edge; the count is the loaded review queue.
+                        let font = egui::FontId::new(10.5, egui::FontFamily::Proportional);
+                        let galley = ui.painter().layout_no_wrap(
+                            pending.to_string(),
+                            font,
+                            egui::Color32::WHITE,
+                        );
+                        let w = galley.size().x + 10.0;
+                        let rect = egui::Rect::from_min_size(
+                            egui::pos2(resp.rect.max.x - w - 8.0, resp.rect.center().y - 8.0),
+                            egui::vec2(w, 16.0),
+                        );
+                        ui.painter().rect_filled(rect, 8.0, ROSE);
+                        ui.painter().galley(
+                            egui::pos2(
+                                rect.center().x - galley.size().x / 2.0,
+                                rect.center().y - galley.size().y / 2.0,
+                            ),
+                            galley,
+                            egui::Color32::WHITE,
+                        );
+                    }
+                }
+                if resp.clicked() {
+                    if let Some(pos) = sections.iter().position(|x| *x == name) {
+                        self.settings.section = pos;
+                    }
+                }
+            }
+        }
+        // Org fold (prototype settings sidebar): the company org
+        // tree under a collapsible header with the member count.
+        // Its rows and add buttons land on the 组织管理 section,
+        // where the real department/account forms live — the fold
+        // is a shortcut into that section, not a second form.
+        if sections.iter().any(|x| *x == "组织管理") {
+            let depts = self
+                .org
+                .get("departments")
+                .and_then(|d| d.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let user_count = self
+                .org
+                .get("users")
+                .and_then(|u| u.as_array())
+                .map_or(0, |a| a.len());
+            let mut jump_org = false;
+            ui.add_space(10.0);
+            egui::CollapsingHeader::new(
+                egui::RichText::new(format!("{} · {} 人", tr("公司组织架构"), user_count))
+                    .size(12.5),
+            )
+            .default_open(false)
+            .show(ui, |ui| {
+                if depts.is_empty() {
+                    ui.label(
+                        egui::RichText::new(tr("暂无部门"))
+                            .size(12.0)
+                            .color(palette_color(TEXT_WEAK)),
+                    );
+                }
+                for d in &depts {
+                    if tree_row(
+                        ui,
+                        false,
+                        0.0,
+                        Some(ChromeIcon::Directory),
+                        &s(d, "name"),
+                        12.5,
+                    )
+                    .clicked()
+                    {
+                        jump_org = true;
+                    }
+                }
+                ui.add_space(4.0);
+                let add_sub = egui::Button::new(
+                    egui::RichText::new(tr("＋ 在所选部门下新建子部门"))
+                        .size(12.5)
+                        .color(egui::Color32::WHITE),
+                )
+                .fill(ACCENT)
+                .corner_radius(6);
+                if ui.add_sized([ui.available_width(), 30.0], add_sub).clicked() {
+                    jump_org = true;
+                }
+                let add_root = egui::Button::new(
+                    egui::RichText::new(tr("＋ 新建一级部门"))
+                        .size(12.5)
+                        .color(palette_color(TEXT_MAIN)),
+                )
+                .fill(palette_color(HOVER_BG))
+                .corner_radius(6);
+                if ui.add_sized([ui.available_width(), 30.0], add_root).clicked() {
+                    jump_org = true;
+                }
+            });
+            if jump_org {
+                if let Some(pos) = sections.iter().position(|x| *x == "组织管理") {
+                    self.settings.section = pos;
+                }
             }
         }
     }
@@ -9333,7 +9526,11 @@ impl App {
                 st.closed
             }
             ContentFrame::Wall(w) => {
-                self.content_wall(ui, w);
+                if self.content.cache_open && self.pick.is_none() {
+                    self.content_cache_body(ui);
+                } else {
+                    self.content_wall(ui, w);
+                }
                 false
             }
         };
@@ -9571,15 +9768,205 @@ impl App {
         });
     }
 
+    /// Content page · local cache management (prototype #6b
+    /// wallCacheView): the same on-device cache the showroom 我的
+    /// zone lists as cards, here as management rows — stats hero,
+    /// capacity bar, and per-entry 打开 / 常驻 / 移除 actions on
+    /// the existing cache machinery (open_cache / remove_cache /
+    /// the persisted cache index). Pinning persists a flag on the
+    /// entry; the client cache has no eviction pass yet, so today
+    /// the flag is state (shown in the stats and the row badge),
+    /// not yet a behavior difference.
+    fn content_cache_body(&mut self, ui: &mut egui::Ui) {
+        body_frame().show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(tr("本地缓存"))
+                    .strong()
+                    .size(16.0)
+                    .color(palette_color(TEXT_MAIN)),
+            );
+            ui.add_space(8.0);
+            let entries = self.cache_entries.clone();
+            let used_bytes: i64 = entries.iter().map(|e| i(e, "bytes")).sum();
+            let cap_mb = self
+                .cache_policy
+                .get("max_mb")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(500);
+            let pinned = entries
+                .iter()
+                .filter(|e| e.get("pinned").and_then(|v| v.as_bool()) == Some(true))
+                .count();
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("已缓存条目 · {}", entries.len()))
+                        .size(12.5)
+                        .color(palette_color(TEXT_WEAK)),
+                );
+                ui.add_space(16.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "总占用 {:.1} MB / 上限 {} MB",
+                        used_bytes as f64 / 1_000_000.0,
+                        cap_mb
+                    ))
+                    .size(12.5)
+                    .color(palette_color(TEXT_WEAK)),
+                );
+                ui.add_space(16.0);
+                ui.label(
+                    egui::RichText::new(format!("常驻条数 · {}", pinned))
+                        .size(12.5)
+                        .color(palette_color(TEXT_WEAK)),
+                );
+            });
+            ui.add_space(10.0);
+            let pct = if cap_mb > 0 {
+                (used_bytes as f64 / (cap_mb as f64 * 1024.0 * 1024.0)).clamp(0.0, 1.0) as f32
+            } else {
+                0.0
+            };
+            let bar_w = ui.available_width().min(560.0);
+            let (track, _) =
+                ui.allocate_exact_size(egui::vec2(bar_w, 6.0), egui::Sense::hover());
+            ui.painter().rect_filled(track, 3.0, palette_color(HOVER_BG));
+            if pct > 0.0 {
+                let fill_rect = egui::Rect::from_min_size(
+                    track.min,
+                    egui::vec2(track.width() * pct, 6.0),
+                );
+                ui.painter().rect_filled(fill_rect, 3.0, ACCENT);
+            }
+            ui.label(
+                egui::RichText::new(format!(
+                    "本地已用 {:.1} MB / 上限 {} MB",
+                    used_bytes as f64 / 1_000_000.0,
+                    cap_mb
+                ))
+                .size(11.5)
+                .color(palette_color(TEXT_WEAK)),
+            );
+            ui.add_space(14.0);
+            if entries.is_empty() {
+                ui.label(
+                    egui::RichText::new(tr("本地还没有缓存任何稿件。"))
+                        .size(12.5)
+                        .color(palette_color(TEXT_WEAK)),
+                );
+                return;
+            }
+            // 0 open · 1 toggle pin · 2 remove — applied after the
+            // render pass, like the review queue's action locals.
+            let mut act: Option<(String, u8)> = None;
+            egui::ScrollArea::vertical()
+                .id_salt("content_cache")
+                .show(ui, |ui| {
+                    for e in &entries {
+                        let key = s(e, "key");
+                        let is_pinned =
+                            e.get("pinned").and_then(|v| v.as_bool()) == Some(true);
+                        egui::Frame::NONE
+                            .fill(palette_color(PANEL_BG))
+                            .stroke(egui::Stroke::new(1.0, palette_color(FIELD_BORDER)))
+                            .corner_radius(egui::CornerRadius::same(6))
+                            .inner_margin(egui::Margin::same(12))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.vertical(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(s(e, "title"))
+                                                .size(13.0)
+                                                .strong()
+                                                .color(palette_color(TEXT_MAIN)),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{} 页 · {:.1} MB · 缓存于 {}",
+                                                i(e, "page_count"),
+                                                i(e, "bytes") as f64 / 1_000_000.0,
+                                                fmt_time(i(e, "cached_ms"))
+                                            ))
+                                            .size(11.5)
+                                            .color(palette_color(TEXT_WEAK)),
+                                        );
+                                    });
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if btn_default(ui, tr("移除缓存")).clicked() {
+                                                act = Some((key.clone(), 2));
+                                            }
+                                            if btn_default(
+                                                ui,
+                                                if is_pinned {
+                                                    tr("取消常驻")
+                                                } else {
+                                                    tr("设为常驻")
+                                                },
+                                            )
+                                            .clicked()
+                                            {
+                                                act = Some((key.clone(), 1));
+                                            }
+                                            if btn_default(ui, tr("打开")).clicked() {
+                                                act = Some((key.clone(), 0));
+                                            }
+                                        },
+                                    );
+                                });
+                                ui.add_space(6.0);
+                                if is_pinned {
+                                    chip(
+                                        ui,
+                                        tr("已缓存 · 常驻本地"),
+                                        palette_color(ACCENT_DEEP),
+                                        CHIP_BLUE_BG,
+                                    );
+                                } else {
+                                    chip(
+                                        ui,
+                                        tr("已缓存"),
+                                        palette_color(CHIP_GREEN_FG),
+                                        CHIP_GREEN_BG,
+                                    );
+                                }
+                            });
+                        ui.add_space(8.0);
+                    }
+                });
+            if let Some((key, what)) = act {
+                match what {
+                    0 => self.open_cache(&key),
+                    2 => self.remove_cache(&key),
+                    _ => {
+                        if let Some(e) =
+                            self.cache_entries.iter_mut().find(|e| s(e, "key") == key)
+                        {
+                            let now =
+                                e.get("pinned").and_then(|v| v.as_bool()).unwrap_or(false);
+                            e["pinned"] = json!(!now);
+                        }
+                        save_cache_index(&self.cache_entries);
+                    }
+                }
+            }
+        });
+    }
+
     fn unit_detail(&mut self, ui: &mut egui::Ui, st: &mut UnitState) {
         let detail = st.detail.clone();
         let unit = detail.get("unit").cloned().unwrap_or(json!({}));
+        // Breadcrumb (drill-down standard): 内容 › block name, the
+        // root crumb being the way back — this frame was the last
+        // one without a crumb bar, headed by a plain back button.
+        let unit_name = s(&unit, "name");
+        if crumb_bar(ui, &[tr("内容"), &unit_name]) == Some(0) {
+            st.closed = true;
+            self.refresh_all();
+            return;
+        }
+        ui.add_space(6.0);
         ui.horizontal(|ui| {
-            if ui.button("← 返回").clicked() {
-                st.closed = true;
-                self.refresh_all();
-                return;
-            }
             ui.heading(s(&unit, "name"));
             ui.label(format!(
                 "内容修订 r{} · 维护人 {}",

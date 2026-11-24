@@ -99,7 +99,8 @@ impl App {
                 let action_height = match page {
                     Page::Home => 166.0,
                     Page::Index => 90.0,
-                    Page::Showroom | Page::Content | Page::Trash => 52.0,
+                    Page::Content => 96.0,
+                    Page::Showroom | Page::Trash => 52.0,
                     Page::Settings => 0.0,
                 };
                 if action_height > 0.0 {
@@ -229,6 +230,23 @@ impl App {
                 .corner_radius(6);
             if ui.add_sized([ui.available_width(), 32.0], button).clicked() {
                 self.run_home_action(Some(key));
+            }
+        }
+        if page == Page::Content {
+            let open = self.content.cache_open;
+            let label = if open {
+                tr("正在管理 · 点此返回")
+            } else {
+                tr("本地缓存")
+            };
+            let button = egui::Button::new(
+                egui::RichText::new(label).color(egui::Color32::WHITE),
+            )
+            .fill(ACCENT)
+            .corner_radius(6);
+            if ui.add_sized([ui.available_width(), 32.0], button).clicked() {
+                self.content.stack.pop_to(0);
+                self.content.cache_open = !self.content.cache_open;
             }
         }
         let can_add_folder = matches!(page, Page::Content | Page::Index)
