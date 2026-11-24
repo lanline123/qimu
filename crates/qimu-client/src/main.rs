@@ -11835,7 +11835,14 @@ impl App {
                     // sidebar selection only scrolls the matching
                     // block into view; it stays the create / import
                     // target folder, never a display filter.
+                    // Scope isolation (user ruling 2026-11-25): the
+                    // flow shows the content board's own folders
+                    // only — the same set as the page's left
+                    // sidebar tree (scope "content"). Other boards'
+                    // folders (showroom plaza, index, …) never
+                    // render as blocks here.
                     let mut folders = self.folders.clone();
+                    folders.retain(|f| s(f, "scope") == "content");
                     folders.sort_by_key(|f| i(f, "sort"));
                     fn depth_of(folders: &[Value], f: &Value) -> usize {
                         let mut d = 0;
@@ -11923,12 +11930,15 @@ impl App {
                     }
                     // Folder-less blocks (and blocks whose folder
                     // no longer exists): one untitled card group
-                    // closing the flow.
+                    // closing the flow. A block filed under another
+                    // board's folder is NOT loose — it belongs to
+                    // that board and stays out of this flow.
                     let root_items: Vec<Value> = all_units
                         .iter()
                         .filter(|it| {
                             let fid = unit_folder(it);
-                            fid.is_empty() || !ordered.iter().any(|f| s(f, "id") == fid)
+                            fid.is_empty()
+                                || !self.folders.iter().any(|f| s(f, "id") == fid)
                         })
                         .cloned()
                         .collect();
