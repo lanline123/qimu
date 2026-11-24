@@ -2841,6 +2841,222 @@ async fn review_showroom(
 }
 
 
+
+// ---------------- submissions (local-first P3, design §6.3) ----------------
+// The real-byte submission chain, replacing reference-style
+// showroom submission for content that lives in a submitter's
+// local library: the client uploads the content package itself
+// (manifest + fragment bytes), the package waits in the isolated
+// staging zone (submissions table + `<data root>/staging/<id>/` —
+// never the landed store's tables or its CAS), and only a super's
+// approval runs the landing transaction that rebuilds it as
+// organization content with a live showroom entry. The
+// reference-style POST /v1/showroom above stays for one cycle for
+// content that already lives on this server (design §8.3); the
+// approval face distinguishes the two sources.
+
+#[derive(Deserialize)]
+struct SubmissionReq {
+    title: String,
+    intro: Option<String>,
+    /// The submitter's note riding with the package.
+    note: Option<String>,
+    /// A rejected submission of the caller's that this one
+    /// replaces (resubmission link).
+    supersedes: Option<String>,
+    /// The submitter-side local index id (provenance for the
+    /// submitter's own client; never resolved server-side).
+    source_index_id: Option<String>,
+    manifest: SubmissionManifest,
+    /// Fragment bytes by SHA-256 hash, base64 — the manifest's
+    /// versions name the hashes they need.
+    files: HashMap<String, String>,
+}
+
+async fn create_submission(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Json(req): Json<SubmissionReq>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let manifest = &req.manifest;
+    if manifest.format != 1 {
+        return Err(bad("提交包格式版本不受支持"));
+    }
+    if manifest.commit.entries.is_empty() {
+        return Err(bad("提交包没有任何条目"));
+    }
+    // The file set must cover exactly the fragments the manifest's
+    // versions name — no missing pages, no undeclared bytes.
+    let mut want: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for v in &manifest.versions {
+        want.insert(v.fragment_hash.as_str());
+    }
+    for h in req.files.keys() {
+        if !want.contains(h.as_str()) {
+            return Err(bad("提交包包含清单外文件"));
+        }
+    }
+    for h in &want {
+        if !req.files.contains_key(*h) {
+            return Err(bad("提交包缺少片段文件"));
+        }
+    }
+    let store = st.store.lock().unwrap();
+    if let Some(prev_id) = &req.supersedes {
+        let prev = store
+            .get_submission(prev_id)
+            .map_err(bad)?
+            .ok_or_else(|| bad("重提指向的原提交不存在"))?;
+        if prev.submitter_id != user.id {
+            return Err(bad("重提必须指向自己的提交"));
+        }
+        if prev.state != "rejected" {
+            return Err(bad("只有被驳回的提交可以被重提取代"));
+        }
+    }
+    let id = qimu_core::auth::new_id("sub");
+    let page_count: i64 = manifest.versions.iter().map(|v| v.page_count).sum();
+    let rec = SubmissionRec {
+        id: id.clone(),
+        title: req.title.clone(),
+        intro: req.intro.clone().unwrap_or_default(),
+        submitter_id: user.id.clone(),
+        submitter_name: user.display_name.clone(),
+        state: "pending".into(),
+        note: req.note.clone().unwrap_or_default(),
+        review_note: String::new(),
+        reviewed_by: String::new(),
+        reviewed_ms: 0,
+        created_ms: qimu_core::auth::now_ms(),
+        supersedes: req.supersedes.clone(),
+        source_index_id: req.source_index_id.clone(),
+        landed_index_id: None,
+        landed_showroom_id: None,
+        entry_count: manifest.commit.entries.len() as i64,
+        page_count,
+        land_error: String::new(),
+    };
+    let manifest_json =
+        serde_json::to_string(manifest).map_err(|e| bad(e.to_string()))?;
+    // Stage the bytes first (hash-verified inside core); the row
+    // insert is the commit point — a failure before it leaves no
+    // submission behind, and the error path removes the staging
+    // directory again.
+    let staged = (|| -> Result<(), (StatusCode, Json<Value>)> {
+        for (hash, b64) in &req.files {
+            let bytes = b64d(b64)?;
+            store.stage_submission_file(&id, hash, &bytes).map_err(bad)?;
+        }
+        store.insert_submission(&rec, &manifest_json).map_err(bad)?;
+        Ok(())
+    })();
+    if let Err(e) = staged {
+        store.clear_submission_staging(&id);
+        return Err(e);
+    }
+    Ok(Json(json!(rec)))
+}
+
+async fn list_submissions(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let store = st.store.lock().unwrap();
+    let items = if q.get("mine").map(|v| v == "1").unwrap_or(false) {
+        store
+            .list_submissions_by_submitter(&user.id)
+            .map_err(bad)?
+    } else {
+        // The review queue face: supers only, mirroring the
+        // showroom review gate.
+        if user.role != "super" {
+            return Err(forbidden());
+        }
+        store
+            .list_submissions(q.get("state").map(|s| s.as_str()))
+            .map_err(bad)?
+    };
+    Ok(Json(json!({ "items": items })))
+}
+
+async fn review_submission(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<ReviewReq>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    if user.role != "super" {
+        return Err(forbidden());
+    }
+    let note = req.note.as_deref().unwrap_or("");
+    let store = st.store.lock().unwrap();
+    let sub = store
+        .get_submission(&id)
+        .map_err(bad)?
+        .ok_or_else(not_found)?;
+    if sub.state != "pending" {
+        return Err(bad("该提交已处理"));
+    }
+    match req.state.as_str() {
+        "live" => {
+            let manifest_json = store.submission_manifest(&id).map_err(bad)?;
+            let manifest: SubmissionManifest = serde_json::from_str(&manifest_json)
+                .map_err(|e| bad(format!("提交包清单无法解析：{e}")))?;
+            match store.land_submission(&id, &manifest, &user.display_name) {
+                Ok((index_id, showroom_id)) => Ok(Json(json!({
+                    "ok": true,
+                    "landed_index_id": index_id,
+                    "landed_showroom_id": showroom_id
+                }))),
+                Err(e) => {
+                    // The landing rolled back: the submission
+                    // stays pending with the reason recorded.
+                    let _ = store.set_submission_land_error(&id, &e);
+                    Err(bad(format!("落地失败（提交仍在待审区）：{e}")))
+                }
+            }
+        }
+        "rejected" => {
+            if note.trim().is_empty() {
+                return Err(bad("驳回必须填写理由（会原样回到提交人）"));
+            }
+            store
+                .set_submission_rejected(&id, note, &user.display_name)
+                .map_err(bad)?;
+            Ok(Json(json!({ "ok": true })))
+        }
+        _ => Err(bad("未知审批结果")),
+    }
+}
+
+async fn delete_submission(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let store = st.store.lock().unwrap();
+    let sub = store
+        .get_submission(&id)
+        .map_err(bad)?
+        .ok_or_else(not_found)?;
+    // Withdraw (pending) and cleanup (rejected) belong to the
+    // submitter; a landed submission's record is provenance and
+    // only a super may remove it (the landed content itself is a
+    // separate object and is never touched here).
+    let allowed = user.role == "super"
+        || (sub.state != "landed" && sub.submitter_id == user.id);
+    if !allowed {
+        return Err(forbidden());
+    }
+    store.delete_submission(&id).map_err(bad)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
 // ---------------- trash (soft delete, prototype #trashView) ----------------
 // Deleting moves an object behind the store's trash overlay: it
 // disappears from the normal lists but keeps every version and
@@ -4278,6 +4494,9 @@ async fn main() {
         .route("/v1/attachments/:id/download", get(download_attachment))
         .route("/v1/showroom", get(list_showroom).post(submit_showroom))
         .route("/v1/showroom/:id/review", post(review_showroom))
+        .route("/v1/submissions", get(list_submissions).post(create_submission))
+        .route("/v1/submissions/:id/review", post(review_submission))
+        .route("/v1/submissions/:id", delete(delete_submission))
         .route("/v1/trash", get(list_trash).post(add_trash))
         .route("/v1/trash/purge-all", post(purge_all_trash))
         .route("/v1/trash/:id/restore", post(restore_trash))

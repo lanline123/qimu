@@ -403,6 +403,125 @@ pub const GUEST_TTL_MS: i64 = 24 * 3600 * 1000;
 pub const USER_IDLE_TTL_MS: i64 = 30 * 24 * 3600 * 1000;
 const SESSION_TOUCH_MS: i64 = 60 * 1000;
 
+/// One row of the submissions table (local-first P3, design §6.3):
+/// a real-byte submission waiting in the server's staging zone.
+/// The package's content files live outside the landed store, in
+/// `<data root>/staging/<id>/`; the manifest rides in the row
+/// (read back via `submission_manifest`, deliberately not part of
+/// this record so list responses stay small). A submission is NOT
+/// landed content: no units / indexes / versions / showroom rows
+/// exist for it until `land_submission` runs at approval time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmissionRec {
+    pub id: String,
+    pub title: String,
+    pub intro: String,
+    pub submitter_id: String,
+    pub submitter_name: String,
+    pub state: String, // pending | landed | rejected
+    /// The submitter's own note riding with the package.
+    pub note: String,
+    /// Rejection reason, returned to the submitter verbatim.
+    #[serde(default)]
+    pub review_note: String,
+    #[serde(default)]
+    pub reviewed_by: String,
+    #[serde(default)]
+    pub reviewed_ms: i64,
+    pub created_ms: i64,
+    /// The rejected submission this one replaces (resubmission).
+    pub supersedes: Option<String>,
+    /// The submitter-side (local library) index id — provenance
+    /// for the submitter's own client only; the server never
+    /// resolves it against its own indexes.
+    pub source_index_id: Option<String>,
+    pub landed_index_id: Option<String>,
+    pub landed_showroom_id: Option<String>,
+    pub entry_count: i64,
+    pub page_count: i64,
+    /// Last landing failure, recorded when an approval's landing
+    /// transaction rolled back (the submission stays pending).
+    #[serde(default)]
+    pub land_error: String,
+}
+
+/// The content manifest of a submission package (design §6.3):
+/// one local index pinned at one commit, with every referenced
+/// unit / rendition / version's metadata. Fragment bytes travel
+/// separately, keyed by SHA-256 hash (the `files` map of the
+/// upload), so the manifest itself stays small and reviewable.
+/// All ids are the *submitter's local* ids; landing re-mints
+/// server ids and records the mapping on the submission row
+/// (design §9 R4).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmissionManifest {
+    pub format: u32,
+    pub index_name: String,
+    pub index_scope: String,
+    pub commit: SubmissionCommit,
+    pub units: Vec<SubmissionUnit>,
+    pub renditions: Vec<SubmissionRendition>,
+    pub versions: Vec<SubmissionVersion>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmissionCommit {
+    pub branch: String,
+    pub message: String,
+    pub entries: Vec<SubmissionEntry>,
+}
+
+/// One commit entry plus the version it resolved to in the
+/// submitter's library — the exact version whose fragment the
+/// package ships for this entry (the same resolution the export
+/// path performs).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmissionEntry {
+    pub entry: IndexEntry,
+    pub version_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmissionUnit {
+    pub id: String,
+    pub name: String,
+    pub lead_lang: String,
+    pub description: String,
+    pub current_revision: i64,
+    pub maintainer: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmissionRendition {
+    pub id: String,
+    pub unit_id: String,
+    pub form: String,
+    pub lang: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmissionVersion {
+    pub id: String,
+    pub rendition_id: String,
+    pub semver: String,
+    pub basis_revision: i64,
+    pub author: String,
+    pub note: String,
+    pub status: String,
+    pub created_ms: i64,
+    pub fragment_hash: String,
+    pub page_count: i64,
+    /// Per-page speaker scripts, aligned with the fragment's pages.
+    pub scripts: Vec<String>,
+}
+
+/// The content group submission landings rebuild into. Created on
+/// first landing with view/use grants for every root department
+/// (so landed content is visible in the org's material faces, not
+/// only through the showroom); grants are issued only at creation
+/// time and never re-asserted afterwards.
+pub const LANDING_GROUP_NAME: &str = "演示厅落地";
+
 /// One row of the sessions table (org-model G1): named user
 /// sessions and anonymous guest sessions share the table and the
 /// opaque-token form; `kind` is the only distinction, and a guest
@@ -436,6 +555,7 @@ CREATE TABLE IF NOT EXISTS exports(id TEXT PRIMARY KEY, index_id TEXT NOT NULL, 
 CREATE TABLE IF NOT EXISTS attachments(id TEXT PRIMARY KEY, parent_type TEXT NOT NULL, parent_id TEXT NOT NULL, filename TEXT NOT NULL, hash TEXT NOT NULL, size INTEGER NOT NULL, uploader TEXT NOT NULL, created_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS version_tags(id TEXT PRIMARY KEY, version_id TEXT NOT NULL, dim TEXT NOT NULL, value TEXT NOT NULL, strength TEXT NOT NULL DEFAULT 'fits', author TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS showroom(id TEXT PRIMARY KEY, title TEXT NOT NULL, intro TEXT NOT NULL DEFAULT '', source_index_id TEXT, commit_id TEXT, submitted_by TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending', created_ms INTEGER NOT NULL, scope TEXT NOT NULL DEFAULT 'org_public');
+CREATE TABLE IF NOT EXISTS submissions(id TEXT PRIMARY KEY, title TEXT NOT NULL, intro TEXT NOT NULL DEFAULT '', submitter_id TEXT NOT NULL, submitter_name TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending', note TEXT NOT NULL DEFAULT '', review_note TEXT NOT NULL DEFAULT '', reviewed_by TEXT NOT NULL DEFAULT '', reviewed_ms INTEGER NOT NULL DEFAULT 0, created_ms INTEGER NOT NULL, supersedes TEXT, source_index_id TEXT, landed_index_id TEXT, landed_showroom_id TEXT, entry_count INTEGER NOT NULL DEFAULT 0, page_count INTEGER NOT NULL DEFAULT 0, land_error TEXT NOT NULL DEFAULT '', manifest_json TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS trash_items(id TEXT PRIMARY KEY, kind TEXT NOT NULL, object_id TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', origin TEXT NOT NULL DEFAULT '', deleted_by TEXT NOT NULL DEFAULT '', deleted_ms INTEGER NOT NULL DEFAULT 0, UNIQUE(kind, object_id));
 CREATE TABLE IF NOT EXISTS assemblies(id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, entries_json TEXT NOT NULL, created_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS page_bindings(id TEXT PRIMARY KEY, unit_id TEXT NOT NULL, from_version_id TEXT NOT NULL, from_slot INTEGER NOT NULL, to_version_id TEXT NOT NULL, to_slot INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'manual', author TEXT NOT NULL, created_ms INTEGER NOT NULL);
@@ -2448,6 +2568,470 @@ impl Store {
 
     /// Move an object to the trash. Idempotent: re-deleting an
     /// already-trashed object returns the existing row.
+    // ---------- submissions (local-first P3, design §6.3) ----------
+    //
+    // The server-side staging zone of the submission chain. Rows
+    // here are *not* landed content: the package files sit in
+    // `<root>/staging/<id>/`, outside the content-addressed store,
+    // and no units / indexes / versions / showroom rows exist for
+    // a pending submission — which is what makes pending content
+    // structurally invisible to every distribution and material
+    // face (they all read only the landed tables). Approval runs
+    // `land_submission`; rejection only stamps the row.
+
+    const SUBMISSION_COLS: &str = "id, title, intro, submitter_id, submitter_name, state, note, review_note, reviewed_by, reviewed_ms, created_ms, supersedes, source_index_id, landed_index_id, landed_showroom_id, entry_count, page_count, land_error";
+
+    fn row_to_submission(r: &rusqlite::Row) -> rusqlite::Result<SubmissionRec> {
+        Ok(SubmissionRec {
+            id: r.get(0)?,
+            title: r.get(1)?,
+            intro: r.get(2)?,
+            submitter_id: r.get(3)?,
+            submitter_name: r.get(4)?,
+            state: r.get(5)?,
+            note: r.get(6)?,
+            review_note: r.get(7)?,
+            reviewed_by: r.get(8)?,
+            reviewed_ms: r.get(9)?,
+            created_ms: r.get(10)?,
+            supersedes: r.get(11)?,
+            source_index_id: r.get(12)?,
+            landed_index_id: r.get(13)?,
+            landed_showroom_id: r.get(14)?,
+            entry_count: r.get(15)?,
+            page_count: r.get(16)?,
+            land_error: r.get(17)?,
+        })
+    }
+
+    pub fn insert_submission(
+        &self,
+        rec: &SubmissionRec,
+        manifest_json: &str,
+    ) -> SResult<SubmissionRec> {
+        self.conn
+            .execute(
+                "INSERT INTO submissions(id, title, intro, submitter_id, submitter_name, state, note, review_note, reviewed_by, reviewed_ms, created_ms, supersedes, source_index_id, landed_index_id, landed_showroom_id, entry_count, page_count, land_error, manifest_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+                params![
+                    rec.id,
+                    rec.title,
+                    rec.intro,
+                    rec.submitter_id,
+                    rec.submitter_name,
+                    rec.state,
+                    rec.note,
+                    rec.review_note,
+                    rec.reviewed_by,
+                    rec.reviewed_ms,
+                    rec.created_ms,
+                    rec.supersedes,
+                    rec.source_index_id,
+                    rec.landed_index_id,
+                    rec.landed_showroom_id,
+                    rec.entry_count,
+                    rec.page_count,
+                    rec.land_error,
+                    manifest_json
+                ],
+            )
+            .map_err(db_err)?;
+        self.get_submission(&rec.id)?
+            .ok_or_else(|| "提交写入后无法读回".to_string())
+    }
+
+    pub fn get_submission(&self, id: &str) -> SResult<Option<SubmissionRec>> {
+        self.conn
+            .query_row(
+                &format!(
+                    "SELECT {} FROM submissions WHERE id=?1",
+                    Self::SUBMISSION_COLS
+                ),
+                params![id],
+                Self::row_to_submission,
+            )
+            .optional()
+            .map_err(db_err)
+    }
+
+    pub fn list_submissions(&self, state: Option<&str>) -> SResult<Vec<SubmissionRec>> {
+        let sql = match state {
+            Some(_) => format!(
+                "SELECT {} FROM submissions WHERE state=?1 ORDER BY created_ms DESC",
+                Self::SUBMISSION_COLS
+            ),
+            None => format!(
+                "SELECT {} FROM submissions ORDER BY created_ms DESC",
+                Self::SUBMISSION_COLS
+            ),
+        };
+        let mut stmt = self.conn.prepare(&sql).map_err(db_err)?;
+        let rows = match state {
+            Some(s) => stmt
+                .query_map(params![s], Self::row_to_submission)
+                .map_err(db_err)?
+                .collect::<Result<Vec<_>, _>>(),
+            None => stmt
+                .query_map([], Self::row_to_submission)
+                .map_err(db_err)?
+                .collect::<Result<Vec<_>, _>>(),
+        };
+        rows.map_err(db_err)
+    }
+
+    pub fn list_submissions_by_submitter(
+        &self,
+        user_id: &str,
+    ) -> SResult<Vec<SubmissionRec>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "SELECT {} FROM submissions WHERE submitter_id=?1 ORDER BY created_ms DESC",
+                Self::SUBMISSION_COLS
+            ))
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![user_id], Self::row_to_submission)
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(rows)
+    }
+
+    /// The stored package manifest JSON for one submission (kept
+    /// out of SubmissionRec so list responses stay small).
+    pub fn submission_manifest(&self, id: &str) -> SResult<String> {
+        self.conn
+            .query_row(
+                "SELECT manifest_json FROM submissions WHERE id=?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .map_err(db_err)
+    }
+
+    pub fn set_submission_rejected(&self, id: &str, note: &str, by: &str) -> SResult<()> {
+        self.conn
+            .execute(
+                "UPDATE submissions SET state='rejected', review_note=?2, reviewed_by=?3, reviewed_ms=?4, land_error='' WHERE id=?1",
+                params![id, note, by, now_ms()],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Record why a landing attempt rolled back. The submission
+    /// itself stays pending; only the error note changes.
+    pub fn set_submission_land_error(&self, id: &str, err: &str) -> SResult<()> {
+        self.conn
+            .execute(
+                "UPDATE submissions SET land_error=?2 WHERE id=?1",
+                params![id, err],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Delete a submission row and its staged package. Landed
+    /// content (if any) is a separate object by then and is not
+    /// touched — this removes the submission record only.
+    pub fn delete_submission(&self, id: &str) -> SResult<()> {
+        self.conn
+            .execute("DELETE FROM submissions WHERE id=?1", params![id])
+            .map_err(db_err)?;
+        self.clear_submission_staging(id);
+        Ok(())
+    }
+
+    /// The staging directory of one submission package:
+    /// `<root>/staging/<id>/`, deliberately outside `files/` (the
+    /// landed CAS) so staged bytes are unreachable through every
+    /// content-addressed read path.
+    pub fn submission_staging_dir(&self, id: &str) -> PathBuf {
+        self.root.join("staging").join(id)
+    }
+
+    /// Store one package file in the staging zone, verifying the
+    /// bytes against the manifest's claimed SHA-256 (the same
+    /// hash the landed CAS will key on after landing).
+    pub fn stage_submission_file(&self, id: &str, hash: &str, bytes: &[u8]) -> SResult<()> {
+        let mut h = Sha256::new();
+        h.update(bytes);
+        let actual = format!("{:x}", h.finalize());
+        if actual != hash {
+            return Err(format!(
+                "提交包文件哈希不符（清单 {hash}，实际 {actual}）"
+            ));
+        }
+        let sub = if hash.len() >= 2 { &hash[..2] } else { "00" };
+        let dir = self.submission_staging_dir(id).join("files").join(sub);
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let path = dir.join(format!("{hash}.bin"));
+        if !path.exists() {
+            craft_atomic::atomic_write(&path, bytes).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    pub fn staged_file_get(&self, id: &str, hash: &str) -> SResult<Vec<u8>> {
+        let sub = if hash.len() >= 2 { &hash[..2] } else { "00" };
+        let path = self
+            .submission_staging_dir(id)
+            .join("files")
+            .join(sub)
+            .join(format!("{hash}.bin"));
+        std::fs::read(&path).map_err(|e| format!("待审包文件 {hash}: {e}"))
+    }
+
+    pub fn clear_submission_staging(&self, id: &str) {
+        let _ = std::fs::remove_dir_all(self.submission_staging_dir(id));
+    }
+
+    /// The landing transaction (design §6.3): rebuild a pending
+    /// submission's package as organization content — units,
+    /// renditions, versions, an index with its pinned commit, and
+    /// a live showroom entry — and stamp the submission landed.
+    /// All database writes run inside one SQLite transaction: any
+    /// failure rolls the whole landing back, leaving the
+    /// submission pending (the caller records the reason via
+    /// `set_submission_land_error`) and the staged package intact.
+    /// Fragment bytes move through the content-addressed store
+    /// (`insert_version` → `file_put`); files written before a
+    /// rollback stay in the CAS as unreferenced orphans, harmless
+    /// by construction (content-addressed, deduplicated, never
+    /// served without a version row pointing at them). Ids are
+    /// re-minted server-side (design §9 R4); a Locked entry
+    /// re-locks onto the landed counterpart of the version the
+    /// package resolved for it.
+    pub fn land_submission(
+        &self,
+        id: &str,
+        manifest: &SubmissionManifest,
+        reviewer: &str,
+    ) -> SResult<(String, String)> {
+        let sub = self
+            .get_submission(id)?
+            .ok_or_else(|| "提交不存在".to_string())?;
+        if sub.state != "pending" {
+            return Err("该提交已处理，不能重复落地".into());
+        }
+        // Manifest consistency, checked before the transaction so
+        // a malformed package fails fast and stays pending.
+        if manifest.format != 1 {
+            return Err("提交包格式版本不受支持".into());
+        }
+        if manifest.commit.entries.is_empty() {
+            return Err("提交包没有任何条目".into());
+        }
+        let unit_ids: HashSet<&str> = manifest.units.iter().map(|u| u.id.as_str()).collect();
+        let rendition_ids: HashSet<&str> =
+            manifest.renditions.iter().map(|r| r.id.as_str()).collect();
+        for r in &manifest.renditions {
+            if !unit_ids.contains(r.unit_id.as_str()) {
+                return Err(format!(
+                    "提交包清单不一致：rendition {} 引用了未声明的内容块",
+                    r.id
+                ));
+            }
+        }
+        for v in &manifest.versions {
+            if !rendition_ids.contains(v.rendition_id.as_str()) {
+                return Err(format!(
+                    "提交包清单不一致：版本 {} 引用了未声明的 rendition",
+                    v.id
+                ));
+            }
+        }
+        for e in &manifest.commit.entries {
+            if !unit_ids.contains(e.entry.unit_id.0.as_str())
+                || !rendition_ids.contains(e.entry.rendition_id.0.as_str())
+            {
+                return Err(
+                    "提交包清单不一致：索引条目引用了未声明的内容块或 rendition".into(),
+                );
+            }
+            if !manifest.versions.iter().any(|v| v.id == e.version_id) {
+                return Err("提交包清单不一致：索引条目引用了未声明的版本".into());
+            }
+        }
+
+        self.conn.execute_batch("BEGIN IMMEDIATE").map_err(db_err)?;
+        let attempt = || -> SResult<(String, String)> {
+            // Landing group: created once with root-department
+            // view/use grants, reused afterwards (later grant
+            // edits by an admin are never re-asserted).
+            let group_id = match self
+                .list_groups()?
+                .into_iter()
+                .find(|g| g.name == LANDING_GROUP_NAME)
+            {
+                Some(g) => g.id,
+                None => {
+                    let g = self.create_group(LANDING_GROUP_NAME)?;
+                    for dept in self
+                        .list_departments()?
+                        .into_iter()
+                        .filter(|d| d.parent_id.is_none())
+                    {
+                        self.add_grant(&g.id, "dept", &dept.id, "view")?;
+                        self.add_grant(&g.id, "dept", &dept.id, "use")?;
+                    }
+                    g.id
+                }
+            };
+            let mut unit_map = std::collections::HashMap::new();
+            for u in &manifest.units {
+                let nu = self.create_unit(
+                    &u.name,
+                    None,
+                    &group_id,
+                    &sub.submitter_name,
+                    &u.lead_lang,
+                    &u.description,
+                )?;
+                if u.current_revision != 1 {
+                    self.conn
+                        .execute(
+                            "UPDATE units SET current_revision=?2 WHERE id=?1",
+                            params![nu.id, u.current_revision],
+                        )
+                        .map_err(db_err)?;
+                }
+                unit_map.insert(u.id.clone(), nu.id);
+            }
+            let mut rendition_map = std::collections::HashMap::new();
+            for r in &manifest.renditions {
+                let nr =
+                    self.get_or_create_rendition(&unit_map[r.unit_id.as_str()], &r.form, &r.lang)?;
+                rendition_map.insert(r.id.clone(), nr.id);
+            }
+            let mut version_map = std::collections::HashMap::new();
+            for v in &manifest.versions {
+                let bytes = self.staged_file_get(id, &v.fragment_hash)?;
+                let semver = SemVer::parse(&v.semver)?;
+                // A recalled version can never be a resolution
+                // result, so a package carrying one is malformed;
+                // land anything else verbatim.
+                if v.status == "recalled" {
+                    return Err(format!(
+                        "提交包清单不一致：版本 {} 已被召回，不能作为条目解析结果",
+                        v.id
+                    ));
+                }
+                let nv = self.insert_version_with_scripts(
+                    &rendition_map[v.rendition_id.as_str()],
+                    semver,
+                    v.basis_revision,
+                    &v.author,
+                    &v.note,
+                    &bytes,
+                    &v.status,
+                    Some(v.scripts.as_slice()),
+                )?;
+                if nv.created_ms != v.created_ms {
+                    self.conn
+                        .execute(
+                            "UPDATE versions SET created_ms=?2 WHERE id=?1",
+                            params![nv.id, v.created_ms],
+                        )
+                        .map_err(db_err)?;
+                }
+                version_map.insert(v.id.clone(), nv.id);
+            }
+            let mut entries: Vec<IndexEntry> = Vec::new();
+            for e in &manifest.commit.entries {
+                let policy = match &e.entry.policy {
+                    crate::model::EntryPolicy::FollowLatest => {
+                        crate::model::EntryPolicy::FollowLatest
+                    }
+                    crate::model::EntryPolicy::Locked { .. } => {
+                        crate::model::EntryPolicy::Locked {
+                            version_id: crate::model::Id(
+                                version_map[e.version_id.as_str()].clone(),
+                            ),
+                        }
+                    }
+                };
+                entries.push(IndexEntry {
+                    unit_id: crate::model::Id(unit_map[e.entry.unit_id.0.as_str()].clone()),
+                    rendition_id: crate::model::Id(
+                        rendition_map[e.entry.rendition_id.0.as_str()].clone(),
+                    ),
+                    policy,
+                    locked_semver: e.entry.locked_semver.clone(),
+                    excerpt_slots: e.entry.excerpt_slots.clone(),
+                });
+            }
+            let scope = if ["company", "parent_org", "dept_sub", "dept", "private"]
+                .contains(&manifest.index_scope.as_str())
+            {
+                manifest.index_scope.as_str()
+            } else {
+                "company"
+            };
+            let index_id = new_id("idx");
+            self.conn
+                .execute(
+                    "INSERT INTO indexes_tbl(id, name, folder_id, group_id, maintainer, lifecycle, scope, created_ms) VALUES(?1,?2,NULL,?3,?4,'active',?5,?6)",
+                    params![
+                        index_id,
+                        manifest.index_name,
+                        group_id,
+                        sub.submitter_name,
+                        scope,
+                        now_ms()
+                    ],
+                )
+                .map_err(db_err)?;
+            self.conn
+                .execute(
+                    "INSERT INTO index_branches(index_id, name, head_commit) VALUES(?1,'main',NULL)",
+                    params![index_id],
+                )
+                .map_err(db_err)?;
+            let message = if manifest.commit.message.trim().is_empty() {
+                "提交落地"
+            } else {
+                manifest.commit.message.as_str()
+            };
+            // The package pins one commit on the submitter's main
+            // branch; it lands as the new index's main head.
+            let commit =
+                self.create_commit(&index_id, "main", &sub.submitter_name, message, entries)?;
+            let item = self.insert_showroom(
+                &sub.title,
+                &sub.intro,
+                Some(&index_id),
+                Some(&commit.id),
+                &sub.submitter_name,
+                "live",
+            )?;
+            let reviewed_ms = now_ms();
+            self.conn
+                .execute(
+                    "UPDATE showroom SET reviewed_by=?2, reviewed_ms=?3 WHERE id=?1",
+                    params![item.id, reviewer, reviewed_ms],
+                )
+                .map_err(db_err)?;
+            self.conn
+                .execute(
+                    "UPDATE submissions SET state='landed', landed_index_id=?2, landed_showroom_id=?3, reviewed_by=?4, reviewed_ms=?5, review_note='', land_error='' WHERE id=?1",
+                    params![id, index_id, item.id, reviewer, reviewed_ms],
+                )
+                .map_err(db_err)?;
+            Ok((index_id, item.id))
+        };
+        match attempt() {
+            Ok(v) => {
+                self.conn.execute_batch("COMMIT").map_err(db_err)?;
+                Ok(v)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
     pub fn trash_add(
         &self,
         kind: &str,

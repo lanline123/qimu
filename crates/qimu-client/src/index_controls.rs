@@ -194,7 +194,7 @@ impl App {
                 .tool(ui, ChromeIcon::Publish, "发布版本", editor, false, true)
                 .clicked();
             let push = icons
-                .tool(ui, ChromeIcon::Push, "推送到演示厅", editor, false, true)
+                .tool(ui, ChromeIcon::Push, "提交到演示厅", editor, false, true)
                 .clicked();
             if let IndexFrame::Detail(st) = self.index.stack.top_mut() {
                 if let Some(selected) = selected {
@@ -216,7 +216,7 @@ impl App {
                 if push {
                     let id = st.index_id.clone();
                     let title = s(&st.detail["index"], "name");
-                    self.push_index_to_showroom(&id, &title);
+                    self.submit_index_to_showroom(&id, &title);
                 }
             }
             tool_vsep(ui);
@@ -224,16 +224,51 @@ impl App {
         });
     }
 
-    fn push_index_to_showroom(&mut self, id: &str, title: &str) {
-        if !self.need_identity("推送到演示厅") {
+    /// Submit an index for showroom review (local-first P3,
+    /// design §6.3). An index that lives in the local library is
+    /// submitted as a real-byte package (POST /v1/submissions):
+    /// the content itself travels, waits in the server's staging
+    /// zone, and becomes organization content only when an
+    /// approval lands it. A resubmission after a rejection
+    /// automatically supersedes the rejected row (the server
+    /// requires the link). Content that is not in the local
+    /// library (organization-side indexes) keeps the legacy
+    /// reference submission for this cycle (design §8.3), as does
+    /// the whole action while the local library is closed.
+    fn submit_index_to_showroom(&mut self, id: &str, title: &str) {
+        if !self.need_identity("提交到演示厅") {
             return;
+        }
+        if let Some(local) = &self.local {
+            match local.build_submission_package(id, "main") {
+                Some(Ok(mut body)) => {
+                    body["title"] = json!(title);
+                    body["intro"] = json!("");
+                    body["source_index_id"] = json!(id);
+                    if let Some(prev) = self.my_submissions.iter().find(|x| {
+                        s(x, "source_index_id") == id && s(x, "state") == "rejected"
+                    }) {
+                        body["supersedes"] = json!(s(prev, "id"));
+                    }
+                    self.msg = match self.call("POST", "/v1/submissions", Some(body)) {
+                        Ok(_) => "已提交，等待审核".into(),
+                        Err(error) => error,
+                    };
+                    return;
+                }
+                Some(Err(e)) => {
+                    self.msg = format!("提交包构建失败：{e}");
+                    return;
+                }
+                None => {}
+            }
         }
         self.msg = match self.call(
             "POST",
             "/v1/showroom",
             Some(json!({ "title": title, "intro": "", "source_index_id": id })),
         ) {
-            Ok(_) => "已推送，等待审核".into(),
+            Ok(_) => "已提交，等待审核".into(),
             Err(error) => error,
         };
     }

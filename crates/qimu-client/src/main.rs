@@ -2541,6 +2541,14 @@ struct App {
     grants: Vec<Value>,
     showroom_live: Vec<Value>,
     showroom_pending: Vec<Value>,
+    /// P3 submission chain (design §6.3): pending real-byte
+    /// submissions feeding the super approval queue, and the
+    /// signed-in user's own submissions for 「我的提交」.
+    submissions_pending: Vec<Value>,
+    my_submissions: Vec<Value>,
+    /// Inline reject-reason draft on a submission card in the
+    /// approval queue: (submission id, reason text).
+    sub_reject: Option<(String, String)>,
     showroom: ShowroomState,
     my_assemblies: Vec<Value>,
     inbox: Vec<Value>,
@@ -3170,6 +3178,9 @@ impl App {
             grants: vec![],
             showroom_live: vec![],
             showroom_pending: vec![],
+            submissions_pending: vec![],
+            my_submissions: vec![],
+            sub_reject: None,
             showroom: ShowroomState::default(),
             my_assemblies: vec![],
             inbox: vec![],
@@ -3968,6 +3979,9 @@ impl App {
         self.org = json!({});
         self.showroom_live.clear();
         self.showroom_pending.clear();
+        self.submissions_pending.clear();
+        self.my_submissions.clear();
+        self.sub_reject = None;
         self.my_assemblies.clear();
         self.inbox.clear();
         self.group_spaces.clear();
@@ -4056,6 +4070,19 @@ impl App {
         }
         if let Ok(v) = self.call("GET", "/v1/showroom?state=pending", None) {
             self.showroom_pending = v.get("items").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+        }
+        // P3 submission chain (design §6.3): the approval queue
+        // also counts real-byte submissions, and the signed-in
+        // user's own submissions feed the 「我的提交」 face.
+        if self.role() == "super" {
+            if let Ok(v) = self.call("GET", "/v1/submissions?state=pending", None) {
+                self.submissions_pending = v.get("items").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+            }
+        }
+        if self.user.is_some() {
+            if let Ok(v) = self.call("GET", "/v1/submissions?mine=1", None) {
+                self.my_submissions = v.get("items").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+            }
         }
         if let Ok(v) = self.call("GET", "/v1/assemblies", None) {
             self.my_assemblies = v
@@ -4198,6 +4225,19 @@ impl App {
         }
         if let Ok(v) = self.call("GET", "/v1/showroom?state=pending", None) {
             self.showroom_pending = v.get("items").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+        }
+        // P3 submission chain (design §6.3): the approval queue
+        // also counts real-byte submissions, and the signed-in
+        // user's own submissions feed the 「我的提交」 face.
+        if self.role() == "super" {
+            if let Ok(v) = self.call("GET", "/v1/submissions?state=pending", None) {
+                self.submissions_pending = v.get("items").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+            }
+        }
+        if self.user.is_some() {
+            if let Ok(v) = self.call("GET", "/v1/submissions?mine=1", None) {
+                self.my_submissions = v.get("items").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+            }
         }
         if let Ok(v) = self.call("GET", "/v1/assemblies", None) {
             self.my_assemblies = v
@@ -6303,7 +6343,7 @@ impl App {
             for (name, icon) in visible {
                 let resp = tree_row(ui, current == name, 0.0, Some(icon), tr(name), 12.5);
                 if name == "审批队列" {
-                    let pending = self.showroom_pending.len();
+                    let pending = self.showroom_pending.len() + self.submissions_pending.len();
                     // Pending count (prototype .set-toc .cnt, L969):
                     // plain text, muted at rest, amber only when warn
                     // (prototype renderSetToc, L5537: warn = qn > 0;
@@ -7207,7 +7247,7 @@ impl App {
             return vec!["服务器", "离线缓存", "演示偏好"];
         }
         let role = self.role();
-        let mut sections: Vec<&str> = vec!["服务器", "个人资料"];
+        let mut sections: Vec<&str> = vec!["服务器", "个人资料", "我的提交"];
         if role != "member" {
             sections.push("组织管理");
         }
@@ -9555,7 +9595,7 @@ impl App {
         if self.showroom.zone == "plaza"
             && matches!(self.showroom.stack.top(), SrFrame::Wall)
             && self.role() == "super"
-            && !self.showroom_pending.is_empty()
+            && (!self.showroom_pending.is_empty() || !self.submissions_pending.is_empty())
         {
             let review_height = ui.available_height() * 0.28;
             egui::Panel::bottom("showroom_review")
@@ -9585,6 +9625,31 @@ impl App {
                             .color(palette_color(TEXT_MAIN)),
                     );
                     ui.add_space(10.0);
+                    for sub in self.submissions_pending.clone() {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(s(&sub, "title")).strong());
+                            ui.label(format!("提交人 {}", s(&sub, "submitter_name")));
+                            ui.label(tr("提交包"));
+                            if ui.button("通过").clicked() && self.need_identity("审批演示厅投稿") {
+                                self.review_submission_act(&s(&sub, "id"), "live", "");
+                            }
+                            if ui.button("驳回").clicked() {
+                                // Rejection needs a reason — continue
+                                // in the approval queue, whose
+                                // submission cards carry the form.
+                                self.page = Page::Settings;
+                                self.review.jump_source = Some(Page::Showroom);
+                                let sections = self.settings_sections();
+                                if let Some(pos) =
+                                    sections.iter().position(|x| *x == "审批队列")
+                                {
+                                    self.settings.section = pos;
+                                }
+                                self.review.stack.pop_to(0);
+                                self.sub_reject = Some((s(&sub, "id"), String::new()));
+                            }
+                        });
+                    }
                     for item in self.showroom_pending.clone() {
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new(s(&item, "title")).strong());
@@ -9667,6 +9732,42 @@ impl App {
         }
     }
 
+    /// One review decision on a P3 submission. Approval runs the
+    /// server-side landing transaction — the response only comes
+    /// back once the content has actually landed (or rolled back,
+    /// leaving the submission pending with the reason recorded).
+    /// Rejection requires a reason (server-enforced, returned to
+    /// the submitter verbatim).
+    fn review_submission_act(&mut self, sub_id: &str, state: &str, note: &str) -> bool {
+        if !self.need_identity("审批演示厅投稿") {
+            return false;
+        }
+        let mut body = json!({ "state": state });
+        if !note.is_empty() {
+            body["note"] = json!(note);
+        }
+        match self.call(
+            "POST",
+            &format!("/v1/submissions/{sub_id}/review"),
+            Some(body),
+        ) {
+            Ok(_) => {
+                self.msg = if state == "live" {
+                    "已通过并落地".into()
+                } else {
+                    "已驳回".into()
+                };
+                self.review.records_loaded = false;
+                self.refresh_all();
+                true
+            }
+            Err(e) => {
+                self.msg = format!("审批失败：{e}");
+                false
+            }
+        }
+    }
+
     /// Handled records = approved + rejected items that carry a
     /// review stamp (reviewer / time / reason).
     fn review_records_load(&mut self) {
@@ -9679,9 +9780,151 @@ impl App {
             }
         }
         all.retain(|x| i(x, "reviewed_ms") > 0);
+        // P3 submissions: a rejected submission produces no
+        // showroom row, so its processed record comes from the
+        // submissions table itself (landed submissions are already
+        // represented by their live showroom records above — never
+        // counted twice).
+        if self.role() == "super" {
+            if let Ok(v) = self.call("GET", "/v1/submissions?state=rejected", None) {
+                if let Some(arr) = v.get("items").and_then(|x| x.as_array()) {
+                    for sub in arr {
+                        all.push(json!({
+                            "id": s(sub, "id"),
+                            "title": s(sub, "title"),
+                            "state": "rejected",
+                            "submitted_by": s(sub, "submitter_name"),
+                            "reviewed_by": s(sub, "reviewed_by"),
+                            "reviewed_ms": i(sub, "reviewed_ms"),
+                            "review_note": s(sub, "review_note"),
+                        }));
+                    }
+                }
+            }
+        }
         all.sort_by_key(|x| -i(x, "reviewed_ms"));
         self.review.records = all;
         self.review.records_loaded = true;
+    }
+
+    /// 「我的提交」 (Settings, named users): the submitter's own
+    /// P3 submissions with their review state — pending in the
+    /// server's staging zone, landed (as organization content +
+    /// a live showroom entry), or rejected with the reviewer's
+    /// reason verbatim. A pending submission can be withdrawn
+    /// here; resubmission happens from the index detail, where it
+    /// automatically supersedes the rejected row.
+    fn my_submissions_body(&mut self, ui: &mut egui::Ui) {
+        let subs = self.my_submissions.clone();
+        if subs.is_empty() {
+            ui.label(
+                egui::RichText::new(tr(
+                    "暂无提交记录。从索引详情提交到演示厅的内容会出现在这里。",
+                ))
+                .size(12.5)
+                .color(palette_color(TEXT_WEAK)),
+            );
+            return;
+        }
+        let mut withdraw: Option<String> = None;
+        let mut goto_showroom = false;
+        for sub in &subs {
+            let state = s(sub, "state");
+            standard_card_v(
+                ui,
+                false,
+                None,
+                false,
+                if state == "rejected" {
+                    CardVariant::Rejected
+                } else {
+                    CardVariant::Normal
+                },
+                |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(s(sub, "title"))
+                                .size(13.0)
+                                .color(palette_color(TEXT_MAIN)),
+                        );
+                        match state.as_str() {
+                            "pending" => badge(ui, tr("待审"), BadgeTone::Warn),
+                            "landed" => badge(ui, tr("已落地"), BadgeTone::Ok),
+                            _ => badge(ui, tr("被驳回"), BadgeTone::Bad),
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} · {} {} · {} {}",
+                            fmt_time(i(sub, "created_ms")),
+                            i(sub, "entry_count"),
+                            tr("个内容块"),
+                            i(sub, "page_count"),
+                            tr("页")
+                        ))
+                        .size(11.0)
+                        .color(palette_color(TEXT_FAINT)),
+                    );
+                    let note = s(sub, "note");
+                    if !note.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!("{}：{}", tr("提交说明"), note))
+                                .size(11.5)
+                                .color(palette_color(TEXT_WEAK)),
+                        );
+                    }
+                    if state == "rejected" {
+                        let reason = s(sub, "review_note");
+                        if !reason.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{}：{}",
+                                    tr("驳回理由"),
+                                    reason
+                                ))
+                                .size(11.5)
+                                .color(palette_color(TEXT_WEAK)),
+                            );
+                        }
+                        ui.label(
+                            egui::RichText::new(tr(
+                                "修改后在索引详情重新提交即可（会自动关联本次驳回）",
+                            ))
+                            .size(11.5)
+                            .color(palette_color(TEXT_FAINT)),
+                        );
+                    }
+                    ui.horizontal(|ui| {
+                        if state == "pending"
+                            && btn_danger(ui, tr("撤回")).clicked()
+                        {
+                            withdraw = Some(s(sub, "id"));
+                        }
+                        if state == "landed"
+                            && btn_default(ui, tr("去演示厅查看")).clicked()
+                        {
+                            goto_showroom = true;
+                        }
+                    });
+                },
+            );
+            ui.add_space(8.0);
+        }
+        if let Some(id) = withdraw {
+            match self.call("DELETE", &format!("/v1/submissions/{id}"), None) {
+                Ok(_) => {
+                    self.msg = "已撤回".into();
+                    self.refresh_all();
+                }
+                Err(e) => {
+                    self.msg = format!("撤回失败：{e}");
+                }
+            }
+        }
+        if goto_showroom {
+            self.page = Page::Showroom;
+            self.showroom.zone = "plaza".into();
+        }
     }
 
     /// Approval queue (Settings, super only): the GUI face of the
@@ -9726,12 +9969,94 @@ impl App {
         let mut approve: Option<String> = None;
         if tab == 0 {
             let pending = self.showroom_pending.clone();
-            if pending.is_empty() {
+            let subs = self.submissions_pending.clone();
+            if pending.is_empty() && subs.is_empty() {
                 ui.label(
                     egui::RichText::new(tr("暂无待审批的演示成品。新提交会先进入这里，人工通过后才公开展示。"))
                         .size(12.5)
                         .color(palette_color(TEXT_WEAK)),
                 );
+            }
+            let mut approve_sub: Option<String> = None;
+            let mut confirm_sub_reject: Option<(String, String)> = None;
+            let mut cancel_sub_reject = false;
+            let mut reject_draft = self.sub_reject.clone();
+            for sub in &subs {
+                let sid = s(sub, "id");
+                let title = s(sub, "title");
+                std_card(ui, false, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(
+                                egui::RichText::new(&title).size(13.0).color(palette_color(TEXT_MAIN)),
+                            );
+                            ui.horizontal(|ui| {
+                                badge(ui, tr("待审"), BadgeTone::Warn);
+                                badge(ui, tr("提交包"), BadgeTone::Info);
+                            });
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                            ui.vertical(|ui| {
+                                if btn_primary(ui, tr("通过")).clicked() {
+                                    approve_sub = Some(sid.clone());
+                                }
+                                if btn_danger(ui, tr("驳回…")).clicked() {
+                                    reject_draft = Some((sid.clone(), String::new()));
+                                }
+                            });
+                        });
+                    });
+                    std_card_meta(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} {} · {} · {} {} · {} {}",
+                                tr("提交人"),
+                                s(sub, "submitter_name"),
+                                fmt_time(i(sub, "created_ms")),
+                                i(sub, "entry_count"),
+                                tr("个内容块"),
+                                i(sub, "page_count"),
+                                tr("页")
+                            ))
+                            .size(11.0)
+                            .color(palette_color(TEXT_FAINT)),
+                        );
+                    });
+                    let note = s(sub, "note");
+                    if !note.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!("{}：{}", tr("提交说明"), note))
+                                .size(11.5)
+                                .color(palette_color(TEXT_WEAK)),
+                        );
+                    }
+                    if reject_draft.as_ref().map(|(rid, _)| rid) == Some(&sid) {
+                        if let Some((_, draft)) = &mut reject_draft {
+                            ui.add_space(6.0);
+                            ui.label(
+                                egui::RichText::new(tr("驳回理由（必填，会原样回到提交人）"))
+                                    .size(11.5)
+                                    .color(palette_color(TEXT_WEAK)),
+                            );
+                            ui.text_edit_singleline(draft);
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add_enabled(
+                                        !draft.trim().is_empty(),
+                                        egui::Button::new(tr("确认驳回")),
+                                    )
+                                    .clicked()
+                                {
+                                    confirm_sub_reject = Some((sid.clone(), draft.clone()));
+                                }
+                                if ui.button(tr("取消")).clicked() {
+                                    cancel_sub_reject = true;
+                                }
+                            });
+                        }
+                    }
+                });
+                ui.add_space(8.0);
             }
             for item in &pending {
                 let iid = s(item, "id");
@@ -9794,6 +10119,18 @@ impl App {
                 });
                 ui.add_space(8.0);
             }
+            if let Some(sid) = approve_sub {
+                self.review_submission_act(&sid, "live", "");
+            }
+            if let Some((sid, note)) = confirm_sub_reject {
+                if self.review_submission_act(&sid, "rejected", &note) {
+                    reject_draft = None;
+                }
+            }
+            if cancel_sub_reject {
+                reject_draft = None;
+            }
+            self.sub_reject = reject_draft;
         } else {
             let records = self.review.records.clone();
             if records.is_empty() {
@@ -14501,6 +14838,9 @@ impl App {
                             if ui.checkbox(&mut self.dc_auto_quit, tr("放映结束自动关闭 DeckCraft")).changed() {
                                 save_client_settings(json!({ "deckcraft_auto_quit": self.dc_auto_quit }));
                             }
+                        }
+                        "我的提交" => {
+                            self.my_submissions_body(ui);
                         }
                         "审批队列" => {
                             self.review_queue_body(ui);

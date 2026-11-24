@@ -488,6 +488,105 @@ impl LocalStore {
         Some(run())
     }
 
+    /// Build the P3 submission package for one index of this
+    /// library at a branch head (design §6.3): the pinned commit's
+    /// entries, each resolved to the exact version the export path
+    /// would use, plus every referenced fragment's bytes. The
+    /// returned JSON is the POST /v1/submissions body minus the
+    /// caller-supplied fields (title / intro / note / supersedes /
+    /// source_index_id). `None` when the index is not in this
+    /// library at all — the content is organization-side and the
+    /// caller keeps the legacy reference path for it.
+    pub fn build_submission_package(
+        &self,
+        index_id: &str,
+        branch: &str,
+    ) -> Option<Result<Value, String>> {
+        let store = self.store.lock().unwrap();
+        let index = match store.get_index(index_id) {
+            Ok(i) => i,
+            Err(_) => return None,
+        };
+        let run = || -> Result<Value, String> {
+            let head = store
+                .branch_head(index_id, branch)?
+                .ok_or_else(|| "分支尚无提交".to_string())?;
+            let commit = store.get_commit(&head)?;
+            let mut units: Vec<qimu_core::store::SubmissionUnit> = Vec::new();
+            let mut renditions: Vec<qimu_core::store::SubmissionRendition> = Vec::new();
+            let mut versions: Vec<qimu_core::store::SubmissionVersion> = Vec::new();
+            let mut entries: Vec<qimu_core::store::SubmissionEntry> = Vec::new();
+            let mut files = serde_json::Map::new();
+            for e in &commit.entries {
+                let version = store.resolve_entry_version(e)?.ok_or_else(|| {
+                    "有条目无法解析到版本（内容块尚无已发布版本）".to_string()
+                })?;
+                if !units.iter().any(|u| u.id == e.unit_id.0) {
+                    let u = store.get_unit(&e.unit_id.0)?;
+                    units.push(qimu_core::store::SubmissionUnit {
+                        id: u.id.clone(),
+                        name: u.name.clone(),
+                        lead_lang: u.lead_lang.clone(),
+                        description: u.description.clone(),
+                        current_revision: u.current_revision,
+                        maintainer: u.maintainer.clone(),
+                    });
+                }
+                if !renditions.iter().any(|r| r.id == e.rendition_id.0) {
+                    let r = store.get_rendition(&e.rendition_id.0)?;
+                    renditions.push(qimu_core::store::SubmissionRendition {
+                        id: r.id.clone(),
+                        unit_id: r.unit_id.clone(),
+                        form: r.form.clone(),
+                        lang: r.lang.clone(),
+                    });
+                }
+                if !versions.iter().any(|v| v.id == version.id) {
+                    let bytes = store.file_get(&version.fragment_hash)?;
+                    files.insert(
+                        version.fragment_hash.clone(),
+                        Value::String(crate::b64e(&bytes)),
+                    );
+                    versions.push(qimu_core::store::SubmissionVersion {
+                        id: version.id.clone(),
+                        rendition_id: version.rendition_id.clone(),
+                        semver: version.semver.clone(),
+                        basis_revision: version.basis_revision,
+                        author: version.author.clone(),
+                        note: version.note.clone(),
+                        status: version.status.clone(),
+                        created_ms: version.created_ms,
+                        fragment_hash: version.fragment_hash.clone(),
+                        page_count: version.page_count,
+                        scripts: version.scripts.clone(),
+                    });
+                }
+                entries.push(qimu_core::store::SubmissionEntry {
+                    entry: e.clone(),
+                    version_id: version.id.clone(),
+                });
+            }
+            let manifest = qimu_core::store::SubmissionManifest {
+                format: 1,
+                index_name: index.name.clone(),
+                index_scope: index.scope.clone(),
+                commit: qimu_core::store::SubmissionCommit {
+                    branch: branch.to_string(),
+                    message: commit.message.clone(),
+                    entries,
+                },
+                units,
+                renditions,
+                versions,
+            };
+            Ok(json!({
+                "manifest": serde_json::to_value(&manifest).unwrap_or_default(),
+                "files": Value::Object(files),
+            }))
+        };
+        Some(run())
+    }
+
     /// Thumbnail cache directory for one version, in the server's
     /// exact layout (`<root>/thumbs/deckcraft-v2/<version id>`), so
     /// a library previously served by the bundled server hands its
