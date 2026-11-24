@@ -74,8 +74,12 @@ deckcraft-engine = { path = "../../vendor/deckcraft/crates/engine" }
 deckcraft-pptx   = { path = "../../vendor/deckcraft/crates/pptx" }
 deckcraft-fonts  = { path = "../../vendor/deckcraft/crates/fonts" }
 deckcraft-text   = { path = "../../vendor/deckcraft/crates/text" }
-# - Still reserved: pdf (T1 export), ui-egui (T2 show hosting).
-# deckcraft-pdf    = { path = "../../vendor/deckcraft/crates/pdf" }
+# - T1 (PDF export in-process): pdf. deckcraft_pdf::export() is
+#   where the qimu-skin CJK text-layer fix lives; calling it
+#   in-process (through engine's pdf_options, the parser the CLI's
+#   --export-params shares) keeps PdfError::TextLoss structured
+#   for the client prompt instead of a subprocess stderr line.
+deckcraft-pdf    = { path = "../../vendor/deckcraft/crates/pdf" }
 deckcraft-ui-egui = { path = "../../vendor/deckcraft/crates/ui-egui" }
 # ---------------------------------------------------------------------------
 

@@ -1,4 +1,4 @@
-//! In-process DeckCraft rendering (transplant T0, DESIGN §2.1/§6):
+//! In-process DeckCraft rendering (transplant T0/T1, DESIGN §2.1/§2.2/§6):
 //! the thumbnail and page-edit stage-preview renders that used to
 //! shell out to deckcraft-cli (on the server) now call the very same
 //! library functions the CLI wrapped —
@@ -12,6 +12,10 @@
 //!     -> render_png_with(doc, page, 0.75, edit=false, transparent=false)
 //!   edit stage preview: `render --slide N --scale 1 --edit`
 //!     -> render_png_with(doc, page, 1.0, edit=true, transparent=false)
+//!   PDF export: `run --export --export-params {…}` (server
+//!     `deck_to_pdf` builds the params)
+//!     -> pdf_options(params) + deckcraft_pdf::export in-process
+//!        (see export_pdf below; T1)
 //! The CLI's render subcommand is itself only an argument shell over
 //! render_png_with (deckcraft-cli main.rs), so both eras produce the
 //! same function's pixels; the dual-track comparison gate in the
@@ -31,8 +35,12 @@ fn warm_fonts() {
 
 /// Open a PPTX / fragment byte string as a DeckCraft presentation.
 fn open(bytes: &[u8]) -> Result<deckcraft_model::Presentation, String> {
+    open_named("frag.pptx", bytes)
+}
+
+fn open_named(name: &str, bytes: &[u8]) -> Result<deckcraft_model::Presentation, String> {
     warm_fonts();
-    deckcraft_engine::cmd::file::open_presentation("frag.pptx", bytes)
+    deckcraft_engine::cmd::file::open_presentation(name, bytes)
         .map_err(|e| e.to_string())
 }
 
@@ -98,4 +106,63 @@ pub fn local_thumb(
     let frag = local.version_fragment(version_id)?;
     render_frag_thumbs(&frag, &cache_dir).ok()?;
     std::fs::read(&cache_file).ok()
+}
+
+/// Why an in-process PDF export failed (transplant T1). `TextLoss`
+/// is kept structured — count and first lost characters — so the
+/// caller can tell the user exactly what would be lost instead of
+/// forwarding a subprocess stderr line (DESIGN §2.2: the CJK fix's
+/// `deckcraft_pdf::PdfError::TextLoss`, raised by `export()` itself
+/// before any bytes are produced).
+pub enum PdfFail {
+    TextLoss { count: usize, sample: String },
+    Other(String),
+}
+
+/// Export an assembled deck to PDF in-process: the same call the
+/// deckcraft-cli `run --export` wraps
+/// (`deckcraft_engine::cmd::file::pdf_bytes` = `pdf_options` +
+/// `deckcraft_pdf::export`), minus pdf_bytes' error
+/// stringification, so TextLoss survives as data. `form` / `page`
+/// are the client's export vocabulary; the params JSON built here
+/// is identical to the one the server's `deck_to_pdf` passes as
+/// `--export-params` for the same form — `{textLayer: true,
+/// layout: slides|notes|handouts, perPage: 6 (handout only),
+/// slides: [page] (single page only)}` — with the single deliberate
+/// exception of `text_layer = false`, the documented raster-only
+/// escape (TextLoss's own remedy for slide text): no text layer is
+/// emitted, so no glyph can be lost from it, at the price of text
+/// that cannot be searched or copied. Notes text is drawn as real
+/// text and stays guarded by TextLoss either way.
+pub fn export_pdf(
+    deck: &[u8],
+    form: &str,
+    page: Option<usize>,
+    text_layer: bool,
+) -> Result<Vec<u8>, PdfFail> {
+    let doc = open_named("deck.pptx", deck).map_err(PdfFail::Other)?;
+    let mut params = serde_json::json!({ "textLayer": text_layer });
+    match form {
+        "handout" => {
+            params["layout"] = serde_json::json!("handouts");
+            params["perPage"] = serde_json::json!(6);
+        }
+        "notes" => {
+            params["layout"] = serde_json::json!("notes");
+        }
+        _ => {
+            params["layout"] = serde_json::json!("slides");
+        }
+    }
+    if let Some(p) = page {
+        params["slides"] = serde_json::json!([p]);
+    }
+    let opts = deckcraft_engine::cmd::file::pdf_options(&params, doc.slides.len())
+        .map_err(|e| PdfFail::Other(e.to_string()))?;
+    deckcraft_pdf::export(&doc, &opts).map_err(|e| match e {
+        deckcraft_pdf::PdfError::TextLoss { count, sample } => {
+            PdfFail::TextLoss { count, sample }
+        }
+        other => PdfFail::Other(other.to_string()),
+    })
 }

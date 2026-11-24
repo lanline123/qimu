@@ -18,8 +18,11 @@
 //! endpoints return. Write paths still go over REST until P1/P2 flip
 //! them over one by one.
 
+use qimu_core::manifest::{Binding, Manifest, SourceRef};
+use qimu_core::pptx::{self, Package};
 use qimu_core::store::{Store, UserRec};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -345,6 +348,159 @@ impl LocalStore {
         let store = self.store.lock().unwrap();
         let ver = store.get_version(version_id).ok()?;
         store.file_get(&ver.fragment_hash).ok()
+    }
+
+    /// Assemble one showroom item's deck from this library,
+    /// mirroring the server's export funnel step for step (handler
+    /// `export_showroom_pdf` + `build_export`): the item's commit
+    /// (pinned `commit_id`, else the source index's main head)
+    /// supplies the entries; each entry resolves to a version whose
+    /// fragment is split and excerpted; speaker scripts are written
+    /// back into the notes pages when `include_notes`; personal
+    /// placeholders resolve against the company profile + the
+    /// library owner's profile (kind "personal", the only kind the
+    /// client requests) and a missing value blocks the export with
+    /// the server's message; the manifest is embedded exactly as
+    /// the server embeds it. Returns the deck bytes and the deck's
+    /// page count.
+    ///
+    /// `None` when the item (or its source index) is not in this
+    /// library at all — the deck is not local and the caller keeps
+    /// the server path. `Some(Err)` is a local verdict on local
+    /// data; the caller still falls back to the server path, whose
+    /// answer on the same data is the same.
+    pub fn assemble_showroom_deck(
+        &self,
+        item_id: &str,
+        include_notes: bool,
+    ) -> Option<Result<(Vec<u8>, i64), String>> {
+        let store = self.store.lock().unwrap();
+        let item = match store.get_showroom(item_id) {
+            Ok(Some(it)) => it,
+            Ok(None) => return None,
+            Err(e) => return Some(Err(e)),
+        };
+        let idx_id = match &item.source_index_id {
+            Some(id) => id.clone(),
+            None => return None,
+        };
+        let run = || -> Result<(Vec<u8>, i64), String> {
+            let commit = match &item.commit_id {
+                Some(cid) => store.get_commit(cid)?,
+                None => {
+                    let head = store
+                        .branch_head(&idx_id, "main")?
+                        .ok_or_else(|| "来源索引尚无提交".to_string())?;
+                    store.get_commit(&head)?
+                }
+            };
+            let mut pkgs: Vec<Package> = Vec::new();
+            let mut bindings: Vec<Binding> = Vec::new();
+            let mut binding_scripts: Vec<Vec<String>> = Vec::new();
+            for e in &commit.entries {
+                let version = store
+                    .resolve_entry_version(e)?
+                    .ok_or_else(|| {
+                        "有条目无法解析到版本（内容块尚无已发布版本）".to_string()
+                    })?;
+                let frag_bytes = store.file_get(&version.fragment_hash)?;
+                let frag_pkg = Package::load(&frag_bytes)?;
+                let singles = pptx::split(&frag_pkg)?;
+                let chosen: Vec<usize> = match &e.excerpt_slots {
+                    Some(slots) => slots
+                        .iter()
+                        .filter_map(|sl| sl.parse::<usize>().ok())
+                        .filter(|i| *i < singles.len())
+                        .collect(),
+                    None => (0..singles.len()).collect(),
+                };
+                let mut fps = Vec::new();
+                let mut scripts = Vec::new();
+                for i in &chosen {
+                    if let Some(p) = version.pages.get(*i) {
+                        fps.push(p.fp.clone());
+                    }
+                    scripts.push(version.scripts.get(*i).cloned().unwrap_or_default());
+                    pkgs.push(singles[*i].clone());
+                }
+                binding_scripts.push(scripts);
+                bindings.push(Binding {
+                    unit_id: e.unit_id.0.clone(),
+                    rendition_id: e.rendition_id.0.clone(),
+                    version_id: version.id.clone(),
+                    version_semver: version.semver.clone(),
+                    page_fps: fps,
+                });
+            }
+            if pkgs.is_empty() {
+                return Err("没有可导出的页面".into());
+            }
+            let page_count = pkgs.len() as i64;
+            let mut assembled = qimu_core::assemble::assemble(&pkgs)?;
+            if include_notes {
+                let mut cursor = 0usize;
+                for scripts in &binding_scripts {
+                    for script in scripts {
+                        if !script.is_empty() {
+                            qimu_core::pptx::set_notes_text(
+                                &mut assembled,
+                                cursor,
+                                script,
+                            );
+                        }
+                        cursor += 1;
+                    }
+                }
+            }
+            // Personal binding (§3.14), kind "personal" with the
+            // library owner as the exporter (the server substitutes
+            // the requesting user; in the local library that is the
+            // owner). Company tokens are mapped exactly as the
+            // server maps them; a placeholder with no value blocks
+            // the export — never fill with someone else's data.
+            let mut values: BTreeMap<String, String> = BTreeMap::new();
+            for (k, v) in store.company_profile()? {
+                let token = match k.as_str() {
+                    "phone" => "company_phone",
+                    "website" => "company_website",
+                    "address" => "company_address",
+                    "gongzhonghao" => "company_gongzhonghao",
+                    _ => continue,
+                };
+                if !v.is_empty() {
+                    values.insert(token.to_string(), v);
+                }
+            }
+            values.insert("name".to_string(), self.owner.display_name.clone());
+            for (k, v) in store.profile(&self.owner.id)? {
+                if !v.is_empty() {
+                    values.insert(k, v);
+                }
+            }
+            let missing = qimu_core::personalize::substitute(&mut assembled, &values, &[]);
+            if !missing.is_empty() {
+                return Err(format!(
+                    "导出已拦截：以下占位字段没有值（请先在设置里补全资料）：{}",
+                    missing.join("、")
+                ));
+            }
+            let deck = assembled.to_bytes()?;
+            let manifest = Manifest {
+                deck_id: qimu_core::auth::new_id("deck"),
+                kind: "personal".to_string(),
+                source: Some(SourceRef {
+                    index_id: idx_id.clone(),
+                    branch: "main".to_string(),
+                    commit_id: commit.id.clone(),
+                    tag: None,
+                }),
+                exported_ms: qimu_core::auth::now_ms(),
+                bindings,
+            };
+            let deck = qimu_core::manifest::embed_manifest(&deck, &manifest)?;
+            Ok((deck, page_count))
+        };
+        Some(run())
     }
 
     /// Thumbnail cache directory for one version, in the server's

@@ -2297,6 +2297,13 @@ enum ConfirmAction {
     PurgeTrashMany(Vec<String>),
     EmptyTrash,
     DiscardPageEdit,
+    /// Transplant T1: the in-process PDF export hit TextLoss and
+    /// the user accepted the raster-only retry (no text layer).
+    PdfRasterFallback {
+        item: Value,
+        form: String,
+        page: Option<usize>,
+    },
 }
 
 /// Showroom page state (drill retrofit): zone + folder filter
@@ -8170,6 +8177,13 @@ impl App {
             (_, Some(p)) => format!("{title}-第{}页", p + 1),
             _ => title.clone(),
         };
+        // Transplant T1: when this deck lives in the local
+        // library, assemble and export it in-process instead
+        // (try_pdf_local); anything else keeps the server path
+        // below, unchanged.
+        if self.try_pdf_local(item, form, page, &stem, true) {
+            return;
+        }
         let mut body = json!({ "kind": "personal", "form": form });
         if let Some(p) = page {
             body["page"] = json!(p);
@@ -8193,6 +8207,94 @@ impl App {
                 }
             }
             Err(e) => self.msg = format!("导出 PDF 失败：{e}"),
+        }
+    }
+
+    /// Transplant T1 (DESIGN §2.2/§6): the local half of
+    /// export_showroom_pdf. When the item lives in the local
+    /// library, its deck is assembled in-process (LocalStore
+    /// mirrors the server's build_export) and the PDF is rendered
+    /// by deckcraft-pdf in this process — no server round-trip, no
+    /// deckcraft-cli subprocess. Runs synchronously like the server
+    /// call it replaces (the user waits for the save dialog either
+    /// way). Returns true when the local path settled the request —
+    /// saved, a raster-fallback Confirm queued, or a definitive
+    /// local verdict (page out of range, TextLoss with the raster
+    /// escape already spent, a non-TextLoss export error); false
+    /// when the deck is not local or local assembly failed, in
+    /// which case the caller falls back to the server path,
+    /// unchanged.
+    fn try_pdf_local(
+        &mut self,
+        item: &Value,
+        form: &str,
+        page: Option<usize>,
+        stem: &str,
+        text_layer: bool,
+    ) -> bool {
+        let outcome = match &self.local {
+            Some(local) => local.assemble_showroom_deck(&s(item, "id"), form == "notes"),
+            None => None,
+        };
+        let (deck, page_count) = match outcome {
+            None => return false,
+            Some(Err(e)) => {
+                eprintln!("[qimu] 本地组装稿件失败，回退服务端导出：{e}");
+                return false;
+            }
+            Some(Ok(pair)) => pair,
+        };
+        if let Some(p) = page {
+            if (p as i64) >= page_count {
+                self.msg = "导出 PDF 失败：页码超出成品页数".into();
+                return true;
+            }
+        }
+        match local_render::export_pdf(&deck, form, page, text_layer) {
+            Ok(bytes) => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_file_name(format!("{stem}.pdf"))
+                    .save_file()
+                {
+                    let _ = std::fs::write(path, bytes);
+                    self.msg = if text_layer {
+                        "已保存".into()
+                    } else {
+                        "已保存（纯图片版：文字不可搜索、复制）".into()
+                    };
+                }
+                true
+            }
+            Err(local_render::PdfFail::TextLoss { count, sample }) => {
+                if text_layer {
+                    // Never emit a PDF whose text layer silently
+                    // lost glyphs: report the loss with its count
+                    // and first lost characters, and offer the
+                    // raster-only escape as an explicit choice.
+                    self.overlays.push(Overlay::Confirm(ConfirmState {
+                        title: "导出 PDF".into(),
+                        body: format!(
+                            "这份稿件有 {count} 个字没有覆盖字体（首个：{sample}），带文本层导出会让这些文字在 PDF 里丢失。改用纯图片导出可以继续：版面不变，但文字不可搜索、复制。"
+                        ),
+                        confirm_label: "纯图片导出".into(),
+                        danger: false,
+                        action: ConfirmAction::PdfRasterFallback {
+                            item: item.clone(),
+                            form: form.to_string(),
+                            page,
+                        },
+                    }));
+                } else {
+                    self.msg = format!(
+                        "导出 PDF 失败：{count} 个字没有覆盖字体（首个：{sample}），纯图片导出也保留不了这些文字，已取消导出"
+                    );
+                }
+                true
+            }
+            Err(local_render::PdfFail::Other(e)) => {
+                self.msg = format!("导出 PDF 失败：{e}");
+                true
+            }
         }
     }
 
@@ -11271,6 +11373,18 @@ impl App {
                         .rposition(|o| matches!(o, Overlay::PageEdit(_)))
                     {
                         self.overlays.remove(pos);
+                    }
+                }
+                ConfirmAction::PdfRasterFallback { item, form, page } => {
+                    let title = s(&item, "title");
+                    let stem = match (form.as_str(), page) {
+                        ("handout", _) => format!("{title}-讲义"),
+                        ("notes", _) => format!("{title}-备注页"),
+                        (_, Some(p)) => format!("{title}-第{}页", p + 1),
+                        _ => title.clone(),
+                    };
+                    if !self.try_pdf_local(&item, &form, page, &stem, false) {
+                        self.msg = "导出 PDF 失败：本地稿件已不可用".into();
                     }
                 }
             }
