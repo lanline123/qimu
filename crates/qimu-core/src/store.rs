@@ -72,6 +72,22 @@ pub struct FolderRec {
     pub note: String,
 }
 
+/// How `Store::delete_folder` treats a folder's contents (user
+/// ruling 2026-11-24: deleting a folder always offers the user
+/// this exact choice).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FolderDeleteMode {
+    /// Delete only the folder row: child folders, content units
+    /// and indexes homed in it are lifted to the folder's parent
+    /// (contents of a root folder land at the root — folder-less,
+    /// which the index page shows as 未分类).
+    Lift,
+    /// Delete the folder and its whole subtree: every content
+    /// unit, index and showroom item homed in the subtree goes
+    /// behind the trash overlay, then the folder rows are removed.
+    Trash,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroupRec {
     pub id: String,
