@@ -507,12 +507,106 @@ fn save_client_settings(patch: Value) {
     );
 }
 
+/// Probe that `dir` can serve as a cache root: create it, then write
+/// and remove a scratch file (named per process, so two clients
+/// probing the same fresh directory do not trip over each other).
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn dir_writable_probe(dir: &std::path::Path) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let probe = dir.join(format!(".qimu-probe-{}", std::process::id()));
+    match std::fs::write(&probe, b"qimu") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Platform-preferred default cache root (user ruling 2026-11-24):
+/// keep cache bulk off the system disk — Windows prefers the D:
+/// drive, macOS a writable non-system volume. `None` keeps the
+/// historic beside-the-executable default. Probed once per process
+/// (see `platform_cache_resolved`): a volume (un)mounted mid-run does
+/// not move a running client's cache, same as the exe-side default.
+#[cfg(target_os = "windows")]
+fn platform_cache_default() -> Option<std::path::PathBuf> {
+    let cand = std::path::PathBuf::from("D:\\Qimu\\cache");
+    if std::path::Path::new("D:\\").is_dir() && dir_writable_probe(&cand) {
+        Some(cand)
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn platform_cache_default() -> Option<std::path::PathBuf> {
+    let vols = std::fs::read_dir("/Volumes").ok()?;
+    let mut best: Option<(u64, std::path::PathBuf)> = None;
+    for entry in vols.flatten() {
+        let vol = entry.path();
+        if !vol.is_dir() {
+            continue;
+        }
+        // The boot volume appears in /Volumes as a link to `/` (or a
+        // folder canonicalizing to it) — never a candidate.
+        if std::fs::canonicalize(&vol)
+            .map(|c| c == std::path::Path::new("/"))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let cand = vol.join("Qimu").join("cache");
+        if !dir_writable_probe(&cand) {
+            continue;
+        }
+        // Among writable candidates the roomiest volume wins.
+        let free = df_available_kb(&vol).unwrap_or(0);
+        if best.as_ref().map(|(f, _)| free > *f).unwrap_or(true) {
+            best = Some((free, cand));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// Available KiB on the volume holding `path`, via `df -k` (its
+/// fourth column). `None` when df is missing or its output does not
+/// parse — callers treat that as zero, never as an error.
+#[cfg(target_os = "macos")]
+fn df_available_kb(path: &std::path::Path) -> Option<u64> {
+    let out = std::process::Command::new("df")
+        .arg("-k")
+        .arg(path)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().nth(1)?;
+    line.split_whitespace().nth(3)?.parse().ok()
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn platform_cache_default() -> Option<std::path::PathBuf> {
+    None
+}
+
+/// The platform default, resolved at most once per process.
+fn platform_cache_resolved() -> Option<std::path::PathBuf> {
+    static PLATFORM_DEFAULT: std::sync::OnceLock<Option<std::path::PathBuf>> =
+        std::sync::OnceLock::new();
+    PLATFORM_DEFAULT.get_or_init(platform_cache_default).clone()
+}
+
 /// Offline cache (§3.17): adopted snapshots live in the cache directory
 /// with a small JSON index — usable with no server at all. The directory
-/// is a local setting: default is a `cache` folder beside the client
-/// executable (the install dir); the user can move it in 设置.
+/// is a local setting: a user-configured path always wins; the default
+/// prefers a platform location off the system disk (Windows: `D:\Qimu`,
+/// macOS: a writable non-system volume) and otherwise falls back to a
+/// `cache` folder beside the client executable (the install dir); the
+/// user can move it in 设置.
 fn default_cache_dir() -> std::path::PathBuf {
-    exe_dir().join("cache")
+    platform_cache_resolved().unwrap_or_else(|| exe_dir().join("cache"))
 }
 
 fn legacy_cache_dir() -> std::path::PathBuf {
@@ -13840,6 +13934,23 @@ impl App {
             .size(11.5)
             .color(palette_color(TEXT_WEAK)),
         );
+        let user_set = client_settings()
+            .get("cache_dir")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty());
+        if !user_set {
+            if let Some(p) = platform_cache_resolved() {
+                if p == effective {
+                    ui.label(
+                        egui::RichText::new(
+                            "未手动指定路径：当前使用平台默认位置（Windows 优先 D 盘、macOS 优先非系统卷）。",
+                        )
+                        .size(11.5)
+                        .color(palette_color(TEXT_WEAK)),
+                    );
+                }
+            }
+        }
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.add_sized(
