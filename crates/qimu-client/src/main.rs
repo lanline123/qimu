@@ -5910,15 +5910,23 @@ impl App {
         match self.showroom.zone.as_str() {
             "library" => {
                 ui.label(egui::RichText::new("我的目录").size(12.0).color(palette_color(TEXT_WEAK)));
-                for (idx, label) in ["全部", "收藏", "本地缓存", "我的组装"]
-                    .into_iter()
-                    .enumerate()
+                // Sidebar tree rows lead with an icon (prototype
+                // .tree blanket rule); the 全部 row reuses the
+                // all-applications glyph folder_tree uses for it.
+                for (idx, (label, icon)) in [
+                    ("全部", ChromeIcon::Settings),
+                    ("收藏", ChromeIcon::Folder),
+                    ("本地缓存", ChromeIcon::Cache),
+                    ("我的组装", ChromeIcon::Folder),
+                ]
+                .into_iter()
+                .enumerate()
                 {
                     if tree_row(
                         ui,
                         self.showroom.library_view == idx,
                         0.0,
-                        None,
+                        Some(icon),
                         label,
                         12.5,
                     )
@@ -5931,7 +5939,13 @@ impl App {
             }
             "inbox" => {
                 ui.label(egui::RichText::new("分享来源").size(12.0).color(palette_color(TEXT_WEAK)));
-                for (idx, label) in ["全部", "个人分享", "部门分享"].into_iter().enumerate()
+                for (idx, (label, icon)) in [
+                    ("全部", ChromeIcon::Settings),
+                    ("个人分享", ChromeIcon::Share),
+                    ("部门分享", ChromeIcon::Directory),
+                ]
+                .into_iter()
+                .enumerate()
                 {
                     let count = self
                         .inbox
@@ -5942,7 +5956,7 @@ impl App {
                         ui,
                         self.showroom.share_source == idx,
                         0.0,
-                        None,
+                        Some(icon),
                         &format!("{label} · {count}"),
                         12.5,
                     )
@@ -5966,7 +5980,7 @@ impl App {
                         s(group, "name"),
                         group["members"].as_array().map_or(0, Vec::len),
                     );
-                    if tree_row(ui, active.as_ref() == Some(&id), 0.0, None, &label, 12.5).clicked()
+                    if tree_row(ui, active.as_ref() == Some(&id), 0.0, Some(ChromeIcon::Folder), &label, 12.5).clicked()
                     {
                         self.showroom.group_id = Some(id);
                         self.showroom.stack.pop_to(0);
@@ -6243,11 +6257,11 @@ impl App {
             TrashFrame::List(state) => state.filter,
             TrashFrame::Preview(_) => usize::MAX,
         };
-        for (filter, (kind, label)) in [
-            ("", "全部"),
-            ("index", "索引"),
-            ("unit", "内容块"),
-            ("showroom", "演示成品"),
+        for (filter, (kind, label, icon)) in [
+            ("", "全部", ChromeIcon::Settings),
+            ("index", "索引", ChromeIcon::Index),
+            ("unit", "内容块", ChromeIcon::Content),
+            ("showroom", "演示成品", ChromeIcon::Showroom),
         ]
         .into_iter()
         .enumerate()
@@ -6259,7 +6273,7 @@ impl App {
                 .filter(|item| kind.is_empty() || s(item, "kind") == kind)
                 .count();
             let text = format!("{} {}", tr(label), count);
-            if tree_row(ui, active == filter, 0.0, None, &text, 12.5).clicked() {
+            if tree_row(ui, active == filter, 0.0, Some(icon), &text, 12.5).clicked() {
                 self.trash.stack.pop_to(0);
                 if let TrashFrame::List(state) = self.trash.stack.top_mut() {
                     state.filter = filter;
