@@ -7,6 +7,7 @@
 
 mod account_menu;
 mod chrome_icons;
+mod content_detail;
 mod index_controls;
 mod index_history;
 mod index_lineage;
@@ -25,6 +26,7 @@ mod local_store;
 use prototype_dialogs::{PullDialogState, PushDialogState, ShareDialogState};
 
 use chrome_icons::{ChromeIcon, ChromeIcons};
+use content_detail::{binding_targets, LightState, PageBindingPick, PageBindingRequest};
 use index_controls::{IndexMoreAction, IndexOverviewControls, IndexScope};
 use index_lineage::IndexGraphs;
 use qimu_core::store::IndexGraph;
@@ -1354,6 +1356,9 @@ struct UnitState {
     publish_note: String,
     publish_file: Option<std::path::PathBuf>,
     bindings: Vec<Value>,
+    selected_rendition: Option<String>,
+    selected_page: Option<usize>,
+    bind_pick: Option<PageBindingPick>,
     bind_from: String,
     bind_to: String,
     bind_from_slot: Option<i64>,
@@ -1380,6 +1385,9 @@ impl UnitState {
             publish_note: String::new(),
             publish_file: None,
             bindings: Vec::new(),
+            selected_rendition: None,
+            selected_page: None,
+            bind_pick: None,
             bind_from: String::new(),
             bind_to: String::new(),
             bind_from_slot: None,
@@ -2572,6 +2580,7 @@ enum Overlay {
     AllVersions { entry_pos: usize },
     Present(PresentState),
     PageEdit(PageEditState),
+    Light(LightState),
     PickTemplate(PickTemplateState),
     Confirm(ConfirmState),
     DeckInfo(DeckInfoState),
@@ -2603,6 +2612,7 @@ enum ConfirmAction {
     PurgeTrashMany(Vec<String>),
     EmptyTrash,
     DiscardPageEdit,
+    MovePageBinding(PageBindingRequest),
     /// Transplant T1: the in-process PDF export hit TextLoss and
     /// the user accepted the raster-only retry (no text layer).
     PdfRasterFallback {
@@ -2803,6 +2813,8 @@ struct App {
     index_tags: std::collections::HashMap<String, String>,
     index_search_tags: BTreeMap<String, Vec<String>>,
     content: ContentState,
+    rendering_unit: Option<String>,
+    pending_unit_reload: Option<String>,
     index: IndexState,
     settings: SettingsState,
     frames: u64,
@@ -3503,6 +3515,8 @@ impl App {
             index_tags: std::collections::HashMap::new(),
             index_search_tags: BTreeMap::new(),
             content: ContentState::default(),
+            rendering_unit: None,
+            pending_unit_reload: None,
             index: IndexState::default(),
             settings: SettingsState {
                 grant_subject_type: "dept".into(),
@@ -4917,6 +4931,53 @@ impl App {
                 self.content.stack.push(ContentFrame::Unit(st));
             }
             Err(e) => self.msg = format!("打开失败：{e}"),
+        }
+    }
+
+    fn reload_unit_detail(&mut self, unit_id: &str) {
+        if self.rendering_unit.as_deref() == Some(unit_id) {
+            self.pending_unit_reload = Some(unit_id.to_string());
+            return;
+        }
+        let same_unit = matches!(self.content.stack.top(), ContentFrame::Unit(st) if st.unit_id == unit_id);
+        if !same_unit {
+            self.open_unit_detail(unit_id);
+            return;
+        }
+        let detail = match self.call_work("GET", &format!("/v1/units/{unit_id}"), None) {
+            Ok(detail) => detail,
+            Err(error) => {
+                self.msg = format!("刷新失败：{error}");
+                return;
+            }
+        };
+        let bindings = match self.call_work(
+            "GET",
+            &format!("/v1/units/{unit_id}/page-bindings"),
+            None,
+        ) {
+            Ok(value) => value
+                .get("bindings")
+                .and_then(|x| x.as_array())
+                .cloned()
+                .unwrap_or_default(),
+            Err(error) => {
+                self.msg = format!("刷新绑定失败：{error}");
+                return;
+            }
+        };
+        if let ContentFrame::Unit(st) = self.content.stack.top_mut() {
+            st.detail = detail.clone();
+            st.bindings = bindings.clone();
+            st.bind_pick = None;
+        }
+        for overlay in &mut self.overlays {
+            if let Overlay::Light(light) = overlay {
+                if light.unit_id == unit_id {
+                    light.bindings = bindings.clone();
+                    light.targets = binding_targets(&detail, &s(&light.version, "id"));
+                }
+            }
         }
     }
 
@@ -8154,7 +8215,7 @@ impl eframe::App for App {
                             }
                             self.msg = m;
                             if let Some((uid, _, _)) = finished {
-                                self.open_unit_detail(&uid);
+                                self.reload_unit_detail(&uid);
                             }
                         }
                         Err(e) => self.msg = format!("翻译失败：{e}"),
@@ -11696,12 +11757,14 @@ impl App {
             .replace_top(ContentFrame::Wall(WallState::default()));
         let closed = match &mut frame {
             ContentFrame::Unit(st) => {
+                self.rendering_unit = Some(st.unit_id.clone());
                 body_frame().show(ui, |ui| {
                     if self.pick.is_some() {
                         self.pick_bar(ui);
                     }
                     self.unit_detail(ui, st);
                 });
+                self.rendering_unit = None;
                 st.closed
             }
             ContentFrame::Wall(w) => {
@@ -11713,22 +11776,15 @@ impl App {
                 false
             }
         };
-        if matches!(self.content.stack.top(), ContentFrame::Unit(_)) {
-            // Opening from the wall pushed a detail above the placeholder.
-            // Restore the wall itself, including its search and selection.
-            if let ContentFrame::Wall(mut wall) = frame {
-                let root = self.content.stack.root_mut();
-                if let ContentFrame::Wall(placeholder) = root {
-                    wall.selected = placeholder.selected.take().or(wall.selected);
-                }
-                *root = ContentFrame::Wall(wall);
-            }
-        } else if self.content.stack.depth() == depth {
+        if self.content.stack.depth() == depth {
             if closed {
                 self.content.stack.pop();
             } else {
                 self.content.stack.replace_top(frame);
             }
+        }
+        if let Some(unit_id) = self.pending_unit_reload.take() {
+            self.reload_unit_detail(&unit_id);
         }
     }
 
@@ -12460,7 +12516,7 @@ impl App {
         };
         let uid = st.unit_id.clone();
         match self.call_work("PATCH", &format!("/v1/units/{uid}"), Some(body)) {
-            Ok(_) => self.open_unit_detail(&uid),
+            Ok(_) => self.reload_unit_detail(&uid),
             Err(e) => self.msg = format!("保存失败：{e}"),
         }
     }
@@ -12510,6 +12566,10 @@ impl App {
     }
 
     fn unit_detail(&mut self, ui: &mut egui::Ui, st: &mut UnitState) {
+        if ui.input(|input| input.key_pressed(egui::Key::Escape)) && st.bind_pick.is_some() {
+            st.bind_pick = None;
+            self.msg = "已取消页面挑选".into();
+        }
         let detail = st.detail.clone();
         let unit = detail.get("unit").cloned().unwrap_or(json!({}));
         // Breadcrumb (drill-down standard): 页面 › block name, the
@@ -12637,55 +12697,7 @@ impl App {
                 ui.separator();
                 ui.add_space(6.0);
             }
-            // 页面缩略图 (prototype #101's first section): the
-            // current version's pages as a thumb wall — the
-            // first rendition's newest non-recalled version.
-            // A page double-click opens the page editor on
-            // that page (the client's page-level surface; the
-            // version rows' 编辑页面 lands on page 0).
-            if let Some(wall_v) = detail
-                .get("renditions")
-                .and_then(|r| r.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|r| r.get("versions"))
-                .and_then(|v| v.as_array())
-                .and_then(|vs| {
-                    vs.iter()
-                        .find(|v| s(v, "status") != "recalled")
-                        .or_else(|| vs.first())
-                        .cloned()
-                })
-            {
-                let wall_vid = s(&wall_v, "id");
-                ui.label(egui::RichText::new("页面缩略图").strong());
-                ui.add_space(6.0);
-                let pages = i(&wall_v, "page_count") as usize;
-                let titles: Vec<String> = wall_v
-                    .get("pages")
-                    .and_then(|p| p.as_array())
-                    .map(|arr| arr.iter().map(|p| s(p, "title")).collect())
-                    .unwrap_or_default();
-                ui.horizontal_wrapped(|ui| {
-                    for p in 0..pages {
-                        ui.vertical(|ui| {
-                            let resp =
-                                self.thumb_response(ui, &wall_vid, p, 200.0, false);
-                            if resp.double_clicked() {
-                                self.open_page_editor(&unit, &wall_v, p);
-                            }
-                            let caption = titles
-                                .get(p)
-                                .filter(|t| !t.is_empty())
-                                .cloned()
-                                .unwrap_or_else(|| format!("第 {} 页", p + 1));
-                            ui.label(egui::RichText::new(caption).small());
-                        });
-                    }
-                });
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(6.0);
-            }
+            self.unit_pages_ui(ui, st);
             if let Some(rends) = detail.get("renditions").and_then(|r| r.as_array()) {
                 for r in rends.clone() {
                     let rend = r.get("rendition").cloned().unwrap_or(json!({}));
@@ -12697,7 +12709,16 @@ impl App {
                         for v in versions {
                             ui.horizontal(|ui| {
                                 let vid = s(v, "id");
-                                self.thumb_ui(ui, &vid, 0, 96.0);
+                                let thumb = self.thumb_response(
+                                    ui,
+                                    &vid,
+                                    0,
+                                    96.0,
+                                    st.selected_rendition.as_deref() == Some(s(&rend, "id")),
+                                );
+                                if thumb.double_clicked() {
+                                    self.open_light(st, v, 0);
+                                }
                                 ui.label(format!(
                                     "v{} · {} 页 · {} · {}",
                                     s(v, "semver"),
@@ -12763,52 +12784,11 @@ impl App {
                                         &format!("/v1/versions/{}/recall", s(v, "id")),
                                         None,
                                     );
-                                    self.open_unit_detail(&st.unit_id.clone());
+                                    self.reload_unit_detail(&st.unit_id.clone());
                                 }
                                 if s(v, "status") != "recalled" && ui.button("编辑页面").clicked()
                                 {
-                                    // Page-level visual editing (overlay):
-                                    // text runs + speaker notes of this
-                                    // version; saving publishes a new
-                                    // version under the §8 bump rule.
-                                    let mut scripts: Vec<String> = v
-                                        .get("scripts")
-                                        .and_then(|x| x.as_array())
-                                        .map(|arr| {
-                                            arr.iter()
-                                                .map(|t| t.as_str().unwrap_or("").to_string())
-                                                .collect()
-                                        })
-                                        .unwrap_or_default();
-                                    let pages = i(v, "page_count") as usize;
-                                    while scripts.len() < pages {
-                                        scripts.push(String::new());
-                                    }
-                                    self.overlays.push(Overlay::PageEdit(PageEditState {
-                                        version_id: s(v, "id"),
-                                        unit_id: st.unit_id.clone(),
-                                        unit_name: s(&unit, "name"),
-                                        semver: s(v, "semver"),
-                                        page_count: pages,
-                                        original_page_count: pages,
-                                        page: 0,
-                                        base: Default::default(),
-                                        work: Default::default(),
-                                        scripts_base: scripts.clone(),
-                                        scripts,
-                                        bump: 1,
-                                        note: String::new(),
-                                        elems: Default::default(),
-                                        elems_base: Default::default(),
-                                        slide_cx: 12192000,
-                                        slide_cy: 6858000,
-                                        sel: None,
-                                        selection: Default::default(),
-                                        preview: Default::default(),
-                                        drag: None,
-                                        undo: Vec::new(),
-                                        redo: Vec::new(),
-                                    }));
+                                    self.open_page_editor(&unit, v, 0);
                                 }
                             });
                         }
@@ -12976,7 +12956,7 @@ impl App {
                         ) {
                             Ok(_) => {
                                 self.msg = "讲稿已保存".into();
-                                self.open_unit_detail(&st.unit_id.clone());
+                                self.reload_unit_detail(&st.unit_id.clone());
                             }
                             Err(e) => self.msg = format!("保存讲稿失败：{e}"),
                         }
@@ -13047,7 +13027,7 @@ impl App {
                         match r {
                             Ok(v) => {
                                 self.msg = format!("已发布 v{}", s(&v, "semver"));
-                                self.open_unit_detail(&uid);
+                                self.reload_unit_detail(&uid);
                             }
                             Err(e) => self.msg = format!("发布失败：{e}"),
                         }
@@ -13057,162 +13037,7 @@ impl App {
                 }
             }
             ui.separator();
-            ui.label(egui::RichText::new("语言绑定（逐页）").strong());
-            let mut all_versions: Vec<(String, String, i64)> = Vec::new();
-            if let Some(rends) = detail.get("renditions").and_then(|r| r.as_array()) {
-                for r in rends {
-                    let rend = r.get("rendition").cloned().unwrap_or(json!({}));
-                    if let Some(vs) = r.get("versions").and_then(|v| v.as_array()) {
-                        for v in vs {
-                            all_versions.push((
-                                s(v, "id"),
-                                format!(
-                                    "{} · {} · v{}",
-                                    s(&rend, "form"),
-                                    s(&rend, "lang"),
-                                    s(v, "semver")
-                                ),
-                                i(v, "page_count"),
-                            ));
-                        }
-                    }
-                }
-            }
-            if all_versions.len() >= 2 {
-                if st.bind_from.is_empty() {
-                    st.bind_from = all_versions[0].0.clone();
-                }
-                if st.bind_to.is_empty() {
-                    st.bind_to = all_versions[1].0.clone();
-                }
-                ui.horizontal(|ui| {
-                    ui.label("基准");
-                    let cur = all_versions
-                        .iter()
-                        .find(|v| v.0 == st.bind_from)
-                        .map(|v| v.1.clone())
-                        .unwrap_or_default();
-                    egui::ComboBox::from_id_salt("bind_from")
-                        .selected_text(cur)
-                        .show_ui(ui, |ui| {
-                            for v in &all_versions {
-                                ui.selectable_value(&mut st.bind_from, v.0.clone(), &v.1);
-                            }
-                        });
-                    ui.label("对应");
-                    let cur = all_versions
-                        .iter()
-                        .find(|v| v.0 == st.bind_to)
-                        .map(|v| v.1.clone())
-                        .unwrap_or_default();
-                    egui::ComboBox::from_id_salt("bind_to")
-                        .selected_text(cur)
-                        .show_ui(ui, |ui| {
-                            for v in &all_versions {
-                                ui.selectable_value(&mut st.bind_to, v.0.clone(), &v.1);
-                            }
-                        });
-                });
-                let from_pages = all_versions
-                    .iter()
-                    .find(|v| v.0 == st.bind_from)
-                    .map(|v| v.2)
-                    .unwrap_or(0);
-                let to_pages = all_versions
-                    .iter()
-                    .find(|v| v.0 == st.bind_to)
-                    .map(|v| v.2)
-                    .unwrap_or(0);
-                ui.label("基准页（点选）：");
-                ui.horizontal(|ui| {
-                    for p in 0..from_pages {
-                        ui.vertical(|ui| {
-                            let vid = st.bind_from.clone();
-                            self.thumb_ui(ui, &vid, p as usize, 84.0);
-                            let selected = st.bind_from_slot == Some(p);
-                            if ui
-                                .selectable_label(selected, format!("第{}页", p + 1))
-                                .clicked()
-                            {
-                                st.bind_from_slot = Some(p);
-                            }
-                        });
-                    }
-                });
-                ui.label("对应页（点「绑定/已绑定」切换）：");
-                ui.horizontal(|ui| {
-                    for p in 0..to_pages {
-                        ui.vertical(|ui| {
-                            let vid = st.bind_to.clone();
-                            self.thumb_ui(ui, &vid, p as usize, 84.0);
-                            let existing = st
-                                .bindings
-                                .iter()
-                                .find(|b| {
-                                    s(b, "from_version_id") == st.bind_from
-                                        && st.bind_from_slot == Some(i(b, "from_slot"))
-                                        && s(b, "to_version_id") == st.bind_to
-                                        && i(b, "to_slot") == p
-                                })
-                                .map(|b| s(b, "id"));
-                            match (st.bind_from_slot, existing) {
-                                (Some(_), Some(bid)) => {
-                                    if ui
-                                        .add(
-                                            egui::Button::new(
-                                                egui::RichText::new("已绑定 ✓")
-                                                    .color(palette_color(CHIP_GREEN_FG)),
-                                            )
-                                            .fill(palette_color(CHIP_GREEN_BG))
-                                            .corner_radius(6),
-                                        )
-                                        .clicked()
-                                    {
-                                        let uid = st.unit_id.clone();
-                                        let _ = self.call_work(
-                                            "POST",
-                                            &format!("/v1/units/{uid}/page-bindings/{bid}/delete"),
-                                            None,
-                                        );
-                                        self.open_unit_detail(&uid);
-                                    }
-                                }
-                                (Some(fs), None) => {
-                                    if ui.button("绑定").clicked() {
-                                        let uid = st.unit_id.clone();
-                                        let r = self.call_work(
-                                            "POST",
-                                            &format!("/v1/units/{uid}/page-bindings"),
-                                            Some(json!({
-                                                "from_version_id": st.bind_from,
-                                                "from_slot": fs,
-                                                "to_version_id": st.bind_to,
-                                                "to_slot": p,
-                                            })),
-                                        );
-                                        match r {
-                                            Ok(_) => self.open_unit_detail(&uid),
-                                            Err(e) => self.msg = format!("绑定失败：{e}"),
-                                        }
-                                    }
-                                }
-                                _ => {
-                                    ui.label("先选基准页");
-                                }
-                            }
-                        });
-                    }
-                });
-                if !st.bindings.is_empty() {
-                    ui.label(
-                        egui::RichText::new(format!("已有绑定 {} 条", st.bindings.len()))
-                            .small()
-                            .weak(),
-                    );
-                }
-            } else {
-                ui.label(egui::RichText::new("至少两个版本后可做逐页绑定").weak());
-            }
+            self.unit_bindings_ui(ui, st);
         });
         self.attachments_ui(ui, "unit", &st.unit_id.clone());
     }
@@ -13994,6 +13819,9 @@ impl App {
                 Some(Overlay::Confirm(_)) => {
                     self.overlays.pop();
                 }
+                Some(Overlay::Light(_)) => {
+                    self.overlays.pop();
+                }
                 Some(Overlay::PageEdit(_)) => {
                     let dirty = match self.overlays.last() {
                         Some(Overlay::PageEdit(pe)) => pe.dirty(),
@@ -14132,6 +13960,7 @@ impl App {
             Overlay::DeckInfo(st) => self.deck_info_ui(ui, st),
             Overlay::PickTemplate(t) => self.pick_template_ui(ui, t),
             Overlay::PageEdit(pe) => self.page_edit_ui(ui, screen, pe),
+            Overlay::Light(light) => self.light_ui(ui, screen, light),
             Overlay::Present(p) => self.present_ui(ui, screen, p),
         }
     }
@@ -14215,6 +14044,7 @@ impl App {
                         self.overlays.remove(pos);
                     }
                 }
+                ConfirmAction::MovePageBinding(req) => self.apply_page_binding(req),
                 ConfirmAction::PdfRasterFallback { item, form, page } => {
                     let title = s(&item, "title");
                     let stem = match (form.as_str(), page) {
@@ -14789,7 +14619,7 @@ impl App {
             _ => None,
         };
         if let Some(uid) = open_uid {
-            self.open_unit_detail(&uid);
+            self.reload_unit_detail(&uid);
         }
         self.refresh_all();
         Some(saved_version_id)

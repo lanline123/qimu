@@ -614,6 +614,14 @@ impl App {
         {
             self.deckbar_back();
         }
+        if self.page == Page::Content && matches!(self.overlays.last(), Some(Overlay::Light(_))) {
+            if ChromeIcons
+                .tool(ui, ChromeIcon::Doc, "编辑这一页", true, false, true)
+                .clicked()
+            {
+                self.open_light_editor();
+            }
+        }
         tool_vsep(ui);
         // sdPresent — the accent main button (the tool button's
         // selected form is its accent-filled state).
@@ -1165,6 +1173,14 @@ impl App {
         }
     }
 
+    fn content_light_open(&self) -> bool {
+        self.page == Page::Content
+            && self
+                .overlays
+                .iter()
+                .any(|overlay| matches!(overlay, Overlay::Light(_)))
+    }
+
     /// sdClose's label for the current state (prototype
     /// updateBarAvail): None on the home page, where the button
     /// greys out entirely.
@@ -1180,7 +1196,11 @@ impl App {
                 SrFrame::Wall => Some("回主页"),
             },
             Page::Content => match self.content.stack.top() {
-                ContentFrame::Unit(_) => Some("返回上一层"),
+                ContentFrame::Unit(_) => Some(if self.content_light_open() {
+                    "返回内容块详情"
+                } else {
+                    "返回上一层"
+                }),
                 ContentFrame::Wall(_) => Some("回主页"),
             },
             Page::Index => match self.index.stack.top() {
@@ -1220,7 +1240,9 @@ impl App {
                 }
             }
             Page::Content => {
-                if let ContentFrame::Unit(st) = self.content.stack.top_mut() {
+                if self.content_light_open() {
+                    self.overlays.pop();
+                } else if let ContentFrame::Unit(st) = self.content.stack.top_mut() {
                     st.closed = true;
                     self.refresh_all();
                 } else {
@@ -1310,7 +1332,16 @@ impl App {
                             "groups" => "#5",
                             _ => "#2",
                         },
-                        Page::Content => "#6",
+                        Page::Content => {
+                            if self.content_light_open() {
+                                "#406"
+                            } else {
+                                match self.content.stack.top() {
+                                    ContentFrame::Unit(_) => "#101",
+                                    ContentFrame::Wall(_) => "#6",
+                                }
+                            }
+                        }
                         Page::Index => "#7",
                         Page::Settings => "#8",
                         Page::Trash => "#9",
