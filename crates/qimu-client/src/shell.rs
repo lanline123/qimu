@@ -858,8 +858,13 @@ impl App {
             let item = item.clone().unwrap();
             self.cache_showroom_deck(&item);
         }
+        // sdShare: enabled whenever a deck is open, like
+        // sdExport/sdExportPdf — the share dialog's 链接 form
+        // is export-style and works offline and without login
+        // (user ruling 2026-11-24); its server forms gate
+        // themselves at their send point.
         if ChromeIcons
-            .tool(ui, ChromeIcon::Share, "分享给…", deck_open && self.org_online(), false, true)
+            .tool(ui, ChromeIcon::Share, "分享给…", deck_open, false, true)
             .clicked()
         {
             let item = item.clone().unwrap();

@@ -7,6 +7,7 @@ enum ShareMode {
     Person,
     Department,
     Group,
+    Link,
 }
 
 pub(super) struct ShareDialogState {
@@ -19,6 +20,8 @@ pub(super) struct ShareDialogState {
     search: String,
     contacts: Vec<Value>,
     reload_contacts: bool,
+    link: String,
+    link_error: String,
 }
 
 pub(super) struct PullDialogState {
@@ -41,6 +44,31 @@ pub(super) struct PushDialogState {
     rows: Vec<(String, Option<String>, String)>,
     initial: bool,
     note: String,
+}
+
+/// File-name stem for a generated share artifact: deck
+/// titles are user text, so path separators and control
+/// characters fold to underscores; a title with nothing
+/// usable left falls back to a neutral stem.
+fn sanitize_file_stem(title: &str) -> String {
+    let cleaned: String = title
+        .chars()
+        .map(|c| {
+            if c.is_control()
+                || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+            {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim().trim_matches('.');
+    if trimmed.is_empty() {
+        "分享稿件".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn department_depth(departments: &[Value], id: &str) -> usize {
@@ -102,12 +130,17 @@ impl App {
     }
 
     pub(super) fn open_share_dialog(&mut self, item: &Value) {
-        if !self.require_org_online("分享给…") {
-            return;
-        }
-        if !self.need_identity("分享给…") {
-            return;
-        }
+        // The dialog hosts two coexisting share forms (user
+        // ruling 2026-11-24): the server forms (个人 / 部门 /
+        // 群组, POST /v1/shares) and the export-style 链接
+        // form, which is login-free and works offline. The
+        // dialog therefore opens unconditionally and starts on
+        // the 链接 tab whenever the server forms are not usable
+        // right now; the server forms keep their gates at the
+        // send point in share_dialog_ui (the org-online
+        // re-check from audit issue 4, plus the identity check
+        // that used to sit here).
+        let server_ready = self.org_online() && !self.anon_active();
         let pages = i(item, "page_count").max(0);
         let meta = if pages > 0 {
             format!("{} 页 · 维护人 {}", pages, s(item, "submitted_by"))
@@ -118,22 +151,30 @@ impl App {
             item_id: s(item, "id"),
             title: s(item, "title"),
             meta,
-            mode: ShareMode::Person,
+            mode: if server_ready {
+                ShareMode::Person
+            } else {
+                ShareMode::Link
+            },
             target: String::new(),
             note: String::new(),
             search: String::new(),
             contacts: Vec::new(),
-            reload_contacts: true,
+            reload_contacts: server_ready,
+            link: String::new(),
+            link_error: String::new(),
         };
-        if let Ok(response) = self.call("GET", "/v1/org/contacts", None) {
-            state.contacts = response["users"].as_array().cloned().unwrap_or_default();
-            state.target = state
-                .contacts
-                .iter()
-                .find(|user| s(user, "id") != self.my_id)
-                .map(|user| s(user, "id"))
-                .unwrap_or_default();
-            state.reload_contacts = false;
+        if server_ready {
+            if let Ok(response) = self.call("GET", "/v1/org/contacts", None) {
+                state.contacts = response["users"].as_array().cloned().unwrap_or_default();
+                state.target = state
+                    .contacts
+                    .iter()
+                    .find(|user| s(user, "id") != self.my_id)
+                    .map(|user| s(user, "id"))
+                    .unwrap_or_default();
+                state.reload_contacts = false;
+            }
         }
         self.share_dialog = Some(state);
     }
@@ -143,6 +184,8 @@ impl App {
             return;
         };
         let mut submit = false;
+        let mut copy_link = false;
+        let mut want_link_gen = false;
         let dialog = egui::Modal::new(egui::Id::unique("share-deck")).show(ctx, |ui| {
             ui.set_width(620.0);
             ui.heading(tr("分享这套演示稿"));
@@ -158,6 +201,7 @@ impl App {
                     (ShareMode::Person, "个人"),
                     (ShareMode::Department, "部门"),
                     (ShareMode::Group, "群组"),
+                    (ShareMode::Link, "链接"),
                 ] {
                     ui.selectable_value(&mut state.mode, mode, tr(label));
                 }
@@ -167,6 +211,14 @@ impl App {
                 state.search.clear();
                 state.reload_contacts = state.mode == ShareMode::Person;
             }
+            // The 链接 form generates its artifact after the
+            // modal, in the same deferred slot as the contacts
+            // reload: generation may assemble the deck and call
+            // the server fallback, neither of which belongs in
+            // the modal closure.
+            want_link_gen = state.mode == ShareMode::Link
+                && state.link.is_empty()
+                && state.link_error.is_empty();
             ui.add_space(6.0);
             match state.mode {
                 ShareMode::Person => {
@@ -313,6 +365,41 @@ impl App {
                             }
                         });
                 }
+                ShareMode::Link => {
+                    if !state.link.is_empty() {
+                        ui.horizontal(|ui| {
+                            let mut shown = state.link.clone();
+                            ui.add_sized(
+                                [ui.available_width() - 92.0, 28.0],
+                                egui::TextEdit::singleline(&mut shown),
+                            );
+                            if ui.button(tr("复制链接")).clicked() {
+                                copy_link = true;
+                            }
+                        });
+                        ui.label(
+                            egui::RichText::new(tr(
+                                "链接指向本机生成的分享文件；把文件发给同事，对方导入即可打开。",
+                            ))
+                            .size(11.5)
+                            .color(palette_color(TEXT_WEAK)),
+                        );
+                    } else if !state.link_error.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "分享文件生成失败：{}",
+                                state.link_error
+                            ))
+                            .size(12.0)
+                            .color(palette_color(TEXT_WEAK)),
+                        );
+                        if ui.button(tr("重新生成")).clicked() {
+                            state.link_error.clear();
+                        }
+                    } else {
+                        ui.label(tr("正在生成分享文件…"));
+                    }
+                }
             }
             ui.add_space(8.0);
             ui.label(tr("附言（可选）"));
@@ -323,8 +410,13 @@ impl App {
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let can_send = if state.mode == ShareMode::Link {
+                        !state.link.is_empty()
+                    } else {
+                        !state.target.is_empty()
+                    };
                     if ui
-                        .add_enabled(!state.target.is_empty(), egui::Button::new(tr("发送分享")))
+                        .add_enabled(can_send, egui::Button::new(tr("发送分享")))
                         .clicked()
                     {
                         submit = true;
@@ -335,6 +427,10 @@ impl App {
                 });
             });
         });
+        if copy_link {
+            ctx.copy_text(state.link.clone());
+            self.msg = "链接已复制".into();
+        }
         if state.reload_contacts {
             let query = state.search.trim().to_string();
             if let Ok(response) = self.call(
@@ -361,13 +457,33 @@ impl App {
         if dialog.should_close() {
             return;
         }
+        if want_link_gen {
+            self.generate_share_link(&mut state);
+        }
         if submit {
+            // The 链接 form's send button copies the link and
+            // closes (prototype shareDlg: shareOk in link mode
+            // is doShareLink). No server round-trip and no gate:
+            // the artifact was generated locally.
+            if state.mode == ShareMode::Link {
+                ctx.copy_text(state.link.clone());
+                self.msg = "链接已复制".into();
+                return;
+            }
             // Execution-point re-check (audit issue 4): the
             // dialog may have been opened while online and the
-            // network dropped since — the open-time gate in
-            // open_share_dialog is not enough. On a failed check
-            // the dialog stays open with its draft intact.
+            // network dropped since — an open-time gate is not
+            // enough. On a failed check the dialog stays open
+            // with its draft intact. The identity check sits at
+            // this same point: since the 链接 form landed
+            // (2026-11-24) the dialog opens without gates so
+            // the link form stays login-free, and the server
+            // forms enforce both gates here instead.
             if !self.require_org_online("分享给…") {
+                self.share_dialog = Some(state);
+                return;
+            }
+            if !self.need_identity("分享给…") {
                 self.share_dialog = Some(state);
                 return;
             }
@@ -375,6 +491,7 @@ impl App {
                 ShareMode::Person => "user",
                 ShareMode::Department => "dept",
                 ShareMode::Group => "group",
+                ShareMode::Link => unreachable!(),
             };
             match self.call(
                 "POST",
@@ -393,6 +510,69 @@ impl App {
             return;
         }
         self.share_dialog = Some(state);
+    }
+
+    /// The 链接 share form (the prototype shareDlg's fourth
+    /// tab, restored 2026-11-24): generate the share artifact
+    /// locally — the deck's PPTX, acquired exactly the way
+    /// export_showroom_pptx acquires it, minus the save
+    /// dialog — write it into the share folder under the
+    /// cache dir, and present its file:// link for copying.
+    /// The prototype's link pointed at a LAN server that
+    /// would serve the share; this phase has no anonymous
+    /// share-serving endpoint, so the link points at the
+    /// generated file itself: the user sends the file on,
+    /// the recipient imports it. No login and no online
+    /// gate — with the deck in the local library the whole
+    /// form works offline.
+    fn generate_share_link(&mut self, state: &mut ShareDialogState) {
+        match self.share_link_bytes(&state.item_id) {
+            Ok(bytes) => {
+                let dir = cache_dir().join("share");
+                let path = dir.join(format!("{}.pptx", sanitize_file_stem(&state.title)));
+                match std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, &bytes))
+                {
+                    Ok(()) => {
+                        let shown = path.display().to_string().replace('\\', "/");
+                        state.link = if shown.starts_with('/') {
+                            format!("file://{shown}")
+                        } else {
+                            format!("file:///{shown}")
+                        };
+                        state.link_error.clear();
+                    }
+                    Err(e) => state.link_error = format!("写入失败：{e}"),
+                }
+            }
+            Err(e) => state.link_error = e,
+        }
+    }
+
+    /// The PPTX bytes behind the 链接 share form: local
+    /// assembly first (a deck in the local library), the
+    /// server's export as the fallback — the acquisition
+    /// half of export_showroom_pptx without its save-dialog
+    /// landing.
+    fn share_link_bytes(&mut self, item_id: &str) -> Result<Vec<u8>, String> {
+        if let Some(local) = &self.local {
+            match local.assemble_showroom_deck(item_id, false) {
+                Some(Ok((bytes, _page_count))) => return Ok(bytes),
+                Some(Err(e)) => {
+                    eprintln!("[qimu] 本地组装分享稿件失败，回退服务端导出：{e}");
+                }
+                None => {}
+            }
+        }
+        let v = self.call(
+            "POST",
+            &format!("/v1/showroom/{item_id}/export"),
+            Some(json!({ "kind": "personal" })),
+        )?;
+        let data = v
+            .get("data_base64")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| "服务端导出未返回文件内容".to_string())?;
+        b64d(data)
     }
 
     pub(super) fn open_pull_dialog(&mut self, item: &Value, share_id: Option<String>) {
