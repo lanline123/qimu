@@ -1,4 +1,5 @@
 use super::*;
+use qimu_core::model::IndexEntry;
 use std::collections::{BTreeMap, HashSet};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -36,6 +37,7 @@ pub(super) struct PushDialogState {
     title: String,
     published_version: Option<String>,
     published_tag_id: Option<String>,
+    pinned_versions: Vec<(IndexEntry, String)>,
     rows: Vec<(String, Option<String>, String)>,
     initial: bool,
     note: String,
@@ -78,6 +80,20 @@ fn resolved_version(rows: &[Value]) -> Vec<(String, String, String)> {
     out
 }
 
+fn preview_pins(rows: &[Value]) -> Result<Vec<(IndexEntry, String)>, String> {
+    rows.iter()
+        .map(|row| {
+            let entry = serde_json::from_value(row["entry"].clone())
+                .map_err(|_| "推送摘要缺少内容块条目".to_string())?;
+            let version = s(&row["resolved"], "id");
+            if version.is_empty() {
+                return Err("内容块尚无已发布版本，请先发布后再推送".into());
+            }
+            Ok((entry, version))
+        })
+        .collect()
+}
+
 impl App {
     pub(super) fn prototype_dialogs_ui(&mut self, ctx: &egui::Context) {
         self.share_dialog_ui(ctx);
@@ -86,6 +102,9 @@ impl App {
     }
 
     pub(super) fn open_share_dialog(&mut self, item: &Value) {
+        if !self.require_org_online("分享给…") {
+            return;
+        }
         if !self.need_identity("分享给…") {
             return;
         }
@@ -133,6 +152,7 @@ impl App {
                     .color(palette_color(TEXT_WEAK)),
             );
             ui.add_space(8.0);
+            let previous_mode = state.mode;
             ui.horizontal(|ui| {
                 for (mode, label) in [
                     (ShareMode::Person, "个人"),
@@ -142,6 +162,11 @@ impl App {
                     ui.selectable_value(&mut state.mode, mode, tr(label));
                 }
             });
+            if state.mode != previous_mode {
+                state.target.clear();
+                state.search.clear();
+                state.reload_contacts = state.mode == ShareMode::Person;
+            }
             ui.add_space(6.0);
             match state.mode {
                 ShareMode::Person => {
@@ -168,7 +193,11 @@ impl App {
                         .max_height(190.0)
                         .show(ui, |ui| {
                             if state.contacts.is_empty() {
-                                ui.label(tr("没有匹配的同事"));
+                                if self.role() == "member" {
+                                    ui.label(tr("普通成员不可浏览公司通讯录，可切换到群组分享。"));
+                                } else {
+                                    ui.label(tr("没有匹配的同事"));
+                                }
                             }
                             for contact in &state.contacts {
                                 let id = s(contact, "id");
@@ -252,15 +281,22 @@ impl App {
                         .id_salt("share-groups")
                         .max_height(220.0)
                         .show(ui, |ui| {
-                            for group in self.groups.clone() {
-                                let id = s(&group, "id");
+                            if self.my_teams.is_empty() {
+                                ui.label(tr("还没有加入任何群组"));
+                            }
+                            for group in &self.my_teams {
+                                let id = s(group, "id");
                                 let selected = state.target == id;
+                                let member_count = group["members"]
+                                    .as_array()
+                                    .map(Vec::len)
+                                    .unwrap_or_default();
                                 if ui
                                     .add(
                                         egui::Button::new(format!(
                                             "{} · {} 位成员",
-                                            s(&group, "name"),
-                                            group["member_count"].as_u64().unwrap_or(0)
+                                            s(group, "name"),
+                                            member_count
                                         ))
                                         .fill(
                                             if selected {
@@ -351,7 +387,10 @@ impl App {
     }
 
     pub(super) fn open_pull_dialog(&mut self, item: &Value, share_id: Option<String>) {
-        if !self.need_identity("收进我的") {
+        if !self.require_org_online("保存到我的库") {
+            return;
+        }
+        if !self.need_identity("保存到我的库") {
             return;
         }
         let item_kind = share_id.as_ref().map_or_else(
@@ -400,7 +439,7 @@ impl App {
         let mut submit = false;
         let dialog = egui::Modal::new(egui::Id::unique("pull-into-library")).show(ctx, |ui| {
             ui.set_width(460.0);
-            ui.heading(format!("{} · {}", tr("收进我的"), state.title));
+            ui.heading(format!("{} · {}", tr("保存到我的库"), state.title));
             ui.label(
                 egui::RichText::new(format!("{} · 引用，跟随来源更新", state.meta))
                     .size(12.0)
@@ -471,6 +510,9 @@ impl App {
     }
 
     pub(super) fn open_push_dialog(&mut self, id: &str, title: &str) {
+        if !self.require_org_online("推送到演示厅") {
+            return;
+        }
         if !self.need_identity("推送到演示厅") {
             return;
         }
@@ -478,7 +520,7 @@ impl App {
             IndexFrame::Detail(state) => state.branch.clone(),
             _ => "main".into(),
         };
-        let response = match self.call(
+        let mut response = match self.call_work(
             "GET",
             &format!(
                 "/v1/indexes/{id}/push-preview?branch={}",
@@ -492,12 +534,30 @@ impl App {
                 return;
             }
         };
-        let current = resolved_version(
-            response["current_entries"]
-                .as_array()
-                .map(Vec::as_slice)
-                .unwrap_or_default(),
-        );
+        if response["previous_entries"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+        {
+            if let Some(previous) = self
+                .showroom_live
+                .iter()
+                .find(|item| s(item, "source_index_id") == id)
+            {
+                response["previous_entries"] = previous["resolved_entries"].clone();
+            }
+        }
+        let current_rows = response["current_entries"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let pinned_versions = match preview_pins(current_rows) {
+            Ok(pins) => pins,
+            Err(error) => {
+                self.msg = error;
+                return;
+            }
+        };
+        let current = resolved_version(current_rows);
         let previous = resolved_version(
             response["previous_entries"]
                 .as_array()
@@ -532,6 +592,7 @@ impl App {
             title: title.to_string(),
             published_version: response["published_version"].as_str().map(str::to_owned),
             published_tag_id: response["published_tag_id"].as_str().map(str::to_owned),
+            pinned_versions,
             rows,
             initial,
             note: String::new(),
@@ -624,6 +685,7 @@ impl App {
                 &state.index_id,
                 &state.title,
                 state.published_tag_id.as_deref().unwrap_or_default(),
+                &state.pinned_versions,
                 state.note.trim(),
             );
             return;

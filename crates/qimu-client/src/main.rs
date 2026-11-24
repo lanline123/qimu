@@ -4078,6 +4078,7 @@ impl App {
 
     /// Drop every server-scoped list tied to the previous identity.
     fn clear_account_state(&mut self) {
+        self.settings.profile.clear();
         self.folders.clear();
         self.groups.clear();
         self.units.clear();
@@ -8220,6 +8221,17 @@ impl App {
             })
     }
 
+    fn require_org_online(&mut self, action: &str) -> bool {
+        if self.org_online() {
+            return true;
+        }
+        self.msg = format!(
+            "{action}：{}",
+            tr("需要连接服务器；离线内容仍可打开。")
+        );
+        false
+    }
+
     /// True when the item's offline cache is the complete bundle
     /// (T1 cache payload: index + blocks): the entry carries its
     /// source index file, the same marker `cached_index_detail`
@@ -9523,6 +9535,9 @@ impl App {
     /// the showroom access gate. Either way the result is the
     /// library entry the header's saved state reads.
     fn save_showroom_to_library(&mut self, item: &Value) {
+        if !self.require_org_online("保存到我的库") {
+            return;
+        }
         let item_id = s(item, "id");
         if let Some(share) = self
             .inbox
@@ -9593,6 +9608,9 @@ impl App {
     }
 
     fn cache_showroom_deck(&mut self, item: &Value) {
+        if !self.require_org_online("缓存到本地") {
+            return;
+        }
         let source = s(item, "source_index_id");
         if source.is_empty() {
             self.msg = "该条目暂不支持缓存到本地".into();
@@ -9836,6 +9854,14 @@ impl App {
                 .small()
                 .weak(),
             );
+            let note = s(item, "note");
+            if !note.is_empty() {
+                ui.label(
+                    egui::RichText::new(format!("{}：{note}", tr("分享说明")))
+                        .size(11.5)
+                        .color(palette_color(TEXT_WEAK)),
+                );
+            }
             if item["item_kind"] == "showroom"
                 && !app.org_online()
                 && !app.sr_bundle_cached(&id)
@@ -9848,7 +9874,7 @@ impl App {
                     }
                     if saved {
                         ui.label(egui::RichText::new("已在我的库").small().weak());
-                    } else if ui.small_button("收进我的").clicked() {
+                    } else if app.org_online() && ui.small_button("保存到我的库").clicked() {
                         let sid = s(item, "id");
                         app.open_pull_dialog(item, Some(sid));
                     }
@@ -10099,6 +10125,9 @@ impl App {
     /// One review decision against the server's manual approval
     /// flow. Rejection requires a reason (server-enforced).
     fn review_act(&mut self, item_id: &str, state: &str, note: &str) -> bool {
+        if !self.require_org_online("审批演示厅投稿") {
+            return false;
+        }
         if !self.need_identity("审批演示厅投稿") {
             return false;
         }
@@ -10135,6 +10164,9 @@ impl App {
     /// Rejection requires a reason (server-enforced, returned to
     /// the submitter verbatim).
     fn review_submission_act(&mut self, sub_id: &str, state: &str, note: &str) -> bool {
+        if !self.require_org_online("审批演示厅投稿") {
+            return false;
+        }
         if !self.need_identity("审批演示厅投稿") {
             return false;
         }
@@ -10224,6 +10256,7 @@ impl App {
         }
         let mut withdraw: Option<String> = None;
         let mut goto_showroom = false;
+        let online = self.org_online();
         for sub in &subs {
             let state = s(sub, "state");
             standard_card_v(
@@ -10292,6 +10325,7 @@ impl App {
                     }
                     ui.horizontal(|ui| {
                         if state == "pending"
+                            && online
                             && btn_danger(ui, tr("撤回")).clicked()
                         {
                             withdraw = Some(s(sub, "id"));
@@ -10947,15 +10981,16 @@ impl App {
                         app.start_present_from_deck(ui);
                     }
                 }
-                if !app
-                    .library_refs
-                    .iter()
-                    .any(|entry| entry["item_id"] == item["id"])
-                    && ui.small_button("收进我的").clicked()
+                if app.org_online()
+                    && !app
+                        .library_refs
+                        .iter()
+                        .any(|entry| entry["item_id"] == item["id"])
+                    && ui.small_button("保存到我的库").clicked()
                 {
                     app.open_pull_dialog(item, None);
                 }
-                if !s(item, "source_index_id").is_empty() {
+                if app.org_online() && !s(item, "source_index_id").is_empty() {
                     let key = format!("sr_{id}");
                     let cached = app.cache_entries.iter().any(|entry| entry["key"] == key);
                     let label = if cached {
@@ -10967,11 +11002,12 @@ impl App {
                         app.cache_showroom_deck(item);
                     }
                 }
-                if app.role() == "super"
-                    || app
-                        .user
-                        .as_ref()
-                        .is_some_and(|u| s(u, "display_name") == s(item, "submitted_by"))
+                if app.org_online()
+                    && (app.role() == "super"
+                        || app
+                            .user
+                            .as_ref()
+                            .is_some_and(|u| s(u, "display_name") == s(item, "submitted_by")))
                 {
                     if text_action(ui, "删除", palette_color(BADGE_BAD_FG), 12.0) {
                         app.trash_add("showroom", &id);

@@ -2097,6 +2097,9 @@ async fn index_push_preview(
 ) -> Api<Value> {
     let user = auth(&st, &headers)?;
     let branch = q.branch.unwrap_or_else(|| "main".to_string());
+    if branch != "main" {
+        return Err(bad("只能推送主分支的发布版本"));
+    }
     let store = st.store.lock().unwrap();
     let index = store.get_index(&id).map_err(|_| not_found())?;
     if !store.can_see_group(&user, &index.group_id).map_err(bad)? {
@@ -3928,6 +3931,44 @@ struct ShareReq {
     note: Option<String>,
 }
 
+fn validate_share_target(
+    store: &Store,
+    user: &UserRec,
+    target_kind: &str,
+    target_id: &str,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    match target_kind {
+        "user" => {
+            if !store
+                .list_users()
+                .map_err(bad)?
+                .iter()
+                .any(|u| u.id == target_id)
+            {
+                return Err(bad("目标用户不存在"));
+            }
+        }
+        "dept" => {
+            if !store
+                .list_departments()
+                .map_err(bad)?
+                .iter()
+                .any(|d| d.id == target_id)
+            {
+                return Err(bad("目标部门不存在"));
+            }
+        }
+        "group" => {
+            let members = store.custom_group_members(target_id).map_err(bad)?;
+            if !members.iter().any(|m| m == &user.id) {
+                return Err(forbidden());
+            }
+        }
+        _ => return Err(bad("target_kind 只能是 user、dept 或 group")),
+    }
+    Ok(())
+}
+
 async fn create_share(
     State(st): State<St>,
     headers: HeaderMap,
@@ -3957,36 +3998,7 @@ async fn create_share(
         }
         _ => return Err(bad("item_kind 只能是 showroom 或 assembly")),
     };
-    // validate target
-    match req.target_kind.as_str() {
-        "user" => {
-            if !store
-                .list_users()
-                .map_err(bad)?
-                .iter()
-                .any(|u| u.id == req.target_id)
-            {
-                return Err(bad("目标用户不存在"));
-            }
-        }
-        "dept" => {
-            if !store
-                .list_departments()
-                .map_err(bad)?
-                .iter()
-                .any(|d| d.id == req.target_id)
-            {
-                return Err(bad("目标部门不存在"));
-            }
-        }
-        "group" => {
-            let members = store.custom_group_members(&req.target_id).map_err(bad)?;
-            if !members.iter().any(|m| m == &user.id) {
-                return Err(forbidden());
-            }
-        }
-        _ => return Err(bad("target_kind 只能是 user、dept 或 group")),
-    }
+    validate_share_target(&store, &user, &req.target_kind, &req.target_id)?;
     let id = store
         .create_share(
             &req.item_kind,
@@ -4038,12 +4050,9 @@ async fn list_inbox(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
     Ok(Json(json!({ "shares": out })))
 }
 
-/// Group space: shares targeted at custom groups I belong to, grouped.
-async fn group_space(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
-    let user = auth(&st, &headers)?;
-    let store = st.store.lock().unwrap();
-    let groups = store.list_custom_groups_for(&user.id).map_err(bad)?;
-    let shares = store.list_shares().map_err(bad)?;
+fn group_space_items(store: &Store, user_id: &str) -> SResult<Vec<Value>> {
+    let groups = store.list_custom_groups_for(user_id)?;
+    let shares = store.list_shares()?;
     let mut out = Vec::new();
     for g in &groups {
         let items: Vec<Value> = shares
@@ -4053,6 +4062,14 @@ async fn group_space(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
             .collect();
         out.push(json!({ "group": g, "items": items }));
     }
+    Ok(out)
+}
+
+/// Group space: shares targeted at custom groups I belong to, grouped.
+async fn group_space(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let store = st.store.lock().unwrap();
+    let out = group_space_items(&store, &user.id).map_err(bad)?;
     Ok(Json(json!({ "spaces": out })))
 }
 
@@ -4652,6 +4669,53 @@ mod collaboration_tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn group_share_requires_membership_and_reaches_only_members() {
+        let dir = TestDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        store.ensure_seed("test-password").unwrap();
+        let alice = store
+            .create_user("alice", "Alice", "test-password", None, "member")
+            .unwrap();
+        let bob = store
+            .create_user("bob", "Bob", "test-password", None, "member")
+            .unwrap();
+        let outsider = store
+            .create_user("outsider", "Outsider", "test-password", None, "member")
+            .unwrap();
+        let group_id = store.create_custom_group(&alice.id, "项目组").unwrap();
+        store.add_custom_group_member(&group_id, &bob.id).unwrap();
+
+        assert!(validate_share_target(&store, &alice, "group", &group_id).is_ok());
+        assert!(validate_share_target(&store, &bob, "group", &group_id).is_ok());
+        let denied = validate_share_target(&store, &outsider, "group", &group_id).unwrap_err();
+        assert_eq!(denied.0, StatusCode::FORBIDDEN);
+
+        let item = store
+            .insert_showroom("演示稿", "", None, None, "Alice", "pending")
+            .unwrap();
+        store
+            .create_share(
+                "showroom",
+                &item.id,
+                &item.title,
+                &alice.id,
+                "group",
+                &group_id,
+                "请查收",
+            )
+            .unwrap();
+
+        let bob_spaces = group_space_items(&store, &bob.id).unwrap();
+        assert_eq!(bob_spaces.len(), 1);
+        assert_eq!(bob_spaces[0]["group"]["id"], group_id);
+        assert_eq!(bob_spaces[0]["items"][0]["item_id"], item.id);
+        assert_eq!(bob_spaces[0]["items"][0]["note"], "请查收");
+        assert!(group_space_items(&store, &outsider.id)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

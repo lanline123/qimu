@@ -837,21 +837,18 @@ impl App {
             let (it, pgs) = info_target.clone().unwrap();
             self.open_deck_info(&it, pgs);
         }
-        // sdCache — the prototype's sdPull slot (T6 ruling
-        // 2026-11-24: the slot is 缓存, not 收进我的 — the
-        // prototype itself was wrong). Accent-filled while the
-        // open deck sits in the local cache (the same cache-entry
-        // probe the deck header uses); clicking (re)caches through
-        // the deck header's own cache handler.
+        // sdSave — save a server-side library reference. Cached decks
+        // remain openable offline; this action and sharing require a
+        // live organization connection.
         if ChromeIcons
-            .tool(ui, ChromeIcon::Import, "收进我的", deck_open, false, true)
+            .tool(ui, ChromeIcon::Import, "保存到我的库", deck_open && self.org_online(), false, true)
             .clicked()
         {
             let item = item.clone().unwrap();
             self.open_pull_dialog(&item, None);
         }
         if ChromeIcons
-            .tool(ui, ChromeIcon::Share, "分享给…", deck_open, false, true)
+            .tool(ui, ChromeIcon::Share, "分享给…", deck_open && self.org_online(), false, true)
             .clicked()
         {
             let item = item.clone().unwrap();

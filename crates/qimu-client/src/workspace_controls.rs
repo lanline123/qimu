@@ -621,18 +621,16 @@ impl App {
                 String::new()
             };
             let server = self.active_server_label();
-            let email = self
-                .settings
-                .profile
-                .get("email")
-                .cloned()
-                .unwrap_or_default();
-            let phone = self
-                .settings
-                .profile
-                .get("phone")
-                .cloned()
-                .unwrap_or_default();
+            let email = if self.user.is_some() {
+                self.settings.profile.get("email").cloned().unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let phone = if self.user.is_some() {
+                self.settings.profile.get("phone").cloned().unwrap_or_default()
+            } else {
+                String::new()
+            };
             let entry = AccountMenuEntry {
                 name: &display_name,
                 role: &role,
