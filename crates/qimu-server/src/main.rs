@@ -2982,11 +2982,14 @@ async fn submit_showroom(
             req.intro.as_deref().unwrap_or(""),
             req.source_index_id.as_deref(),
             (!commit_id.is_empty()).then_some(commit_id.as_str()),
-            &user.display_name,
+            &user.id,
             "pending",
         )
         .map_err(bad)?;
-    Ok(Json(json!(rec)))
+    let mut value = serde_json::to_value(&rec).unwrap_or(Value::Null);
+    value["submitted_by"] = json!(user.display_name);
+    value["submitted_by_id"] = json!(user.id);
+    Ok(Json(value))
 }
 
 async fn list_showroom(
@@ -3008,6 +3011,15 @@ async fn list_showroom(
         }
         _ => {}
     }
+    // Wire presentation of the submitter: rows store the stable
+    // user id in submitted_by (ownership checks compare ids);
+    // clients keep seeing the display name, with the id alongside
+    // as submitted_by_id. Legacy rows stamped with a display name
+    // resolve to no id and pass through unchanged.
+    let submitter_names: std::collections::HashMap<String, String> = store
+        .list_users()
+        .map(|us| us.into_iter().map(|u| (u.id, u.display_name)).collect())
+        .unwrap_or_default();
     drop(store);
     let items = items
         .into_iter()
@@ -3016,6 +3028,10 @@ async fn list_showroom(
                 .map(|commit| resolved_entries(&st, &commit))
                 .unwrap_or_default();
             let mut value = serde_json::to_value(&item).unwrap_or(Value::Null);
+            value["submitted_by_id"] = json!(item.submitted_by.clone());
+            if let Some(name) = submitter_names.get(&item.submitted_by) {
+                value["submitted_by"] = json!(name);
+            }
             value["resolved_entries"] = json!(entries);
             value
         })
@@ -3326,7 +3342,7 @@ fn trash_check_cap(
                     .get_showroom(object_id)
                     .map_err(bad)?
                     .ok_or_else(not_found)?;
-                if user.role != "super" && item.submitted_by != user.display_name {
+                if user.role != "super" && item.submitted_by != user.id {
                     return Err(forbidden());
                 }
                 (item.title.clone(), "演示厅".to_string(), None)
@@ -3343,7 +3359,7 @@ fn trash_check_cap(
 /// Restore / purge gate on an existing trash row: super, the person
 /// who deleted it, or a `manage` holder on the object's group.
 fn trash_row_cap(st: &St, user: &UserRec, row: &TrashRec) -> Result<(), (StatusCode, Json<Value>)> {
-    if user.role == "super" || row.deleted_by == user.display_name {
+    if user.role == "super" || row.deleted_by == user.id {
         return Ok(());
     }
     let gid = {
@@ -3396,7 +3412,7 @@ async fn list_trash(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
     let rows = store.trash_list().map_err(bad)?;
     let mut items = Vec::new();
     for row in rows {
-        let see = if user.role == "super" || row.deleted_by == user.display_name {
+        let see = if user.role == "super" || row.deleted_by == user.id {
             true
         } else {
             let in_groups = |gid: &str| {
@@ -3421,7 +3437,14 @@ async fn list_trash(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
             continue;
         }
         let (cover, pages) = trash_cover(&store, &row);
+        let deleter_name = store
+            .user_by_id(&row.deleted_by)
+            .ok()
+            .map(|u| u.display_name);
         let mut v = json!(row);
+        if let Some(name) = deleter_name {
+            v["deleted_by"] = json!(name);
+        }
         v["cover_version_id"] = json!(cover);
         v["page_count"] = json!(pages);
         items.push(v);
@@ -3443,7 +3466,7 @@ async fn add_trash(
             &req.object_id,
             &title,
             &origin,
-            &user.display_name,
+            &user.id,
         )
         .map_err(bad)?;
     Ok(Json(json!(rec)))

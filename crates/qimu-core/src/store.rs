@@ -3216,7 +3216,7 @@ impl Store {
                         &sub.intro,
                         Some(&index_id),
                         Some(&commit.id),
-                        &sub.submitter_name,
+                        &sub.submitter_id,
                         "live",
                     )?
                     .id
@@ -3742,7 +3742,7 @@ impl Store {
             },
             None => false,
         };
-        if item.submitted_by == user.id || item.submitted_by == user.display_name {
+        if item.submitted_by == user.id {
             return Ok(item.source_index_id.is_none() || source_visible);
         }
         if item.state != "live" {

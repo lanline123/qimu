@@ -11011,7 +11011,7 @@ impl App {
                         || app
                             .user
                             .as_ref()
-                            .is_some_and(|u| s(u, "display_name") == s(item, "submitted_by")))
+                            .is_some_and(|u| s(u, "id") == s(item, "submitted_by_id")))
                 {
                     if text_action(ui, "删除", palette_color(BADGE_BAD_FG), 12.0) {
                         app.trash_add("showroom", &id);
