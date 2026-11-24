@@ -1,7 +1,9 @@
-# 启幕 Windows 试装包构建 —— 客户端与服务器两个独立安装包
+# 启幕 Windows 试装包构建 —— 只构建客户端 (用户 2026-11-24 口径:
+# 构建只建客户端、不用构建服务端; 且用 staging 非正式包 profile
+# 求快 —— opt-level 2 / codegen-units 32 / 无 LTO, 见根 Cargo.toml)。
 #
-# 路径与作者本机出包一致: ubuntu + mingw 交叉编译 x86_64-pc-windows-gnu
-# (release) -> makensis 出两个 NSIS 包 -> 作为 artifact 上传。
+# 路径: ubuntu + mingw 交叉编译 x86_64-pc-windows-gnu
+# (staging) -> makensis 出客户端 NSIS 包 -> 作为 artifact 上传。
 # 手动触发 (workflow_dispatch), 也可在推送到 main 时按需开启 push 触发。
 #
 # 注意 (落仓须知): 本文件受 GitHub App 权限限制, 无法经 Muse 的
@@ -53,7 +55,7 @@ jobs:
           toolchain: "1.95"
           targets: x86_64-pc-windows-gnu
 
-      - name: Build client + server + cli (release, windows-gnu)
+      - name: Build client only (staging profile, windows-gnu)
         env:
           # deckcraft-fonts embedding for the client's in-process
           # renderer (transplant T0): REQUIRED turns a missing
@@ -62,24 +64,7 @@ jobs:
           # the fonts crate; server/cli are unaffected.
           CRAFT_FONTS_DIR: ${{ github.workspace }}/vendor/craft-fonts
           CRAFT_FONTS_REQUIRED: "1"
-        run: cargo build --release --target x86_64-pc-windows-gnu -p qimu-client -p qimu-server -p qimu-cli
-
-      # deckcraft-cli: the server's thumbnail renderer (and the PDF
-      # export engine once that endpoint lands). The server resolves
-      # the binary next to qimu-server.exe (QIMU_DECKCRAFT_CLI env,
-      # then exe-dir, then PATH), so it must ship inside the server
-      # installer — until now the installer never carried it and
-      # clean installs silently fell back to LibreOffice. Built from
-      # the vendor/deckcraft submodule workspace, the same workspace
-      # thumb-dual-track builds natively for the verdict.
-      # NOTE: the windows-gnu cross build of the deckcraft engine is
-      # verified by THIS step (test -f below): if it fails, the run
-      # goes red here instead of shipping a renderer-less server.
-      - name: Build deckcraft-cli (release, windows-gnu)
-        working-directory: vendor/deckcraft
-        run: |
-          cargo build --release --target x86_64-pc-windows-gnu -p deckcraft-cli
-          test -f target/x86_64-pc-windows-gnu/release/deckcraft-cli.exe
+        run: cargo build --profile staging --target x86_64-pc-windows-gnu -p qimu-client
 
       # NOTE (ruling 2026-11-24): the client installer does NOT
       # bundle the DeckCraft desktop app. Presentation jumps locate
@@ -89,10 +74,7 @@ jobs:
       - name: Stage binaries for NSIS
         run: |
           mkdir -p packaging/win
-          cp target/x86_64-pc-windows-gnu/release/qimu-client.exe packaging/win/
-          cp target/x86_64-pc-windows-gnu/release/qimu-server.exe packaging/win/
-          cp target/x86_64-pc-windows-gnu/release/qimu.exe packaging/win/
-          cp vendor/deckcraft/target/x86_64-pc-windows-gnu/release/deckcraft-cli.exe packaging/win/
+          cp target/x86_64-pc-windows-gnu/staging/qimu-client.exe packaging/win/
           cp packaging/使用说明.txt packaging/win/
 
       - name: Generate installer icon (brand logo)
@@ -127,16 +109,9 @@ jobs:
           cp 启幕-客户端.nsi qimu-client-setup.nsi
           LC_ALL=C.UTF-8 makensis qimu-client-setup.nsi
 
-      - name: Build server installer
-        working-directory: packaging
-        run: |
-          cp 启幕-服务器.nsi qimu-server-setup.nsi
-          LC_ALL=C.UTF-8 makensis qimu-server-setup.nsi
-
       - name: Upload installers
         uses: actions/upload-artifact@v4
         with:
           name: qimu-windows-setups
           path: |
             packaging/启幕客户端-Setup.exe
-            packaging/启幕服务器-Setup.exe
