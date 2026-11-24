@@ -12714,7 +12714,7 @@ impl App {
                                     &vid,
                                     0,
                                     96.0,
-                                    st.selected_rendition.as_deref() == Some(s(&rend, "id")),
+                                    st.selected_rendition.as_deref() == Some(s(&rend, "id").as_str()),
                                 );
                                 if thumb.double_clicked() {
                                     self.open_light(st, v, 0);

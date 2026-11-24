@@ -171,7 +171,7 @@ impl App {
         }));
     }
 
-    fn unit_pages_ui(&mut self, ui: &mut egui::Ui, st: &mut UnitState) {
+    pub(super) fn unit_pages_ui(&mut self, ui: &mut egui::Ui, st: &mut UnitState) {
         let versions = unit_versions(&st.detail);
         let Some(first) = versions.first() else {
             return;
@@ -306,7 +306,7 @@ impl App {
         ui.add_space(6.0);
     }
 
-    fn unit_bindings_ui(&mut self, ui: &mut egui::Ui, st: &mut UnitState) {
+    pub(super) fn unit_bindings_ui(&mut self, ui: &mut egui::Ui, st: &mut UnitState) {
         ui.label(egui::RichText::new("语言绑定（逐页）").strong());
         let all_versions = unit_versions(&st.detail);
         if all_versions.len() < 2 {
@@ -463,7 +463,7 @@ impl App {
         }
     }
 
-    fn apply_page_binding(&mut self, request: PageBindingRequest) {
+    pub(super) fn apply_page_binding(&mut self, request: PageBindingRequest) {
         let Ok(bindings) = self.call_work(
             "GET",
             &format!("/v1/units/{}/page-bindings", request.unit_id),
@@ -584,9 +584,7 @@ impl App {
                                 let image_width = left_width
                                     .min((preview_screen.height() - 170.0).max(240.0) * 16.0 / 9.0);
                                 ui.with_layout(
-                                    egui::Layout::centered_and_justified(
-                                        egui::Direction::TopToBottom,
-                                    ),
+                                    egui::Layout::top_down(egui::Align::Center),
                                     |ui| {
                                         self.thumb_ui(
                                             ui,
@@ -716,13 +714,13 @@ impl App {
             });
         if let Some(binding) = unbind {
             self.delete_page_binding(&light.unit_id, &s(&binding, "id"));
-            if let Some(ContentFrame::Unit(st)) = self.content.stack.top() {
+            if let ContentFrame::Unit(st) = self.content.stack.top() {
                 light.bindings = st.bindings.clone();
             }
         }
         if let Some(request) = request {
             self.request_page_binding(request, &light.bindings);
-            if let Some(ContentFrame::Unit(st)) = self.content.stack.top() {
+            if let ContentFrame::Unit(st) = self.content.stack.top() {
                 light.bindings = st.bindings.clone();
             }
         }
@@ -746,11 +744,12 @@ impl App {
     }
 
     pub(super) fn open_light_editor(&mut self) {
-        let Some(Overlay::Light(light)) = self.overlays.last().cloned() else {
+        let Some(Overlay::Light(light_ref)) = self.overlays.last() else {
             return;
         };
+        let light = light_ref.clone();
         let unit = match self.content.stack.top() {
-            Some(ContentFrame::Unit(st)) => st.detail["unit"].clone(),
+            ContentFrame::Unit(st) => st.detail["unit"].clone(),
             _ => return,
         };
         self.overlays.pop();
