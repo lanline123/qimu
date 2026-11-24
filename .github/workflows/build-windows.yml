@@ -1,4 +1,5 @@
-# 启幕 Windows 试装包构建 —— 只构建客户端 (用户 2026-11-24 口径:
+# 启幕 Windows 试装包构建 —— 只构建客户端 (含随客户端包出货的 CLI qimu.exe;
+# 用户 2026-11-24 口径:
 # 构建只建客户端、不用构建服务端; 且用 staging 非正式包 profile
 # 求快 —— opt-level 2 / codegen-units 32 / 无 LTO, 见根 Cargo.toml)。
 #
@@ -64,7 +65,7 @@ jobs:
           # the fonts crate; server/cli are unaffected.
           CRAFT_FONTS_DIR: ${{ github.workspace }}/vendor/craft-fonts
           CRAFT_FONTS_REQUIRED: "1"
-        run: cargo build --profile staging --target x86_64-pc-windows-gnu -p qimu-client
+        run: cargo build --profile staging --target x86_64-pc-windows-gnu -p qimu-client -p qimu-cli
 
       # NOTE (ruling 2026-11-24): the client installer does NOT
       # bundle the DeckCraft desktop app. Presentation jumps locate
@@ -75,6 +76,7 @@ jobs:
         run: |
           mkdir -p packaging/win
           cp target/x86_64-pc-windows-gnu/staging/qimu-client.exe packaging/win/
+          cp target/x86_64-pc-windows-gnu/staging/qimu.exe packaging/win/
           cp packaging/使用说明.txt packaging/win/
 
       - name: Generate installer icon (brand logo)
