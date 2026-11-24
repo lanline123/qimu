@@ -9866,6 +9866,10 @@ impl App {
                 && !app.org_online()
                 && !app.sr_bundle_cached(&id)
             {
+                // Offline with no complete local bundle (T3
+                // ruling): a status label instead of the action
+                // row. Non-showroom shares keep their save action —
+                // the bundle test only speaks for showroom decks.
                 ui.label(egui::RichText::new("离线不可用").small().weak());
             } else {
                 ui.horizontal_wrapped(|ui| {

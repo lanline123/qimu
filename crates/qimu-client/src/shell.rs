@@ -460,14 +460,22 @@ impl App {
         ui.spacing_mut().item_spacing.x = 6.0;
         // Snapshot of the open deck, cloned out of the frame: the
         // handlers below need &mut self.
-        let (item, pages, from, view) = match self.showroom.stack.top() {
-            SrFrame::Deck(st) => (
-                Some(st.item.clone()),
-                Some(st.pages.clone()),
-                st.selected_page.unwrap_or(0),
-                st.view,
-            ),
-            _ => (None, None, 0, DeckView::Thumbnails),
+        let (item, pages, from, view, cached) = match self.showroom.stack.top() {
+            SrFrame::Deck(st) => {
+                let cache_key = format!("sr_{}", s(&st.item, "id"));
+                let cached = self
+                    .cache_entries
+                    .iter()
+                    .any(|e| s(e, "key") == cache_key);
+                (
+                    Some(st.item.clone()),
+                    Some(st.pages.clone()),
+                    st.selected_page.unwrap_or(0),
+                    st.view,
+                    cached,
+                )
+            }
+            _ => (None, None, 0, DeckView::Thumbnails, false),
         };
         let deck_open = item.is_some();
         // Editor snapshot for sdBlockSave / sdBlockPublish: the
@@ -837,15 +845,18 @@ impl App {
             let (it, pgs) = info_target.clone().unwrap();
             self.open_deck_info(&it, pgs);
         }
-        // sdSave — save a server-side library reference. Cached decks
-        // remain openable offline; this action and sharing require a
-        // live organization connection.
+        // sdCache — the prototype's sdPull slot (T6 ruling
+        // 2026-11-24: the slot is 缓存, not a save-to-library
+        // action — the prototype itself was wrong). Accent-filled
+        // while the open deck sits in the local cache (the same
+        // cache-entry probe the deck header uses); clicking
+        // (re)caches through the deck header's own cache handler.
         if ChromeIcons
-            .tool(ui, ChromeIcon::Import, "保存到我的库", deck_open && self.org_online(), false, true)
+            .tool(ui, ChromeIcon::Cache, "缓存到本地", deck_open, cached, true)
             .clicked()
         {
             let item = item.clone().unwrap();
-            self.open_pull_dialog(&item, None);
+            self.cache_showroom_deck(&item);
         }
         if ChromeIcons
             .tool(ui, ChromeIcon::Share, "分享给…", deck_open && self.org_online(), false, true)
