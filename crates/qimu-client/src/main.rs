@@ -22,209 +22,73 @@ use eframe::egui;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
-/// The UI faces the client takes from the bundled craft-fonts set,
-/// as (catalog family, style, egui font key). The installer stages
-/// the payload into `fonts/` beside the executable — CI copies it
-/// from the lanline123/craft-fonts checkout at a pinned commit and
-/// verifies every file's SHA-256 against the two bundled manifests
-/// (fonts/simplified-chinese-manifest.txt + fonts/latin-manifest.txt;
-/// user ruling 2026-11-23: Simplified Chinese + Latin only, no other
-/// scripts in the package). egui's chains need exactly one Regular
-/// face per slot — glyph fallback is per character along the family
-/// list, weight and italic are not selected from it — so the rest of
-/// the payload (Inter's other faces, the Latin presentation
-/// families) stays on disk for the DeckCraft render path, which
-/// resolves document fonts from the same directory through the same
-/// catalog.
-const BUNDLED_FONT_PLAN: [(&str, &str, &str); 3] = [
-    ("Inter", "Regular", "craft-inter"),
-    ("LXGW WenKai Lite", "Regular", "craft-wenkai"),
-    ("Liberation Mono", "Regular", "craft-mono"),
-];
+fn install_system_fonts(ctx: &egui::Context) {
+    use egui::epaint::text::{FallbackRequest, FontProvider};
+    use egui::{FontDefinitions, FontFamily};
+    use std::sync::Arc;
 
-/// Which of the planned bundled faces were actually installed.
-#[derive(Default)]
-struct BundledFonts {
-    inter: bool,
-    wenkai: bool,
-    mono: bool,
-}
-
-/// The directory the installer stages the bundled fonts into:
-/// `fonts/` beside the executable. `QIMU_FONTS_DIR` overrides it
-/// (portable layouts, development runs without an installer).
-fn bundled_fonts_dir() -> Option<std::path::PathBuf> {
-    if let Ok(dir) = std::env::var("QIMU_FONTS_DIR") {
-        let dir = std::path::PathBuf::from(dir);
-        if dir.is_dir() {
-            return Some(dir);
+    let provider = Arc::new(egui_system_font_provider::SystemFontProvider::new());
+    let mut fonts = FontDefinitions::default();
+    for family in [FontFamily::Proportional, FontFamily::Monospace] {
+        let face = if family == FontFamily::Proportional {
+            system_ui_font()
+        } else {
+            None
         }
+        .or_else(|| {
+            let font = provider.font_for(&FallbackRequest {
+                cluster: "A",
+                family: &family,
+            })?;
+            Some((font.name, font.data))
+        });
+        let Some((name, data)) = face else {
+            // Keep this family's framework defaults if the system has no usable font.
+            continue;
+        };
+        fonts.font_data.insert(name.clone(), Arc::new(data));
+        // Install the default face before discovering CJK and other fallback glyphs.
+        // egui's private-use control symbols still need their icon face.
+        fonts
+            .families
+            .insert(family, vec![name, "egui-icons".into()]);
     }
-    let exe = std::env::current_exe().ok()?;
-    let dir = exe.parent()?.join("fonts");
-    if dir.is_dir() {
-        Some(dir)
-    } else {
-        None
-    }
-}
-
-/// The bytes of one face of `family` in `style`, taken only from the
-/// catalog's app-dir source (a system font that happens to share the
-/// family name must not shadow the packaged payload, whose bytes the
-/// installer verified). Falls back to any app-dir face of the family
-/// — a renamed style must not lose the whole family.
-fn catalog_app_face(
-    catalog: &craft_font_catalog::Catalog,
-    family: &str,
-    style: &str,
-) -> Option<Vec<u8>> {
-    let faces = catalog.load_family(family);
-    let from_app = |f: &craft_font_catalog::LoadedFace| {
-        f.info.source == craft_font_catalog::Source::App && f.info.index == 0
-    };
-    let face = faces
-        .iter()
-        .filter(|f| from_app(f))
-        .find(|f| f.info.style == style)
-        .or_else(|| faces.iter().find(|f| from_app(f)))?;
-    Some(Vec::from(&face.data.bytes[..]))
-}
-
-/// Discover and load the planned UI faces from the bundled `fonts/`
-/// directory through craft-font-catalog, registering them in
-/// `fonts`. The catalog is the suite's font manager: the app dir is
-/// set before the catalog's first lookup, so its first scan picks
-/// the directory up (the client is the catalog's only consumer
-/// today; a later consumer must likewise set its dirs before its
-/// first lookup or rescan). Soft failure throughout: no directory,
-/// no face or an unreadable file only leaves a flag unset.
-fn install_bundled_fonts(fonts: &mut egui::FontDefinitions) -> BundledFonts {
-    let mut installed = BundledFonts::default();
-    let Some(dir) = bundled_fonts_dir() else {
-        return installed;
-    };
-    let catalog: &craft_font_catalog::Catalog = craft_font_catalog::Catalog::global();
-    catalog.set_app_dirs(vec![dir]);
-    for (family, style, key) in BUNDLED_FONT_PLAN {
-        if let Some(bytes) = catalog_app_face(catalog, family, style) {
-            fonts.font_data.insert(
-                key.to_owned(),
-                std::sync::Arc::new(egui::FontData::from_owned(bytes)),
-            );
-            match key {
-                "craft-inter" => installed.inter = true,
-                "craft-wenkai" => installed.wenkai = true,
-                "craft-mono" => installed.mono = true,
-                _ => {}
-            }
-        }
-    }
-    installed
-}
-
-fn install_cjk_font(ctx: &egui::Context) {
-    // Font installation. egui resolves glyphs per character along
-    // each family's list, so the chains below are fallback chains:
-    //   1. the bundled craft-fonts faces (Inter for Latin,
-    //      PuHuiTi/WenKai for Han, Liberation Mono for monospace);
-    //   2. egui's own bundled fonts (kept, after the packaged set);
-    //   3. the first readable system CJK font, appended last.
-    // Alibaba PuHuiTi 3.0 is embedded at build time when the font
-    // file was present in assets/ (see build.rs); it stays the first
-    // Han face when embedded — it is a UI sans, where WenKai is a
-    // Kai face — and WenKai Lite, which the package always carries,
-    // guarantees Han coverage on machines where neither PuHuiTi nor
-    // a system CJK font exists. Every layer is optional: a missing
-    // fonts dir or face only shortens the chain, and the caller
-    // additionally guards this whole function with catch_unwind.
-    let mut fonts = egui::FontDefinitions::default();
-    let bundled = install_bundled_fonts(&mut fonts);
-    #[cfg(puhuiti)]
-    {
-        fonts.font_data.insert(
-            "puhuiti".to_owned(),
-            std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
-                "../assets/AlibabaPuHuiTi-3-55-Regular.ttf"
-            ))),
-        );
-    }
-    // Assemble the chains: packaged faces first, then the families
-    // egui itself bundles, in their default order.
-    let mut proportional: Vec<String> = Vec::new();
-    if bundled.inter {
-        proportional.push("craft-inter".to_owned());
-    }
-    #[cfg(puhuiti)]
-    proportional.push("puhuiti".to_owned());
-    if bundled.wenkai {
-        proportional.push("craft-wenkai".to_owned());
-    }
-    let mut monospace: Vec<String> = Vec::new();
-    if bundled.mono {
-        monospace.push("craft-mono".to_owned());
-    }
-    monospace.extend(proportional.iter().cloned());
-    for (fam, prefix) in [
-        (egui::FontFamily::Proportional, proportional),
-        (egui::FontFamily::Monospace, monospace),
-    ] {
-        let entry = fonts.families.entry(fam).or_default();
-        let mut chain = prefix;
-        for key in entry.iter() {
-            if !chain.contains(key) {
-                chain.push(key.clone());
-            }
-        }
-        *entry = chain;
-    }
-    let candidates = [
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-        "C:\\Windows\\Fonts\\msyh.ttc",
-        "C:\\Windows\\Fonts\\simhei.ttf",
-        "/System/Library/Fonts/PingFang.ttc",
-        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
-    ];
-    for path in candidates {
-        if let Ok(bytes) = std::fs::read(path) {
-            fonts.font_data.insert(
-                "cjk".to_owned(),
-                std::sync::Arc::new(egui::FontData::from_owned(bytes)),
-            );
-            for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-                fonts
-                    .families
-                    .entry(fam)
-                    .or_default()
-                    .push("cjk".to_owned());
-            }
-            break;
-        }
-    }
-    startup_log(&format!(
-        "fonts: bundled inter={} wenkai={} mono={}",
-        bundled.inter, bundled.wenkai, bundled.mono
-    ));
+    fonts
+        .font_data
+        .retain(|name, _| fonts.families.values().any(|chain| chain.contains(name)));
     ctx.set_fonts(fonts);
+    ctx.add_font_provider(provider);
 }
 
-/// Visual authority (user ruling 2026-11-23): the HTML prototype
-/// (启幕原型-内容索引页.html, repo root) is the single source of truth
-/// for ALL visual parameters — colors, radii, type scale, spacing,
-/// shadows, borders. The constants below transcribe its CSS custom
-/// properties (dark theme = the prototype default) one-to-one; token
-/// names in the comments are the prototype's. History: this theme was
-/// first benchmarked on the EffectCraft design spec (design/设计规范-
-/// EffectCraft风格.md — canvas #121212, cards #1E1F24, accent
-/// #2D8CEB, widget radius 5); phase 1 (2026-11-23) moved only the
-/// accent to the prototype's #2F6BF5; this alignment completes the
-/// move for every remaining parameter. Do not re-align to the design
-/// spec. Light mode maps the shared colors to the prototype’s light palette.
-/// State ladder (prototype): rest --panel → row hover --panel2
-/// (.tree button:hover) / button hover --panel3 (.btn:hover) →
-/// pressed/open --panel3; selected list rows take --accent-soft fill
-/// with accent text (.tree button.active).
+fn system_ui_font() -> Option<(String, egui::FontData)> {
+    use fontique::{
+        Collection, CollectionOptions, GenericFamily, QueryFamily, QueryStatus, SourceCache,
+    };
+
+    let mut collection = Collection::new(CollectionOptions {
+        shared: false,
+        system_fonts: true,
+    });
+    let mut sources = SourceCache::default();
+    let mut query = collection.query(&mut sources);
+    query.set_families([QueryFamily::Generic(GenericFamily::SystemUi)]);
+    let mut face = None;
+    query.matches_with(|font| {
+        if font.charmap().and_then(|map| map.map('A')).is_none() {
+            return QueryStatus::Continue;
+        }
+        let (bytes, _) = font.blob.clone().into_raw_parts();
+        face = Some((
+            "system-ui".into(),
+            egui::FontData::from_blob(bytes, font.index),
+        ));
+        QueryStatus::Stop
+    });
+    face
+}
+
+/// The shared palette uses the prototype's surfaces and accent. Text and
+/// icon colors provide higher contrast in both themes.
 pub const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x2F, 0x6B, 0xF5);
 /// Secondary blue — the prototype's --blue (info text, version meta).
 pub const ACCENT_DEEP: egui::Color32 = egui::Color32::from_rgb(0x5B, 0x8C, 0xFF);
@@ -236,11 +100,10 @@ pub const APP_BG: egui::Color32 = egui::Color32::from_rgb(0x0B, 0x0B, 0x0D);
 pub const CARD_BG: egui::Color32 = egui::Color32::from_rgb(0x15, 0x15, 0x19);
 pub const CARD_BORDER: egui::Color32 = egui::Color32::from_rgb(0x28, 0x28, 0x30);
 pub const SEPARATOR: egui::Color32 = egui::Color32::from_rgb(0x28, 0x28, 0x30);
-pub const TEXT_MAIN: egui::Color32 = egui::Color32::from_rgb(0xE9, 0xE9, 0xEF);
-pub const TEXT_WEAK: egui::Color32 = egui::Color32::from_rgb(0x8B, 0x8B, 0x97);
-/// Third text tier — derived: --muted at 62% alpha (the prototype
-/// defines only --ink and --muted).
-pub const TEXT_FAINT: egui::Color32 = egui::Color32::from_rgba_unmultiplied_const(0x8B, 0x8B, 0x97, 158);
+pub const TEXT_MAIN: egui::Color32 = egui::Color32::WHITE;
+pub const TEXT_WEAK: egui::Color32 = egui::Color32::from_rgb(0xC4, 0xC4, 0xCC);
+/// Metadata, placeholders and lower-emphasis labels.
+pub const TEXT_FAINT: egui::Color32 = egui::Color32::from_rgb(0xAA, 0xAA, 0xB4);
 /// Row/ghost hover fill — the prototype's --panel2 (.tree button:hover).
 pub const HOVER_BG: egui::Color32 = egui::Color32::from_rgb(0x1D, 0x1D, 0x23);
 /// Button hover / pressed / open fill — the prototype's --panel3
@@ -253,8 +116,8 @@ pub const HEADER_BG: egui::Color32 = egui::Color32::from_rgb(0x0B, 0x0B, 0x0D);
 pub const PANEL_BG: egui::Color32 = egui::Color32::from_rgb(0x15, 0x15, 0x19);
 /// Dock tab text: inactive --muted / active --ink (color-only
 /// difference — no fill, no underline on panel tabs).
-pub const TAB_TEXT: egui::Color32 = egui::Color32::from_rgb(0x8B, 0x8B, 0x97);
-pub const TAB_TEXT_ACTIVE: egui::Color32 = egui::Color32::from_rgb(0xE9, 0xE9, 0xEF);
+pub const TAB_TEXT: egui::Color32 = TEXT_WEAK;
+pub const TAB_TEXT_ACTIVE: egui::Color32 = TEXT_MAIN;
 /// Workspace-tab active blue — EffectCraft hot_text #3D8FF5; used
 /// ONLY on the tool row's workspace tabs (text + 2px underline).
 /// Aligned to the prototype accent #2f6bf5 in phase 1 (was
@@ -265,8 +128,8 @@ pub const HOT: egui::Color32 = egui::Color32::from_rgb(0x2F, 0x6B, 0xF5);
 pub const FIELD_BORDER: egui::Color32 = egui::Color32::from_rgb(0x3A, 0x3A, 0x44);
 /// Tool-row vertical separator — the prototype's --line.
 pub const LINE_34: egui::Color32 = egui::Color32::from_rgb(0x28, 0x28, 0x30);
-/// Icon tint at rest — the prototype's --muted (.icon-btn color).
-pub const ICON_TINT: egui::Color32 = egui::Color32::from_rgb(0x8B, 0x8B, 0x97);
+/// Foreground for monochrome controls on neutral surfaces.
+pub const ICON_TINT: egui::Color32 = TEXT_MAIN;
 /// Icon-slot hover fill — the prototype's --panel3 (.icon-btn:hover).
 pub const ICON_HOVER: egui::Color32 = egui::Color32::from_rgb(0x26, 0x26, 0x2E);
 /// Text-field fill — the prototype's --panel2 (skin layer §5:
@@ -286,8 +149,10 @@ pub const SEL_BG: egui::Color32 = egui::Color32::from_rgba_unmultiplied_const(0x
 pub const PAGE_PAD_L: f32 = 22.0;
 
 fn apply_modern_style(ctx: &egui::Context) {
+    let light = LIGHT_THEME.get();
+    ctx.set_theme(if light { egui::Theme::Light } else { egui::Theme::Dark });
     let mut style = (*ctx.global_style()).clone();
-    let mut v = if LIGHT_THEME.get() {
+    let mut v = if light {
         egui::Visuals::light()
     } else {
         egui::Visuals::dark()
@@ -308,8 +173,12 @@ fn apply_modern_style(ctx: &egui::Context) {
     // so it carries the accent.
     v.selection.bg_fill = egui::Color32::from_rgba_unmultiplied(0x2F, 0x6B, 0xF5, 90);
     v.selection.stroke = egui::Stroke::new(1.0, ACCENT);
-    v.hyperlink_color = ACCENT;
-    v.override_text_color = Some(palette_color(TEXT_MAIN));
+    v.hyperlink_color = palette_color(ACCENT_DEEP);
+    v.warn_fg_color = palette_color(CHIP_ORANGE_FG);
+    v.error_fg_color = palette_color(ROSE);
+    let foreground = palette_color(TEXT_MAIN);
+    v.override_text_color = Some(foreground);
+    v.weak_text_color = Some(palette_color(TEXT_FAINT));
     // Windows/dialogs: the prototype's dialog cascade resolves to
     // 10px (18px → 14px → 10px rules of equal specificity, last wins).
     v.window_corner_radius = egui::CornerRadius::same(10);
@@ -319,7 +188,7 @@ fn apply_modern_style(ctx: &egui::Context) {
     // Shadows live only on windows/popups: the prototype's single
     // --shadow token (0 14px 34px rgba(0,0,0,.5)); cards and chrome
     // layer by brightness + border alone.
-    let shadow = if LIGHT_THEME.get() {
+    let shadow = if light {
         egui::Color32::from_rgba_unmultiplied(20, 25, 40, 26)
     } else {
         egui::Color32::from_black_alpha(128)
@@ -350,6 +219,7 @@ fn apply_modern_style(ctx: &egui::Context) {
         &mut v.widgets.open,
     ] {
         w.corner_radius = r;
+        w.fg_stroke.color = foreground;
     }
     v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, palette_color(SEPARATOR));
     // State ladder (prototype, skin layer §5): buttons/fields rest
@@ -486,20 +356,20 @@ pub const CHIP_GREEN_BG: egui::Color32 = egui::Color32::from_rgba_unmultiplied_c
 pub const CHIP_ORANGE_FG: egui::Color32 = egui::Color32::from_rgb(0xE0, 0x91, 0x3A);
 pub const CHIP_ORANGE_BG: egui::Color32 = egui::Color32::from_rgba_unmultiplied_const(0xE0, 0x91, 0x3A, 36);
 pub const CHIP_BLUE_BG: egui::Color32 = egui::Color32::from_rgba_unmultiplied_const(0x5B, 0x8C, 0xFF, 41);
-pub const CHIP_GRAY_FG: egui::Color32 = egui::Color32::from_rgb(0x8B, 0x8B, 0x97);
+pub const CHIP_GRAY_FG: egui::Color32 = TEXT_WEAK;
 pub const CHIP_GRAY_BG: egui::Color32 = egui::Color32::from_rgb(0x1D, 0x1D, 0x23);
 /// Danger pair — the prototype's --rose / --rose-soft.
-pub const ROSE: egui::Color32 = egui::Color32::from_rgb(0xF2, 0x55, 0x5A);
+pub const ROSE: egui::Color32 = egui::Color32::from_rgb(0xFF, 0x72, 0x76);
 pub const ROSE_SOFT_BG: egui::Color32 = egui::Color32::from_rgba_unmultiplied_const(0xF2, 0x55, 0x5A, 36);
 /// Accent-soft fill (prototype --accent-soft — the same value as
 /// SEL_BG): the .show-seg selected state and accent-tinted fills.
 pub const ACCENT_SOFT: egui::Color32 = egui::Color32::from_rgba_unmultiplied_const(0x2F, 0x6B, 0xF5, 41);
 /// Badge Bad tone: the prototype's --rose over its soft pair
 /// (identical values to ROSE / ROSE_SOFT_BG above).
-pub const BADGE_BAD_FG: egui::Color32 = egui::Color32::from_rgb(0xF2, 0x55, 0x5A);
+pub const BADGE_BAD_FG: egui::Color32 = ROSE;
 pub const BADGE_BAD_BG: egui::Color32 = egui::Color32::from_rgba_unmultiplied_const(0xF2, 0x55, 0x5A, 36);
-/// Danger button fill (prototype --rose, solid).
-pub const DANGER_BG: egui::Color32 = egui::Color32::from_rgb(0xF2, 0x55, 0x5A);
+/// Solid danger button fill with white text.
+pub const DANGER_BG: egui::Color32 = egui::Color32::from_rgb(0xB9, 0x1C, 0x1C);
 
 /// Ghost text action — the boards draw secondary actions as plain text
 /// (no box): 开始演示 in accent, the rest in main/weak text color.
@@ -569,7 +439,11 @@ fn tree_row(
         tx += 15.0 + 6.0;
     }
     let font = egui::FontId::new(size, egui::FontFamily::Proportional);
-    let color = if selected { ACCENT } else { palette_color(TEXT_MAIN) };
+    let color = if selected {
+        palette_color(ACCENT_DEEP)
+    } else {
+        palette_color(TEXT_MAIN)
+    };
     let galley = painter.layout_no_wrap(label.to_string(), font, color);
     let ty = rect.center().y - galley.size().y / 2.0;
     painter.galley(egui::pos2(tx, ty), galley, color);
@@ -1454,7 +1328,7 @@ fn crumb_bar(ui: &mut egui::Ui, crumbs: &[&str]) -> Option<usize> {
                         .color(palette_color(TEXT_MAIN))
                         .strong(),
                 );
-            } else if text_action(ui, label, ACCENT, 12.5) {
+            } else if text_action(ui, label, palette_color(ACCENT_DEEP), 12.5) {
                 clicked = Some(idx);
             }
         }
@@ -2117,7 +1991,7 @@ fn page_edit_inspector(
                 ui.label(
                     egui::RichText::new(tr("已选择新图片，保存后替换。"))
                         .size(11.5)
-                        .color(ACCENT),
+                        .color(palette_color(ACCENT_DEEP)),
                 );
             }
             if ui.button(tr("替换图片…")).clicked() {
@@ -3067,16 +2941,7 @@ fn spawn_local_server(exe: &std::path::Path) -> bool {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // A pathological system font must never kill startup: if font
-        // installation panics, continue with egui's bundled fonts.
-        let font_ctx = cc.egui_ctx.clone();
-        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            install_cjk_font(&font_ctx);
-        }))
-        .is_err()
-        {
-            startup_log("install_cjk_font panicked; continuing with bundled fonts");
-        }
+        install_system_fonts(&cc.egui_ctx);
         init_i18n();
         apply_modern_style(&cc.egui_ctx);
         migrate_cache_dir_once();
@@ -4599,7 +4464,7 @@ impl App {
         let mut confirm = false;
         let mut cancel = false;
         egui::Frame::NONE
-            .fill(CHIP_BLUE_BG)
+            .fill(palette_color(CHIP_BLUE_BG))
             .corner_radius(8)
             .inner_margin(egui::Margin::symmetric(14, 8))
             .show(ui, |ui| {
@@ -5026,7 +4891,7 @@ fn btn_ghost_enabled(ui: &mut egui::Ui, enabled: bool, label: &str) -> egui::Res
 fn btn_danger(ui: &mut egui::Ui, label: &str) -> egui::Response {
     ui.add(
         egui::Button::new(egui::RichText::new(label).size(12.5).color(egui::Color32::WHITE))
-            .fill(palette_color(DANGER_BG))
+            .fill(DANGER_BG)
             .corner_radius(6)
             .min_size(egui::vec2(0.0, 28.0)),
     )
@@ -5251,7 +5116,8 @@ impl App {
         for page in [Page::Showroom, Page::Index, Page::Content] {
             let (name, icon) = page.icon();
             let texture = self.tex_icon(ui, name, icon);
-            let image = egui::Image::new((texture, egui::vec2(16.0, 16.0))).tint(ACCENT);
+            let image = egui::Image::new((texture, egui::vec2(16.0, 16.0)))
+                .tint(palette_color(ICON_TINT));
             let button = egui::Button::image_and_text(image, tr(page.label()))
                 .fill(palette_color(HOVER_BG))
                 .stroke(egui::Stroke::new(1.0, palette_color(FIELD_BORDER)));
@@ -7132,7 +6998,7 @@ impl App {
         bytes: &'static [u8],
         label: &str,
     ) -> bool {
-        self.icon_button_tinted(ui, name, bytes, label, egui::Color32::WHITE)
+        self.icon_button_tinted(ui, name, bytes, label, palette_color(ICON_TINT))
     }
 
     /// The brand logo at `size` px (shell tool row, login popup,
@@ -7142,9 +7008,8 @@ impl App {
         ui.image((id, egui::vec2(size, size)));
     }
 
-    /// Load an embedded IconPark PNG into the texture cache (once)
-    /// and return its texture id — shared by every icon consumer:
-    /// buttons, toolbar slots and nav rows.
+    /// Cache the logo in full color and control glyphs as white alpha masks
+    /// so the painter can apply the current theme's tint.
     fn tex_icon(
         &mut self,
         ui: &egui::Ui,
@@ -7153,7 +7018,12 @@ impl App {
     ) -> egui::TextureId {
         if !self.icon_tex.contains_key(name) {
             let img = image::load_from_memory(bytes).expect("embedded icon png");
-            let rgba = img.to_rgba8();
+            let mut rgba = img.to_rgba8();
+            if name != "logo" {
+                for pixel in rgba.pixels_mut() {
+                    pixel.0[..3].fill(255);
+                }
+            }
             let (w, h) = rgba.dimensions();
             let ci = egui::ColorImage::from_rgba_unmultiplied(
                 [w as usize, h as usize],
@@ -7382,9 +7252,9 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 let (cache_label, cache_tint) = if already_cached {
-                    ("已缓存（点击更新缓存）", egui::Color32::from_gray(150))
+                    ("已缓存（点击更新缓存）", palette_color(TEXT_WEAK))
                 } else {
-                    ("缓存到本地", egui::Color32::WHITE)
+                    ("缓存到本地", palette_color(ICON_TINT))
                 };
                 if self.icon_button_tinted(
                     ui,
@@ -8190,7 +8060,7 @@ impl App {
         // back to the source frame.
         if self.review.jump_source.is_some() {
             ui.horizontal(|ui| {
-                if text_action(ui, "‹ 返回演示厅", ACCENT, 13.0) {
+                if text_action(ui, "‹ 返回演示厅", palette_color(ACCENT_DEEP), 13.0) {
                     self.page = self.review.jump_source.take().unwrap_or(Page::Showroom);
                 }
             });
@@ -8595,7 +8465,7 @@ impl App {
         ui.add_space(6.0);
         if self.deep_source == Some(Page::Home) {
             ui.horizontal(|ui| {
-                if text_action(ui, "‹ 返回主页", ACCENT, 13.0) {
+                if text_action(ui, "‹ 返回主页", palette_color(ACCENT_DEEP), 13.0) {
                     self.deep_source = None;
                     self.page = Page::Home;
                 }
@@ -8939,7 +8809,7 @@ impl App {
         if self.pick.is_none() {
         ui.horizontal(|ui| {
             if self.deep_source == Some(Page::Home) {
-                if text_action(ui, "‹ 返回主页", ACCENT, 13.0) {
+                if text_action(ui, "‹ 返回主页", palette_color(ACCENT_DEEP), 13.0) {
                     self.deep_source = None;
                     self.page = Page::Home;
                 }
@@ -9268,7 +9138,7 @@ impl App {
                                 if s(v, "status") == "recalled" {
                                     ui.label(
                                         egui::RichText::new("已撤回")
-                                            .color(egui::Color32::RED),
+                                            .color(palette_color(ROSE)),
                                     );
                                 }
                                 if !s(v, "note").is_empty() {
@@ -9723,7 +9593,7 @@ impl App {
                                                 egui::RichText::new("已绑定 ✓")
                                                     .color(palette_color(CHIP_GREEN_FG)),
                                             )
-                                            .fill(CHIP_GREEN_BG)
+                                            .fill(palette_color(CHIP_GREEN_BG))
                                             .corner_radius(6),
                                         )
                                         .clicked()
@@ -10146,7 +10016,11 @@ impl App {
                                             i(v, "page_count")
                                         ))
                                         .small()
-                                        .color(if is_cur { ACCENT } else { palette_color(TEXT_WEAK) }),
+                                        .color(palette_color(if is_cur {
+                                            ACCENT_DEEP
+                                        } else {
+                                            TEXT_WEAK
+                                        })),
                                     );
                                 });
                             }
@@ -11639,7 +11513,7 @@ impl App {
         ui.add_space(2.0);
         if self.deep_source == Some(Page::Home) {
             ui.horizontal(|ui| {
-                if text_action(ui, "‹ 返回主页", ACCENT, 13.0) {
+                if text_action(ui, "‹ 返回主页", palette_color(ACCENT_DEEP), 13.0) {
                     self.deep_source = None;
                     self.page = Page::Home;
                 }
@@ -12234,7 +12108,11 @@ impl App {
                                                         s(v, "semver")
                                                     ))
                                                     .size(10.5)
-                                                    .color(if is_cur { ACCENT } else { palette_color(TEXT_WEAK) }),
+                                                    .color(palette_color(if is_cur {
+                                                        ACCENT_DEEP
+                                                    } else {
+                                                        TEXT_WEAK
+                                                    })),
                                                 );
                                             });
                                         }
@@ -13428,6 +13306,7 @@ fn main() {
         viewport = viewport.with_icon(icon);
     }
     let options = eframe::NativeOptions {
+        system_font_fallback: false, // The client installs and seeds its own provider.
         viewport,
         ..Default::default()
     };
@@ -13500,5 +13379,55 @@ mod cache_crypto_tests {
         assert_eq!(back, plain.to_vec());
         let wrong = [8u8; 32];
         assert!(decrypt_bytes(&wrong, &enc).is_none());
+    }
+}
+
+#[cfg(test)]
+mod appearance_tests {
+    use super::*;
+
+    #[test]
+    fn app_theme_overrides_system_theme_for_text_and_controls() {
+        let ctx = egui::Context::default();
+        for (light, theme, system_theme, foreground) in [
+            (false, egui::Theme::Dark, egui::Theme::Light, egui::Color32::WHITE),
+            (true, egui::Theme::Light, egui::Theme::Dark, egui::Color32::BLACK),
+            (false, egui::Theme::Dark, egui::Theme::Light, egui::Color32::WHITE),
+        ] {
+            LIGHT_THEME.set(light);
+            apply_modern_style(&ctx);
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    system_theme: Some(system_theme),
+                    ..Default::default()
+                },
+                |ui| {
+                    assert_eq!(ui.ctx().theme(), theme);
+                    assert_eq!(palette_color(ICON_TINT), foreground);
+                    assert_eq!(ui.visuals().override_text_color, Some(foreground));
+                    assert_eq!(ui.visuals().widgets.hovered.fg_stroke.color, foreground);
+                    assert_eq!(ui.visuals().weak_text_color(), palette_color(TEXT_FAINT));
+                },
+            );
+            output.textures_delta.clear();
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed Latin and Simplified Chinese system fonts"]
+    fn system_fonts_render_chinese_and_latin() {
+        let ctx = egui::Context::default();
+        install_system_fonts(&ctx);
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.fonts_mut(|fonts| {
+                for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                    let primary = &fonts.definitions().families[&family][0];
+                    assert!(primary.starts_with("system"), "primary font: {primary}");
+                    let id = egui::FontId::new(13.5, family);
+                    assert!(fonts.has_glyphs(&id, "启幕 · Showroom"));
+                }
+            });
+        });
+        output.textures_delta.clear();
     }
 }

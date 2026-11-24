@@ -17,6 +17,9 @@ qimu-bridge = { path = "../qimu-bridge" }
 # which is the trial package's toolchain.
 eframe = { version = "0.37", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "glow", "wayland", "x11"] }
 egui = "0.37"
+# Match the workspace's egui revision so the native font provider uses the same epaint types.
+egui_system_font_provider = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+fontique = { version = "0.11.1", default-features = false, features = ["system"] }
 serde_json = "1"
 ureq = { version = "2", features = ["json"] }
 base64 = "0.22"
@@ -43,17 +46,6 @@ pdfcraft-render = { git = "https://github.com/storytold/pdfcraft", rev = "27287c
 # Apache-2.0): parse_github_release_list + offers_update +
 # download_url_under_mirror drive the LAN update-mirror check (prompt only).
 craft-update = { git = "https://github.com/lanline123/craft-libs", rev = "b9c7b6970382acb1da090d83eb21e51f7006763a" }
-# craft-font-catalog (storytold/craft-libs@63196e6, MIT OR Apache-2.0):
-# the suite's font manager — discovery, family/style resolution and
-# loading. The client points it at the bundled fonts directory
-# (fonts/ beside the exe, staged by CI from lanline123/craft-fonts:
-# Simplified Chinese + Latin manifests only) and registers the UI
-# faces from it at startup. The `system` font-service feature stays
-# off: the catalog is used for the app dir only, and egui keeps its
-# own system fallbacks. Like the other craft pins, this one moves
-# with the baseline bump (fork source + b9c7b69) when that lands.
-craft-font-catalog = { git = "https://github.com/lanline123/craft-libs", rev = "b9c7b6970382acb1da090d83eb21e51f7006763a", default-features = false }
-
 # ---------------------------------------------------------------------------
 # craft-libs baseline (phase 1, route plan §5 stage 1; supersedes
 # the P0 per-crate pin alignment that used to be documented here):

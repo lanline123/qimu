@@ -25,11 +25,11 @@ pub(super) fn palette_color(dark: egui::Color32) -> egui::Color32 {
     } else if dark == FIELD_BORDER {
         0xd2d5de
     } else if dark == TEXT_MAIN {
-        0x16161a
+        0x000000
     } else if dark == TEXT_WEAK {
-        0x6b6b78
+        0x373740
     } else if dark == TEXT_FAINT {
-        0x767681
+        0x55555f
     } else if dark == ACCENT_DEEP {
         0x1d4ed8
     } else if dark == CHIP_GREEN_BG {

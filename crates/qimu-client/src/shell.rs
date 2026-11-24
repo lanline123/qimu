@@ -120,8 +120,13 @@ impl App {
             _ => &[],
         };
         for &(key, label) in actions {
-            let button = egui::Button::new(tr(label))
-                .fill(if key == "new" { ACCENT } else { palette_color(HOVER_BG) })
+            let (fill, foreground) = if key == "new" {
+                (ACCENT, egui::Color32::WHITE)
+            } else {
+                (palette_color(HOVER_BG), palette_color(TEXT_MAIN))
+            };
+            let button = egui::Button::new(egui::RichText::new(tr(label)).color(foreground))
+                .fill(fill)
                 .corner_radius(6);
             if ui.add_sized([ui.available_width(), 32.0], button).clicked() {
                 self.run_home_action(Some(key));

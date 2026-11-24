@@ -51,12 +51,6 @@ Section "启幕客户端" SEC_CLIENT
   File "win/qimu.exe"
   File "win/使用说明.txt"
   File "win/qimu.ico"
-  ; 随包字体 (craft-fonts 简中+拉丁清单, CI 逐文件校验 SHA-256 后暂存到
-  ; win\fonts): 客户端启动时经 craft-font-catalog 从 fonts\ 装载 UI 字体,
-  ; 目录缺失时软回退系统字体, 不影响启动。
-  SetOutPath "$INSTDIR\fonts"
-  File /r "win\fonts\*.*"
-  SetOutPath "$INSTDIR"
   ; 离线缓存目录预建 (客户端默认 cache 路径 = 安装目录\cache)
   CreateDirectory "$INSTDIR\cache"
   ; 快捷方式: 桌面 + 开始菜单

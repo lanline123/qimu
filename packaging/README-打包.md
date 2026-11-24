@@ -14,5 +14,5 @@
 ## 构建路径
 
 - 工具链与旧包一致：Linux 上 mingw 交叉编译 `x86_64-pc-windows-gnu`（release）得三个 exe → 拷入 `packaging/win/`；另在 `vendor/deckcraft` 子模块同法交叉构建 `deckcraft-cli.exe` 一并拷入 `win/`（仅服务器包装） → makensis 出两个包。NSIS 脚本头有中文文件名需先拷 ASCII 名的注意事项。
-- **字体**：客户端内嵌普惠体需构建前把 `AlibabaPuHuiTi-3-55-Regular.ttf` 放到 `crates/qimu-client/assets/`（来源与 SHA-256 见该目录 README）；缺失时回退系统字体，不影响功能。
+- **字体**：客户端界面使用操作系统的字体和字形回退。
 - GitHub Actions 自动化见 `.github/workflows/build-windows.yml`（手动触发：交叉编译 → 两次 makensis → 两个安装包作为 artifact 上传）。
