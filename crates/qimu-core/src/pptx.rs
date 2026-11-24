@@ -402,6 +402,56 @@ pub fn deck_sections(pkg: &Package) -> PptxResult<Option<Vec<SectionSpan>>> {
     Ok(Some(spans))
 }
 
+/// The fingerprint entries of one part's relationships: for every
+/// relationship, its type plus the content hash of its target (or the
+/// target itself for external relationships). Target NAMES are
+/// deliberately not hashed: assembly renames parts when merging
+/// fragments, and a rename must not make a page look "modified".
+fn rel_content_entries(pkg: &Package, part: &str) -> Vec<String> {
+    let rels_name = rels_part_name(part);
+    let Some(bytes) = pkg.parts.get(&rels_name) else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(bytes);
+    parse_rels(&text)
+        .iter()
+        .map(|r| {
+            let ty = r.ty.as_str();
+            if r.external {
+                format!("{ty}|ext|{}", r.target)
+            } else {
+                let abs = resolve_target(part, &r.target);
+                let content_hash = pkg
+                    .parts
+                    .get(&abs)
+                    .map(|b| {
+                        let mut hh = Sha256::new();
+                        hh.update(b);
+                        format!("{:x}", hh.finalize())
+                    })
+                    .unwrap_or_default();
+                format!("{ty}|{content_hash}")
+            }
+        })
+        .collect()
+}
+
+/// The internal targets of `part`'s relationships whose type ends
+/// with `suffix` (e.g. "/slideLayout", "/slideMaster"), resolved to
+/// absolute part names.
+fn rel_targets_of_type(pkg: &Package, part: &str, suffix: &str) -> Vec<String> {
+    let rels_name = rels_part_name(part);
+    let Some(bytes) = pkg.parts.get(&rels_name) else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(bytes);
+    parse_rels(&text)
+        .iter()
+        .filter(|r| !r.external && r.ty.ends_with(suffix))
+        .map(|r| resolve_target(part, &r.target))
+        .collect()
+}
+
 /// Per-page fingerprint: slide XML plus its relationship table, so a page
 /// whose media/layout links change is a different page.
 pub fn page_fingerprint(pkg: &Package, slide_part: &str) -> String {
@@ -411,39 +461,37 @@ pub fn page_fingerprint(pkg: &Package, slide_part: &str) -> String {
     // merging fragments, and a rename must not make a page look
     // "modified". Changing a referenced part's content (media, layout,
     // chart) does change the fingerprint.
+    //
+    // Audit2 E-N1: the walk used to stop at the slide's direct
+    // targets. The layout's own content was hashed, but the chain
+    // above it — layout -> slideMaster -> theme — was not, so two
+    // pages with identical slide+layout content under different
+    // masters/themes (different backgrounds, theme colors/fonts,
+    // master placeholders) collapsed into one page entity and shared
+    // one thumbnail and one assembled scaffold. The walk now extends
+    // two more levels: the layout's relationships (which reach the
+    // master) and the master's relationships (which reach the
+    // theme), each entry namespaced by its level so a hash cannot
+    // migrate between levels unnoticed.
     let mut h = Sha256::new();
     if let Some(bytes) = pkg.parts.get(slide_part) {
         h.update(bytes);
     }
-    let rels_name = rels_part_name(slide_part);
-    if let Some(bytes) = pkg.parts.get(&rels_name) {
-        let text = String::from_utf8_lossy(bytes);
-        let mut entries: Vec<String> = parse_rels(&text)
-            .iter()
-            .map(|r| {
-                let ty = r.ty.as_str();
-                if r.external {
-                    format!("{ty}|ext|{}", r.target)
-                } else {
-                    let abs = resolve_target(slide_part, &r.target);
-                    let content_hash = pkg
-                        .parts
-                        .get(&abs)
-                        .map(|b| {
-                            let mut hh = Sha256::new();
-                            hh.update(b);
-                            format!("{:x}", hh.finalize())
-                        })
-                        .unwrap_or_default();
-                    format!("{ty}|{content_hash}")
-                }
-            })
-            .collect();
-        entries.sort();
-        for e in entries {
-            h.update(e.as_bytes());
-            h.update(b"\n");
+    let mut entries = rel_content_entries(pkg, slide_part);
+    for layout in rel_targets_of_type(pkg, slide_part, "/slideLayout") {
+        for e in rel_content_entries(pkg, &layout) {
+            entries.push(format!("layout>{e}"));
         }
+        for master in rel_targets_of_type(pkg, &layout, "/slideMaster") {
+            for e in rel_content_entries(pkg, &master) {
+                entries.push(format!("master>{e}"));
+            }
+        }
+    }
+    entries.sort();
+    for e in entries {
+        h.update(e.as_bytes());
+        h.update(b"\n");
     }
     format!("{:x}", h.finalize())
 }
@@ -482,16 +530,60 @@ pub fn split(pkg: &Package) -> PptxResult<Vec<Package>> {
         });
         notes_of.insert(s.part.clone(), note);
     }
+    let _ = &notes_of;
 
     let mut fragments = Vec::new();
     for (i, s) in deck_slides.iter().enumerate() {
+        fragments.push(split_slide_at(
+            pkg,
+            &pres_root,
+            &ct_root,
+            &sld_elements[i],
+            &s.part,
+        )?);
+    }
+    Ok(fragments)
+}
+
+/// Build the single-slide fragment for slide `index` of a deck —
+/// exactly the fragment `split` produces at that position, but
+/// computed without building any other slide's fragment (lazy
+/// import, user ruling 2026-11-25: after the deck is opened, its
+/// pages split one at a time in priority order, so the split cost
+/// of a page is paid only when that page's turn comes).
+pub fn split_one(pkg: &Package, index: usize) -> PptxResult<Package> {
+    let deck_slides = slides(pkg)?;
+    let slide = deck_slides.get(index).ok_or("拆分目标页位越界")?;
+    let pres_xml = pkg.get_text(PRESENTATION)?;
+    let pres_root = parse_xml(&pres_xml, PRESENTATION)?;
+    let sld_elements: Vec<El> = pres_root
+        .find(Local("sldIdLst"))
+        .map(|lst| lst.children(Local("sldId")).cloned().collect())
+        .unwrap_or_default();
+    if sld_elements.len() != deck_slides.len() {
+        return Err("sldId count mismatch while parsing presentation.xml".into());
+    }
+    let ct_root = parse_xml(&pkg.get_text(CONTENT_TYPES)?, CONTENT_TYPES)?;
+    split_slide_at(pkg, &pres_root, &ct_root, &sld_elements[index], &slide.part)
+}
+
+/// One slide's fragment construction — the per-slide body of
+/// `split`, shared with `split_one` so both produce the identical
+/// fragment for the same slide.
+fn split_slide_at(
+    pkg: &Package,
+    pres_root: &El,
+    ct_root: &El,
+    sld_el: &El,
+    slide_part: &str,
+) -> PptxResult<Package> {
         // Keep only what this slide actually reaches through its
         // relationship closure (layout/master/theme chain, media,
         // charts, notes) plus package scaffolding. Everything else —
         // above all other slides' media — is pruned, so a fragment is
         // proportional to its own page, not to the whole deck.
         let mut keep: BTreeSet<String> = BTreeSet::new();
-        let mut stack = vec![s.part.clone()];
+        let mut stack = vec![slide_part.to_string()];
         // The notes master is scaffolding (kept below), but its own
         // relationship closure (its theme) must come with it.
         for name in pkg.parts.keys() {
@@ -532,7 +624,6 @@ pub fn split(pkg: &Package) -> PptxResult<Vec<Package>> {
                 keep.insert(name.clone());
             }
         }
-        let _ = &notes_of;
         let removed: BTreeSet<String> = pkg
             .parts
             .keys()
@@ -551,7 +642,7 @@ pub fn split(pkg: &Package) -> PptxResult<Vec<Package>> {
         // Prune presentation.xml: keep only this slide's sldId element.
         let mut frag_pres = pres_root.clone();
         if let Some(lst) = frag_pres.child_mut(Local("sldIdLst")) {
-            lst.children = vec![Node::El(sld_elements[i].clone())];
+            lst.children = vec![Node::El(sld_el.clone())];
         }
         parts.insert(PRESENTATION.to_string(), serialize_xml(&frag_pres));
 
@@ -578,9 +669,7 @@ pub fn split(pkg: &Package) -> PptxResult<Vec<Package>> {
         });
         parts.insert(CONTENT_TYPES.to_string(), serialize_xml(&frag_ct));
 
-        fragments.push(Package { parts });
-    }
-    Ok(fragments)
+        return Ok(Package { parts });
 }
 
 /// Reassemble a full deck from single-slide fragments produced by `split`.

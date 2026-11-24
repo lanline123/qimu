@@ -32,6 +32,13 @@ struct AppState {
     /// env wins; unset falls back to a standalone.on marker in the
     /// data dir. An organization server never enables it.
     standalone: bool,
+    /// Login failure throttle (audit M7): key "ip|username" →
+    /// (consecutive failures, last failure ms). In-memory only —
+    /// a restart clears it, acceptable for a LAN host.
+    login_guard: Mutex<HashMap<String, (u32, i64)>>,
+    /// Guest-token issuance throttle (audit L1): key peer ip →
+    /// (tokens issued in the window, window start ms).
+    guest_guard: Mutex<HashMap<String, (u32, i64)>>,
 }
 
 type St = Arc<AppState>;
@@ -42,6 +49,33 @@ fn err(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<Value>) 
 }
 
 fn bad(msg: impl Into<String>) -> (StatusCode, Json<Value>) {
+    let msg = msg.into();
+    // Internal-error hygiene (audit L5): core and OS error text
+    // (SQLite strings, filesystem details, subprocess stderr)
+    // maps the server's internals for an attacker. Business
+    // errors — the deliberate Chinese strings raised across core
+    // — pass through untouched; anything that smells internal is
+    // logged server-side and answered with a generic line.
+    let lower = msg.to_lowercase();
+    const INTERNAL_MARKERS: [&str; 10] = [
+        "rusqlite",
+        "sqlite",
+        "no such table",
+        "no such column",
+        "unique constraint",
+        "foreign key",
+        "no such file",
+        "permission denied",
+        "os error",
+        "stderr",
+    ];
+    if INTERNAL_MARKERS.iter().any(|m| lower.contains(m)) {
+        eprintln!("[qimu-server] internal error hidden from client: {msg}");
+        return err(
+            StatusCode::BAD_REQUEST,
+            "操作失败，请稍后重试；如反复出现请联系管理员",
+        );
+    }
     err(StatusCode::BAD_REQUEST, msg)
 }
 
@@ -125,7 +159,23 @@ fn standalone_owner(st: &St, headers: &HeaderMap) -> Option<UserRec> {
         .ok()
 }
 
+/// The gated door every named handler uses: a session carrying
+/// the first-login forced-change flag (audit H6) is refused here,
+/// at the one choke point all handlers share. The only doors open
+/// to such a session are `me` (so the client can see the flag),
+/// password change and logout — those use auth_allow_pending.
 fn auth(st: &St, headers: &HeaderMap) -> Result<UserRec, (StatusCode, Json<Value>)> {
+    let user = auth_allow_pending(st, headers)?;
+    if user.must_change_password {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            "首次登录必须先修改口令",
+        ));
+    }
+    Ok(user)
+}
+
+fn auth_allow_pending(st: &St, headers: &HeaderMap) -> Result<UserRec, (StatusCode, Json<Value>)> {
     if let Some(user) = session_user(st, headers)? {
         return Ok(user);
     }
@@ -206,6 +256,67 @@ fn need_cap(
     }
 }
 
+/// Entry-reference validation (audit H3/H4): an index commit or
+/// a personal assembly may only reference content the caller can
+/// see. Every entry's unit must sit in a group visible to the
+/// caller, the rendition must belong to that unit, and a locked
+/// policy must name a version of that rendition. Without this,
+/// knowing an id would be enough to embed — and then export —
+/// another group's private content.
+fn validate_entries_visible(
+    st: &St,
+    user: &UserRec,
+    entries: &[IndexEntry],
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let store = st.store.lock().unwrap();
+    for e in entries {
+        let unit = store
+            .get_unit(&e.unit_id.0)
+            .map_err(|_| bad("条目引用的内容块不存在"))?;
+        if !store.can_see_group(user, &unit.group_id).map_err(bad)? {
+            return Err(forbidden());
+        }
+        let rend = store
+            .get_rendition(&e.rendition_id.0)
+            .map_err(|_| bad("条目引用的版本形态不存在"))?;
+        if rend.unit_id != unit.id {
+            return Err(bad("条目的版本形态不属于该内容块"));
+        }
+        if let EntryPolicy::Locked { version_id } = &e.policy {
+            let v = store
+                .get_version(&version_id.0)
+                .map_err(|_| bad("条目锁定的版本不存在"))?;
+            if v.rendition_id != rend.id {
+                return Err(bad("条目锁定的版本不属于该形态"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Source-index visibility for the update-check doors (audit
+/// H5): a client-presented manifest only earns a diff — and the
+/// fragment bytes that follow it — when the caller can see the
+/// source index's group. A manifest whose source index is gone
+/// passes here and earns only diff_updates' empty "source_gone"
+/// answer, which carries no content.
+fn check_manifest_source_visible(
+    st: &St,
+    user: &UserRec,
+    manifest: &Manifest,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let Some(src) = &manifest.source else {
+        return Ok(());
+    };
+    let store = st.store.lock().unwrap();
+    if let Ok(index) = store.get_index(&src.index_id) {
+        if !store.can_see_group(user, &index.group_id).map_err(bad)? {
+            return Err(not_found());
+        }
+    }
+    Ok(())
+}
+
 fn b64e(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
@@ -233,15 +344,55 @@ struct LoginReq {
 }
 
 async fn login(State(st): State<St>, headers: HeaderMap, Json(req): Json<LoginReq>) -> Api<Value> {
-    let store = st.store.lock().unwrap();
-    let (token, user) = store
-        .login_with_ip(
+    let ip = peer_ip_str(&headers).unwrap_or_default();
+    let guard_key = format!("{ip}|{}", req.username);
+    // Failure throttle (audit M7): 10 consecutive failures lock
+    // the (ip, username) pair for 5 minutes — online brute force
+    // against a LAN host stops being free.
+    {
+        let now = qimu_core::auth::now_ms();
+        let mut guard = st.login_guard.lock().unwrap();
+        if guard.len() > 4096 {
+            guard.retain(|_, (_, last_ms)| now - *last_ms < 3600 * 1000);
+        }
+        if let Some((fails, last_ms)) = guard.get(&guard_key) {
+            if *fails >= 10 && now - last_ms < 5 * 60 * 1000 {
+                return Err(err(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "登录失败次数过多，请 5 分钟后再试",
+                ));
+            }
+        }
+    }
+    let result = {
+        let store = st.store.lock().unwrap();
+        store.login_with_ip(
             &req.username,
             &req.password,
             peer_ip_str(&headers).as_deref(),
         )
-        .map_err(bad)?;
-    Ok(Json(json!({ "token": token, "user": user })))
+    };
+    match result {
+        Ok((token, user)) => {
+            st.login_guard.lock().unwrap().remove(&guard_key);
+            // must_change_password rides both at the top level
+            // and inside the user record (audit H6 contract):
+            // while true, the client must force the change
+            // dialog before anything else.
+            Ok(Json(json!({
+                "token": token,
+                "must_change_password": user.must_change_password,
+                "user": user,
+            })))
+        }
+        Err(e) => {
+            let mut guard = st.login_guard.lock().unwrap();
+            let entry = guard.entry(guard_key).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 = qimu_core::auth::now_ms();
+            Err(bad(e))
+        }
+    }
 }
 
 /// Anonymous guest session issuance (org-model G1): the client
@@ -252,6 +403,25 @@ async fn login(State(st): State<St>, headers: HeaderMap, Json(req): Json<LoginRe
 /// through the entry funnel only; auth() rejects it at every
 /// named-identity door.
 async fn guest_auth(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
+    // Issuance throttle (audit L1): at most 60 guest tokens per
+    // peer IP per hour — plenty for reconnecting clients, useless
+    // for flooding the session table.
+    {
+        let now = qimu_core::auth::now_ms();
+        let ip = peer_ip_str(&headers).unwrap_or_default();
+        let mut guard = st.guest_guard.lock().unwrap();
+        let entry = guard.entry(ip).or_insert((0, now));
+        if now - entry.1 > 3600 * 1000 {
+            *entry = (0, now);
+        }
+        entry.0 += 1;
+        if entry.0 > 60 {
+            return Err(err(
+                StatusCode::TOO_MANY_REQUESTS,
+                "游客会话签发过于频繁，请稍后再试",
+            ));
+        }
+    }
     let store = st.store.lock().unwrap();
     let token = store
         .create_guest_session(peer_ip_str(&headers).as_deref())
@@ -278,11 +448,43 @@ async fn logout(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
 }
 
 async fn me(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
-    let user = auth(&st, &headers)?;
+    // `me` stays open to a must-change session (audit H6): the
+    // client reads the flag from here to raise the forced-change
+    // dialog.
+    let user = auth_allow_pending(&st, &headers)?;
     let store = st.store.lock().unwrap();
     let profile: HashMap<String, String> =
         store.profile(&user.id).map_err(bad)?.into_iter().collect();
     Ok(Json(json!({ "user": user, "profile": profile })))
+}
+
+#[derive(Deserialize)]
+struct ChangePasswordReq {
+    current_password: String,
+    new_password: String,
+}
+
+/// POST /v1/me/password — the one write door open to a
+/// must-change-password session (audit H6 contract): the client
+/// forces this dialog on login while the flag is set. Success
+/// clears the flag, keeps the calling session, and revokes the
+/// user's other sessions.
+async fn change_password(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Json(req): Json<ChangePasswordReq>,
+) -> Api<Value> {
+    let user = auth_allow_pending(&st, &headers)?;
+    let store = st.store.lock().unwrap();
+    store
+        .change_password(&user.id, &req.current_password, &req.new_password)
+        .map_err(bad)?;
+    if let Some(token) = bearer_token(&headers) {
+        store
+            .delete_other_sessions(&user.id, &token)
+            .map_err(bad)?;
+    }
+    Ok(Json(json!({ "ok": true })))
 }
 
 #[derive(Deserialize)]
@@ -296,6 +498,22 @@ async fn put_profile(
     Json(req): Json<ProfileReq>,
 ) -> Api<Value> {
     let user = auth(&st, &headers)?;
+    // Personal fields may not impersonate company placeholders
+    // (audit L3): build_export fills company tokens from the
+    // company profile first and personal fields second, so a
+    // personal key named like a company token would overwrite
+    // the company's value in the exporter's own decks. Company
+    // keys are reserved; key/value sizes are capped.
+    for (k, v) in &req.fields {
+        if k.starts_with("company_")
+            || qimu_core::personalize::COMPANY_FIELDS.contains(&k.as_str())
+        {
+            return Err(bad(format!("「{k}」是公司资料字段，不能写入个人资料")));
+        }
+        if k.chars().count() > 64 || v.chars().count() > 2000 {
+            return Err(bad("资料字段过长"));
+        }
+    }
     let store = st.store.lock().unwrap();
     for (k, v) in &req.fields {
         store.set_profile_field(&user.id, k, v).map_err(bad)?;
@@ -390,6 +608,23 @@ async fn create_dept(
         return Err(forbidden());
     }
     let store = st.store.lock().unwrap();
+    if let Some(pid) = req.parent_id.as_deref() {
+        if !store.list_departments().map_err(bad)?.iter().any(|d| d.id == pid) {
+            return Err(bad("父部门不存在"));
+        }
+        // Department scope (audit H1, same root as create_user):
+        // a dept_admin grows the tree only inside their own
+        // subtree — never at the root, never under another
+        // department.
+        if user.role == "dept_admin" {
+            let own = user.dept_id.as_deref().ok_or_else(forbidden)?;
+            if !store.dept_within(pid, own).map_err(bad)? {
+                return Err(forbidden());
+            }
+        }
+    } else if user.role == "dept_admin" {
+        return Err(forbidden());
+    }
     let d = store
         .create_department(&req.name, req.parent_id.as_deref())
         .map_err(bad)?;
@@ -414,14 +649,38 @@ async fn create_user(
     if user.role == "member" {
         return Err(forbidden());
     }
+    // Role ceiling (audit H1): the requested role is validated
+    // as an enum and clamped by the caller's own role — only a
+    // super may mint another super or a dept_admin; a dept_admin
+    // mints members only, and only into their own department
+    // subtree. (Core create_user re-validates the enum as the
+    // last line.)
+    let role = req.role.as_deref().unwrap_or("member");
+    if !matches!(role, "member" | "dept_admin" | "super") {
+        return Err(bad(format!("未知角色：{role}")));
+    }
+    if role != "member" && user.role != "super" {
+        return Err(forbidden());
+    }
     let store = st.store.lock().unwrap();
+    if user.role == "dept_admin" {
+        match (req.dept_id.as_deref(), user.dept_id.as_deref()) {
+            (Some(d), Some(own)) => {
+                if !store.dept_within(d, own).map_err(bad)? {
+                    return Err(forbidden());
+                }
+            }
+            (Some(_), None) => return Err(forbidden()),
+            _ => {}
+        }
+    }
     let u = store
         .create_user(
             &req.username,
             &req.display_name,
             &req.password,
             req.dept_id.as_deref(),
-            req.role.as_deref().unwrap_or("member"),
+            role,
         )
         .map_err(bad)?;
     Ok(Json(json!(u)))
@@ -1075,6 +1334,17 @@ async fn start_translate_job(
     let job_id = format!("tj-{millis}-{seq}");
     {
         let mut jobs = st.translate_jobs.lock().unwrap();
+        // Concurrency gate (audit M8): a translation job polls a
+        // provider for up to ~20 minutes; unbounded fan-out from
+        // one client could occupy the host. At most 4 run at
+        // once across the whole server.
+        let running = jobs.values().filter(|j| j.state == "running").count();
+        if running >= 4 {
+            return Err(err(
+                StatusCode::TOO_MANY_REQUESTS,
+                "翻译任务繁忙，请稍后再试",
+            ));
+        }
         // Keep only a bounded tail of finished jobs for polling clients.
         if jobs.len() > 50 {
             jobs.retain(|_, j| j.state == "running");
@@ -1199,6 +1469,12 @@ async fn put_cache_policy(
     let user = auth(&st, &headers)?;
     if user.role != "super" {
         return Err(forbidden());
+    }
+    // Range check (audit L4): clients execute this policy
+    // against their local disks; a negative or absurd cap must
+    // not land in the setting.
+    if !(0..=102_400).contains(&req.max_mb) {
+        return Err(bad("缓存上限超出允许范围（0–102400 MB）"));
     }
     let store = st.store.lock().unwrap();
     store
@@ -1351,6 +1627,70 @@ async fn delete_folder_mode(
         "trash" => FolderDeleteMode::Trash,
         other => return Err(bad(format!("unknown delete mode: {other}"))),
     };
+    if mode == FolderDeleteMode::Trash {
+        // Whole-subtree trash is not a folder operation, it is a
+        // bulk delete (audit round-2 N1): the caller must hold,
+        // for every object in the subtree, the same right that
+        // deleting it one by one would take — `manage` on the
+        // object's group for units and indexes (the trash door's
+        // own rule), and ownership-or-super for the showroom
+        // items homed by those indexes.
+        let (groups, item_owners) = {
+            let store = st.store.lock().unwrap();
+            let all = store.list_folders().map_err(bad)?;
+            let mut subtree: Vec<String> = vec![id.clone()];
+            let mut grew = true;
+            while grew {
+                grew = false;
+                for f in &all {
+                    if let Some(p) = f.parent_id.as_deref() {
+                        if subtree.iter().any(|x| x.as_str() == p) && !subtree.contains(&f.id) {
+                            subtree.push(f.id.clone());
+                            grew = true;
+                        }
+                    }
+                }
+            }
+            let in_subtree = |fid: &Option<String>| {
+                fid.as_deref()
+                    .map(|f| subtree.iter().any(|x| x.as_str() == f))
+                    .unwrap_or(false)
+            };
+            let mut groups: Vec<String> = Vec::new();
+            let mut index_ids: Vec<String> = Vec::new();
+            for u in store.list_units(None).map_err(bad)? {
+                if in_subtree(&u.folder_id) && !groups.contains(&u.group_id) {
+                    groups.push(u.group_id.clone());
+                }
+            }
+            for x in store.list_indexes(None).map_err(bad)? {
+                if in_subtree(&x.folder_id) {
+                    index_ids.push(x.id.clone());
+                    if !groups.contains(&x.group_id) {
+                        groups.push(x.group_id.clone());
+                    }
+                }
+            }
+            let mut owners: Vec<String> = Vec::new();
+            for item in store.list_showroom(None).map_err(bad)? {
+                if item
+                    .source_index_id
+                    .as_deref()
+                    .map(|sid| index_ids.iter().any(|x| x.as_str() == sid))
+                    .unwrap_or(false)
+                {
+                    owners.push(item.submitted_by.clone());
+                }
+            }
+            (groups, owners)
+        };
+        for gid in &groups {
+            need_cap(&st, &user, gid, "manage")?;
+        }
+        if user.role != "super" && item_owners.iter().any(|o| o != &user.id) {
+            return Err(forbidden());
+        }
+    }
     let store = st.store.lock().unwrap();
     store.delete_folder(&id, mode, &user.id).map_err(bad)?;
     Ok(Json(json!({ "ok": true })))
@@ -1395,12 +1735,18 @@ async fn set_folder_main_index(
     Path(id): Path<String>,
     Json(req): Json<MainIndexReq>,
 ) -> Api<Value> {
-    let _ = auth(&st, &headers)?;
+    let user = auth(&st, &headers)?;
     let store = st.store.lock().unwrap();
     if let Some(xid) = req.index_id.as_deref() {
         let idx = store.get_index(xid).map_err(bad)?;
         if idx.folder_id.as_deref() != Some(id.as_str()) {
             return Err(bad("主索引必须属于该文件夹".to_string()));
+        }
+        // The caller must be able to see the index they are
+        // designating (audit M2): without this the endpoint is an
+        // existence oracle for indexes in invisible groups.
+        if !store.can_see_group(&user, &idx.group_id).map_err(bad)? {
+            return Err(not_found());
         }
     }
     store
@@ -1556,8 +1902,25 @@ async fn import_propose(
     headers: HeaderMap,
     Json(req): Json<ProposeReq>,
 ) -> Api<Value> {
-    let _ = auth(&st, &headers)?;
-    let _ = &st;
+    let user = auth(&st, &headers)?;
+    // Capability gate (audit M8): proposing parses a whole
+    // package in memory, so it takes the same publish standing
+    // the import itself will — any group the caller may publish
+    // to (or an admin role) is enough at this no-target stage.
+    if user.role == "member" {
+        let store = st.store.lock().unwrap();
+        let mut may_publish = false;
+        for g in store.list_groups().map_err(bad)? {
+            let caps = store.capabilities(&user, &g.id).map_err(bad)?;
+            if caps.contains("publish") || caps.contains("manage") {
+                may_publish = true;
+                break;
+            }
+        }
+        if !may_publish {
+            return Err(forbidden());
+        }
+    }
     let bytes = b64d(&req.data_base64)?;
     let pkg = Package::load(&bytes).map_err(bad)?;
     let report = qimu_core::propose::propose_blocks(&pkg).map_err(bad)?;
@@ -1663,6 +2026,11 @@ async fn publish(
         Some(v) => SemVer::parse(&v.semver).map_err(bad)?.bumped(inc),
         None => SemVer::new(1, 0, 0),
     };
+    // Version status is a closed vocabulary (audit L2).
+    let status = req.status.as_deref().unwrap_or("normal");
+    if !matches!(status, "normal" | "draft") {
+        return Err(bad(format!("未知的版本状态：{status}")));
+    }
     let ver = store
         .insert_version(
             &rend.id,
@@ -1671,7 +2039,7 @@ async fn publish(
             &user.display_name,
             req.note.as_deref().unwrap_or(""),
             &frag,
-            req.status.as_deref().unwrap_or("normal"),
+            status,
         )
         .map_err(bad)?;
     Ok(Json(json!(ver)))
@@ -2016,8 +2384,17 @@ async fn add_version_tag(
     Json(req): Json<VerTagReq>,
 ) -> Api<Value> {
     let user = auth(&st, &headers)?;
+    // Tag writes take publish standing on the version's group
+    // (audit M6) — tags steer search and recommendation, they
+    // are not free graffiti on other groups' versions.
+    let unit = {
+        let store = st.store.lock().unwrap();
+        let ver = store.get_version(&id).map_err(|_| not_found())?;
+        let rend = store.get_rendition(&ver.rendition_id).map_err(bad)?;
+        store.get_unit(&rend.unit_id).map_err(bad)?
+    };
+    need_cap(&st, &user, &unit.group_id, "publish")?;
     let store = st.store.lock().unwrap();
-    store.get_version(&id).map_err(|_| not_found())?;
     let t = store
         .add_version_tag(
             &id,
@@ -2035,8 +2412,16 @@ async fn list_version_tags(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Api<Value> {
-    let _ = auth(&st, &headers)?;
+    let user = auth(&st, &headers)?;
     let store = st.store.lock().unwrap();
+    // Tag reads take visibility of the version's group (audit
+    // M6), the same bar as reading the version itself.
+    let ver = store.get_version(&id).map_err(|_| not_found())?;
+    let rend = store.get_rendition(&ver.rendition_id).map_err(bad)?;
+    let unit = store.get_unit(&rend.unit_id).map_err(bad)?;
+    if !store.can_see_group(&user, &unit.group_id).map_err(bad)? {
+        return Err(not_found());
+    }
     Ok(Json(
         json!({ "tags": store.list_version_tags(&id).map_err(bad)? }),
     ))
@@ -2107,6 +2492,10 @@ async fn create_index(
     let user = auth(&st, &headers)?;
     need_cap(&st, &user, &req.group_id, "publish")?;
     let entries: Vec<IndexEntry> = req.entries.iter().map(entry_req_to_entry).collect();
+    // Referenced content must be visible to the caller (audit
+    // H4): publish standing on the target group does not license
+    // embedding another group's private blocks.
+    validate_entries_visible(&st, &user, &entries)?;
     let store = st.store.lock().unwrap();
     let idx = store
         .create_index(
@@ -2322,9 +2711,16 @@ async fn list_commits(
     Path(id): Path<String>,
     Query(q): Query<BranchQuery>,
 ) -> Api<Value> {
-    let _ = auth(&st, &headers)?;
+    let user = auth(&st, &headers)?;
     let branch = q.branch.unwrap_or_else(|| "main".to_string());
     let store = st.store.lock().unwrap();
+    // Commit history takes the same visibility bar as the index
+    // itself (audit M5) — entries, authors and messages of an
+    // invisible group's index do not leak through this door.
+    let index = store.get_index(&id).map_err(|_| not_found())?;
+    if !store.can_see_group(&user, &index.group_id).map_err(bad)? {
+        return Err(not_found());
+    }
     Ok(Json(json!({
         "commits": store.list_commits(&id, &branch).map_err(bad)?
     })))
@@ -2349,6 +2745,8 @@ async fn post_commit(
         store.get_index(&id).map_err(|_| not_found())?
     };
     need_cap(&st, &user, &index.group_id, "publish")?;
+    // Same reference rule as create_index (audit H4).
+    validate_entries_visible(&st, &user, &req.entries)?;
     let store = st.store.lock().unwrap();
     let c = store
         .create_commit(
@@ -2814,11 +3212,31 @@ async fn list_exports(
     headers: HeaderMap,
     Query(q): Query<HashMap<String, String>>,
 ) -> Api<Value> {
-    let _ = auth(&st, &headers)?;
+    let user = auth(&st, &headers)?;
     let store = st.store.lock().unwrap();
-    Ok(Json(json!({
-        "exports": store.list_exports(q.get("index_id").map(|s| s.as_str())).map_err(bad)?
-    })))
+    // The export registry is not a public bulletin (audit M4):
+    // a caller sees their own exports plus exports of indexes
+    // whose group they can see — the same bar deck_manifest_by_id
+    // already applies to a single manifest. Super sees all.
+    let mut rows = store
+        .list_exports(q.get("index_id").map(|s| s.as_str()))
+        .map_err(bad)?;
+    if user.role != "super" {
+        let visible = store.visible_groups(&user).map_err(bad)?;
+        rows.retain(|e| {
+            e.user_id == user.id
+                || visible
+                    .as_ref()
+                    .map(|set| {
+                        store
+                            .get_index(&e.index_id)
+                            .map(|idx| set.contains(&idx.group_id))
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(true)
+        });
+    }
+    Ok(Json(json!({ "exports": rows })))
 }
 
 // ---------------- update check (the colleague flow) ----------------
@@ -2959,7 +3377,8 @@ async fn check_updates(
     headers: HeaderMap,
     Json(req): Json<CheckReq>,
 ) -> Api<Value> {
-    let _ = auth(&st, &headers)?;
+    let user = auth(&st, &headers)?;
+    check_manifest_source_visible(&st, &user, &req.manifest)?;
     Ok(Json(diff_updates(&st, &req.manifest)?))
 }
 
@@ -2972,7 +3391,8 @@ async fn update_package(
     headers: HeaderMap,
     Json(req): Json<CheckReq>,
 ) -> Api<Value> {
-    let _ = auth(&st, &headers)?;
+    let user = auth(&st, &headers)?;
+    check_manifest_source_visible(&st, &user, &req.manifest)?;
     let diff = diff_updates(&st, &req.manifest)?;
     let store = st.store.lock().unwrap();
     let mut pages: Vec<Value> = Vec::new();
@@ -3025,16 +3445,31 @@ async fn update_asset(
     Path((tag, name)): Path<(String, String)>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    // Path segments cannot contain '/', but refuse traversal spellings.
-    if tag.contains("..")
-        || name.contains("..")
-        || name.contains('\\')
-        || tag.is_empty()
-        || name.is_empty()
-    {
+    // Path safety (audit H2): axum percent-decodes captured
+    // segments, so a single segment CAN carry '/' after decoding
+    // ("%2Fetc%2Fpasswd"), and PathBuf::join with an absolute
+    // component silently discards the mirror root. Both segments
+    // are therefore required to be plain file names — no
+    // separators of either flavor, no traversal spellings, no
+    // NUL — and the joined path is verified to stay under the
+    // mirror root before anything is read.
+    fn plain_segment(s: &str) -> bool {
+        !s.is_empty()
+            && s != "."
+            && s != ".."
+            && !s.contains('/')
+            && !s.contains('\\')
+            && !s.contains('\0')
+            && !std::path::Path::new(s).is_absolute()
+    }
+    if !plain_segment(&tag) || !plain_segment(&name) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let path = st.data_dir.join("update-mirror").join(&tag).join(&name);
+    let mirror = st.data_dir.join("update-mirror");
+    let path = mirror.join(&tag).join(&name);
+    if !path.starts_with(&mirror) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     match std::fs::read(&path) {
         Ok(bytes) => (
             [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
@@ -3055,12 +3490,52 @@ struct AttachmentReq {
     data_base64: String,
 }
 
+/// Attachment parent ACL (audit M3): an attachment inherits its
+/// parent object's visibility. unit/index parents resolve to
+/// their group; a showroom parent resolves through the item
+/// access rule. Unknown parent types and invisible parents both
+/// answer 404 — attachments never widen access to their parent.
+fn attachment_parent_check(
+    st: &St,
+    user: &UserRec,
+    parent_type: &str,
+    parent_id: &str,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let store = st.store.lock().unwrap();
+    match parent_type {
+        "unit" => {
+            let unit = store.get_unit(parent_id).map_err(|_| not_found())?;
+            if !store.can_see_group(user, &unit.group_id).map_err(bad)? {
+                return Err(not_found());
+            }
+        }
+        "index" => {
+            let index = store.get_index(parent_id).map_err(|_| not_found())?;
+            if !store.can_see_group(user, &index.group_id).map_err(bad)? {
+                return Err(not_found());
+            }
+        }
+        "showroom" => {
+            let item = store
+                .get_showroom(parent_id)
+                .map_err(bad)?
+                .ok_or_else(not_found)?;
+            if !store.showroom_item_access(user, &item).map_err(bad)? {
+                return Err(not_found());
+            }
+        }
+        _ => return Err(bad(format!("未知附件父对象类型：{parent_type}"))),
+    }
+    Ok(())
+}
+
 async fn add_attachment(
     State(st): State<St>,
     headers: HeaderMap,
     Json(req): Json<AttachmentReq>,
 ) -> Api<Value> {
     let user = auth(&st, &headers)?;
+    attachment_parent_check(&st, &user, &req.parent_type, &req.parent_id)?;
     let bytes = b64d(&req.data_base64)?;
     let store = st.store.lock().unwrap();
     let rec = store
@@ -3080,12 +3555,20 @@ async fn list_attachments(
     headers: HeaderMap,
     Query(q): Query<HashMap<String, String>>,
 ) -> Api<Value> {
-    let _ = auth(&st, &headers)?;
+    let user = auth(&st, &headers)?;
     let parent = q.get("parent_id").cloned().unwrap_or_default();
-    let store = st.store.lock().unwrap();
-    Ok(Json(json!({
-        "attachments": store.list_attachments(&parent).map_err(bad)?
-    })))
+    let rows = {
+        let store = st.store.lock().unwrap();
+        store.list_attachments(&parent).map_err(bad)?
+    };
+    // The list door names only a parent id; the parent type
+    // rides on the rows themselves. An empty list leaks nothing
+    // and needs no check; a non-empty one must pass the parent
+    // ACL before any row is served (audit M3).
+    if let Some(first) = rows.first() {
+        attachment_parent_check(&st, &user, &first.parent_type, &first.parent_id)?;
+    }
+    Ok(Json(json!({ "attachments": rows })))
 }
 
 async fn download_attachment(
@@ -3093,9 +3576,13 @@ async fn download_attachment(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Api<Value> {
-    let _ = auth(&st, &headers)?;
+    let user = auth(&st, &headers)?;
+    let rec = {
+        let store = st.store.lock().unwrap();
+        store.get_attachment(&id).map_err(|_| not_found())?
+    };
+    attachment_parent_check(&st, &user, &rec.parent_type, &rec.parent_id)?;
     let store = st.store.lock().unwrap();
-    let rec = store.get_attachment(&id).map_err(|_| not_found())?;
     let bytes = store.file_get(&rec.hash).map_err(bad)?;
     Ok(Json(json!({
         "filename": rec.filename,
@@ -3166,9 +3653,14 @@ async fn submit_showroom(
     // the confirmed version set of the push summary. Supplied
     // pins are validated against the tag commit exactly the way
     // the submission-package builder validates them — count,
-    // rendition ownership, formally published status — and a
-    // mismatch rejects the push as a stale summary rather than
-    // pinning something the submitter never saw.
+    // rendition ownership, formally published status — plus
+    // equality with the resolution the summary displayed (pin
+    // audit N2: the shape checks alone cannot catch a same-shape
+    // swap), and a mismatch rejects the push as a stale summary
+    // rather than pinning something the submitter never saw.
+    // Absent pins (older clients) are captured at submit time
+    // under the same published-status caliber: a resolution
+    // landing on a draft is never pinned.
     let pins: Vec<String> = if commit_id.is_empty() {
         Vec::new()
     } else {
@@ -3186,6 +3678,23 @@ async fn submit_showroom(
                     if v.status != "normal" {
                         return Err(bad("推送摘要中的内容块版本已失效，请重新发布后再提交"));
                     }
+                    // Equality with the resolution the summary
+                    // displayed: a locked entry pins its locked
+                    // version, a follow-latest entry pins the
+                    // version it resolves to at this moment — the
+                    // mirror of the landing transaction's
+                    // follow-latest equality check. Anything else
+                    // is a summary the submitter never confirmed.
+                    let expected = match &e.policy {
+                        EntryPolicy::Locked { version_id } => Some(version_id.0.clone()),
+                        EntryPolicy::FollowLatest => store
+                            .resolve_entry_version(e)
+                            .map_err(bad)?
+                            .map(|rv| rv.id),
+                    };
+                    if expected.as_deref() != Some(vid.as_str()) {
+                        return Err(bad("推送摘要已过期，请重新读取后再提交"));
+                    }
                 }
                 supplied.clone()
             }
@@ -3193,11 +3702,21 @@ async fn submit_showroom(
                 .entries
                 .iter()
                 .map(|e| {
-                    store
+                    // Same caliber as the supplied path: the
+                    // submit-time capture pins only formally
+                    // published (normal) versions. The bare
+                    // resolution can land on a draft (a
+                    // follow-latest entry whose newest version is
+                    // still a draft); pinning it would make an
+                    // unreviewed draft the item's formal version.
+                    let v = store
                         .resolve_entry_version(e)
                         .map_err(bad)?
-                        .map(|v| v.id)
-                        .ok_or_else(|| bad("内容块尚无已发布版本，请先发布后再推送"))
+                        .ok_or_else(|| bad("内容块尚无已发布版本，请先发布后再推送"))?;
+                    if v.status != "normal" {
+                        return Err(bad("内容块的最新版本仍是草稿，请先发布后再推送"));
+                    }
+                    Ok(v.id)
                 })
                 .collect::<Result<Vec<String>, _>>()?,
         }
@@ -3213,7 +3732,7 @@ async fn submit_showroom(
         )
         .map_err(bad)?;
     if !pins.is_empty() {
-        store.set_showroom_pins(&rec.id, &pins).map_err(bad)?;
+        store.set_showroom_pins(&rec.id, &commit_id, &pins).map_err(bad)?;
     }
     let mut value = serde_json::to_value(&rec).unwrap_or(Value::Null);
     value["submitted_by"] = json!(user.display_name);
@@ -3288,6 +3807,10 @@ async fn review_showroom(
         return Err(forbidden());
     }
     let note = req.note.as_deref().unwrap_or("");
+    // The review door speaks exactly two states (audit L2).
+    if !matches!(req.state.as_str(), "live" | "rejected") {
+        return Err(bad(format!("未知的审核状态：{}", req.state)));
+    }
     if req.state == "rejected" && note.trim().is_empty() {
         return Err(bad("驳回必须填写理由（会原样回到提交人）"));
     }
@@ -3329,6 +3852,31 @@ struct SubmissionReq {
     files: HashMap<String, String>,
 }
 
+/// F5 quotas: the staging zone is bounded per submitter, so one
+/// account cannot fill the server's disk with pending packages.
+/// The package cap sits well under the global 512 MiB body limit
+/// (base64 inflates bytes by ~4/3 on the wire). Staged bytes of
+/// decided submissions are removed at decision time (review
+/// handler), so the byte quota only ever counts pending work.
+const MAX_PENDING_SUBMISSIONS_PER_USER: usize = 20;
+const MAX_STAGED_BYTES_PER_USER: u64 = 1 << 30; // 1 GiB
+const MAX_SUBMISSION_PACKAGE_BYTES: u64 = 256 << 20; // 256 MiB
+
+/// Decoded size of a base64 string (exact for well-formed input;
+/// malformed input fails later at decode time in the staging
+/// loop, so an approximation there is harmless for quota math).
+fn b64_decoded_len(s: &str) -> u64 {
+    let n = s.len() as u64;
+    let pad = if s.ends_with("==") {
+        2
+    } else if s.ends_with('=') {
+        1
+    } else {
+        0
+    };
+    (n / 4 * 3).saturating_sub(pad)
+}
+
 async fn create_submission(
     State(st): State<St>,
     headers: HeaderMap,
@@ -3359,6 +3907,18 @@ async fn create_submission(
         }
     }
     let store = st.store.lock().unwrap();
+    // Per-user pending quota (audit M8): staged packages occupy
+    // real disk until reviewed; one account may hold at most 20
+    // awaiting review at a time.
+    let pending = store
+        .list_submissions_by_submitter(&user.id)
+        .map_err(bad)?
+        .into_iter()
+        .filter(|s| s.state == "pending")
+        .count();
+    if pending >= 20 {
+        return Err(bad("待审核的提交已达上限（20），请等审核完成后再提交"));
+    }
     if let Some(prev_id) = &req.supersedes {
         let prev = store
             .get_submission(prev_id)
@@ -3370,6 +3930,53 @@ async fn create_submission(
         if prev.state != "rejected" {
             return Err(bad("只有被驳回的提交可以被重提取代"));
         }
+    }
+    // F9: at most one pending package per (submitter, source
+    // index). Two pendings for the same source fork the review
+    // state — whichever approval lands second silently replaces
+    // the first one's formal version. A resubmission that
+    // supersedes a REJECTED row is unaffected (that row is not
+    // pending); replacing a pending package goes through
+    // withdraw (DELETE) first, deliberately, so a failed
+    // replacement can never take the standing package down
+    // with it.
+    if let Some(src) = req.source_index_id.as_deref().filter(|s| !s.is_empty()) {
+        let clash = store
+            .list_submissions_by_submitter(&user.id)
+            .map_err(bad)?
+            .into_iter()
+            .any(|s| {
+                s.state == "pending"
+                    && s.source_index_id.as_deref() == Some(src)
+            });
+        if clash {
+            return Err(bad(
+                "该索引已有一份待审提交，请先撤回或等待审批完成",
+            ));
+        }
+    }
+    // F5 quota (see the constants above): package size first
+    // (cheap), then the caller's pending count / staged bytes.
+    let package_bytes: u64 = req.files.values().map(|b| b64_decoded_len(b)).sum();
+    if package_bytes > MAX_SUBMISSION_PACKAGE_BYTES {
+        return Err(bad(format!(
+            "提交包过大（{} MiB，上限 {} MiB）",
+            package_bytes >> 20,
+            MAX_SUBMISSION_PACKAGE_BYTES >> 20
+        )));
+    }
+    let (pending_count, staged_bytes) =
+        store.pending_submission_usage(&user.id).map_err(bad)?;
+    if pending_count >= MAX_PENDING_SUBMISSIONS_PER_USER {
+        return Err(bad(format!(
+            "待审提交已达上限（{MAX_PENDING_SUBMISSIONS_PER_USER} 份），请先撤回或等待审批"
+        )));
+    }
+    if staged_bytes + package_bytes > MAX_STAGED_BYTES_PER_USER {
+        return Err(bad(format!(
+            "待审提交暂存总量已达上限（{} GiB），请先撤回部分待审提交",
+            MAX_STAGED_BYTES_PER_USER >> 30
+        )));
     }
     let id = qimu_core::auth::new_id("sub");
     let page_count: i64 = manifest.versions.iter().map(|v| v.page_count).sum();
@@ -3463,11 +4070,19 @@ async fn review_submission(
             let manifest: SubmissionManifest = serde_json::from_str(&manifest_json)
                 .map_err(|e| bad(format!("提交包清单无法解析：{e}")))?;
             match store.land_submission(&id, &manifest, &user.display_name) {
-                Ok((index_id, showroom_id)) => Ok(Json(json!({
-                    "ok": true,
-                    "landed_index_id": index_id,
-                    "landed_showroom_id": showroom_id
-                }))),
+                Ok((index_id, showroom_id)) => {
+                    // F5: the package's bytes now live in the
+                    // landed CAS and content tables; the staging
+                    // copy is a pure duplicate — remove it.
+                    // (Before this fix, landed staging was kept
+                    // forever.)
+                    store.clear_submission_staging(&id);
+                    Ok(Json(json!({
+                        "ok": true,
+                        "landed_index_id": index_id,
+                        "landed_showroom_id": showroom_id
+                    })))
+                }
                 Err(e) => {
                     // The landing rolled back: the submission
                     // stays pending with the reason recorded.
@@ -3483,10 +4098,74 @@ async fn review_submission(
             store
                 .set_submission_rejected(&id, note, &user.display_name)
                 .map_err(bad)?;
+            // F5: a rejected package never lands, so its staged
+            // bytes have no further reader — remove them. The
+            // manifest stays on the submission row for the
+            // record (and for the review preview's structure).
+            store.clear_submission_staging(&id);
             Ok(Json(json!({ "ok": true })))
         }
         _ => Err(bad("未知审批结果")),
     }
+}
+
+/// F1 (blind review): the review face's read side — one
+/// submission's row plus its stored package manifest, so a
+/// reviewer can see exactly what an approval would land
+/// （所见即所审）. The data comes from the staged package itself,
+/// never from the submitter's source library, whose current
+/// state may already have moved on. Supers (the reviewer role)
+/// and the submitter may read it; nobody else.
+async fn submission_manifest_view(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let store = st.store.lock().unwrap();
+    let sub = store
+        .get_submission(&id)
+        .map_err(bad)?
+        .ok_or_else(not_found)?;
+    if user.role != "super" && sub.submitter_id != user.id {
+        return Err(forbidden());
+    }
+    let manifest_json = store.submission_manifest(&id).map_err(bad)?;
+    let manifest: Value = serde_json::from_str(&manifest_json)
+        .map_err(|e| bad(format!("提交包清单无法解析：{e}")))?;
+    Ok(Json(json!({ "submission": sub, "manifest": manifest })))
+}
+
+/// F1: one staged package file by hash — the review preview
+/// renders pages from these bytes. The hash must be one the
+/// package's own manifest declares, so the staging zone is
+/// never browsable beyond the package under review (this also
+/// keeps unvalidated hashes away from the staging read path).
+/// Staged bytes exist only while the submission is pending:
+/// a decision clears the staging zone (F5), after which the
+/// manifest above stays readable but fragments are gone.
+async fn submission_staged_file(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path((id, hash)): Path<(String, String)>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let store = st.store.lock().unwrap();
+    let sub = store
+        .get_submission(&id)
+        .map_err(bad)?
+        .ok_or_else(not_found)?;
+    if user.role != "super" && sub.submitter_id != user.id {
+        return Err(forbidden());
+    }
+    let manifest_json = store.submission_manifest(&id).map_err(bad)?;
+    let manifest: SubmissionManifest = serde_json::from_str(&manifest_json)
+        .map_err(|e| bad(format!("提交包清单无法解析：{e}")))?;
+    if !manifest.versions.iter().any(|v| v.fragment_hash == hash) {
+        return Err(not_found());
+    }
+    let bytes = store.staged_file_get(&id, &hash).map_err(bad)?;
+    Ok(Json(json!({ "hash": hash, "data_base64": b64e(&bytes) })))
 }
 
 async fn delete_submission(
@@ -3501,11 +4180,18 @@ async fn delete_submission(
         .map_err(bad)?
         .ok_or_else(not_found)?;
     // Withdraw (pending) and cleanup (rejected) belong to the
-    // submitter; a landed submission's record is provenance and
-    // only a super may remove it (the landed content itself is a
-    // separate object and is never touched here).
-    let allowed = user.role == "super"
-        || (sub.state != "landed" && sub.submitter_id == user.id);
+    // submitter, with a super able to remove those too. A landed
+    // submission's record is NOT removable by anyone (F2): the
+    // row itself is the lineage mapping the landing chain reads
+    // (landed_source_target), so deleting one breaks the mapping
+    // — and deleting only the newest landed row silently
+    // re-points it at an older landed index, forking the
+    // source's lineage. The landed content is a separate object
+    // and is never touched here either way.
+    if sub.state == "landed" {
+        return Err(bad("已落地的提交记录是落地谱系凭证，不能删除"));
+    }
+    let allowed = user.role == "super" || sub.submitter_id == user.id;
     if !allowed {
         return Err(forbidden());
     }
@@ -4768,6 +5454,10 @@ async fn create_assembly(
     Json(req): Json<AssemblyReq>,
 ) -> Api<Value> {
     let user = auth(&st, &headers)?;
+    // An assembly may only reference content its owner can see
+    // (audit H3) — otherwise saving one is the first half of an
+    // export bypass.
+    validate_entries_visible(&st, &user, &req.entries)?;
     let store = st.store.lock().unwrap();
     let id = store
         .save_assembly(&user.id, &req.name, &req.entries)
@@ -4790,8 +5480,22 @@ async fn export_assembly(
     let user = auth(&st, &headers)?;
     let entries = {
         let store = st.store.lock().unwrap();
+        // Ownership first (audit H3): an assembly is personal
+        // working state; exporting someone else's by id is not a
+        // sharing channel (shares are). Super may export any.
+        let owner = store.assembly_owner(&id).map_err(bad)?;
+        match owner {
+            None => return Err(not_found()),
+            Some(o) if o != user.id && user.role != "super" => {
+                return Err(not_found());
+            }
+            _ => {}
+        }
         store.assembly_entries(&id).map_err(|_| not_found())?
     };
+    // And the entries must still be visible to the exporter —
+    // group membership can change after an assembly is saved.
+    validate_entries_visible(&st, &user, &entries)?;
     let (deck, manifest, page_count) = build_export(
         &st,
         Some(&user),
@@ -4922,6 +5626,7 @@ mod collaboration_tests {
             dept_id: Some("dept".into()),
             role: role.into(),
             disabled,
+            must_change_password: false,
         }
     }
 
@@ -5064,20 +5769,36 @@ fn dir_writable(p: &std::path::Path) -> bool {
     }
 }
 
-/// Data directory resolution: $QIMU_DATA_DIR wins; otherwise a `qimu-data`
-/// folder beside the executable when writable (installed layouts, e.g.
-/// D:\Program Files\启幕); otherwise a per-user/system fallback so a
-/// read-only install dir (C:\Program Files) still works.
+/// Data directory resolution: $QIMU_SERVER_DATA_DIR wins (the
+/// legacy $QIMU_DATA_DIR is still honored as a fallback — audit2
+/// F-N2: one variable used to name BOTH this server's data root and
+/// the client's local-library root, so a machine-wide setting could
+/// collide the two onto one directory); otherwise a `qimu-data`
+/// folder beside the executable **that already holds a database**
+/// (installed layouts, e.g. D:\Program Files\启幕); otherwise a
+/// per-user/system fallback so a read-only install dir (C:\Program
+/// Files) still works.
 fn resolve_data_dir() -> std::path::PathBuf {
-    if let Ok(d) = std::env::var("QIMU_DATA_DIR") {
-        if !d.trim().is_empty() {
-            return std::path::PathBuf::from(d);
+    for var in ["QIMU_SERVER_DATA_DIR", "QIMU_DATA_DIR"] {
+        if let Ok(d) = std::env::var(var) {
+            if !d.trim().is_empty() {
+                return std::path::PathBuf::from(d);
+            }
         }
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let cand = dir.join("qimu-data");
-            if dir_writable(&cand) {
+            // Audit2 X1: "writable" alone is not enough — the NSI
+            // pre-creates this directory in every fresh install, so
+            // an upgrade redirected to a new install dir used to
+            // adopt the empty folder and seed a brand-new database
+            // (with the default admin password) while the real data
+            // sat untouched in the old directory. Only a folder
+            // that already carries a `qimu.db` is an existing data
+            // root; anything else falls through to the per-user
+            // fallback below.
+            if cand.join("qimu.db").is_file() && dir_writable(&cand) {
                 return cand;
             }
         }
@@ -5111,9 +5832,127 @@ fn fatal_startup(msg: &str) -> ! {
     std::process::exit(1)
 }
 
+/// Advisory single-instance lock for the server data directory
+/// (audit2 X2): the same pid-file discipline as the client's local
+/// library lock. The server used to have no lock at all, and
+/// `Store::open` ran before the port bind — a double-clicked second
+/// instance re-ran the whole migration set against the live database
+/// before dying on the bind, and a second instance on a different
+/// QIMU_PORT ran fully concurrent against the same store. Now the
+/// lock is taken first: a live holder stops the second instance
+/// before it touches the database; a dead holder's lock is stale
+/// and is taken over.
+struct ServerLock {
+    path: std::path::PathBuf,
+}
+
+impl Drop for ServerLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn server_pid_alive(pid: u32) -> bool {
+    // Same tasklist probe as the client's pid_alive: a live holder
+    // yields one CSV row carrying `,"{pid}",`; a dead one yields
+    // only the localized INFO line. Conservative true when the
+    // probe itself cannot run.
+    let mut cmd = std::process::Command::new("cmd");
+    cmd.args([
+        "/C",
+        "tasklist",
+        "/FI",
+        &format!("PID eq {pid}"),
+        "/FO",
+        "CSV",
+        "/NH",
+    ])
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::null());
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    match cmd.output() {
+        Ok(out) => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            text.lines().any(|l| l.contains(&format!(",\"{pid}\",")))
+        }
+        Err(_) => true,
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn server_pid_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(true)
+}
+
+fn acquire_server_lock(data_dir: &std::path::Path) -> Result<ServerLock, String> {
+    std::fs::create_dir_all(data_dir).map_err(|e| e.to_string())?;
+    let lock_path = data_dir.join("qimu-server.lock");
+    for _ in 0..3 {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(mut f) => {
+                use std::io::Write;
+                let started = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let _ = writeln!(f, "{}\n{started}", std::process::id());
+                return Ok(ServerLock { path: lock_path });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let holder: Option<u32> = std::fs::read_to_string(&lock_path)
+                    .ok()
+                    .and_then(|t| t.lines().next()?.trim().parse().ok());
+                match holder {
+                    Some(pid) if pid != std::process::id() && server_pid_alive(pid) => {
+                        return Err(format!(
+                            "数据目录 {} 已被另一个启幕服务器占用（进程 {pid} 仍在运行）；\
+                             若要重启，先关掉已运行的实例。",
+                            data_dir.display()
+                        ));
+                    }
+                    _ => {
+                        // Stale lock (dead holder, our own pid, or
+                        // unreadable): remove and retry.
+                        let _ = std::fs::remove_file(&lock_path);
+                    }
+                }
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Err(format!(
+        "无法取得数据目录 {} 的实例锁（{}）",
+        data_dir.display(),
+        lock_path.display()
+    ))
+}
+
 #[tokio::main]
 async fn main() {
     let data_dir = resolve_data_dir();
+    // Audit2 X2 ordering: instance lock BEFORE Store::open, so a
+    // second instance never re-runs migrations against the live
+    // database (and never gets as far as the port bind either).
+    // Held for the whole process lifetime; Drop removes the file on
+    // a graceful exit, and the stale-takeover above covers a kill.
+    let _server_lock = match acquire_server_lock(&data_dir) {
+        Ok(l) => l,
+        Err(e) => fatal_startup(&e),
+    };
     let store = match Store::open(&data_dir) {
         Ok(s) => s,
         Err(e) => fatal_startup(&format!(
@@ -5121,18 +5960,36 @@ async fn main() {
             data_dir.display()
         )),
     };
-    if store.user_count().map(|c| c == 0).unwrap_or(false) {
-        let pw = std::env::var("QIMU_ADMIN_PASSWORD").unwrap_or_else(|_| "admin12345".to_string());
-        if let Err(e) = store.ensure_seed(&pw) {
-            fatal_startup(&format!("初始化管理员账号失败：{e}"));
-        }
-        println!("首次启动：已创建超级管理员 admin / {pw}（请登录后修改；可用环境变量 QIMU_ADMIN_PASSWORD 指定）");
-    }
     let standalone = match std::env::var("QIMU_STANDALONE").as_deref() {
         Ok("1") | Ok("true") => true,
         Ok("0") | Ok("false") => false,
         _ => data_dir.join("standalone.on").exists(),
     };
+    if store.user_count().map(|c| c == 0).unwrap_or(false) {
+        let env_pw = std::env::var("QIMU_ADMIN_PASSWORD").ok();
+        let pw = env_pw.clone().unwrap_or_else(|| "admin12345".to_string());
+        if let Err(e) = store.ensure_seed(&pw) {
+            fatal_startup(&format!("初始化管理员账号失败：{e}"));
+        }
+        // Default-password containment (audit H6): when the seed
+        // password is the built-in default, the account carries
+        // the must-change flag — its first login can do nothing
+        // but change the password (see the auth gate). The
+        // password itself is no longer printed to stdout.
+        // Standalone installs are exempt: the loopback owner
+        // mapping never passes a login screen, and single-machine
+        // use must stay zero-account (standalone ruling); the
+        // default-password exposure there is the machine owner's
+        // own console, not the LAN.
+        if env_pw.is_none() && !standalone {
+            if let Ok(admin) = store.user_by_username("admin") {
+                let _ = store.set_must_change_password(&admin.id, true);
+            }
+            println!("首次启动：已创建超级管理员 admin（初始口令为内置默认值，首次登录必须修改；可用环境变量 QIMU_ADMIN_PASSWORD 指定初始口令）");
+        } else {
+            println!("首次启动：已创建超级管理员 admin（可用环境变量 QIMU_ADMIN_PASSWORD 指定初始口令）");
+        }
+    }
     if standalone {
         println!("单机模式：回环来源的免登录请求按本机所有者处理（设 QIMU_STANDALONE=0 可禁用）");
     }
@@ -5141,6 +5998,8 @@ async fn main() {
         translate_jobs: Mutex::new(HashMap::new()),
         data_dir: data_dir.clone(),
         standalone,
+        login_guard: Mutex::new(HashMap::new()),
+        guest_guard: Mutex::new(HashMap::new()),
     });
     let app = Router::new()
         .route(
@@ -5160,6 +6019,7 @@ async fn main() {
         .route("/v1/auth/guest", post(guest_auth))
         .route("/v1/auth/logout", post(logout))
         .route("/v1/me", get(me))
+        .route("/v1/me/password", post(change_password))
         .route("/v1/me/profile", axum::routing::put(put_profile))
         .route("/v1/org", get(org))
         .route("/v1/org/contacts", get(org_contacts))
@@ -5262,6 +6122,8 @@ async fn main() {
         .route("/v1/showroom/:id/review", post(review_showroom))
         .route("/v1/submissions", get(list_submissions).post(create_submission))
         .route("/v1/submissions/:id/review", post(review_submission))
+        .route("/v1/submissions/:id/manifest", get(submission_manifest_view))
+        .route("/v1/submissions/:id/files/:hash", get(submission_staged_file))
         .route("/v1/submissions/:id", delete(delete_submission))
         .route("/v1/trash", get(list_trash).post(add_trash))
         .route("/v1/trash/purge-all", post(purge_all_trash))

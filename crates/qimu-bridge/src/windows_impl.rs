@@ -16,9 +16,8 @@
 
 use windows::core::{Interface, BSTR, GUID, PCWSTR, VARIANT};
 use windows::Win32::System::Com::{
-    CLSIDFromProgID, CoCreateInstance, CoInitializeEx, CoUninitialize, IDispatch,
-    CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, DISPATCH_METHOD, DISPATCH_PROPERTYGET,
-    DISPPARAMS,
+    CLSIDFromProgID, CoInitializeEx, CoUninitialize, IDispatch, COINIT_APARTMENTTHREADED,
+    DISPATCH_METHOD, DISPATCH_PROPERTYGET, DISPPARAMS,
 };
 use windows::Win32::System::Ole::GetActiveObject;
 
@@ -131,10 +130,15 @@ fn active_powerpoint() -> Result<IDispatch, String> {
                 .map_err(|e| format!("获取 PowerPoint 自动化接口失败: {e}"));
         }
     }
-    // Fallback: CoCreateInstance binds to the running instance for
-    // single-instance applications like PowerPoint.
-    unsafe { CoCreateInstance(&clsid, None, CLSCTX_LOCAL_SERVER) }
-        .map_err(|e| format!("PowerPoint 未在运行: {e}"))
+    // Audit2 E-M8: there is deliberately NO CoCreateInstance
+    // fallback here. For a local-server class like PowerPoint,
+    // CoCreateInstance does not merely "bind to the running
+    // instance" — it starts the process when none is running,
+    // which contradicts this file's contract (only the running
+    // instance is used) and made even a status() probe launch a
+    // hidden PowerPoint. GetActiveObject failing means: not
+    // running, full stop.
+    Err("PowerPoint 未在运行".into())
 }
 
 fn active_presentation(app: &IDispatch) -> Result<IDispatch, String> {
@@ -246,7 +250,16 @@ impl PowerPointBridge for WindowsBridge {
         // Add(WithWindow = msoFalse = 0): no window for the temp deck.
         let added = call(&presentations, "Add", &mut [VARIANT::from(0i32)])?;
         let pres = IDispatch::try_from(&added).map_err(|e| format!("新建临时演示失败: {e}"))?;
-        let slides = get_obj(&pres, "Slides")?;
+        // Audit2 E-L3: a failure here must still close the
+        // throwaway presentation — the Paste/SaveAs paths below
+        // already do, this early return used to leak it.
+        let slides = match get_obj(&pres, "Slides") {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = call(&pres, "Close", &mut []);
+                return Err(e);
+            }
+        };
         if call(&slides, "Paste", &mut []).is_err() || get_i32(&slides, "Count").unwrap_or(0) == 0 {
             let _ = call(&pres, "Close", &mut []);
             return Ok(None);
@@ -255,7 +268,14 @@ impl PowerPointBridge for WindowsBridge {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!("qimu-paste-{stamp}.pptx"));
+        // The pid rides along so two captures in the same
+        // millisecond (or two clients on one machine) never share
+        // a name (audit2 E-L2); callers delete the file after
+        // reading it.
+        let path = std::env::temp_dir().join(format!(
+            "qimu-paste-{stamp}-{}.pptx",
+            std::process::id()
+        ));
         let saved = call(
             &pres,
             "SaveAs",

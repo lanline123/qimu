@@ -625,6 +625,32 @@ impl App {
                 Err(error) => self.workspace_controls.search_error = Some(error),
             }
         }
+        // F7: with a local library open, the call above is
+        // answered by the local face alone, so the organization's
+        // full-text hits never arrived. While connected, merge
+        // the server's hits in too (the server applies its own
+        // visibility filtering), labelled as organization results
+        // so their source is explicit; local hits win id ties.
+        // With no local library the call above already read the
+        // server and this pass deduplicates to a no-op.
+        if self.org_online() {
+            if let Ok(response) = self.call(
+                "GET",
+                &format!("/v1/search?q={}", query_component(query)),
+                None,
+            ) {
+                for hit in response["hits"].as_array().into_iter().flatten() {
+                    let unit = &hit["unit"];
+                    let id = s(unit, "id");
+                    if !id.is_empty() && units.insert(id.clone()) {
+                        hits.push((
+                            format!("{}（组织）", s(unit, "name")),
+                            SearchTarget::Unit(id),
+                        ));
+                    }
+                }
+            }
+        }
         self.workspace_controls.search_hits = hits;
         self.workspace_controls.search_open = true;
     }

@@ -36,7 +36,13 @@ RequestExecutionLevel admin
 !insertmacro MUI_LANGUAGE "SimpChinese"
 
 Function .onInit
-  ${If} ${FileExists} "D:\*.*"
+  ; 审计 X1: 已装过 (注册表有 InstallDir) 时绝不改道 —— 旧逻辑只要
+  ; D 盘存在就无条件改目录, 升级装进新目录后服务器会在新目录开空库
+  ; 并种默认口令管理员, 真数据留在旧目录。D 盘默认只对全新安装生效。
+  ReadRegStr $0 HKLM "Software\QimuServer" "InstallDir"
+  ${If} $0 != ""
+    StrCpy $INSTDIR $0
+  ${ElseIf} ${FileExists} "D:\*.*"
     StrCpy $INSTDIR "D:\Program Files\启幕服务器"
   ${EndIf}
 FunctionEnd
@@ -44,9 +50,10 @@ FunctionEnd
 Section "启幕服务器" SEC_SERVER
   SectionIn RO
   SetOutPath "$INSTDIR"
-  File "win/qimu-server.exe"
+  ; X13: 服务器开着 (开机自启) 时装新版, 锁住的 exe 走重启替换
+  File /REBOOTOK "win/qimu-server.exe"
   File "win/qimu.ico"
-  File "win/deckcraft-cli.exe"
+  File /REBOOTOK "win/deckcraft-cli.exe"
   ; 数据目录预建: 服务器 exe 同目录有 qimu-data 时优先用它
   CreateDirectory "$INSTDIR\qimu-data"
   CreateDirectory "$SMPROGRAMS\启幕"
@@ -70,9 +77,9 @@ Section "Uninstall"
   DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "QimuServer"
   Delete "$SMPROGRAMS\启幕\启幕服务器.lnk"
   RMDir "$SMPROGRAMS\启幕"
-  Delete "$INSTDIR\qimu-server.exe"
+  Delete /REBOOTOK "$INSTDIR\qimu-server.exe"
   Delete "$INSTDIR\qimu.ico"
-  Delete "$INSTDIR\deckcraft-cli.exe"
+  Delete /REBOOTOK "$INSTDIR\deckcraft-cli.exe"
   Delete "$INSTDIR\uninstall.exe"
   ; 服务器数据默认保留, 询问后才删
   ${If} ${FileExists} "$INSTDIR\qimu-data\*.*"

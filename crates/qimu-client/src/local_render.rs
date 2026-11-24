@@ -44,30 +44,78 @@ fn open_named(name: &str, bytes: &[u8]) -> Result<deckcraft_model::Presentation,
         .map_err(|e| e.to_string())
 }
 
+/// Thumbnail cache epoch (audit2 E-N4): the cache key is the page
+/// alone — it carries no renderer or font-catalog dimension, so a
+/// page first rendered while fonts were missing used to pin the
+/// substitute-font image forever. All thumbnail files live under
+/// this epoch subdirectory; when the renderer or the bundled font
+/// set changes materially, bump the epoch and every page re-renders
+/// once (the old epoch's files are simply never read again).
+const THUMB_EPOCH: &str = "r1";
+
+fn epoch_dir(cache_dir: &Path) -> std::path::PathBuf {
+    cache_dir.join(THUMB_EPOCH)
+}
+
+/// A cached file only counts as a thumbnail when it actually looks
+/// like a PNG (audit2 E-M1: a concurrent write to the old shared
+/// fixed-name temp file could publish a truncated image, and the
+/// bare `exists()` checks then pinned it forever).
+fn valid_png(bytes: &[u8]) -> bool {
+    bytes.len() >= 32 && bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A])
+}
+
+/// Read a cached thumbnail, treating a corrupt file as a miss (and
+/// removing it, so the render below republishes a good one).
+fn read_cached_png(path: &Path) -> Option<Vec<u8>> {
+    let bytes = std::fs::read(path).ok()?;
+    if valid_png(&bytes) {
+        Some(bytes)
+    } else {
+        let _ = std::fs::remove_file(path);
+        None
+    }
+}
+
 /// Render every page of a fragment into `cache_dir` as `<page>.png`
-/// (0-based), mirroring the server renderer's publish discipline: a
-/// page already in the cache is left alone, and a page is published
-/// complete (temp file + rename), never written in place.
+/// (0-based, under the epoch subdirectory), mirroring the server
+/// renderer's publish discipline: a page already in the cache is
+/// left alone, and a page is published complete (temp file +
+/// rename), never written in place.
 pub fn render_frag_thumbs(frag: &[u8], cache_dir: &Path) -> Result<(), String> {
     let doc = open(frag)?;
-    std::fs::create_dir_all(cache_dir).map_err(|e| e.to_string())?;
+    let dir = epoch_dir(cache_dir);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let pages = doc.slides.len();
     if pages == 0 {
         return Err("DeckCraft 渲染未产出任何页面".into());
     }
     for page in 0..pages {
-        let cached = cache_dir.join(format!("{page}.png"));
-        if cached.exists() {
+        let cached = dir.join(format!("{page}.png"));
+        if read_cached_png(&cached).is_some() {
             continue;
         }
         let (png, _, _) =
             deckcraft_engine::cmd::file::render_png_with(&doc, page, 0.75, false, false);
-        let tmp = cache_dir.join(format!(".{page}.png.tmp"));
+        if !valid_png(&png) {
+            return Err("DeckCraft 渲染产出无效图像".into());
+        }
+        // Audit2 E-M1: the temp name is unique to this call — the
+        // old fixed `.{page}.png.tmp` was shared by every thread
+        // rendering the same page (wall, import warm-up, another
+        // version of the same page entity), and concurrent writes
+        // could truncate each other's image before the rename.
+        static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = dir.join(format!(
+            ".{page}.png.tmp-{}-{seq}",
+            std::process::id()
+        ));
         std::fs::write(&tmp, &png).map_err(|e| e.to_string())?;
         if let Err(e) = std::fs::rename(&tmp, &cached) {
             let _ = std::fs::remove_file(&tmp);
             // Another render may have published this page already.
-            if !cached.exists() {
+            if read_cached_png(&cached).is_none() {
                 return Err(e.to_string());
             }
         }
@@ -101,15 +149,22 @@ pub fn local_thumb(
     page: usize,
 ) -> Option<Vec<u8>> {
     if let Some(page_id) = local.version_page_id(version_id, page) {
-        return page_thumb(local, &page_id);
+        if let Some(bytes) = page_thumb(local, &page_id) {
+            return Some(bytes);
+        }
+        // Audit2 E-N5: an entity-backed version whose entity package
+        // is missing or fails to render falls through to the legacy
+        // fragment path below — the version's own fragment is in the
+        // library, so the page must not go blank (and get pinned as
+        // failed) over a broken entity record.
     }
     // Legacy fallback: a version whose pages carry no entity ids
     // (the page-entity migration could not split its fragment)
     // keeps the version-keyed whole-fragment render it always had.
     let cache_dir = local.thumb_cache_dir(version_id);
-    let cache_file = cache_dir.join(format!("{page}.png"));
-    if cache_file.exists() {
-        return std::fs::read(&cache_file).ok();
+    let cache_file = epoch_dir(&cache_dir).join(format!("{page}.png"));
+    if let Some(bytes) = read_cached_png(&cache_file) {
+        return Some(bytes);
     }
     let frag = local.version_fragment(version_id)?;
     cached_thumb(&frag, &cache_dir, page)
@@ -127,13 +182,45 @@ pub fn page_thumb(
     page_id: &str,
 ) -> Option<Vec<u8>> {
     let cache_dir = local.thumb_cache_dir(page_id);
-    let cache_file = cache_dir.join("0.png");
-    if cache_file.exists() {
-        return std::fs::read(&cache_file).ok();
+    let cache_file = epoch_dir(&cache_dir).join("0.png");
+    if let Some(bytes) = read_cached_png(&cache_file) {
+        return Some(bytes);
     }
-    let bytes = local.page_package_bytes(page_id)?;
+    let bytes = match local.page_package_bytes(page_id) {
+        Some(b) => b,
+        None => {
+            // Lazy import (user ruling 2026-11-25): the page's
+            // split has not landed, so it has no entity package
+            // yet — render its thumbnail straight from the whole
+            // deck backing it, so the card shows the real slide
+            // from the moment the deck opened. Rendering is not
+            // "using" the page: the card stays unusable until the
+            // split lands. The render is returned for the session
+            // only, deliberately NOT published into the entity's
+            // disk cache — when the split lands, `page_thumb`
+            // renders (or reuses) the entity package's own image
+            // under this key, so no deck-vs-entity pixel question
+            // can ever become permanent.
+            let (deck_hash, index) = local.lazy_backing_for_page(page_id)?;
+            let deck = local.file_bytes(&deck_hash)?;
+            return render_deck_page(&deck, index);
+        }
+    };
     render_frag_thumbs(&bytes, &cache_dir).ok()?;
-    std::fs::read(&cache_file).ok()
+    read_cached_png(&cache_file)
+}
+
+/// Render ONE page of a whole deck in memory (thumbnail scale,
+/// the same parameters as the batch path) — the lazy import's
+/// pre-split thumbnail source.
+fn render_deck_page(deck: &[u8], index: usize) -> Option<Vec<u8>> {
+    let doc = open(deck).ok()?;
+    if index >= doc.slides.len() {
+        return None;
+    }
+    let (png, _, _) =
+        deckcraft_engine::cmd::file::render_png_with(&doc, index, 0.75, false, false);
+    Some(png)
 }
 
 /// Render one thumbnail page from a fragment byte string into
@@ -143,12 +230,12 @@ pub fn page_thumb(
 /// payload: 索引 + 内容块（页面）) — so a cached deck's pages
 /// render with no server and no local-library copy.
 pub fn cached_thumb(frag: &[u8], cache_dir: &Path, page: usize) -> Option<Vec<u8>> {
-    let cache_file = cache_dir.join(format!("{page}.png"));
-    if cache_file.exists() {
-        return std::fs::read(&cache_file).ok();
+    let cache_file = epoch_dir(cache_dir).join(format!("{page}.png"));
+    if let Some(bytes) = read_cached_png(&cache_file) {
+        return Some(bytes);
     }
     render_frag_thumbs(frag, cache_dir).ok()?;
-    std::fs::read(&cache_file).ok()
+    read_cached_png(&cache_file)
 }
 
 /// Why an in-process PDF export failed (transplant T1). `TextLoss`

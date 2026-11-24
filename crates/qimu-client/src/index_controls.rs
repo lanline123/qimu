@@ -251,6 +251,20 @@ impl App {
             return;
         }
         if let Some(local) = &self.local {
+            // F9 pre-check (the server enforces the same rule):
+            // one pending package per source index — submitting
+            // a second one while the first is still in review
+            // forks the review state, so point at the standing
+            // package instead of building another.
+            if let Some(prev) = self.my_submissions.iter().find(|x| {
+                s(x, "source_index_id") == id && s(x, "state") == "pending"
+            }) {
+                self.msg = format!(
+                    "该索引已有一份待审提交（{}），请先在「我的提交」中撤回或等待审批完成",
+                    s(prev, "title")
+                );
+                return;
+            }
             match local.build_submission_package(id, published_tag_id, pinned_versions) {
                 Some(Ok(mut body)) => {
                     body["title"] = json!(title);

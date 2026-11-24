@@ -631,10 +631,19 @@ fn exe_dir() -> std::path::PathBuf {
 }
 
 fn client_settings() -> Value {
-    std::fs::read_to_string(qimu_home().join("client-settings.json"))
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_else(|| json!({}))
+    // Audit2 X10 (light): a corrupt settings file used to degrade
+    // to {} silently — every preference "forgotten" with no trace.
+    // Behavior is unchanged ({} fallback), but the loss is logged.
+    let path = qimu_home().join("client-settings.json");
+    match std::fs::read_to_string(&path) {
+        Ok(t) => serde_json::from_str(&t).unwrap_or_else(|e| {
+            startup_log(&format!(
+                "client-settings.json unreadable ({e}); defaults in use"
+            ));
+            json!({})
+        }),
+        Err(_) => json!({}),
+    }
 }
 
 /// Merge `patch` keys into client-settings.json and write it back.
@@ -847,11 +856,63 @@ fn migrate_cache_dir_once() {
 }
 
 fn load_cache_index() -> Vec<Value> {
-    std::fs::read_to_string(cache_dir().join("index.json"))
-        .ok()
-        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default()
+    // Audit2 X10 (light): same treatment as client_settings — a
+    // corrupt cache index still falls back to empty, but not
+    // silently (the encrypted files it orphaned are the symptom
+    // the user would otherwise report as "cache vanished").
+    let path = cache_dir().join("index.json");
+    match std::fs::read_to_string(&path) {
+        Ok(t) => serde_json::from_str::<Value>(&t)
+            .ok()
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_else(|| {
+                startup_log("cache index.json unreadable; starting with an empty cache index");
+                Vec::new()
+            }),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Fingerprint of a showroom item's pinned formal version: its
+/// pinned commit plus the ordered version ids its entries
+/// resolve to. A cached bundle records the fingerprint of the
+/// formal version it captured; when a fresh live list shows a
+/// different one, the bundle no longer matches the formal
+/// version (pin audit N3). FNV-1a 64 — a change detector, not a
+/// security digest: it only has to notice a re-pin, never to
+/// resist forgery.
+fn pin_fingerprint(commit_id: &str, version_ids: &[String]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |bytes: &[u8]| {
+        for b in bytes {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    mix(commit_id.as_bytes());
+    mix(&[0xff]);
+    for id in version_ids {
+        mix(id.as_bytes());
+        mix(&[0xfe]);
+    }
+    format!("{h:016x}")
+}
+
+/// The pin fingerprint of a showroom item payload, from the
+/// fields the list payload carries (the item's pinned commit and
+/// its pinned resolution rows). Empty when the payload carries
+/// neither — nothing verifiable to compare against.
+fn item_pin_fingerprint(item: &Value) -> String {
+    let commit = s(item, "commit_id");
+    let ids: Vec<String> = item
+        .get("resolved_entries")
+        .and_then(|r| r.as_array())
+        .map(|rows| rows.iter().map(|row| s(&row["resolved"], "id")).collect())
+        .unwrap_or_default();
+    if commit.is_empty() && ids.iter().all(|i| i.is_empty()) {
+        return String::new();
+    }
+    pin_fingerprint(&commit, &ids)
 }
 
 /// The in-app PPT clipboard (PPT 剪贴板): one fragment .pptx — the
@@ -925,6 +986,23 @@ fn cache_key() -> Option<[u8; 32]> {
     let path = dir.join("cache.key");
     if let Some(key) = read_key_file(&path) {
         return Some(key);
+    }
+    // Audit2 E-M3: a key file that EXISTS but does not parse is not
+    // the same as no key file. Everything already cached was
+    // encrypted under it; silently minting a fresh key (the old
+    // behavior) orphaned the whole cache behind a misleading
+    // "decryption failed". Preserve the corrupt file under a
+    // timestamped name and log it, so the loss is diagnosable and
+    // the file itself survives for any recovery attempt.
+    if path.exists() {
+        let stamp = qimu_core::auth::now_ms();
+        let preserved = dir.join(format!("cache.key.corrupt-{stamp}"));
+        if std::fs::rename(&path, &preserved).is_ok() {
+            startup_log(&format!(
+                "cache.key was unreadable; preserved as {} — previously cached content cannot be decrypted",
+                preserved.display()
+            ));
+        }
     }
     // Pre-move key location (~/.qimu/cache.key): reuse it so snapshots
     // encrypted before the move still open; copy it into the cache dir.
@@ -1005,10 +1083,14 @@ enum DcMode {
 
 /// Events the DeckCraft watcher thread reports back to the UI thread.
 enum DcEvent {
-    /// The show was observed running and then ended.
-    ShowEnded,
+    /// The show was observed running and then ended. Carries the
+    /// watcher generation that observed it (audit2 E-M9: an event
+    /// already queued when a newer jump superseded its session
+    /// used to be applied to the NEW session — the poll side now
+    /// drops events whose generation is no longer current).
+    ShowEnded(u64),
     /// The control channel is dead (instance closed or crashed).
-    Gone,
+    Gone(u64),
 }
 
 /// The managed DeckCraft instance (one per client, never the user's
@@ -1030,8 +1112,15 @@ struct DcSession {
 /// the server's deckcraft-cli convention (deckcraft_cli_bin).
 fn deckcraft_app_path() -> Option<std::path::PathBuf> {
     if let Ok(p) = std::env::var("QIMU_DECKCRAFT_APP") {
+        // Audit2 E-L6: a stale env path used to be trusted blindly —
+        // every door then believed DeckCraft was installed, skipped
+        // the install prompt and failed opaquely in the jump. Only
+        // an existing file counts.
         if !p.is_empty() {
-            return Some(std::path::PathBuf::from(p));
+            let path = std::path::PathBuf::from(p);
+            if path.is_file() {
+                return Some(path);
+            }
         }
     }
     let name = format!("deckcraft{}", std::env::consts::EXE_SUFFIX);
@@ -1071,6 +1160,20 @@ fn dc_content_stamp(bytes: &[u8]) -> String {
         h = h.wrapping_mul(0x100000001b3);
     }
     format!("{:08x}", (h ^ (h >> 32)) as u32)
+}
+
+/// Full-width (64-bit) content stamp for the unified opener's
+/// disposable copies (audit2 E-N3): those names carry no item
+/// scope, so the folded 32-bit stamp alone made collisions between
+/// different decks a matter of volume; the full hash plus the byte
+/// length is the name.
+fn dc_content_stamp64(bytes: &[u8]) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{h:016x}-{}", bytes.len())
 }
 
 /// Device-local preference. Preserve explicit choices from the old settings file.
@@ -1198,14 +1301,14 @@ fn dc_watch(
                     seen_showing = true;
                 } else if seen_showing && !sent_end {
                     sent_end = true;
-                    let _ = tx.send(DcEvent::ShowEnded);
+                    let _ = tx.send(DcEvent::ShowEnded(my_gen));
                 }
             }
             Err(_) => {
                 ctl = None;
                 errors += 1;
                 if errors >= 5 {
-                    let _ = tx.send(DcEvent::Gone);
+                    let _ = tx.send(DcEvent::Gone(my_gen));
                     return;
                 }
             }
@@ -1214,15 +1317,20 @@ fn dc_watch(
     }
 }
 
-fn save_cache_index(entries: &[Value]) {
+/// Persist the cache index. Returns false when the write failed
+/// (audit2 E-M4: callers used to report "已缓存" unconditionally —
+/// the entry then vanished on restart and its encrypted file
+/// became an orphan).
+fn save_cache_index(entries: &[Value]) -> bool {
     let dir = cache_dir();
     let _ = std::fs::create_dir_all(&dir);
-    let _ = craft_atomic::atomic_write(
+    craft_atomic::atomic_write(
         &dir.join("index.json"),
         serde_json::to_string_pretty(&json!(entries))
             .unwrap_or_default()
             .as_bytes(),
-    );
+    )
+    .is_ok()
 }
 
 /// Short human label for one index entry's version policy (merge view).
@@ -1850,6 +1958,22 @@ impl TrashState {
 enum ReviewFrame {
     Queue(ReviewQueueState),
     Detail(ReviewDetailState),
+    /// F1: a P3 submission package's content preview. The
+    /// manifest and page renders come from the staged package
+    /// itself (GET /v1/submissions/:id/manifest + /files/:hash),
+    /// never from the submitter's source library — what the
+    /// reviewer sees is exactly what an approval would land.
+    Submission(SubmissionDetailState),
+}
+
+struct SubmissionDetailState {
+    sub_id: String,
+    /// The endpoint's `{submission, manifest}` payload.
+    manifest: Option<Value>,
+    loaded: bool,
+    load_error: String,
+    reject_open: bool,
+    reject_text: String,
 }
 
 #[derive(Default)]
@@ -2710,7 +2834,11 @@ struct PickTemplateState {
 /// frames in stack order; Confirm is the top-most kind and is the
 /// only one allowed to stack over another overlay (over PageEdit).
 enum Overlay {
-    AllVersions { entry_pos: usize },
+    /// `index_id` is captured when the window opens (audit M2):
+    /// the window renders and acts on that index's detail frame
+    /// only, and closes if a different frame is current — it
+    /// must never silently rebind to whatever detail is open.
+    AllVersions { entry_pos: usize, index_id: String },
     Present(PresentState),
     PageEdit(PageEditState),
     Light(LightState),
@@ -2749,10 +2877,15 @@ enum ConfirmAction {
     MovePageBinding(PageBindingRequest),
     /// Transplant T1: the in-process PDF export hit TextLoss and
     /// the user accepted the raster-only retry (no text layer).
+    /// Carries the deck bytes as assembled when the warning was
+    /// raised (audit2 E-L5): the retry exports exactly the deck
+    /// the user was warned about, not whatever the library has
+    /// since become.
     PdfRasterFallback {
-        item: Value,
+        deck: Vec<u8>,
         form: String,
         page: Option<usize>,
+        stem: String,
     },
     /// Library discovery (2026-11-25): the post-relocation prompt's
     /// affirmative answer — delete the source library a verified
@@ -2880,8 +3013,8 @@ fn showroom_pages(deck: &Value) -> Vec<ShowroomPage> {
 /// while the server job runs, then exactly one terminal result (the
 /// same payload the synchronous translate endpoint returns).
 enum TranslateEvent {
-    Progress(usize, usize),
-    Done(Result<Value, String>),
+    Progress(u64, usize, usize),
+    Done(u64, Result<Value, String>),
 }
 
 /// Events from the import worker thread. `Opened` is the staged
@@ -2893,8 +3026,58 @@ enum TranslateEvent {
 /// the caller's flow computed from the import payload, Err the
 /// failure wording).
 enum ImportEvent {
-    Opened(String),
-    Done(Result<String, String>),
+    Opened(u64, String, Vec<String>),
+    Done(u64, Result<String, String>),
+    /// Lazy import (2026-11-25): a deck finished opening — its
+    /// pages are on the wall as wrappers and the durable split
+    /// state exists under this pending id. Carries no generation:
+    /// the lazy pipeline only exists over the local library,
+    /// which account/mode switches do not invalidate (G4 N4:
+    /// local-mode imports are account-independent and keep
+    /// running across them).
+    LazyOpened(String),
+    /// Lazy import: one page's split step landed (see
+    /// LazyProgressInfo). Sent by the split worker after EVERY
+    /// page, always paired with a repaint request on the wake
+    /// context — a background event that does not wake the frame
+    /// loop is the freeze line's F1 bug and must not recur here.
+    LazyProgress(LazyProgressInfo),
+}
+
+/// One lazy split step's report to the UI.
+struct LazyProgressInfo {
+    pending_id: String,
+    index: usize,
+    split_count: usize,
+    slide_count: usize,
+    /// This step folded at least one block (the wall's unit set
+    /// changed: wrappers were absorbed into a block unit).
+    grouped: bool,
+    done: bool,
+    failed: bool,
+    error: String,
+}
+
+/// One still-splitting deck as the UI mirrors it (the durable
+/// truth lives in the core's pending-import records; this is
+/// the display + queue-bookkeeping copy).
+#[derive(Clone)]
+struct LazyPendingUi {
+    stem: String,
+    slide_count: usize,
+    split_count: usize,
+    failed: bool,
+    error: String,
+}
+
+/// Commands to the lazy split worker. Priority, highest first:
+/// Boost (a page card the user clicked) > Visible (the wall's
+/// current viewport) > the worker's own background order (oldest
+/// deck first, page order within it).
+enum LazyCmd {
+    Boost(Vec<(String, usize)>),
+    Visible(Vec<(String, usize)>),
+    Kick,
 }
 
 struct App {
@@ -3000,12 +3183,14 @@ struct App {
     pdf_view: Option<PdfView>,
     pdf_tx: std::sync::mpsc::Sender<(
         String,
+        u64,
         usize,
         Option<std::sync::Arc<Vec<u8>>>,
         Result<PdfImg, String>,
     )>,
     pdf_rx: std::sync::mpsc::Receiver<(
         String,
+        u64,
         usize,
         Option<std::sync::Arc<Vec<u8>>>,
         Result<PdfImg, String>,
@@ -3022,6 +3207,11 @@ struct App {
     translate_tx: std::sync::mpsc::Sender<TranslateEvent>,
     translate_rx: std::sync::mpsc::Receiver<TranslateEvent>,
     translating: Option<(String, usize, usize)>,
+    /// Generation of the current translation context (audit H1):
+    /// bumped by every account-context reset, captured by the
+    /// worker at spawn; events from an older generation belong to
+    /// the previous account and are dropped, never applied.
+    translate_gen: u64,
     /// PPT import: worker channel plus, while an import runs on
     /// its worker thread, the deck name for the in-progress
     /// readout. The import itself (base64, parse, split, verify,
@@ -3029,6 +3219,68 @@ struct App {
     import_tx: std::sync::mpsc::Sender<ImportEvent>,
     import_rx: std::sync::mpsc::Receiver<ImportEvent>,
     importing: Option<String>,
+    /// Lazy import (2026-11-25): decks still splitting, by
+    /// pending id; wrapper unit id -> (pending id, page index)
+    /// for every page not yet split (the map IS the "unusable"
+    /// set: cards in it render but cannot open, select or
+    /// insert, and clicking one boosts its split); the split
+    /// worker's command channel (None until the first pending
+    /// deck appears); the turbo flag shared with the worker;
+    /// the unsplit unit ids the wall rendered last frame
+    /// (viewport priority feed) and the set last sent.
+    lazy_pendings: std::collections::HashMap<String, LazyPendingUi>,
+    lazy_unit_page: std::collections::HashMap<String, (String, usize)>,
+    lazy_cmd_tx: Option<std::sync::mpsc::Sender<LazyCmd>>,
+    lazy_turbo: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    lazy_visible_boost: std::collections::HashSet<String>,
+    lazy_visible_sent: std::collections::HashSet<String>,
+    /// Frame-wake context the lazy threads clone: every lazy
+    /// background event is paired with a repaint request on it.
+    /// (Kept apart from `egui_ctx` below — the freeze line's
+    /// per-frame handle — so each pipeline wakes through its
+    /// own field.)
+    lazy_wake_ctx: Option<egui::Context>,
+    /// egui context handle, refreshed every frame in `ui`, so a
+    /// worker thread can wake the frame loop when it posts an
+    /// event: the reactive loop otherwise sleeps until the next
+    /// input event arrives, and events queued meanwhile (an
+    /// import's `Opened`, then its `Done`) drain in one late
+    /// batch — the window looks frozen and every page appears
+    /// at once.
+    egui_ctx: Option<egui::Context>,
+    /// An import `Opened` beat whose wall refresh is still
+    /// waiting for the local store's lock (the grouping stage
+    /// holds it): retried on the following frames instead of
+    /// blocking the frame that collected the beat.
+    open_refresh_pending: bool,
+    /// Generation of the current import context (audit N4): same
+    /// discipline as `translate_gen` for the REST-fallback import
+    /// worker, which captures the connection at spawn.
+    import_gen: u64,
+    /// Wrapper unit ids of the in-flight staged import, between
+    /// its Opened beat and its Done (audit N1): grouping is about
+    /// to absorb those units, so opening / editing / trashing
+    /// them is refused until the import settles.
+    import_open_units: Vec<String>,
+    /// PDF preview request generation (audit M3): bumped by every
+    /// open / page flip; render results carrying an older
+    /// generation are stale and dropped.
+    pdf_seq: u64,
+    /// Forced password change (G2 contract): the login surface
+    /// reported `must_change_password` for the active account, so
+    /// a non-dismissable change dialog gates the main UI until
+    /// the change succeeds. The draft fields live and die here.
+    must_change_pw: bool,
+    pw_change_old: String,
+    pw_change_new: String,
+    pw_change_new2: String,
+    pw_change_error: String,
+    /// Toast re-stamp nonce (audit L4): bumped by `say`, so a
+    /// repeated action whose outcome wording is identical to the
+    /// previous message still re-shows the toast and re-records
+    /// in the message center.
+    toast_nonce: u64,
+    toast_seen_nonce: u64,
     /// Last /v1/ai/status payload (provider / configured / model) —
     /// drives the "stub placeholder" hint by the translate button.
     ai_status: Option<Value>,
@@ -3078,7 +3330,10 @@ struct App {
 enum ThumbState {
     Loading,
     Ready(egui::TextureHandle),
-    Failed,
+    /// Carries when the fetch failed (audit2 E-M2): a failure is
+    /// retried after a bounded delay instead of pinning the card
+    /// to its placeholder for the rest of the session.
+    Failed(std::time::Instant),
 }
 
 /// One rendered PDF page (PdfCraft / hayro raster), ready to upload as a
@@ -3101,6 +3356,10 @@ struct PdfView {
     pages: usize,
     tex: Option<egui::TextureHandle>,
     note: String,
+    /// Generation of the latest render request (audit M3): a
+    /// result arriving with an older generation is a page the
+    /// user has already flipped away from.
+    seq: u64,
 }
 
 /// Render one page of a PDF with PdfCraft's rasterizer (off the UI thread).
@@ -3152,7 +3411,10 @@ fn lan_update_check(server: &str) -> Result<Option<String>, String> {
         .map_err(|e| format!("读取镜像发布列表失败：{e}"))?
         .into_string()
         .map_err(|e| format!("读取镜像发布列表失败：{e}"))?;
-    let latest = craft_update::parse_github_release_list(&text, "lanline136/qimu", false)
+    // Audit2 X7: the slug was mistyped "lanline136" — craft-update
+    // filters assets by exact release URL, so every mirrored asset
+    // was filtered out and the prompt never carried a download.
+    let latest = craft_update::parse_github_release_list(&text, "lanline123/qimu", false)
         .map_err(|e| format!("解析镜像发布列表失败：{e}"))?;
     let Some(rel) = latest else { return Ok(None) };
     let (Some(rel_v), Some(cur_v)) = (
@@ -3205,9 +3467,16 @@ fn init_i18n() {
         i18n
     });
     let settings = client_settings();
-    let locale = std::env::var("QIMU_LOCALE")
-        .ok()
-        .unwrap_or_else(|| s(&settings, "locale"));
+    // Audit2 X14: the in-app language choice wins; QIMU_LOCALE is
+    // only the default for a profile that has never chosen (an env
+    // var set machine-wide used to override the user's own pick on
+    // every single launch).
+    let chosen = s(&settings, "locale");
+    let locale = if !chosen.is_empty() {
+        chosen
+    } else {
+        std::env::var("QIMU_LOCALE").unwrap_or_default()
+    };
     ENGLISH_UI.set(locale.to_ascii_lowercase().starts_with("en"));
     LIGHT_THEME.set(settings["theme"] == "light");
 }
@@ -3427,10 +3696,18 @@ fn save_conns(conns: &[Conn]) {
         .collect();
     let dir = qimu_home();
     let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::write(
-        dir.join("servers.json"),
-        serde_json::to_string_pretty(&Value::Array(arr)).unwrap_or_default(),
-    );
+    // Audit2 X6: servers.json holds session tokens — it gets the
+    // same atomic write as client-settings.json next door (a bare
+    // fs::write could leave it truncated mid-crash), and a failed
+    // save is logged instead of silently swallowed.
+    if let Err(e) = craft_atomic::atomic_write(
+        &dir.join("servers.json"),
+        serde_json::to_string_pretty(&Value::Array(arr))
+            .unwrap_or_default()
+            .as_bytes(),
+    ) {
+        startup_log(&format!("save_conns failed: {e}"));
+    }
 }
 
 /// Ask a server for an anonymous guest session (org-model G1):
@@ -3466,6 +3743,40 @@ impl CallFail {
     }
 }
 
+/// The shared REST agent for ordinary calls (audit H2): bounded
+/// connect/read timeouts, so a server that vanishes without a
+/// RST can no longer freeze the UI thread (or a worker thread)
+/// forever. The values are LAN-generous — a 5 s connect bound and
+/// a 120 s read-inactivity window leave slow servers and large
+/// import payloads room, while guaranteeing every call returns.
+fn rest_agent() -> ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT
+        .get_or_init(|| {
+            ureq::AgentBuilder::new()
+                .timeout_connect(std::time::Duration::from_secs(5))
+                .timeout_read(std::time::Duration::from_secs(120))
+                .build()
+        })
+        .clone()
+}
+
+/// The thumbnail fetch agent (audit H2): thumbnails are small and
+/// plentiful, so their read bound is tighter than the general
+/// REST agent's — a stalled fetch resolves as a (retryable)
+/// failure instead of pinning the card in Loading forever.
+fn thumb_agent() -> ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT
+        .get_or_init(|| {
+            ureq::AgentBuilder::new()
+                .timeout_connect(std::time::Duration::from_secs(5))
+                .timeout_read(std::time::Duration::from_secs(30))
+                .build()
+        })
+        .clone()
+}
+
 /// One HTTP call against an explicit server/token (App::call delegates
 /// here with the active connection). `short_timeout` is for session
 /// validation probes, where a dead server must not stall startup.
@@ -3491,12 +3802,13 @@ fn raw_call_k(
             _ => agent.post(&full),
         }
     } else {
+        let agent = rest_agent();
         match method {
-            "GET" => ureq::get(&full),
-            "PUT" => ureq::put(&full),
-            "PATCH" => ureq::patch(&full),
-            "DELETE" => ureq::delete(&full),
-            _ => ureq::post(&full),
+            "GET" => agent.get(&full),
+            "PUT" => agent.put(&full),
+            "PATCH" => agent.patch(&full),
+            "DELETE" => agent.delete(&full),
+            _ => agent.post(&full),
         }
     };
     if let Some(t) = token {
@@ -3576,11 +3888,13 @@ fn staged_import_thread(
     server: &str,
     token: Option<&str>,
     tx: &std::sync::mpsc::Sender<ImportEvent>,
+    gen: u64,
     name: &str,
     bytes: &[u8],
     folder_id: &Option<String>,
     group_id: &str,
     blocks: Option<Value>,
+    wake: Option<&egui::Context>,
 ) -> Result<Value, String> {
     let data = b64e(bytes);
     if local.is_none() {
@@ -3616,9 +3930,26 @@ fn staged_import_thread(
         .get("slide_count")
         .and_then(|x| x.as_i64())
         .unwrap_or(0);
-    let _ = tx.send(ImportEvent::Opened(format!(
-        "已打开「{name}」：{slide_count} 页，正在成块…"
-    )));
+    // The wrapper unit ids ride along so the UI can lock those
+    // cards until grouping settles (audit N1): a wrapper opened,
+    // edited or trashed mid-grouping would be silently discarded
+    // — or fail the whole group stage after half of it landed.
+    let wrapper_ids: Vec<String> = opened
+        .get("pages")
+        .and_then(|p| p.as_array())
+        .map(|arr| arr.iter().map(|p| s(p, "unit_id")).filter(|u| !u.is_empty()).collect())
+        .unwrap_or_default();
+    let _ = tx.send(ImportEvent::Opened(
+        gen,
+        format!("已打开「{name}」：{slide_count} 页，正在成块…"),
+        wrapper_ids,
+    ));
+    // Wake the frame loop so the beat is collected (and the
+    // freshly landed cards painted) now, not whenever the next
+    // input event happens to schedule a frame.
+    if let Some(ctx) = wake {
+        ctx.request_repaint();
+    }
     if let (Some(local_arc), Some(pages)) = (
         local.clone(),
         opened.get("pages").and_then(|p| p.as_array()),
@@ -3650,6 +3981,181 @@ fn staged_import_thread(
         "/v1/import/group",
         Some(group_body),
     )
+}
+
+/// The lazy import split worker (user ruling 2026-11-25): a
+/// long-lived background thread that drains every pending
+/// import page by page through the local face's lazy-split
+/// route — one page per call, so the store lock is held for a
+/// single page's split and the UI thread never parks behind it
+/// (the freeze line's F3 discipline). Page choice, highest
+/// priority first: pages the user clicked (Boost) > pages in
+/// the wall's current viewport (Visible) > background order
+/// (oldest pending deck first, page order inside it — the
+/// worker re-reads the durable states for this tier, so a
+/// restart or a forgotten deck can never desync it). After
+/// every page it reports progress on the import channel AND
+/// requests a repaint on the wake context: an event that does
+/// not wake the frame loop is the freeze line's F1 bug.
+///
+/// Pacing: in the default posture the worker yields 30 ms
+/// between pages so interactive thumbnail renders and other
+/// local calls interleave — the split is still the background's
+/// main job and runs continuously. Turbo （极速分割） removes
+/// the yield entirely. The store is a single serial connection,
+/// so no mode parallelizes splits against each other; turbo is
+/// honestly "no throttling", never fake concurrency.
+fn lazy_worker_thread(
+    local: std::sync::Arc<local_store::LocalStore>,
+    cmd_rx: std::sync::mpsc::Receiver<LazyCmd>,
+    tx: std::sync::mpsc::Sender<ImportEvent>,
+    wake: Option<egui::Context>,
+    turbo: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::collections::VecDeque;
+    let mut boost: VecDeque<(String, usize)> = VecDeque::new();
+    let mut visible: VecDeque<(String, usize)> = VecDeque::new();
+    // Whether any deck might still have unsplit pages. The
+    // worker only spawns when a pending deck exists, and every
+    // new deck arrives with a command, so once a background pick
+    // finds nothing, the worker blocks on the channel instead
+    // of polling the state list forever.
+    let mut dirty = true;
+    loop {
+        // Collect commands; block while there is nothing queued
+        // (a Kick or a fresh Boost/Visible is what wakes us).
+        if boost.is_empty() && visible.is_empty() {
+            let got = if dirty {
+                cmd_rx.recv_timeout(std::time::Duration::from_millis(300))
+            } else {
+                cmd_rx
+                    .recv()
+                    .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
+            };
+            match got {
+                Ok(cmd) => {
+                    dirty = true;
+                    apply_lazy_cmd(cmd, &mut boost, &mut visible);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        }
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            dirty = true;
+            apply_lazy_cmd(cmd, &mut boost, &mut visible);
+        }
+        let next = boost.pop_front().or_else(|| visible.pop_front());
+        let next = match next {
+            Some(p) => Some(p),
+            None if dirty => {
+                let pick = lazy_background_pick(&local);
+                if pick.is_none() {
+                    dirty = false;
+                }
+                pick
+            }
+            None => None,
+        };
+        let Some((pending_id, index)) = next else {
+            continue;
+        };
+        let body = json!({ "pending_id": pending_id, "index": index });
+        let r = local
+            .dispatch("POST", "/v1/import/lazy-split", Some(&body))
+            .unwrap_or_else(|| Err("本地库未接管分割请求".to_string()));
+        match r {
+            Ok(v) => {
+                let info = LazyProgressInfo {
+                    pending_id: pending_id.clone(),
+                    index,
+                    split_count: i(&v, "split_count") as usize,
+                    slide_count: i(&v, "slide_count") as usize,
+                    grouped: v
+                        .get("grouped_units")
+                        .and_then(|g| g.as_array())
+                        .map(|a| !a.is_empty())
+                        .unwrap_or(false),
+                    done: v.get("done").and_then(|x| x.as_bool()).unwrap_or(false),
+                    failed: v.get("failed").and_then(|x| x.as_bool()).unwrap_or(false),
+                    error: s(&v, "error"),
+                };
+                if info.failed {
+                    boost.retain(|(p, _)| p != &pending_id);
+                    visible.retain(|(p, _)| p != &pending_id);
+                }
+                let _ = tx.send(ImportEvent::LazyProgress(info));
+                if let Some(ctx) = &wake {
+                    ctx.request_repaint();
+                }
+            }
+            Err(_) => {
+                // A failed step (transient store error, a deck
+                // forgotten mid-flight): back off briefly instead
+                // of spinning on it; the page stays pending and a
+                // later Kick or click retries it.
+                std::thread::sleep(std::time::Duration::from_millis(400));
+            }
+        }
+        if !turbo.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+    }
+}
+
+fn apply_lazy_cmd(
+    cmd: LazyCmd,
+    boost: &mut std::collections::VecDeque<(String, usize)>,
+    visible: &mut std::collections::VecDeque<(String, usize)>,
+) {
+    match cmd {
+        // Front of the queue, argument order preserved: the
+        // first page named is the next page split.
+        LazyCmd::Boost(pages) => {
+            for p in pages.into_iter().rev() {
+                boost.push_front(p);
+            }
+        }
+        LazyCmd::Visible(pages) => {
+            for p in pages.into_iter().rev() {
+                if !visible.contains(&p) {
+                    visible.push_front(p);
+                }
+            }
+        }
+        LazyCmd::Kick => {}
+    }
+}
+
+/// The worker's background pick: the oldest pending deck's
+/// first unsplit page, straight from the durable states. A deck
+/// whose pages all read split but whose record still exists
+/// (grouping / the deck-level gate not yet run — e.g. right
+/// after a restart) is picked once at its first page, which
+/// runs exactly that advance inside the core.
+fn lazy_background_pick(
+    local: &local_store::LocalStore,
+) -> Option<(String, usize)> {
+    let states = local
+        .dispatch("POST", "/v1/import/lazy-list", None)
+        .and_then(|r| r.ok())?;
+    for st in states.as_array()? {
+        if s(st, "state") == "failed" {
+            continue;
+        }
+        let pid = s(st, "pending_id");
+        let pages = st.get("pages").and_then(|p| p.as_array())?;
+        if let Some(p) = pages
+            .iter()
+            .find(|p| p.get("split").and_then(|x| x.as_bool()) != Some(true))
+        {
+            return Some((pid, i(p, "index") as usize));
+        }
+        if !pages.is_empty() {
+            return Some((pid, i(&pages[0], "index") as usize));
+        }
+    }
+    None
 }
 
 /// LAN discovery: broadcast QIMU_DISCOVER_V1 on UDP 8731 and collect the
@@ -3690,6 +4196,51 @@ fn discover_servers() -> Vec<Value> {
     found
 }
 
+
+/// Login-field seeds from the process environment — the automation
+/// harness's way to start the client already pointed at a test
+/// server with credentials (audit2 F-N1). Debug builds only: the
+/// shipped packages are compiled with the staging or release
+/// profile, both of which inherit release defaults
+/// (debug_assertions off), so in a shipped client the environment
+/// can neither pre-fill a password nor steer the first login at an
+/// attacker-chosen server — the fields start with the plain
+/// defaults, exactly as if the variables were unset.
+#[cfg(debug_assertions)]
+fn env_login_seed() -> (String, String, String) {
+    (
+        std::env::var("QIMU_SERVER").unwrap_or_else(|_| "http://127.0.0.1:8730".into()),
+        std::env::var("QIMU_USERNAME").unwrap_or_else(|_| "admin".into()),
+        std::env::var("QIMU_PASSWORD").unwrap_or_default(),
+    )
+}
+
+/// Release-class counterpart of the seed above: constant defaults,
+/// the environment is never consulted for credentials.
+#[cfg(not(debug_assertions))]
+fn env_login_seed() -> (String, String, String) {
+    (
+        "http://127.0.0.1:8730".into(),
+        "admin".into(),
+        String::new(),
+    )
+}
+
+/// Whether the automation harness asked for an immediate login
+/// (QIMU_AUTOLOGIN). Debug builds only, like the seed: in shipped
+/// packages this is a compile-time false and the branch it guards
+/// (including its QIMU_OPEN sub-actions) is eliminated.
+#[cfg(debug_assertions)]
+fn env_autologin_requested() -> bool {
+    std::env::var("QIMU_AUTOLOGIN").is_ok()
+}
+
+/// Release-class counterpart: never.
+#[cfg(not(debug_assertions))]
+fn env_autologin_requested() -> bool {
+    false
+}
+
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         egui_extras::install_image_loaders(&cc.egui_ctx);
@@ -3713,10 +4264,10 @@ impl App {
         let (import_tx, import_rx) = std::sync::mpsc::channel();
         let (dc_tx, dc_rx) = std::sync::mpsc::channel();
         let mut app = App {
-            server: std::env::var("QIMU_SERVER").unwrap_or_else(|_| "http://127.0.0.1:8730".into()),
+            server: env_login_seed().0,
             current_server_name: String::new(),
-            username: std::env::var("QIMU_USERNAME").unwrap_or_else(|_| "admin".into()),
-            password: std::env::var("QIMU_PASSWORD").unwrap_or_default(),
+            username: env_login_seed().1,
+            password: env_login_seed().2,
             token: None,
             user: None,
             conns: vec![],
@@ -3806,9 +4357,29 @@ impl App {
             translate_tx,
             translate_rx,
             translating: None,
+            translate_gen: 0,
             import_tx,
             import_rx,
             importing: None,
+            lazy_pendings: std::collections::HashMap::new(),
+            lazy_unit_page: std::collections::HashMap::new(),
+            lazy_cmd_tx: None,
+            lazy_turbo: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            lazy_visible_boost: std::collections::HashSet::new(),
+            lazy_visible_sent: std::collections::HashSet::new(),
+            lazy_wake_ctx: Some(cc.egui_ctx.clone()),
+            egui_ctx: None,
+            open_refresh_pending: false,
+            import_gen: 0,
+            import_open_units: vec![],
+            pdf_seq: 0,
+            must_change_pw: false,
+            pw_change_old: String::new(),
+            pw_change_new: String::new(),
+            pw_change_new2: String::new(),
+            pw_change_error: String::new(),
+            toast_nonce: 0,
+            toast_seen_nonce: 0,
             ai_status: None,
             lang_options: Vec::new(),
             workspace_controls: WorkspaceControls::default(),
@@ -3846,10 +4417,22 @@ impl App {
                                 "[qimu] 搬迁后的旧库已按设置（删除）移除：{}",
                                 src.display()
                             ),
-                            Err(e) => eprintln!(
-                                "[qimu] 搬迁后的旧库删除失败（{e}）：{}",
-                                src.display()
-                            ),
+                            Err(e) => {
+                                eprintln!(
+                                    "[qimu] 搬迁后的旧库删除失败（{e}）：{}",
+                                    src.display()
+                                );
+                                // Not stderr-only (audit P5): the
+                                // old libraries usually sit under
+                                // Program Files, where this delete
+                                // routinely lacks permission — the
+                                // user who chose "delete" must hear
+                                // that it did not happen.
+                                app.msg = format!(
+                                    "旧库自动删除失败（{e}）：{} 仍保留在原处，可手动删除，或在设置里调整旧库处置",
+                                    src.display()
+                                );
+                            }
                         }
                     }
                     local_store::OldLibraryPolicy::Ask => {
@@ -3869,7 +4452,13 @@ impl App {
                 }
             }
         }
-        if std::env::var("QIMU_AUTOLOGIN").is_ok() && !app.password.is_empty() {
+        // Lazy import resume (2026-11-25): decks that were still
+        // splitting when the client last closed pick up where
+        // they stopped — their pending records are durable in
+        // the local library, so this launch re-adopts them and
+        // restarts the split worker.
+        app.lazy_resume();
+        if env_autologin_requested() && !app.password.is_empty() {
             app.do_login();
             // Screenshot helper: QIMU_OPEN=index|unit opens the first item's detail.
             match std::env::var("QIMU_OPEN").as_deref() {
@@ -3902,6 +4491,14 @@ impl App {
         if app.active.is_none() {
             app.current_server_name =
                 fetch_server_name(&app.server).unwrap_or_else(|_| conn_display_name(&app.server));
+        }
+        // A startup relocation (a settings-registered data-dir
+        // move, or a cancelled/failed one) leaves a one-shot
+        // notice in the bootstrap config; surface it once here —
+        // set after the connection restore so nothing overwrites
+        // it before the first frame.
+        if let Some(notice) = local_store::take_relocate_notice() {
+            app.msg = notice;
         }
         // Screenshot/test hooks that need a logged-in app, on either
         // start path: QIMU_OPEN=showroom:<item-id> opens the deck view;
@@ -4103,6 +4700,7 @@ impl App {
                     .and_then(|t| t.as_str())
                     .map(|s| s.to_string());
                 self.user = v.get("user").cloned();
+                self.note_must_change(&v);
                 self.msg = "登录成功".into();
                 self.login_open = false;
                 // Persist this server as a saved connection so the next
@@ -4251,6 +4849,22 @@ impl App {
         }
     }
 
+    /// G2 contract: a login / session payload flagging that the
+    /// account still uses a must-change password (e.g. the seeded
+    /// default). The flag may ride at the payload's top level or
+    /// inside its `user` object; either raises the forced change
+    /// dialog (`force_change_pw_ui`).
+    fn note_must_change(&mut self, v: &Value) {
+        let flag = |x: &Value| {
+            x.get("must_change_password")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false)
+        };
+        if flag(v) || v.get("user").map(|u| flag(u)).unwrap_or(false) {
+            self.must_change_pw = true;
+        }
+    }
+
     /// Make conn i the active server: validate, mirror fields, reload.
     fn activate(&mut self, i: usize) {
         if i >= self.conns.len() {
@@ -4276,6 +4890,22 @@ impl App {
                 self.conns[i].name
             );
             self.refresh_guest();
+        } else if self.conns[i].status == ConnStatus::Failed {
+            // A failed revalidation must not be silent (audit
+            // L2): the previous identity's object is already
+            // cleared above; say plainly that this connection did
+            // not come back.
+            self.say(format!(
+                "连接 {} 失败或会话已过期，未能切换；请重新登录",
+                self.conns[i].name
+            ));
+        } else if self.conns[i].status == ConnStatus::LoggedOut {
+            self.say(format!("服务器 {} 尚未登录", self.conns[i].name));
+        }
+        // G2 contract: a session that comes back flagged
+        // must-change raises the forced change dialog.
+        if let Some(u) = self.user.clone() {
+            self.note_must_change(&u);
         }
     }
 
@@ -4324,6 +4954,7 @@ impl App {
                 let (url, token) = (self.conns[i].url.clone(), self.conns[i].token.clone());
                 if let Ok(v) = raw_call(&url, token.as_deref(), "GET", "/v1/me", None, true) {
                     self.user = v.get("user").cloned();
+                    self.note_must_change(&v);
                 }
             }
             self.sync_from_active();
@@ -4380,6 +5011,7 @@ impl App {
             false,
         ) {
             Ok(v) => {
+                self.note_must_change(&v);
                 let token = v
                     .get("token")
                     .and_then(|t| t.as_str())
@@ -4577,13 +5209,30 @@ impl App {
         self.token = None;
         self.user = None;
         if let Some(i) = self.active {
+            let (anon, url) = self
+                .conns
+                .get(i)
+                .map(|c| (c.anon, c.url.clone()))
+                .unwrap_or((false, String::new()));
             if let Some(c) = self.conns.get_mut(i) {
                 c.token = None;
-                c.status = if c.anon {
-                    ConnStatus::Anonymous
-                } else {
-                    ConnStatus::LoggedOut
-                };
+                c.status = ConnStatus::LoggedOut;
+            }
+            if anon {
+                // Logging out of an anonymous connection: fall
+                // back to a FRESH guest session, so status, token
+                // and org_online() agree again (audit L3 — the old
+                // code kept status=Anonymous with the token
+                // cleared, claiming "online" while every guest
+                // read failed). If the server cannot issue one,
+                // the connection honestly reads as logged out.
+                if let Some(t) = issue_guest_token(&url) {
+                    if let Some(c) = self.conns.get_mut(i) {
+                        c.token = Some(t.clone());
+                        c.status = ConnStatus::Anonymous;
+                    }
+                    self.token = Some(t);
+                }
             }
             self.persist_conns();
         }
@@ -4642,6 +5291,13 @@ impl App {
                 .and_then(|f| f.as_array())
                 .cloned()
                 .unwrap_or_default();
+            self.reconcile_cache_staleness();
+            // Same failed-cover recovery as the named path
+            // (refresh_org): drop empty placeholders so a cover
+            // that failed once is retried on the next refresh
+            // instead of staying blank for the whole guest
+            // session (audit L5).
+            self.index_covers.retain(|_, v| !v.is_empty());
             self.resolve_showroom_covers();
         }
         self.cache_entries = load_cache_index();
@@ -4689,7 +5345,11 @@ impl App {
     /// machine, not to whichever account happens to be active.
     /// Only in the REST-fallback mode (the local library failed
     /// to open, so the working lists are server-fed) do the
-    /// working lists clear here too.
+    /// working lists clear here too — and in that mode the trash
+    /// is server-fed as well, so it resets here too (audit H3).
+    /// Async workers and armed confirmations belong to the
+    /// context that spawned them and are closed out here as well
+    /// (audits H1 / M2 / N4).
     fn clear_account_state(&mut self) {
         // Credential drafts typed for the previous context.
         self.password.clear();
@@ -4742,9 +5402,53 @@ impl App {
         self.pull_dialog = None;
         self.push_dialog = None;
         self.pdf_view = None;
-        // The DeckInfo overlay snapshots an org showroom item;
-        // other overlays are local work (page editor) and stay.
-        self.overlays.retain(|o| !matches!(o, Overlay::DeckInfo(_)));
+        // Overlays: the DeckInfo overlay snapshots an org showroom
+        // item; an armed Confirm would execute against the NEW
+        // context if left open (purge-all above all), and the
+        // all-versions window reads its target from whatever
+        // detail frame is current when it renders — all three go
+        // (audit M2). The folder-delete confirm is an App field
+        // with the same exposure and goes too. Page-editor
+        // overlays are local work and stay.
+        self.overlays.retain(|o| {
+            !matches!(
+                o,
+                Overlay::DeckInfo(_) | Overlay::Confirm(_) | Overlay::AllVersions { .. }
+            )
+        });
+        self.folder_delete_confirm = None;
+        // In-flight translation belongs to the previous account:
+        // its worker polls the old server with the old token.
+        // Clear the busy state and bump the generation so the
+        // worker's eventual result is dropped, never applied to
+        // this context (audit H1).
+        self.translating = None;
+        self.translate_gen += 1;
+        // The forced-change gate belongs to the identity that
+        // raised it.
+        self.must_change_pw = false;
+        self.pw_change_old.clear();
+        self.pw_change_new.clear();
+        self.pw_change_new2.clear();
+        self.pw_change_error.clear();
+        // Trash (audit H3): with the local library open, the
+        // trash is this machine's own data and stays. In the
+        // REST fallback it is *server*-fed — the previous
+        // server's list and preview frame must not survive the
+        // switch, or a purge would land on the new server's
+        // trash the user never saw.
+        if self.local.is_none() {
+            self.trash = TrashState::new();
+            // An in-flight fallback import likewise captured the
+            // previous connection: it would land its deck on the
+            // previous server while reporting success here
+            // (audit N4). In local mode the import targets the
+            // local library regardless of account and is left
+            // running.
+            self.importing = None;
+            self.import_open_units.clear();
+            self.import_gen += 1;
+        }
         // Showroom navigation: back to the wall, no stale
         // selection of the previous account's items.
         self.showroom.stack.pop_to(0);
@@ -4771,12 +5475,70 @@ impl App {
         }
     }
 
+    /// After an import settles, drop wall selection ids whose
+    /// units no longer exist (grouping absorbed the one-page
+    /// wrappers): the bottom bar must not count or act on dead
+    /// ids (audit N1).
+    fn prune_wall_selection(&mut self) {
+        let alive: Vec<String> = self
+            .units
+            .iter()
+            .filter_map(|it| it.get("unit"))
+            .map(|u| s(u, "id"))
+            .collect();
+        if let ContentFrame::Wall(w) = self.content.stack.root_mut() {
+            w.multi.retain(|id| alive.contains(id));
+            if let Some(sel) = &w.selected {
+                if !alive.contains(sel) {
+                    w.selected = None;
+                }
+            }
+        }
+    }
+
     /// Refresh dispatcher (local-first P0/P4): working data
     /// (folders/groups/units/indexes) is fed by the in-process
     /// local library and only the organization surfaces go over
     /// REST. The all-REST refresh (refresh_all_rest below) remains
     /// verbatim as the fallback for a local library that failed
     /// to open.
+    /// The import `Opened` beat's wall refresh: stage 1 has
+    /// landed every page as a one-page unit and those cards
+    /// should appear NOW, while the grouping stage may still be
+    /// running on the worker thread. Unlike `refresh_all` this
+    /// never blocks the frame: it takes the four working-data
+    /// lists through the store's try-lock snapshot (skipping
+    /// the per-index detail pass and the org sweep — the
+    /// completion refresh covers both) and returns false when
+    /// the lock is held, leaving `open_refresh_pending` set so
+    /// the drain retries on the following frames. (The full
+    /// `refresh_all` here parked the UI thread on the very lock
+    /// the grouping stage holds, so the window froze until the
+    /// whole import finished and only then showed every page
+    /// at once.)
+    fn refresh_opened(&mut self) -> bool {
+        let Some(local) = self.local.clone() else {
+            return true;
+        };
+        match local.try_snapshot() {
+            Some((folders, groups, units, indexes)) => {
+                self.folders = folders;
+                self.groups = groups;
+                self.units = units;
+                if let IndexFrame::Overview(overview) = self.index.stack.root_mut() {
+                    overview.graphs = None;
+                }
+                self.indexes = indexes;
+                self.open_refresh_pending = false;
+                true
+            }
+            None => {
+                self.open_refresh_pending = true;
+                false
+            }
+        }
+    }
+
     fn refresh_all(&mut self) {
         if self.local.is_some() {
             self.refresh_local();
@@ -4847,6 +5609,7 @@ impl App {
                 .and_then(|f| f.as_array())
                 .cloned()
                 .unwrap_or_default();
+            self.reconcile_cache_staleness();
             self.index_covers.retain(|_, v| !v.is_empty());
             self.resolve_showroom_covers();
         }
@@ -5015,6 +5778,7 @@ impl App {
                 .and_then(|f| f.as_array())
                 .cloned()
                 .unwrap_or_default();
+            self.reconcile_cache_staleness();
             // A guest pass earlier in this session may have parked
             // empty placeholders for covers it could not resolve;
             // a named session re-resolves instead of inheriting
@@ -5200,6 +5964,23 @@ impl App {
     }
 
     fn open_unit_detail(&mut self, unit_id: &str) {
+        // Lazy import: an unsplit page is unusable — every entry
+        // that would open it (wall, home, search, history…) lands
+        // here, so the guard lives here: the click just boosts
+        // the page's split instead.
+        if let Some((pid, idx)) = self.lazy_unit_page.get(unit_id).cloned() {
+            self.lazy_boost(&pid, idx);
+            return;
+        }
+        // A staged import's one-page wrappers are about to be
+        // absorbed by grouping (audit N1): opening one now would
+        // leave the detail frame pointing at a permanently
+        // deleted id, and any edit made in it would be silently
+        // discarded. Refuse until the import settles.
+        if self.importing.is_some() && self.import_open_units.iter().any(|u| u == unit_id) {
+            self.say("该页正在导入成块，完成后再打开");
+            return;
+        }
         // The wall ring follows the open block, as selected_unit did.
         if let ContentFrame::Wall(w) = self.content.stack.root_mut() {
             w.selected = Some(unit_id.to_string());
@@ -5318,6 +6099,8 @@ impl App {
     fn pdf_open(&mut self, att: &Value) {
         let att_id = s(att, "id");
         let filename = s(att, "filename");
+        self.pdf_seq += 1;
+        let seq = self.pdf_seq;
         self.pdf_view = Some(PdfView {
             att_id: att_id.clone(),
             filename,
@@ -5326,6 +6109,7 @@ impl App {
             pages: 0,
             tex: None,
             note: "正在加载…".into(),
+            seq,
         });
         let (server, token, tx) = (self.server.clone(), self.token.clone(), self.pdf_tx.clone());
         // Local-first P4: an attachment held by the local library
@@ -5361,10 +6145,10 @@ impl App {
             };
             match out {
                 Ok((bytes, img)) => {
-                    let _ = tx.send((att_id, 0, Some(bytes), Ok(img)));
+                    let _ = tx.send((att_id, seq, 0, Some(bytes), Ok(img)));
                 }
                 Err(e) => {
-                    let _ = tx.send((att_id, 0, None, Err(e)));
+                    let _ = tx.send((att_id, seq, 0, None, Err(e)));
                 }
             }
         });
@@ -5374,13 +6158,19 @@ impl App {
         let Some(v) = &self.pdf_view else { return };
         let Some(bytes) = v.bytes.clone() else { return };
         let att_id = v.att_id.clone();
+        // Every flip bumps the request generation (audit M3):
+        // renders complete out of order, and only the latest
+        // request's result may land on the preview.
+        self.pdf_seq += 1;
+        let seq = self.pdf_seq;
         if let Some(vv) = &mut self.pdf_view {
             vv.note = "正在加载…".into();
+            vv.seq = seq;
         }
         let tx = self.pdf_tx.clone();
         std::thread::spawn(move || {
             let res = render_pdf_page(&bytes, page);
-            let _ = tx.send((att_id, page, None, res));
+            let _ = tx.send((att_id, seq, page, None, res));
         });
     }
 
@@ -5967,6 +6757,13 @@ impl App {
         };
         let unit = item.get("unit").cloned().unwrap_or(json!({}));
         let uid = s(&unit, "id");
+        // Lazy import: an unsplit page can never enter an index
+        // (the card hides its insert button too; this is the
+        // belt-and-braces guard for the same rule).
+        if let Some((pid, idx)) = self.lazy_unit_page.get(&uid).cloned() {
+            self.lazy_boost(&pid, idx);
+            return;
+        }
         let rid = item
             .get("renditions")
             .and_then(|r| r.as_array())
@@ -6095,13 +6892,17 @@ impl App {
         if !self.need_identity_local("粘贴新建") {
             return;
         }
+        let mut from_bridge = false;
         let frag: Option<std::path::PathBuf> = std::env::var("QIMU_PASTE_FRAGMENT")
             .ok()
             .map(std::path::PathBuf::from)
             .filter(|p| p.exists())
             .or_else(
                 || match qimu_bridge::platform_bridge().capture_copied_slides() {
-                    Ok(p) => p,
+                    Ok(p) => {
+                        from_bridge = p.is_some();
+                        p
+                    }
                     Err(e) => {
                         self.msg = format!("无法读取 PowerPoint 剪贴板：{e}");
                         None
@@ -6112,7 +6913,14 @@ impl App {
             self.msg = "先在 PowerPoint 里复制页面，再点「粘贴 PPT 页新建」".into();
             return;
         };
-        let Ok(bytes) = std::fs::read(&path) else {
+        let read = std::fs::read(&path);
+        if from_bridge {
+            // Audit2 E-L2: bridge captures are one-shot temps (the
+            // QIMU_PASTE_FRAGMENT fixture file is the caller's own
+            // and is never deleted).
+            let _ = std::fs::remove_file(&path);
+        }
+        let Ok(bytes) = read else {
             self.msg = "读取粘贴片段失败".into();
             return;
         };
@@ -6210,50 +7018,71 @@ impl App {
     /// Store fragment bytes as the clipboard content. When
     /// `offer_to_powerpoint` is set, also publish them to the system
     /// clipboard through the bridge and report the outcome honestly.
-    fn clip_store(&mut self, bytes: &[u8], source: &str, offer_to_powerpoint: bool) {
+    /// Store the in-app clipboard fragment + its sidecar.
+    /// Returns true only when BOTH files actually landed —
+    /// audit2 E-H1: cut operations used to proceed (trashing /
+    /// re-versioning the source) without checking this, judging
+    /// success by the stale `ppt_clip` of a previous copy; a failed
+    /// store then destroyed the source while the clipboard held
+    /// old content. Both writes are atomic (E-L1: the fragment
+    /// used to be overwritten in place, the sidecar's result
+    /// swallowed).
+    fn clip_store(&mut self, bytes: &[u8], source: &str, offer_to_powerpoint: bool) -> bool {
         let pkg = match qimu_core::pptx::Package::load(bytes) {
             Ok(p) => p,
             Err(e) => {
-                self.msg = format!("复制失败：不是有效的 PPTX 片段（{e}）");
-                return;
+                self.say(format!("复制失败：不是有效的 PPTX 片段（{e}）"));
+                return false;
             }
         };
         let pages = qimu_core::pptx::slides(&pkg).map(|v| v.len()).unwrap_or(0);
         if pages == 0 {
-            self.msg = "复制失败：片段里没有页面".into();
-            return;
+            self.say("复制失败：片段里没有页面");
+            return false;
         }
-        if std::fs::write(clip_fragment_path(), bytes).is_err() {
-            self.msg = "复制失败：本地剪贴板写入失败".into();
-            return;
+        if craft_atomic::atomic_write(&clip_fragment_path(), bytes).is_err() {
+            self.say("复制失败：本地剪贴板写入失败");
+            return false;
         }
         let meta = json!({
             "pages": pages,
             "source": source,
             "created_ms": qimu_core::auth::now_ms(),
         });
-        let _ = std::fs::write(
-            clip_meta_path(),
-            serde_json::to_string(&meta).unwrap_or_default(),
-        );
+        if craft_atomic::atomic_write(
+            &clip_meta_path(),
+            serde_json::to_string(&meta).unwrap_or_default().as_bytes(),
+        )
+        .is_err()
+        {
+            // Fragment and meta must stay a pair (audit L1):
+            // drop the fragment just written and clear the badge
+            // state rather than leave a clipboard whose badge
+            // (meta) and content (fragment) disagree.
+            let _ = std::fs::remove_file(clip_fragment_path());
+            self.ppt_clip = None;
+            self.say("复制失败：本地剪贴板元信息写入失败");
+            return false;
+        }
         self.ppt_clip = Some(meta);
         if !offer_to_powerpoint {
-            self.msg = format!("已复制 {pages} 页到 PPT 剪贴板");
-            return;
+            self.say(format!("已复制 {pages} 页到 PPT 剪贴板"));
+            return true;
         }
         match qimu_bridge::platform_bridge().publish_slides_to_clipboard(&clip_fragment_path()) {
             Ok(true) => {
-                self.msg = format!("已复制 {pages} 页到 PPT 剪贴板（可直接粘贴到 PowerPoint）")
+                self.say(format!("已复制 {pages} 页到 PPT 剪贴板（可直接粘贴到 PowerPoint）"))
             }
             Ok(false) => {
-                self.msg = format!(
+                self.say(format!(
                     "已复制 {pages} 页到 PPT 剪贴板（PowerPoint 未运行，未同步到系统剪贴板）"
-                )
+                ))
             }
             Err(e) => {
-                self.msg = format!("已复制 {pages} 页到 PPT 剪贴板（同步到 PowerPoint 失败：{e}）")
+                self.say(format!("已复制 {pages} 页到 PPT 剪贴板（同步到 PowerPoint 失败：{e}）"))
             }
         }
+        true
     }
 
     /// The clipboard bytes, adopting whatever PowerPoint last put on
@@ -6261,21 +7090,36 @@ impl App {
     /// same capture path 粘贴新建 uses).
     fn clip_source_bytes(&mut self) -> Option<Vec<u8>> {
         if self.ppt_clip.is_some() {
-            if let Ok(bytes) = std::fs::read(clip_fragment_path()) {
-                return Some(bytes);
+            // The badge says the clipboard holds pages; if the
+            // fragment behind it cannot be read, say exactly that
+            // (audit L1) instead of falling through to the
+            // PowerPoint capture and ending at "剪贴板是空的" —
+            // a message that contradicts the badge.
+            match std::fs::read(clip_fragment_path()) {
+                Ok(bytes) => return Some(bytes),
+                Err(e) => {
+                    self.say(format!("PPT 剪贴板内容读取失败（{e}），请重新复制"));
+                    return None;
+                }
             }
         }
         match qimu_bridge::platform_bridge().capture_copied_slides() {
-            Ok(Some(path)) => match std::fs::read(&path) {
-                Ok(bytes) => {
-                    self.clip_store(&bytes, "PowerPoint", false);
-                    Some(bytes)
+            Ok(Some(path)) => {
+                let read = std::fs::read(&path);
+                // Audit2 E-L2: the capture file is a one-shot temp
+                // in the OS temp dir; it used to stay there forever.
+                let _ = std::fs::remove_file(&path);
+                match read {
+                    Ok(bytes) => {
+                        self.clip_store(&bytes, "PowerPoint", false);
+                        Some(bytes)
+                    }
+                    Err(e) => {
+                        self.msg = format!("读取 PowerPoint 剪贴板失败：{e}");
+                        None
+                    }
                 }
-                Err(e) => {
-                    self.msg = format!("读取 PowerPoint 剪贴板失败：{e}");
-                    None
-                }
-            },
+            }
             Ok(None) => {
                 self.msg = "PPT 剪贴板是空的".into();
                 None
@@ -6323,18 +7167,35 @@ impl App {
                     return;
                 }
             };
+            // Report the same {made}/{total} accounting as
+            // clip_ungroup_unit (audit M4): a page that fails to
+            // serialize or publish is counted and named in the
+            // summary, never silently skipped.
+            let total = singles.len();
             let mut made = 0usize;
+            let mut failed = 0usize;
             for (idx, one) in singles.iter().enumerate() {
                 let name = clip_page_name(one, idx);
-                let Ok(b) = one.to_bytes() else { continue };
+                let Ok(b) = one.to_bytes() else {
+                    failed += 1;
+                    continue;
+                };
                 if self
                     .publish_bytes_as_unit(&b, &name, "剪贴板逐页成块")
                     .is_some()
                 {
                     made += 1;
+                } else {
+                    failed += 1;
                 }
             }
-            self.msg = format!("已逐页成块：新建 {made} 个内容块");
+            if failed == 0 {
+                self.say(format!("已逐页成块：新建 {made} 个内容块"));
+            } else {
+                self.say(format!(
+                    "逐页成块未全部完成：新建 {made}/{total} 个内容块，{failed} 页失败"
+                ));
+            }
         } else {
             let name = if source.is_empty() {
                 "剪贴板内容块".to_string()
@@ -6360,39 +7221,42 @@ impl App {
     /// recycle bin (trash_add, the same path cut uses) only
     /// after every page landed as a new block — a partial
     /// failure keeps the original untouched.
-    fn clip_ungroup_unit(&mut self, uid: &str) {
+    /// Returns true only when the split fully landed AND the
+    /// original reached the recycle bin (audit N3): the deck-bar
+    /// handler clears the selection on success only.
+    fn clip_ungroup_unit(&mut self, uid: &str) -> bool {
         if !self.need_identity_local("解除组合") {
-            return;
+            return false;
         }
         let name = self.unit_name(uid);
         let Some(vid) = self.unit_latest_version_id(uid) else {
-            self.msg = format!("解除组合失败：「{name}」没有可用的版本");
-            return;
+            self.say(format!("解除组合失败：「{name}」没有可用的版本"));
+            return false;
         };
         let frag = match self.version_fragment_bytes(&vid) {
             Ok(b) => b,
             Err(e) => {
-                self.msg = format!("解除组合失败：{e}");
-                return;
+                self.say(format!("解除组合失败：{e}"));
+                return false;
             }
         };
         let pkg = match qimu_core::pptx::Package::load(&frag) {
             Ok(p) => p,
             Err(e) => {
-                self.msg = format!("解除组合失败：{e}");
-                return;
+                self.say(format!("解除组合失败：{e}"));
+                return false;
             }
         };
         let singles = match qimu_core::pptx::split(&pkg) {
             Ok(v) => v,
             Err(e) => {
-                self.msg = format!("解除组合失败：{e}");
-                return;
+                self.say(format!("解除组合失败：{e}"));
+                return false;
             }
         };
         if singles.len() < 2 {
-            self.msg = format!("「{name}」只有一页，无需解除组合");
-            return;
+            self.say(format!("「{name}」只有一页，无需解除组合"));
+            return false;
         }
         // The original block's home folder (empty = root).
         let folder: Option<String> = self
@@ -6419,18 +7283,33 @@ impl App {
                 made += 1;
             }
         }
+        // The recycle-bin outcome is part of the report (audit
+        // N2): a failed trash_add used to be overwritten by the
+        // success wording, telling the user the original was in
+        // the bin while it still sat on the wall.
+        let mut fully_done = false;
         if made == total {
-            self.trash_add("unit", uid);
-            self.msg =
-                format!("已解除组合「{name}」：拆为 {made} 个单页内容块，原内容块已移入回收站");
+            if self.trash_add("unit", uid) {
+                fully_done = true;
+                self.say(format!(
+                    "已解除组合「{name}」：拆为 {made} 个单页内容块，原内容块已移入回收站"
+                ));
+            } else {
+                self.say(format!(
+                    "已解除组合「{name}」：拆为 {made} 个单页内容块，但原内容块移入回收站失败，仍保留在页面墙上"
+                ));
+            }
         } else if made > 0 {
-            self.msg = format!(
+            self.say(format!(
                 "解除组合未完成：已新建 {made}/{total} 个单页内容块，原内容块「{name}」保留未动"
-            );
+            ));
         } else {
-            self.msg = format!("解除组合失败：未能新建任何单页内容块，原内容块「{name}」保留未动");
+            self.say(format!(
+                "解除组合失败：未能新建任何单页内容块，原内容块「{name}」保留未动"
+            ));
         }
         self.refresh_all();
+        fully_done
     }
 
     // ---------------- copy / cut sources ----------------
@@ -6554,18 +7433,23 @@ impl App {
     /// 复制到 PPT 剪贴板 / 剪切：whole blocks from the content wall.
     /// Cut sends each source block to the recycle bin (回收站) —
     /// only after the clipboard holds its pages.
-    fn clip_copy_units(&mut self, unit_ids: &[String], cut: bool) {
+    /// Returns whether the operation fully succeeded (audit
+    /// N3): for a copy, the clipboard holds the new fragment; for
+    /// a cut, additionally every original reached the recycle
+    /// bin. The deck-bar handler clears the selection on success
+    /// only.
+    fn clip_copy_units(&mut self, unit_ids: &[String], cut: bool) -> bool {
         let what = if cut {
             "剪切内容块"
         } else {
             "复制内容块"
         };
         if !self.need_identity_local(what) {
-            return;
+            return false;
         }
         if unit_ids.is_empty() {
-            self.msg = "先选中内容块".into();
-            return;
+            self.say("先选中内容块");
+            return false;
         }
         let label = if unit_ids.len() == 1 {
             self.unit_name(&unit_ids[0])
@@ -6574,16 +7458,36 @@ impl App {
         };
         match self.clip_bytes_from_units(unit_ids) {
             Ok(bytes) => {
-                self.clip_store(&bytes, &label, true);
-                if cut && self.ppt_clip.is_some() {
-                    for uid in unit_ids {
-                        self.trash_add("unit", uid);
-                    }
-                    self.msg = format!("已剪切 {label}（原内容块已移入回收站）");
-                    self.refresh_all();
+                if !self.clip_store(&bytes, &label, true) {
+                    return false;
                 }
+                if !cut {
+                    return true;
+                }
+                // Per-unit trash outcomes are counted, not
+                // overwritten by the success wording (audit N2).
+                let mut trashed = 0usize;
+                for uid in unit_ids {
+                    if self.trash_add("unit", uid) {
+                        trashed += 1;
+                    }
+                }
+                let all = trashed == unit_ids.len();
+                if all {
+                    self.say(format!("已剪切 {label}（原内容块已移入回收站）"));
+                } else {
+                    self.say(format!(
+                        "已剪切 {label}，但 {} 个原内容块移入回收站失败，仍保留在页面墙上",
+                        unit_ids.len() - trashed
+                    ));
+                }
+                self.refresh_all();
+                all
             }
-            Err(e) => self.msg = format!("{}失败：{e}", if cut { "剪切" } else { "复制" }),
+            Err(e) => {
+                self.say(format!("{}失败：{e}", if cut { "剪切" } else { "复制" }));
+                false
+            }
         }
     }
 
@@ -6645,16 +7549,24 @@ impl App {
             .and_then(|p| qimu_core::pptx::slides(&p).ok())
             .map(|v| v.len())
             .unwrap_or(0);
-        match self.clip_pick_pages(&frag, pages) {
+        let stored = match self.clip_pick_pages(&frag, pages) {
             Ok(picked) => self.clip_store(&picked, &self.unit_name(unit_id), true),
             Err(e) => {
                 self.msg = format!("剪切失败：{e}");
                 return;
             }
+        };
+        if !stored {
+            // Audit2 E-H1: the clipboard does not hold the cut
+            // pages — the source block must stay exactly as it is.
+            return;
         }
         if total == 0 || pages.len() >= total {
-            self.trash_add("unit", unit_id);
-            self.msg = "已剪切全部页面（原内容块已移入回收站）".into();
+            if self.trash_add("unit", unit_id) {
+                self.say("已剪切全部页面（原内容块已移入回收站）");
+            } else {
+                self.say("已剪切全部页面，但原内容块移入回收站失败，仍保留在页面墙上");
+            }
             self.refresh_all();
             return;
         }
@@ -6685,13 +7597,13 @@ impl App {
 
     /// 组合为新内容块：the selected blocks' pages, in selection
     /// order, assembled into one new block.
-    fn clip_combine_units(&mut self, unit_ids: &[String]) {
+    fn clip_combine_units(&mut self, unit_ids: &[String]) -> bool {
         if !self.need_identity_local("组合") {
-            return;
+            return false;
         }
         if unit_ids.len() < 2 {
-            self.msg = "组合需要至少选中 2 个内容块".into();
-            return;
+            self.say("组合需要至少选中 2 个内容块");
+            return false;
         }
         match self.clip_bytes_from_units(unit_ids) {
             Ok(bytes) => {
@@ -6704,31 +7616,37 @@ impl App {
                     .publish_bytes_as_unit(&bytes, &name, "组合新建")
                     .is_some()
                 {
-                    self.msg = format!("已组合为新内容块「{name}」");
+                    self.say(format!("已组合为新内容块「{name}」"));
                     self.refresh_all();
+                    true
+                } else {
+                    false
                 }
             }
-            Err(e) => self.msg = format!("组合失败：{e}"),
+            Err(e) => {
+                self.say(format!("组合失败：{e}"));
+                false
+            }
         }
     }
 
     /// 组合为新索引：one index whose entries are the selected
     /// blocks' lead renditions, in selection order.
-    fn clip_combine_index(&mut self, unit_ids: &[String]) {
+    fn clip_combine_index(&mut self, unit_ids: &[String]) -> bool {
         if !self.need_identity_local("组合为新索引") {
-            return;
+            return false;
         }
         if unit_ids.len() < 2 {
-            self.msg = "组合为新索引需要至少选中 2 个内容块".into();
-            return;
+            self.say("组合为新索引需要至少选中 2 个内容块");
+            return false;
         }
         let mut entries = Vec::new();
         for uid in unit_ids {
             match self.unit_lead_rendition(uid) {
                 Some(rid) => entries.push(json!({ "unit_id": uid, "rendition_id": rid })),
                 None => {
-                    self.msg = format!("「{}」没有可用的版本形态", self.unit_name(uid));
-                    return;
+                    self.say(format!("「{}」没有可用的版本形态", self.unit_name(uid)));
+                    return false;
                 }
             }
         }
@@ -6749,10 +7667,14 @@ impl App {
             })),
         ) {
             Ok(_) => {
-                self.msg = format!("已组合为新索引「{name}」");
+                self.say(format!("已组合为新索引「{name}」"));
                 self.refresh_all();
+                true
             }
-            Err(e) => self.msg = format!("组合为新索引失败：{e}"),
+            Err(e) => {
+                self.say(format!("组合为新索引失败：{e}"));
+                false
+            }
         }
     }
 
@@ -8011,11 +8933,37 @@ impl App {
     fn trash_load(&mut self) {
         match self.call_work("GET", "/v1/trash", None) {
             Ok(v) => {
-                self.trash.items = v
+                let mut items = v
                     .get("items")
                     .and_then(|x| x.as_array())
                     .cloned()
                     .unwrap_or_default();
+                // F6: with a local library open, the local face
+                // answers GET /v1/trash by itself, so organization
+                // trash rows (showroom items trashed on the
+                // server) never reached this page — even though
+                // their restore/purge calls already route to the
+                // server by row ownership. Merge the server's
+                // rows in while connected (the server filters
+                // them by the caller's rights), marked "org" so
+                // purge-all can route them back individually.
+                // The page stays local-first: offline, or with no
+                // local library (where call_work already reads
+                // the server), nothing changes.
+                if self.local.is_some() && self.org_online() {
+                    if let Ok(sv) = self.call("GET", "/v1/trash", None) {
+                        if let Some(rows) = sv.get("items").and_then(|x| x.as_array()) {
+                            for row in rows {
+                                if !items.iter().any(|x| s(x, "id") == s(row, "id")) {
+                                    let mut row = row.clone();
+                                    row["org"] = json!(true);
+                                    items.push(row);
+                                }
+                            }
+                        }
+                    }
+                }
+                self.trash.items = items;
                 self.trash.loaded = true;
                 self.trash.load_error.clear();
             }
@@ -8031,19 +8979,29 @@ impl App {
     /// Move an object to the trash (soft delete) — the producers:
     /// unit detail, index detail, showroom cards.
     fn trash_add(&mut self, kind: &str, object_id: &str) -> bool {
+        // Trashing a staged import's wrapper mid-grouping fails
+        // the whole group stage after half of it already landed
+        // (audit N1); refuse until the import settles.
+        if kind == "unit"
+            && self.importing.is_some()
+            && self.import_open_units.iter().any(|u| u == object_id)
+        {
+            self.say("正在导入成块，暂不能移入回收站");
+            return false;
+        }
         match self.call_work(
             "POST",
             "/v1/trash",
             Some(json!({ "kind": kind, "object_id": object_id })),
         ) {
             Ok(_) => {
-                self.msg = "已移入回收站，可随时恢复".into();
+                self.say("已移入回收站，可随时恢复");
                 self.trash.loaded = false;
                 self.refresh_all();
                 true
             }
             Err(e) => {
-                self.msg = format!("删除失败：{e}");
+                self.say(format!("删除失败：{e}"));
                 false
             }
         }
@@ -8484,6 +9442,124 @@ impl App {
         sections
     }
 
+    /// Set the status message AND re-stamp the toast, even when
+    /// the text is identical to the previous message (audit L4):
+    /// repeated actions with the same outcome wording (save,
+    /// restore, rename, delete…) still deserve their feedback.
+    /// Plain `self.msg = …` assignments keep the old dedupe
+    /// behaviour; action handlers route through here.
+    fn say(&mut self, text: impl Into<String>) {
+        self.msg = text.into();
+        self.toast_nonce += 1;
+    }
+
+    /// Forced password change (G2 contract): while the active
+    /// account is flagged `must_change_password`, this modal
+    /// covers the app and cannot be dismissed — no close button,
+    /// and backdrop clicks / Escape are simply never acted on;
+    /// only a successful change releases it. The change goes to
+    /// POST /v1/me/password with
+    /// {current_password, new_password} (G2's implemented
+    /// endpoint; aligned at merge time from the G4-side assumed
+    /// name). Success returns {ok: true}: the server clears the
+    /// flag, KEEPS the current session and logs out the user's
+    /// other sessions — no new token is issued, so the client
+    /// simply clears its local flag and proceeds.
+    fn force_change_pw_ui(&mut self, ui: &mut egui::Ui) {
+        if !self.must_change_pw {
+            return;
+        }
+        let mut submit = false;
+        egui::Modal::new(egui::Id::new("force-change-password")).show(ui.ctx(), |ui| {
+            ui.set_width(360.0);
+            ui.label(
+                egui::RichText::new(tr("修改密码"))
+                    .strong()
+                    .size(19.0)
+                    .color(palette_color(TEXT_MAIN)),
+            );
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(tr(
+                    "当前账号仍在使用初始或临时密码，必须先修改密码才能继续使用。",
+                ))
+                .size(13.5)
+                .color(palette_color(TEXT_MAIN)),
+            );
+            ui.add_space(10.0);
+            ui.label(egui::RichText::new(tr("当前密码")).size(12.5));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.pw_change_old)
+                    .password(true)
+                    .desired_width(360.0),
+            );
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new(tr("新密码")).size(12.5));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.pw_change_new)
+                    .password(true)
+                    .desired_width(360.0),
+            );
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new(tr("再次输入新密码")).size(12.5));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.pw_change_new2)
+                    .password(true)
+                    .desired_width(360.0),
+            );
+            if !self.pw_change_error.is_empty() {
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(&self.pw_change_error)
+                        .size(12.5)
+                        .color(palette_color(DANGER_BG)),
+                );
+            }
+            ui.add_space(14.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if btn_primary(ui, tr("确认修改")).clicked() {
+                    submit = true;
+                }
+            });
+        });
+        if submit {
+            self.submit_change_pw();
+        }
+    }
+
+    fn submit_change_pw(&mut self) {
+        if self.pw_change_new.is_empty() {
+            self.pw_change_error = "新密码不能为空".into();
+            return;
+        }
+        if self.pw_change_new != self.pw_change_new2 {
+            self.pw_change_error = "两次输入的新密码不一致".into();
+            return;
+        }
+        match self.call(
+            "POST",
+            "/v1/me/password",
+            Some(json!({
+                "current_password": self.pw_change_old,
+                "new_password": self.pw_change_new,
+            })),
+        ) {
+            Ok(_v) => {
+                // G2 contract: no token comes back — the current
+                // session stays valid and the server has cleared
+                // the must-change flag (other sessions of this
+                // user were logged out server-side).
+                self.must_change_pw = false;
+                self.pw_change_old.clear();
+                self.pw_change_new.clear();
+                self.pw_change_new2.clear();
+                self.pw_change_error.clear();
+                self.say("密码已修改");
+            }
+            Err(e) => self.pw_change_error = format!("修改失败：{e}"),
+        }
+    }
+
     /// The status surface: no status bar — a floating toast where
     /// the prototype puts it: top-right, 14px below the 100px
     /// chrome (top = --chrome-h + 14 = 114), --panel3 fill with a
@@ -8492,8 +9568,9 @@ impl App {
     /// the toast stamps it when it changes.
     fn toast(&mut self, ui: &mut egui::Ui, _screen: egui::Rect) {
         let now = ui.ctx().input(|i| i.time);
-        if self.msg != self.toast_msg {
+        if self.msg != self.toast_msg || self.toast_nonce != self.toast_seen_nonce {
             self.toast_msg = self.msg.clone();
+            self.toast_seen_nonce = self.toast_nonce;
             self.toast_since = now;
             self.workspace_controls
                 .record_message(&self.msg, now, self.page != Page::Messages);
@@ -8572,6 +9649,7 @@ impl eframe::App for App {
             return;
         }
         let ctx = ui.ctx().clone();
+        self.egui_ctx = Some(ctx.clone());
         self.frames += 1;
         // Collect finished thumbnail fetches and upload them as textures.
         while let Ok((key, bytes)) = self.thumb_rx.try_recv() {
@@ -8586,14 +9664,14 @@ impl eframe::App for App {
                     );
                     ThumbState::Ready(ctx.load_texture(&key, ci, egui::TextureOptions::LINEAR))
                 })
-                .unwrap_or(ThumbState::Failed);
+                .unwrap_or_else(|| ThumbState::Failed(std::time::Instant::now()));
             self.thumbs.insert(key, state);
             ctx.request_repaint();
         }
         // Collect finished PDF page renders for the attachment preview.
-        while let Ok((att_id, page, bytes, res)) = self.pdf_rx.try_recv() {
+        while let Ok((att_id, seq, page, bytes, res)) = self.pdf_rx.try_recv() {
             if let Some(v) = &mut self.pdf_view {
-                if v.att_id == att_id {
+                if v.att_id == att_id && v.seq == seq {
                     if bytes.is_some() {
                         v.bytes = bytes;
                     }
@@ -8640,13 +9718,22 @@ impl eframe::App for App {
         // Collect AI-translation progress / completion.
         while let Ok(ev) = self.translate_rx.try_recv() {
             match ev {
-                TranslateEvent::Progress(d, t) => {
-                    if let Some(tr) = &mut self.translating {
-                        tr.1 = d;
-                        tr.2 = t;
+                TranslateEvent::Progress(g, d, t) => {
+                    if g == self.translate_gen {
+                        if let Some(tr) = &mut self.translating {
+                            tr.1 = d;
+                            tr.2 = t;
+                        }
                     }
                 }
-                TranslateEvent::Done(res) => {
+                TranslateEvent::Done(g, res) => {
+                    // A worker from before an account switch polls
+                    // the old server with the old token; its result
+                    // belongs to that context and is dropped here
+                    // (audit H1).
+                    if g != self.translate_gen {
+                        continue;
+                    }
                     let finished = self.translating.take();
                     match res {
                         Ok(v) => {
@@ -8669,12 +9756,33 @@ impl eframe::App for App {
                             if gget("unresolved") > 0 {
                                 m += &format!("；术语未命中 {} 处，请人工校对", gget("unresolved"));
                             }
-                            self.msg = m;
                             if let Some((uid, _, _)) = finished {
-                                self.reload_unit_detail(&uid);
+                                // Reload in place ONLY when the
+                                // translated block's detail frame is
+                                // the one on screen (audit H1): from
+                                // anywhere else, navigating there
+                                // would pop the frame the user is on
+                                // and silently discard its unsaved
+                                // drafts. The translation is saved
+                                // server-side; opening the block
+                                // later reads it fresh.
+                                let on_frame = matches!(
+                                    self.content.stack.top(),
+                                    ContentFrame::Unit(st) if st.unit_id == uid
+                                );
+                                if on_frame {
+                                    self.say(m);
+                                    self.reload_unit_detail(&uid);
+                                } else {
+                                    self.say(format!(
+                                        "{m}（译文已写入该内容块，打开时即为最新）"
+                                    ));
+                                }
+                            } else {
+                                self.say(m);
                             }
                         }
-                        Err(e) => self.msg = format!("翻译失败：{e}"),
+                        Err(e) => self.say(format!("翻译失败：{e}")),
                     }
                 }
             }
@@ -8687,26 +9795,108 @@ impl eframe::App for App {
         // only `Done` clears it.
         while let Ok(ev) = self.import_rx.try_recv() {
             match ev {
-                ImportEvent::Opened(m) => {
-                    self.msg = m;
+                ImportEvent::Opened(g, m, units) => {
+                    if g == self.import_gen {
+                        self.say(m);
+                        self.import_open_units = units;
+                        // Non-blocking snapshot refresh: the
+                        // grouping stage may still hold the store
+                        // lock, and this frame must not park on
+                        // it (freeze audit F3); a missed snapshot
+                        // retries via open_refresh_pending below.
+                        self.refresh_opened();
+                    }
+                    // One beat per frame: a `Done` already
+                    // queued behind this `Opened` is handled on
+                    // the next frame, so the just-opened cards
+                    // get a painted frame of their own instead
+                    // of being folded into the completion
+                    // refresh (both events draining in one frame
+                    // is what made every page appear at once).
+                    break;
+                }
+                ImportEvent::Done(g, Ok(m)) => {
+                    if g == self.import_gen {
+                        self.importing = None;
+                        self.open_refresh_pending = false;
+                        self.import_open_units.clear();
+                        self.say(m);
+                        self.refresh_all();
+                        self.prune_wall_selection();
+                    }
+                }
+                ImportEvent::Done(g, Err(m)) => {
+                    if g == self.import_gen {
+                        self.importing = None;
+                        self.open_refresh_pending = false;
+                        self.import_open_units.clear();
+                        // Grouping lands block by block and does
+                        // NOT roll back on a mid-way failure
+                        // (audit N1): a bare "import failed" would
+                        // misreport the library's actual state.
+                        // Refresh so the wall shows what really
+                        // landed, and say so.
+                        self.say(format!(
+                            "{m}（已落库的部分不会回滚，墙面已按实际状态刷新）"
+                        ));
+                        self.refresh_all();
+                        self.prune_wall_selection();
+                    }
+                }
+                ImportEvent::LazyOpened(pending_id) => {
+                    // The deck is open: its pages are on the wall
+                    // (refresh), the split state is adopted, and
+                    // the split worker takes it from here. The
+                    // "importing" latch only covered the open.
+                    self.importing = None;
+                    self.lazy_sync_pending(&pending_id);
+                    self.lazy_ensure_worker();
+                    self.lazy_send(LazyCmd::Kick);
                     self.refresh_all();
                 }
-                ImportEvent::Done(Ok(m)) => {
-                    self.importing = None;
-                    self.msg = m;
-                    self.refresh_all();
-                }
-                ImportEvent::Done(Err(m)) => {
-                    self.importing = None;
-                    self.msg = m;
+                ImportEvent::LazyProgress(info) => {
+                    self.lazy_on_progress(info);
                 }
             }
             ctx.request_repaint();
+        }
+        if self.open_refresh_pending && !self.refresh_opened() {
+            // The grouping stage still holds the store lock;
+            // retry the `Opened` refresh on a short tick rather
+            // than ever blocking a frame on that lock.
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
         if self.importing.is_some() {
             // Keep the frame loop ticking while an import runs so
             // its completion is collected promptly (and the window
             // visibly stays alive) even with no user input.
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
+        // Lazy import viewport feed: the unsplit pages the wall
+        // rendered LAST frame are queued ahead of the background
+        // order (they also render first — a visible card asks
+        // for its thumbnail as it is drawn). One frame of lag is
+        // inherent and harmless.
+        if !self.lazy_visible_boost.is_empty()
+            && self.lazy_visible_boost != self.lazy_visible_sent
+        {
+            let pages: Vec<(String, usize)> = self
+                .lazy_visible_boost
+                .iter()
+                .filter_map(|uid| self.lazy_unit_page.get(uid).cloned())
+                .collect();
+            if !pages.is_empty() {
+                self.lazy_ensure_worker();
+                self.lazy_send(LazyCmd::Visible(pages));
+            }
+            self.lazy_visible_sent = self.lazy_visible_boost.clone();
+        }
+        self.lazy_visible_boost.clear();
+        if !self.lazy_pendings.is_empty() {
+            // Keep frames coming while a split runs so progress
+            // (and cards flipping usable) lands promptly even
+            // with no user input; the worker also wakes frames
+            // itself after every page.
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
         // Collect a finished LAN discovery scan, if one is running.
@@ -8755,6 +9945,7 @@ impl eframe::App for App {
         self.login_window(ui);
         self.about_window(ui);
         self.overlay_stack_ui(ui, screen);
+        self.force_change_pw_ui(ui);
     }
 }
 
@@ -8772,8 +9963,13 @@ impl App {
         let key = format!("{version_id}:{page}");
         match self.thumbs.get(&key) {
             Some(ThumbState::Ready(t)) => Some(t.clone()),
-            Some(_) => None,
-            None => {
+            Some(ThumbState::Loading) => None,
+            Some(ThumbState::Failed(at))
+                if at.elapsed() < std::time::Duration::from_secs(30) =>
+            {
+                None
+            }
+            _ => {
                 self.thumbs.insert(key.clone(), ThumbState::Loading);
                 let (server, token, tx) = (
                     self.server.clone(),
@@ -8789,45 +9985,55 @@ impl App {
                 let bundle = self.cache_bundle_block(version_id);
                 let version_id = version_id.to_string();
                 std::thread::spawn(move || {
-                    if let Some(local) = &local {
-                        if let Some(bytes) = local_render::local_thumb(local, &version_id, page) {
-                            let _ = tx.send((key, Some(bytes)));
-                            return;
-                        }
-                    }
-                    // Offline cache bundle (T1): a cached deck's
-                    // blocks render in-process from their cached
-                    // fragments when the server is unreachable.
-                    if let Some((frag_file, thumb_dir)) = &bundle {
-                        let frag = cache_key().and_then(|ck| {
-                            std::fs::read(frag_file)
-                                .ok()
-                                .and_then(|data| decrypt_bytes(&ck, &data))
-                        });
-                        if let Some(frag) = frag {
-                            if let Some(bytes) =
-                                local_render::cached_thumb(&frag, thumb_dir, page)
-                            {
-                                let _ = tx.send((key, Some(bytes)));
-                                return;
+                    // Audit2 E-M2: the whole fetch runs under
+                    // catch_unwind — a panic in here (a poisoned
+                    // store lock inside the render path, a renderer
+                    // edge) used to kill the worker silently and
+                    // pin the card at Loading forever. A panic now
+                    // reports as an ordinary failure, which the
+                    // bounded retry in thumb() re-attempts.
+                    let work = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                        || -> Option<Vec<u8>> {
+                            if let Some(local) = &local {
+                                if let Some(bytes) =
+                                    local_render::local_thumb(local, &version_id, page)
+                                {
+                                    return Some(bytes);
+                                }
                             }
-                        }
-                    }
-                    let mut req = ureq::get(&url);
-                    if let Some(t) = &token {
-                        req = req.set("Authorization", &format!("Bearer {t}"));
-                    }
-                    let out = req
-                        .call()
-                        .ok()
-                        .and_then(|r| r.into_json::<Value>().ok())
-                        .and_then(|v| {
-                            v.get("image_base64")
-                                .and_then(|x| x.as_str())
-                                .map(str::to_string)
-                        })
-                        .and_then(|s| b64d(&s).ok());
-                    let _ = tx.send((key, out));
+                            // Offline cache bundle (T1): a cached deck's
+                            // blocks render in-process from their cached
+                            // fragments when the server is unreachable.
+                            if let Some((frag_file, thumb_dir)) = &bundle {
+                                let frag = cache_key().and_then(|ck| {
+                                    std::fs::read(frag_file)
+                                        .ok()
+                                        .and_then(|data| decrypt_bytes(&ck, &data))
+                                });
+                                if let Some(frag) = frag {
+                                    if let Some(bytes) =
+                                        local_render::cached_thumb(&frag, thumb_dir, page)
+                                    {
+                                        return Some(bytes);
+                                    }
+                                }
+                            }
+                            let mut req = thumb_agent().get(&url);
+                            if let Some(t) = &token {
+                                req = req.set("Authorization", &format!("Bearer {t}"));
+                            }
+                            req.call()
+                                .ok()
+                                .and_then(|r| r.into_json::<Value>().ok())
+                                .and_then(|v| {
+                                    v.get("image_base64")
+                                        .and_then(|x| x.as_str())
+                                        .map(str::to_string)
+                                })
+                                .and_then(|s| b64d(&s).ok())
+                        },
+                    ));
+                    let _ = tx.send((key, work.unwrap_or(None)));
                 });
                 None
             }
@@ -8837,6 +10043,90 @@ impl App {
     fn thumb_ui(&mut self, ui: &mut egui::Ui, version_id: &str, page: usize, width: f32) {
         let h = width * 9.0 / 16.0;
         if let Some(tex) = self.thumb(version_id, page) {
+            ui.image((tex.id(), egui::vec2(width, h)));
+        } else {
+            ui.allocate_ui(egui::vec2(width, h), |ui| {
+                egui::Frame::NONE
+                    .fill(palette_color(HOVER_BG))
+                    .show(ui, |ui| {
+                        ui.set_min_size(egui::vec2(width, h));
+                        ui.centered_and_justified(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!("第 {} 页", page + 1))
+                                    .color(palette_color(TEXT_WEAK)),
+                            );
+                        });
+                    });
+            });
+        }
+    }
+
+    /// Thumbnail for one page of a staged submission fragment
+    /// (F1 review preview): the same worker/channel machinery as
+    /// `thumb`, keyed by fragment hash; the worker fetches the
+    /// fragment bytes from the submission's own staging zone
+    /// (GET /v1/submissions/:id/files/:hash) and renders them
+    /// in-process, so the preview shows the package's pages —
+    /// never a library version's. Once the submission is decided
+    /// its staging is cleared (F5) and pages simply stay
+    /// unrendered.
+    fn sub_thumb(
+        &mut self,
+        sub_id: &str,
+        hash: &str,
+        page: usize,
+    ) -> Option<egui::TextureHandle> {
+        if hash.is_empty() {
+            return None;
+        }
+        let key = format!("sub:{hash}:{page}");
+        match self.thumbs.get(&key) {
+            Some(ThumbState::Ready(t)) => Some(t.clone()),
+            Some(_) => None,
+            None => {
+                self.thumbs.insert(key.clone(), ThumbState::Loading);
+                let (server, token, tx) = (
+                    self.server.clone(),
+                    self.token.clone(),
+                    self.thumb_tx.clone(),
+                );
+                let url = format!("{server}/v1/submissions/{sub_id}/files/{hash}");
+                let dir = cache_dir()
+                    .join("subprev")
+                    .join(hash.chars().take(16).collect::<String>());
+                std::thread::spawn(move || {
+                    let mut req = ureq::get(&url);
+                    if let Some(t) = &token {
+                        req = req.set("Authorization", &format!("Bearer {t}"));
+                    }
+                    let out = req
+                        .call()
+                        .ok()
+                        .and_then(|r| r.into_json::<Value>().ok())
+                        .and_then(|v| {
+                            v.get("data_base64")
+                                .and_then(|x| x.as_str())
+                                .map(str::to_string)
+                        })
+                        .and_then(|b64| b64d(&b64).ok())
+                        .and_then(|frag| local_render::cached_thumb(&frag, &dir, page));
+                    let _ = tx.send((key, out));
+                });
+                None
+            }
+        }
+    }
+
+    fn sub_thumb_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        sub_id: &str,
+        hash: &str,
+        page: usize,
+        width: f32,
+    ) {
+        let h = width * 9.0 / 16.0;
+        if let Some(tex) = self.sub_thumb(sub_id, hash, page) {
             ui.image((tex.id(), egui::vec2(width, h)));
         } else {
             ui.allocate_ui(egui::vec2(width, h), |ui| {
@@ -8959,16 +10249,19 @@ impl App {
             Ok(v) => {
                 if let Some(data) = v.get("data_base64").and_then(|x| x.as_str()) {
                     if let Ok(bytes) = b64d(data) {
-                        let _ = std::fs::write(&path, bytes);
-                        self.msg = format!(
-                            "已导出 {} 页（{}）",
-                            v.get("page_count").and_then(|x| x.as_i64()).unwrap_or(0),
-                            if kind == "company" {
-                                "公用版"
-                            } else {
-                                "个人版"
-                            }
-                        );
+                        // Audit2 E-M10: the write result decides the message — a failed write no longer reports success.
+                        self.msg = match std::fs::write(&path, bytes) {
+                            Ok(()) => format!(
+                                "已导出 {} 页（{}）",
+                                v.get("page_count").and_then(|x| x.as_i64()).unwrap_or(0),
+                                if kind == "company" {
+                                    "公用版"
+                                } else {
+                                    "个人版"
+                                }
+                            ),
+                            Err(e) => format!("导出失败：{e}"),
+                        };
                         self.load_index_detail();
                     }
                 }
@@ -9033,8 +10326,17 @@ impl App {
                     "enc": true,
                     "cached_ms": qimu_core::auth::now_ms(),
                 }));
-                save_cache_index(&self.cache_entries);
-                self.msg = format!("已缓存到本地（加密）：{title}");
+                if save_cache_index(&self.cache_entries) {
+                    self.msg = format!("已缓存到本地（加密）：{title}");
+                } else {
+                    // Audit2 E-M4: the index did not persist — the
+                    // entry would vanish on restart, so do not
+                    // claim the cache; drop the in-memory entry
+                    // again (the encrypted file stays behind as an
+                    // unindexed orphan, like a failed first cache).
+                    self.cache_entries.retain(|e| s(e, "key") != key);
+                    self.msg = "缓存失败：缓存索引保存失败".into();
+                }
             }
             Err(e) => self.msg = format!("缓存失败：{e}"),
         }
@@ -9047,7 +10349,11 @@ impl App {
     /// the deck-only snapshot, and all of it counted against the
     /// same administrator capacity policy. The entry records every
     /// file it owns, so removal and the cache manager's totals
-    /// stay truthful.
+    /// stay truthful. It also records the pin fingerprint of the
+    /// formal version it captured (`pin_fp`): a later re-pin or
+    /// takedown marks the entry stale (see
+    /// `reconcile_cache_staleness`) instead of letting the bundle
+    /// pose as the current formal version forever.
     fn cache_deck_bundle(
         &mut self,
         key: &str,
@@ -9057,6 +10363,7 @@ impl App {
         source_index_id: &str,
         index_json: &[u8],
         blocks: &[(String, String, Vec<u8>, i64)],
+        pin_fp: &str,
     ) {
         if self.cache_policy.get("allowed").and_then(|v| v.as_bool()) == Some(false) {
             self.msg = "管理员已关闭离线缓存".into();
@@ -9098,30 +10405,74 @@ impl App {
                 .collect()
         };
         let safe_key = safe(key);
-        let mut write_enc = |name: &str, plain: &[u8]| -> Result<(), String> {
+        // Two-phase publish (N5): every file is first written
+        // (encrypted) under a `.part` name; only when ALL writes
+        // succeed are the parts renamed over the live names and
+        // the cache entry swapped (below). A mid-bundle failure
+        // — disk full, IO error — therefore leaves the previous
+        // bundle, files and entry alike, exactly as it was,
+        // instead of the old shape: new deck/index files under
+        // an old entry whose block list still names the previous
+        // versions, silently read as one consistent bundle.
+        let nonce = format!("{}-{}", qimu_core::auth::now_ms(), std::process::id());
+        let write_part = |name: &str, plain: &[u8]| -> Result<std::path::PathBuf, String> {
             let enc = encrypt_bytes(&ck, plain).ok_or_else(|| "缓存加密失败".to_string())?;
-            craft_atomic::atomic_write(&dir.join(name), &enc).map_err(|e| e.to_string())
+            let part = dir.join(format!("{name}.part-{nonce}"));
+            craft_atomic::atomic_write(&part, &enc).map_err(|e| e.to_string())?;
+            Ok(part)
         };
         let deck_file = format!("{safe_key}.pptx.enc");
         let index_file = format!("{safe_key}.index.enc");
         let mut block_entries: Vec<Value> = Vec::new();
-        let mut result = write_enc(&deck_file, deck).and_then(|_| write_enc(&index_file, index_json));
+        let mut staged: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+        let mut result: Result<(), String> = Ok(());
+        match write_part(&deck_file, deck) {
+            Ok(p) => staged.push((p, dir.join(&deck_file))),
+            Err(e) => result = Err(e),
+        }
+        if result.is_ok() {
+            match write_part(&index_file, index_json) {
+                Ok(p) => staged.push((p, dir.join(&index_file))),
+                Err(e) => result = Err(e),
+            }
+        }
         if result.is_ok() {
             for (vid, unit_id, frag, pages) in blocks {
                 let file = format!("{safe_key}--{}.frag.enc", safe(vid));
-                match write_enc(&file, frag) {
-                    Ok(_) => block_entries.push(json!({
-                        "version_id": vid,
-                        "unit_id": unit_id,
-                        "file": file,
-                        "bytes": frag.len() as i64,
-                        "page_count": pages,
-                    })),
+                match write_part(&file, frag) {
+                    Ok(p) => {
+                        staged.push((p, dir.join(&file)));
+                        block_entries.push(json!({
+                            "version_id": vid,
+                            "unit_id": unit_id,
+                            "file": file,
+                            "bytes": frag.len() as i64,
+                            "page_count": pages,
+                        }));
+                    }
                     Err(e) => {
                         result = Err(e);
                         break;
                     }
                 }
+            }
+        }
+        if result.is_ok() {
+            // Publish: rename every staged part over its live
+            // name. Same-directory renames replace atomically;
+            // a failure here is the one residual window (some
+            // files new, entry not yet swapped) — it needs a
+            // failing rename after every write succeeded.
+            for (part, fin) in &staged {
+                if let Err(e) = std::fs::rename(part, fin) {
+                    result = Err(e.to_string());
+                    break;
+                }
+            }
+        }
+        if result.is_err() {
+            for (part, _) in &staged {
+                let _ = std::fs::remove_file(part);
             }
         }
         match result {
@@ -9138,12 +10489,21 @@ impl App {
                     "source_index_id": source_index_id,
                     "index_file": index_file,
                     "blocks": block_entries,
+                    "pin_fp": pin_fp,
                 }));
-                save_cache_index(&self.cache_entries);
-                self.msg = format!(
-                    "已缓存到本地（加密）：{title}（含索引与 {} 个内容块）",
-                    blocks.len()
-                );
+                // Audit2 E-M4: an index that failed to save must
+                // not report success — roll the in-memory entry
+                // back out so the cache does not claim a bundle
+                // the next launch will never find.
+                if save_cache_index(&self.cache_entries) {
+                    self.msg = format!(
+                        "已缓存到本地（加密）：{title}（含索引与 {} 个内容块）",
+                        blocks.len()
+                    );
+                } else {
+                    self.cache_entries.retain(|e| s(e, "key") != key);
+                    self.msg = "缓存失败：缓存索引保存失败".into();
+                }
             }
             Err(e) => self.msg = format!("缓存失败：{e}"),
         }
@@ -9188,14 +10548,75 @@ impl App {
     /// keys on, and its `blocks` array rides along in the same
     /// entry. A deck-only entry (an older snapshot, an assembly
     /// export) does not count — offline it cannot open its
-    /// detail or drill into blocks. The entry's `bytes` is the
-    /// whole bundle's total, so capacity and the cache manager
-    /// already account for the bundle as one unit.
+    /// detail or drill into blocks. A stale entry (the item was
+    /// re-pinned or taken down after the bundle was captured —
+    /// see `reconcile_cache_staleness`) does not count either:
+    /// offline it must not present itself as the item's current
+    /// formal version. The entry's `bytes` is the whole bundle's
+    /// total, so capacity and the cache manager already account
+    /// for the bundle as one unit.
     fn sr_bundle_cached(&self, item_id: &str) -> bool {
         let key = format!("sr_{item_id}");
-        self.cache_entries
-            .iter()
-            .any(|e| s(e, "key") == key && !s(e, "index_file").is_empty())
+        let dir = cache_dir();
+        self.cache_entries.iter().any(|e| {
+            s(e, "key") == key
+                && !s(e, "index_file").is_empty()
+                && e.get("stale").and_then(|v| v.as_bool()) != Some(true)
+                // Audit2 E-M7: the entry record alone is not proof
+                // enough — verify the files it names are really on
+                // disk, so a bundle whose files were lost or moved
+                // reads as "not cached" (and can simply be
+                // re-cached) instead of failing only when opened
+                // offline.
+                && dir.join(s(e, "file")).is_file()
+                && dir.join(s(e, "index_file")).is_file()
+        })
+    }
+
+    /// Cache-versus-formal-version reconciliation (pin audit
+    /// N3), run whenever a fresh live showroom list lands. Each
+    /// showroom bundle recorded the pin fingerprint of the
+    /// formal version it captured; the entry goes stale when the
+    /// item's current fingerprint differs (a re-push or a
+    /// re-landing re-pinned it) or when the item no longer
+    /// appears in the live list at all (rejected, recalled or
+    /// deleted — takedown reaches the offline face here, at the
+    /// next successful refresh; a client that never reconnects
+    /// never learns, which is the protocol's limit). A matching
+    /// fingerprint clears the mark again. Entries recorded
+    /// before fingerprints existed carry none and are left alone
+    /// — unverifiable, declared as such.
+    fn reconcile_cache_staleness(&mut self) {
+        let mut changed = false;
+        for e in self.cache_entries.iter_mut() {
+            let key = s(e, "key");
+            let Some(item_id) = key.strip_prefix("sr_") else {
+                continue;
+            };
+            let recorded = s(e, "pin_fp");
+            if recorded.is_empty() {
+                continue;
+            }
+            let stale = match self
+                .showroom_live
+                .iter()
+                .find(|it| s(it, "id") == item_id)
+            {
+                Some(it) => {
+                    let now = item_pin_fingerprint(it);
+                    !now.is_empty() && now != recorded
+                }
+                None => true,
+            };
+            let was = e.get("stale").and_then(|v| v.as_bool()).unwrap_or(false);
+            if stale != was {
+                e["stale"] = json!(stale);
+                changed = true;
+            }
+        }
+        if changed {
+            save_cache_index(&self.cache_entries);
+        }
     }
 
     /// The cached index detail for a showroom item, when its
@@ -9259,6 +10680,28 @@ impl App {
                     if !f.is_empty() {
                         let _ = std::fs::remove_file(cache_dir().join(f));
                     }
+                    // Audit2 E-L7: the bundle's rendered thumbnails
+                    // for this block version go with it — they were
+                    // never counted in the entry's bytes and used to
+                    // outlive every removal, unaccounted forever.
+                    let vid = s(b, "version_id");
+                    if !vid.is_empty() {
+                        let _ = std::fs::remove_dir_all(
+                            cache_dir().join("thumbs").join(vid),
+                        );
+                    }
+                }
+            }
+            // Audit2 E-M6: this entry's decrypted scratch copy in
+            // open/ (named by key since the M11 fix) goes too.
+            let open_dir = cache_dir().join("open");
+            if let Ok(rd) = std::fs::read_dir(&open_dir) {
+                let prefix = format!("{}-", key);
+                for ent in rd.flatten() {
+                    let name = ent.file_name().to_string_lossy().into_owned();
+                    if name.starts_with(&prefix) && name.ends_with(".pptx") {
+                        let _ = std::fs::remove_file(ent.path());
+                    }
                 }
             }
         }
@@ -9295,10 +10738,47 @@ impl App {
             };
             let open_dir = cache_dir().join("open");
             let _ = std::fs::create_dir_all(&open_dir);
-            let p = open_dir.join(format!("{}.pptx", s(&e, "title")));
+            // Audit2 E-M11: the title is peer-controlled text and
+            // used to be the file name verbatim — a title with `/`
+            // or `../` wrote the decrypted copy outside open/, and
+            // same-title decks overwrote each other. The name is
+            // the entry key plus a sanitized title suffix (both
+            // reduced to filesystem-safe characters).
+            let sanitize = |t: &str| -> String {
+                t.chars()
+                    .map(|c| {
+                        if c.is_alphanumeric() || c == '-' || c == '_' {
+                            c
+                        } else {
+                            '_'
+                        }
+                    })
+                    .collect()
+            };
+            let p = open_dir.join(format!(
+                "{}-{}.pptx",
+                sanitize(key),
+                sanitize(&s(&e, "title"))
+            ));
             if std::fs::write(&p, data).is_err() {
                 self.msg = "写出临时副本失败".into();
                 return;
+            }
+            // Audit2 E-M6: these plaintext copies are scratch, not
+            // an archive — sweep the directory's other decks (the
+            // same discipline export_for_present applies to
+            // present/) instead of accumulating decrypted copies
+            // forever. A copy still open in another app simply
+            // fails to delete on Windows and is retried next time.
+            if let Ok(rd) = std::fs::read_dir(&open_dir) {
+                for ent in rd.flatten() {
+                    let other = ent.path();
+                    if other != p
+                        && other.extension().map(|x| x == "pptx").unwrap_or(false)
+                    {
+                        let _ = std::fs::remove_file(other);
+                    }
+                }
             }
             p
         } else {
@@ -9352,10 +10832,18 @@ impl App {
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let path = dir.join(format!("{item_id}-{}.pptx", dc_content_stamp(&bytes)));
         std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+        // Audit2 E-L4: the sweep used to delete every other copy in
+        // present/ — including the file the live DeckCraft session
+        // is showing right now (its session record names it), which
+        // an external reader re-reading by path would lose mid-show.
+        let live_file = self.dc.as_ref().map(|sess| sess.file.clone());
         if let Ok(rd) = std::fs::read_dir(&dir) {
             for e in rd.flatten() {
                 let p = e.path();
-                if p != path && p.extension().map(|x| x == "pptx").unwrap_or(false) {
+                if p != path
+                    && live_file.as_deref() != Some(&p)
+                    && p.extension().map(|x| x == "pptx").unwrap_or(false)
+                {
                     let _ = std::fs::remove_file(p);
                 }
             }
@@ -9428,6 +10916,13 @@ impl App {
         let (path, page_count) = match self.export_for_present(item_id) {
             Ok(v) => v,
             Err(e) => {
+                // Stays `true` on purpose (audit2 E-N2 disposition):
+                // an export refusal — no permission, takedown — is
+                // a *refused* presentation, not a failed engine.
+                // Returning false here would route a deck the user
+                // may not present into the built-in presenter and
+                // defeat the refusal (the permission-refusal
+                // discipline: gates sit at the action point).
                 self.msg = format!("演示失败：{e}");
                 return true;
             }
@@ -9444,11 +10939,14 @@ impl App {
     /// deck a published index, a history version a frozen page
     /// sequence). The three views are only this entry's mode
     /// parameter. `start_hosted_show` is the one show engine; the
-    /// external DeckCraft jump stays as the fallback, and a
-    /// machine with neither gets the install prompt. The showroom
-    /// path's discipline is preserved exactly: the start page is
-    /// clamped to the deck, the hosted failure is always
-    /// surfaced, never silent.
+    /// external DeckCraft jump is the next fallback. When NEITHER
+    /// engine could start the show this returns false (audit2
+    /// E-N2 disposition): showroom callers then fall back to the
+    /// built-in presenter, and the doors without a fallback wired
+    /// (units, indexes) surface the reason left in `msg` — the
+    /// hosted failure is always surfaced, never silent. The
+    /// showroom path's discipline is preserved exactly: the start
+    /// page is clamped to the deck.
     fn open_deck_views(
         &mut self,
         title: &str,
@@ -9470,25 +10968,26 @@ impl App {
             self.msg = format!(
                 "进程内放映不可用（{hosted_err}），且未检测到 DeckCraft 桌面应用：请先安装 DeckCraft 后再试"
             );
-            return true;
+            return false;
         }
         // The jump needs a file: materialize a disposable copy
         // under the same present/ directory the showroom export
-        // uses (its sweep collects these too), named by content
-        // stamp so a re-open never reads back a stale deck.
+        // uses (its sweep collects these too), named by the
+        // full-width content stamp so a re-open never reads back
+        // a stale deck (audit2 E-N3).
         let dir = qimu_home().join("present");
-        let path = dir.join(format!("open-{}.pptx", dc_content_stamp(bytes)));
+        let path = dir.join(format!("open-{}.pptx", dc_content_stamp64(bytes)));
         if let Err(e) = std::fs::create_dir_all(&dir)
             .and_then(|()| std::fs::write(&path, bytes))
         {
             self.msg = format!("进程内放映不可用（{hosted_err}）；写出 DeckCraft 副本失败：{e}");
-            return true;
+            return false;
         }
-        self.dc_jump(&path, title, mode, from);
-        if self.msg.contains("已在 DeckCraft") {
+        let jumped = self.dc_jump(&path, title, mode, from);
+        if jumped && self.msg.contains("已在 DeckCraft") {
             self.msg = format!("进程内放映不可用（{hosted_err}），已改用 DeckCraft 打开");
         }
-        true
+        jumped
     }
 
     /// The path-fed door of the unified opener: the showroom
@@ -9519,13 +11018,13 @@ impl App {
             self.msg = format!(
                 "进程内放映不可用（{hosted_err}），且未检测到 DeckCraft 桌面应用：请先安装 DeckCraft 后再试"
             );
-            return true;
+            return false;
         }
-        self.dc_jump(path, title, mode, from);
-        if self.msg.contains("已在 DeckCraft") {
+        let jumped = self.dc_jump(path, title, mode, from);
+        if jumped && self.msg.contains("已在 DeckCraft") {
             self.msg = format!("进程内放映不可用（{hosted_err}），已改用 DeckCraft 打开");
         }
-        true
+        jumped
     }
 
     /// Resolve ONE content-block version — current or a clicked
@@ -9694,11 +11193,14 @@ impl App {
         if deckcraft_app_path().is_none() {
             return false;
         }
-        self.dc_jump(path, title, DcMode::Play, 0);
-        if self.msg.contains("已在 DeckCraft") {
+        // Audit2 E-N2: the jump's own verdict decides — a failed
+        // jump now really reaches the caller's system-app fallback
+        // instead of being reported as a successful presentation.
+        let jumped = self.dc_jump(path, title, DcMode::Play, 0);
+        if jumped && self.msg.contains("已在 DeckCraft") {
             self.msg = format!("进程内放映不可用（{hosted_err}），已改用 DeckCraft 打开");
         }
-        true
+        jumped
     }
 
     /// Orchestrate one jump into the managed DeckCraft instance
@@ -9709,10 +11211,14 @@ impl App {
     /// `app.open` → presenter flag for this mode → `show.start` →
     /// `ui.focus`; the presenter flag is set explicitly every jump
     /// because it is a persisted DeckCraft preference.
-    fn dc_jump(&mut self, path: &std::path::Path, title: &str, mode: DcMode, from: usize) {
+    /// Returns true when DeckCraft actually took the show
+    /// (managed jump or the degraded plain launch); false when it
+    /// could not be started at all — the doors above use this to
+    /// hand the deck to the caller's own fallback (audit2 E-N2).
+    fn dc_jump(&mut self, path: &std::path::Path, title: &str, mode: DcMode, from: usize) -> bool {
         let Some(bin) = deckcraft_app_path() else {
             self.msg = "未检测到 DeckCraft 桌面应用：播放、普通视图和演示者视图由 DeckCraft 提供，请先安装 DeckCraft 后再试".into();
-            return;
+            return false;
         };
         // Reuse probe: a fresh connection + inspect on the managed port.
         let mut live: Option<(DcControl, Value)> = None;
@@ -9742,7 +11248,7 @@ impl App {
         if live.is_none() {
             let Some(port) = dc_free_port() else {
                 self.msg = "无法分配本地控制端口".into();
-                return;
+                return false;
             };
             let child = match std::process::Command::new(&bin)
                 .arg("--control")
@@ -9752,7 +11258,7 @@ impl App {
                 Ok(c) => c,
                 Err(e) => {
                     self.msg = format!("无法启动 DeckCraft：{e}");
-                    return;
+                    return false;
                 }
             };
             match dc_wait_ready(port) {
@@ -9781,17 +11287,20 @@ impl App {
                     let mut child = child;
                     let _ = child.kill();
                     let _ = child.wait();
-                    match std::process::Command::new(&bin)
+                    return match std::process::Command::new(&bin)
                         .arg("--show")
                         .arg(path)
                         .spawn()
                     {
                         Ok(_) => {
-                            self.msg = "已以降级模式在 DeckCraft 打开演示（控制通道不可用）".into()
+                            self.msg = "已以降级模式在 DeckCraft 打开演示（控制通道不可用）".into();
+                            true
                         }
-                        Err(e) => self.msg = format!("无法启动 DeckCraft：{e}"),
-                    }
-                    return;
+                        Err(e) => {
+                            self.msg = format!("无法启动 DeckCraft：{e}");
+                            false
+                        }
+                    };
                 }
             }
         }
@@ -9824,7 +11333,7 @@ impl App {
             let _ = ctl.call("ui.focus", json!({}));
             Ok(())
         })();
-        match run {
+        let started = match run {
             Ok(()) => {
                 self.msg = match mode {
                     DcMode::Play => format!("已在 DeckCraft 开始演示：{title}"),
@@ -9845,11 +11354,14 @@ impl App {
                     let tx = self.dc_tx.clone();
                     std::thread::spawn(move || dc_watch(port, gen_arc, gen, tx));
                 }
+                true
             }
             Err(e) => {
                 self.msg = format!("DeckCraft 跳转失败：{e}");
+                false
             }
-        }
+        };
+        started
     }
 
     /// Drop the managed-session record (retires its watcher via the
@@ -9875,7 +11387,13 @@ impl App {
     fn dc_poll(&mut self) {
         while let Ok(ev) = self.dc_rx.try_recv() {
             match ev {
-                DcEvent::ShowEnded => {
+                DcEvent::ShowEnded(gen) => {
+                    // Audit2 E-M9: a queued event from a superseded
+                    // session must not restore flags on, or quit,
+                    // the session that replaced it.
+                    if gen != self.dc_gen.load(std::sync::atomic::Ordering::SeqCst) {
+                        continue;
+                    }
                     let auto = self.dc.as_ref().map(|s| s.auto_quit).unwrap_or(false);
                     if auto {
                         if let Some(sess) = &self.dc {
@@ -9895,7 +11413,10 @@ impl App {
                         self.msg = "放映已结束（DeckCraft 仍开着这份稿件）".into();
                     }
                 }
-                DcEvent::Gone => {
+                DcEvent::Gone(gen) => {
+                    if gen != self.dc_gen.load(std::sync::atomic::Ordering::SeqCst) {
+                        continue;
+                    }
                     let dead = match &self.dc {
                         Some(sess) => DcControl::connect(sess.port).is_err(),
                         None => false,
@@ -9953,12 +11474,22 @@ impl App {
             // Not in the live list (e.g. offline after a restart):
             // the offline cache bundle still knows this deck's
             // source index and its pages (T1 cache payload).
-            let src = self
+            let entry = self
                 .cache_entries
                 .iter()
-                .find(|e| s(e, "key") == format!("sr_{item_id}"))
-                .map(|e| s(e, "source_index_id"))
-                .unwrap_or_default();
+                .find(|e| s(e, "key") == format!("sr_{item_id}"));
+            let src = entry.map(|e| s(e, "source_index_id")).unwrap_or_default();
+            if entry
+                .map(|e| e.get("stale").and_then(|v| v.as_bool()) == Some(true))
+                .unwrap_or(false)
+            {
+                // A stale bundle still opens — offline access is
+                // the cache's point — but it must not present
+                // itself as the item's current formal version.
+                self.msg =
+                    "本地缓存已过期（正式版已更新或条目已下架），打开的是旧版缓存"
+                        .into();
+            }
             let pages = self
                 .cached_index_detail(item_id)
                 .map(|v| showroom_pages(&v))
@@ -10221,8 +11752,11 @@ impl App {
                         .set_file_name(format!("{}.pptx", s(&item, "title")))
                         .save_file()
                     {
-                        let _ = std::fs::write(path, bytes);
-                        self.msg = "已保存".into();
+                        // Audit2 E-M10: the write result decides the message — a failed write no longer reports success.
+                        self.msg = match std::fs::write(path, bytes) {
+                            Ok(()) => "已保存".into(),
+                            Err(e) => format!("保存失败：{e}"),
+                        };
                     }
                     return;
                 }
@@ -10245,8 +11779,11 @@ impl App {
                             .set_file_name(format!("{}.pptx", s(&item, "title")))
                             .save_file(),
                     ) {
-                        let _ = std::fs::write(path, bytes);
-                        self.msg = "已保存".into();
+                        // Audit2 E-M10: the write result decides the message — a failed write no longer reports success.
+                        self.msg = match std::fs::write(path, bytes) {
+                            Ok(()) => "已保存".into(),
+                            Err(e) => format!("保存失败：{e}"),
+                        };
                     }
                 }
             }
@@ -10291,8 +11828,11 @@ impl App {
                             .set_file_name(format!("{stem}.pdf"))
                             .save_file(),
                     ) {
-                        let _ = std::fs::write(path, bytes);
-                        self.msg = "已保存".into();
+                        // Audit2 E-M10: the write result decides the message — a failed write no longer reports success.
+                        self.msg = match std::fs::write(path, bytes) {
+                            Ok(()) => "已保存".into(),
+                            Err(e) => format!("保存失败：{e}"),
+                        };
                     }
                 }
             }
@@ -10346,11 +11886,16 @@ impl App {
                     .set_file_name(format!("{stem}.pdf"))
                     .save_file()
                 {
-                    let _ = std::fs::write(path, bytes);
-                    self.msg = if text_layer {
-                        "已保存".into()
-                    } else {
-                        "已保存（纯图片版：文字不可搜索、复制）".into()
+                    // Audit2 E-M10: the write result decides the message — a failed write no longer reports success.
+                    self.msg = match std::fs::write(path, bytes) {
+                        Ok(()) => {
+                            if text_layer {
+                                "已保存".into()
+                            } else {
+                                "已保存（纯图片版：文字不可搜索、复制）".into()
+                            }
+                        }
+                        Err(e) => format!("保存 PDF 失败：{e}"),
                     };
                 }
                 true
@@ -10369,9 +11914,10 @@ impl App {
                         confirm_label: "纯图片导出".into(),
                         danger: false,
                         action: ConfirmAction::PdfRasterFallback {
-                            item: item.clone(),
+                            deck: deck.clone(),
                             form: form.to_string(),
                             page,
+                            stem: stem.to_string(),
                         },
                     }));
                 } else {
@@ -10415,7 +11961,14 @@ impl App {
         let mut act: Option<&'static str> = None;
         let mut pdf_act: Option<(&'static str, Option<usize>)> = None;
         let cache_key = format!("sr_{}", s(&item, "id"));
-        let already_cached = self.cache_entries.iter().any(|e| s(e, "key") == cache_key);
+        // A stale entry (the formal version moved on or the item
+        // was taken down after caching) does not count as cached:
+        // the control below offers a fresh 缓存 instead of
+        // claiming the current formal version is already held.
+        let already_cached = self.cache_entries.iter().any(|e| {
+            s(e, "key") == cache_key
+                && e.get("stale").and_then(|v| v.as_bool()) != Some(true)
+        });
         // T1 transforming button (user rulings 2026-11-24 16:09 and
         // 16:10): this header's save/cache control is ONE button —
         // 保存到我的库 while the deck is not in my library, 缓存
@@ -10793,18 +12346,33 @@ impl App {
         // resolved_entries), not the source index head's: the
         // cached drill-down holds the formal version. The stored
         // detail is stamped with the same rows, so offline page
-        // resolution reads the pinned set too. Items whose
-        // payload carries no resolved rows (older flows) fall
-        // back to the index detail's own rows, as before.
+        // resolution reads the pinned set too.
+        //
+        // Single source (N4): the rows ALWAYS come from the
+        // item's own pinned resolution. When the caller's payload
+        // carries no resolved rows, they are fetched from the
+        // item's own face — the showroom list stamps every item
+        // with its pinned rows — never from the source index
+        // detail, whose rows follow the index head and can name
+        // different versions than the pinned deck being cached
+        // (the old fallback mixed the two into one bundle). If
+        // the item's rows cannot be had either, the bundle is
+        // not built (the caller caches the deck alone).
         let pinned_rows = item
             .get("resolved_entries")
             .and_then(|r| r.as_array())
             .filter(|rows| !rows.is_empty())
-            .cloned();
-        let rows = match &pinned_rows {
-            Some(rows) => rows.clone(),
-            None => detail["resolved_entries"].as_array()?.clone(),
-        };
+            .cloned()
+            .or_else(|| {
+                let list = self.call("GET", "/v1/showroom", None).ok()?;
+                let items = list.get("items")?.as_array()?;
+                let mine = items.iter().find(|it| s(it, "id") == s(item, "id"))?;
+                mine.get("resolved_entries")
+                    .and_then(|r| r.as_array())
+                    .filter(|rows| !rows.is_empty())
+                    .cloned()
+            });
+        let rows = pinned_rows.clone()?;
         if let Some(rows) = &pinned_rows {
             detail["resolved_entries"] = Value::Array(rows.clone());
         }
@@ -10876,6 +12444,7 @@ impl App {
                 &source,
                 &index_json,
                 &blocks,
+                &item_pin_fingerprint(item),
             ),
             None => self.cache_deck(
                 &format!("sr_{}", s(item, "id")),
@@ -10940,8 +12509,11 @@ impl App {
                                                         .and_then(|x| x.as_str())
                                                     {
                                                         if let Ok(bytes) = b64d(data) {
-                                                            let _ = std::fs::write(&path, bytes);
-                                                            app.msg = "已导出".into();
+                                                            // Audit2 E-M10: the write result decides the message — a failed write no longer reports success.
+                                                            app.msg = match std::fs::write(&path, bytes) {
+                                                                Ok(()) => "已导出".into(),
+                                                                Err(e) => format!("导出失败：{e}"),
+                                                            };
                                                         }
                                                     }
                                                 }
@@ -10982,6 +12554,15 @@ impl App {
                                     i(&e, "page_count"),
                                     fmt_time(i(&e, "cached_ms"))
                                 ));
+                                if e.get("stale").and_then(|v| v.as_bool()) == Some(true) {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "已过期：正式版已更新或条目已下架",
+                                        )
+                                        .small()
+                                        .weak(),
+                                    );
+                                }
                                 let key = s(&e, "key");
                                 if ui.button("打开").clicked() {
                                     app.open_cache(&key);
@@ -11263,6 +12844,31 @@ impl App {
                             ui.label(egui::RichText::new(s(&sub, "title")).strong());
                             ui.label(format!("提交人 {}", s(&sub, "submitter_name")));
                             ui.label(tr("提交包"));
+                            if ui.button(tr("查看内容")).clicked() {
+                                // F1: the package preview lives in
+                                // the approval queue as a detail
+                                // frame — jump there with the frame
+                                // already pushed.
+                                self.page = Page::Settings;
+                                self.review.jump_source = Some(Page::Showroom);
+                                let sections = self.settings_sections();
+                                if let Some(pos) =
+                                    sections.iter().position(|x| *x == "审批队列")
+                                {
+                                    self.settings.section = pos;
+                                }
+                                self.review.stack.pop_to(0);
+                                self.review.stack.push(ReviewFrame::Submission(
+                                    SubmissionDetailState {
+                                        sub_id: s(&sub, "id"),
+                                        manifest: None,
+                                        loaded: false,
+                                        load_error: String::new(),
+                                        reject_open: false,
+                                        reject_text: String::new(),
+                                    },
+                                ));
+                            }
                             if ui.button("通过").clicked() && self.need_identity("审批演示厅投稿") {
                                 self.review_submission_act(&s(&sub, "id"), "live", "");
                             }
@@ -11572,6 +13178,10 @@ impl App {
             self.review_detail_body(ui);
             return;
         }
+        if matches!(self.review.stack.top(), ReviewFrame::Submission(_)) {
+            self.submission_detail_body(ui);
+            return;
+        }
         // Cross-page deep jump (nav ruler 3): this stack was entered
         // from the showroom review bar; at its root, offer the way
         // back to the source frame.
@@ -11602,6 +13212,7 @@ impl App {
             let pending = self.showroom_pending.clone();
             let subs = self.submissions_pending.clone();
             let mut approve_sub: Option<String> = None;
+            let mut open_sub: Option<String> = None;
             let mut confirm_sub_reject: Option<(String, String)> = None;
             let mut cancel_sub_reject = false;
             let mut reject_draft = self.sub_reject.clone();
@@ -11626,6 +13237,9 @@ impl App {
                                 }
                                 if btn_danger(ui, tr("驳回…")).clicked() {
                                     reject_draft = Some((sid.clone(), String::new()));
+                                }
+                                if btn_default(ui, tr("查看内容")).clicked() {
+                                    open_sub = Some(sid.clone());
                                 }
                             });
                         });
@@ -11744,6 +13358,16 @@ impl App {
                     });
                 });
                 ui.add_space(8.0);
+            }
+            if let Some(sid) = open_sub {
+                self.review.stack.push(ReviewFrame::Submission(SubmissionDetailState {
+                    sub_id: sid,
+                    manifest: None,
+                    loaded: false,
+                    load_error: String::new(),
+                    reject_open: false,
+                    reject_text: String::new(),
+                }));
             }
             if let Some(sid) = approve_sub {
                 self.review_submission_act(&sid, "live", "");
@@ -12056,6 +13680,316 @@ impl App {
         }
     }
 
+    /// F1: the submission-package preview (approval-queue detail
+    /// frame for a P3 package). Everything shown comes from the
+    /// staged package itself: the manifest from
+    /// GET /v1/submissions/:id/manifest, page renders from the
+    /// package's own fragment bytes — never from the submitter's
+    /// source library, whose current state may already have
+    /// moved on. This is the face that makes review non-blind:
+    /// approve / reject act from here exactly like the queue
+    /// cards, on the content the reviewer is looking at.
+    fn submission_detail_body(&mut self, ui: &mut egui::Ui) {
+        let sub_id = match self.review.stack.top() {
+            ReviewFrame::Submission(d) => d.sub_id.clone(),
+            _ => return,
+        };
+        // Load the manifest once per detail frame.
+        let need = match self.review.stack.top() {
+            ReviewFrame::Submission(d) => !d.loaded,
+            _ => false,
+        };
+        if need {
+            let got = self.call(
+                "GET",
+                &format!("/v1/submissions/{sub_id}/manifest"),
+                None,
+            );
+            if let ReviewFrame::Submission(d) = self.review.stack.top_mut() {
+                match got {
+                    Ok(v) => d.manifest = Some(v),
+                    Err(e) => d.load_error = e,
+                }
+                d.loaded = true;
+            }
+        }
+        let (payload, load_error, reject_open) = match self.review.stack.top() {
+            ReviewFrame::Submission(d) => {
+                (d.manifest.clone(), d.load_error.clone(), d.reject_open)
+            }
+            _ => (None, String::new(), false),
+        };
+        let mut go_back = false;
+        let mut approve = false;
+        let mut open_reject = false;
+        let mut cancel_reject = false;
+        let mut confirm_reject = false;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            let sub = payload
+                .as_ref()
+                .map(|p| p["submission"].clone())
+                .unwrap_or(Value::Null);
+            let title = {
+                let t = s(&sub, "title");
+                if t.is_empty() {
+                    sub_id.clone()
+                } else {
+                    t
+                }
+            };
+            if let Some(d) = crumb_bar(ui, &[tr("审批队列"), &title]) {
+                if d == 0 {
+                    go_back = true;
+                }
+            }
+            ui.add_space(10.0);
+            if !load_error.is_empty() {
+                ui.label(
+                    egui::RichText::new(format!("{}：{}", tr("读取提交包失败"), load_error))
+                        .size(12.5)
+                        .color(palette_color(TEXT_WEAK)),
+                );
+                return;
+            }
+            let Some(payload) = &payload else {
+                ui.label(
+                    egui::RichText::new(tr("正在读取提交包…"))
+                        .size(12.5)
+                        .color(palette_color(TEXT_WEAK)),
+                );
+                return;
+            };
+            let manifest = &payload["manifest"];
+            let state = s(&sub, "state");
+            card_frame().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(s(&sub, "title"))
+                            .size(14.0)
+                            .color(palette_color(TEXT_MAIN)),
+                    );
+                    match state.as_str() {
+                        "pending" => badge(ui, tr("待审"), BadgeTone::Warn),
+                        "landed" => badge(ui, tr("已落地"), BadgeTone::Ok),
+                        "rejected" => badge(ui, tr("已驳回"), BadgeTone::Bad),
+                        _ => {}
+                    }
+                    badge(ui, tr("提交包"), BadgeTone::Info);
+                });
+                let intro = s(&sub, "intro");
+                if !intro.is_empty() {
+                    ui.label(
+                        egui::RichText::new(intro)
+                            .size(12.0)
+                            .color(palette_color(TEXT_WEAK)),
+                    );
+                }
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} {} · {} · {} {} · {} {}",
+                        tr("提交人"),
+                        s(&sub, "submitter_name"),
+                        fmt_time(i(&sub, "created_ms")),
+                        i(&sub, "entry_count"),
+                        tr("个内容块"),
+                        i(&sub, "page_count"),
+                        tr("页")
+                    ))
+                    .size(11.0)
+                    .color(palette_color(TEXT_FAINT)),
+                );
+                let note = s(&sub, "note");
+                if !note.is_empty() {
+                    ui.label(
+                        egui::RichText::new(format!("{}：{}", tr("提交说明"), note))
+                            .size(11.5)
+                            .color(palette_color(TEXT_WEAK)),
+                    );
+                }
+                let land_error = s(&sub, "land_error");
+                if !land_error.is_empty() {
+                    ui.label(
+                        egui::RichText::new(format!("{}：{}", tr("上次落地失败"), land_error))
+                            .size(11.5)
+                            .color(palette_color(TEXT_WEAK)),
+                    );
+                }
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{}：{} · {} {}",
+                        tr("落地索引"),
+                        s(manifest, "index_name"),
+                        tr("可见范围"),
+                        s(manifest, "index_scope")
+                    ))
+                    .size(11.5)
+                    .color(palette_color(TEXT_WEAK)),
+                );
+            });
+            ui.add_space(12.0);
+            // The package's entries, in commit order, each with
+            // its resolved version's pages and speaker scripts —
+            // the exact set an approval lands.
+            let find_in = |arr: &Value, id: &str| -> Value {
+                arr.as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|x| s(x, "id") == id)
+                    .cloned()
+                    .unwrap_or(Value::Null)
+            };
+            let entries = manifest["commit"]["entries"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            for (n, e) in entries.iter().enumerate() {
+                let entry = &e["entry"];
+                let unit = find_in(&manifest["units"], &s(entry, "unit_id"));
+                let rend = find_in(&manifest["renditions"], &s(entry, "rendition_id"));
+                let ver = find_in(&manifest["versions"], &s(e, "version_id"));
+                let policy = if entry["policy"].is_object() {
+                    tr("版本锁定")
+                } else {
+                    tr("跟随最新（落地钉为审核版本）")
+                };
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{}. {} · {}/{} · v{} · {}",
+                        n + 1,
+                        s(&unit, "name"),
+                        s(&rend, "form"),
+                        s(&rend, "lang"),
+                        s(&ver, "semver"),
+                        policy
+                    ))
+                    .size(13.0)
+                    .strong()
+                    .color(palette_color(TEXT_MAIN)),
+                );
+                let total = i(&ver, "page_count");
+                let slots = entry["excerpt_slots"]
+                    .as_array()
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                if slots > 0 {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{}：{} {}，{} {}；{}",
+                            tr("摘页条目"),
+                            tr("版本共"),
+                            total,
+                            tr("本条目选用"),
+                            slots,
+                            tr("下方为版本全部页面，落地按摘页选用")
+                        ))
+                        .size(11.5)
+                        .color(palette_color(TEXT_WEAK)),
+                    );
+                }
+                let hash = s(&ver, "fragment_hash");
+                let scripts = ver["scripts"].as_array().cloned().unwrap_or_default();
+                ui.horizontal_wrapped(|ui| {
+                    for p in 0..total.max(0) as usize {
+                        ui.vertical(|ui| {
+                            ui.set_max_width(216.0);
+                            self.sub_thumb_ui(ui, &sub_id, &hash, p, 216.0);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} {} {}",
+                                    tr("第"),
+                                    p + 1,
+                                    tr("页")
+                                ))
+                                .size(11.0)
+                                .color(palette_color(TEXT_FAINT)),
+                            );
+                            let script = scripts
+                                .get(p)
+                                .and_then(|x| x.as_str())
+                                .unwrap_or_default();
+                            if !script.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(script)
+                                        .size(11.0)
+                                        .color(palette_color(TEXT_WEAK)),
+                                );
+                            }
+                        });
+                    }
+                });
+                ui.add_space(12.0);
+            }
+            if state == "pending" {
+                ui.horizontal(|ui| {
+                    if btn_primary(ui, tr("通过")).clicked() {
+                        approve = true;
+                    }
+                    if !reject_open && btn_danger(ui, tr("驳回…")).clicked() {
+                        open_reject = true;
+                    }
+                });
+                if reject_open {
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(tr("驳回理由（必填，会原样回到提交人）"))
+                            .size(12.0)
+                            .color(palette_color(TEXT_MAIN)),
+                    );
+                    if let ReviewFrame::Submission(d) = self.review.stack.top_mut() {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut d.reject_text)
+                                .desired_width(420.0)
+                                .desired_rows(3),
+                        );
+                    }
+                    ui.horizontal(|ui| {
+                        let empty = match self.review.stack.top() {
+                            ReviewFrame::Submission(d) => {
+                                d.reject_text.trim().is_empty()
+                            }
+                            _ => true,
+                        };
+                        if ui
+                            .add_enabled(!empty, egui::Button::new(tr("确认驳回")))
+                            .clicked()
+                        {
+                            confirm_reject = true;
+                        }
+                        if btn_default(ui, tr("取消")).clicked() {
+                            cancel_reject = true;
+                        }
+                    });
+                }
+            }
+            ui.add_space(14.0);
+        });
+        if open_reject {
+            if let ReviewFrame::Submission(d) = self.review.stack.top_mut() {
+                d.reject_open = true;
+            }
+        }
+        if cancel_reject {
+            if let ReviewFrame::Submission(d) = self.review.stack.top_mut() {
+                d.reject_open = false;
+            }
+        }
+        if approve && self.review_submission_act(&sub_id, "live", "") {
+            self.review.stack.pop();
+        }
+        if confirm_reject {
+            let note = match self.review.stack.top() {
+                ReviewFrame::Submission(d) => d.reject_text.trim().to_string(),
+                _ => String::new(),
+            };
+            if !note.is_empty() && self.review_submission_act(&sub_id, "rejected", &note) {
+                self.review.stack.pop();
+            }
+        }
+        if go_back {
+            self.review.stack.pop();
+        }
+    }
+
     fn showroom_body(&mut self, ui: &mut egui::Ui) {
         // Frame-state take-out, same pattern as content/index.
         // The deck view carries its own header (title + icon
@@ -12156,9 +14090,9 @@ impl App {
                 }
                 if ui.small_button("开始演示").clicked() {
                     // The deck frame stays as the return context;
-                    // presenting now jumps into DeckCraft (the
-                    // built-in presenter is the fallback when no
-                    // DeckCraft desktop app is on this machine).
+                    // presenting tries the hosted show, then
+                    // DeckCraft, and the built-in presenter is the
+                    // fallback when neither engine could start it.
                     app.open_showroom_deck(item);
                     if !app.present_via_deckcraft(&id, &title, DcMode::Play, 0) {
                         app.start_present_from_deck(ui);
@@ -12345,12 +14279,14 @@ impl App {
                     self.token.clone(),
                     self.import_tx.clone(),
                 );
+                let gen = self.import_gen;
                 self.importing = Some(name.clone());
                 self.msg = format!("正在导入「{name}」…");
                 // The propose + import sequence runs on a worker
                 // thread (the translation precedent): both calls
                 // parse and rebuild the whole deck, which froze
                 // the interface for the duration when it ran here.
+                let wake = self.egui_ctx.clone();
                 std::thread::spawn(move || {
                     let data = b64e(&bytes);
                     let done = (|| -> Result<String, String> {
@@ -12373,11 +14309,13 @@ impl App {
                             &server,
                             token.as_deref(),
                             &tx,
+                            gen,
                             &name,
                             &bytes,
                             &folder_id,
                             &group_id,
                             Some(blocks),
+                            wake.as_ref(),
                         )
                         .map_err(|e| format!("导入失败：{e}"))?;
                         Ok(format!(
@@ -12386,9 +14324,232 @@ impl App {
                             names.join("、")
                         ))
                     })();
-                    let _ = tx.send(ImportEvent::Done(done));
+                    let _ = tx.send(ImportEvent::Done(gen, done));
+                    if let Some(ctx) = &wake {
+                        ctx.request_repaint();
+                    }
                 });
+                if let Some(ctx) = &self.egui_ctx {
+                    ctx.request_repaint();
+                }
             }
+        }
+    }
+
+    // ---- lazy import (2026-11-25) ----
+
+    fn lazy_send(&self, cmd: LazyCmd) {
+        if let Some(tx) = &self.lazy_cmd_tx {
+            let _ = tx.send(cmd);
+        }
+    }
+
+    fn lazy_ensure_worker(&mut self) {
+        if self.lazy_cmd_tx.is_some() {
+            return;
+        }
+        let Some(local) = self.local.clone() else {
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let event_tx = self.import_tx.clone();
+        let wake = self.lazy_wake_ctx.clone();
+        let turbo = self.lazy_turbo.clone();
+        std::thread::spawn(move || {
+            lazy_worker_thread(local, rx, event_tx, wake, turbo);
+        });
+        self.lazy_cmd_tx = Some(tx);
+    }
+
+    /// Adopt one durable split state (from lazy-list) into the
+    /// UI mirror: the deck's unsplit unit -> page map is rebuilt
+    /// wholesale, so a sync after grouping can never leave stale
+    /// "unusable" entries behind.
+    fn lazy_adopt_state(&mut self, st: &Value) {
+        let pid = s(st, "pending_id");
+        if pid.is_empty() {
+            return;
+        }
+        self.lazy_unit_page.retain(|_, (p, _)| p != &pid);
+        if let Some(pages) = st.get("pages").and_then(|p| p.as_array()) {
+            for pg in pages {
+                if pg.get("split").and_then(|x| x.as_bool()) != Some(true) {
+                    let uid = s(pg, "unit_id");
+                    if !uid.is_empty() {
+                        self.lazy_unit_page
+                            .insert(uid, (pid.clone(), i(pg, "index") as usize));
+                    }
+                }
+            }
+        }
+        self.lazy_pendings.insert(
+            pid,
+            LazyPendingUi {
+                stem: s(st, "stem"),
+                slide_count: i(st, "slide_count") as usize,
+                split_count: i(st, "split_count") as usize,
+                failed: s(st, "state") == "failed",
+                error: s(st, "error"),
+            },
+        );
+    }
+
+    fn lazy_sync_pending(&mut self, pending_id: &str) {
+        if let Ok(v) = self.call_work("POST", "/v1/import/lazy-list", Some(json!({}))) {
+            if let Some(st) = v
+                .as_array()
+                .and_then(|a| a.iter().find(|x| s(x, "pending_id") == pending_id))
+            {
+                let st = st.clone();
+                self.lazy_adopt_state(&st);
+            }
+        }
+    }
+
+    /// Startup resume: re-adopt every durable pending import
+    /// and restart the worker if any deck is still splitting.
+    fn lazy_resume(&mut self) {
+        if self.local.is_none() {
+            return;
+        }
+        if let Ok(v) = self.call_work("POST", "/v1/import/lazy-list", Some(json!({}))) {
+            if let Some(arr) = v.as_array() {
+                let states = arr.clone();
+                for st in &states {
+                    self.lazy_adopt_state(st);
+                }
+            }
+        }
+        if !self.lazy_pendings.is_empty() {
+            self.lazy_ensure_worker();
+            self.lazy_send(LazyCmd::Kick);
+        }
+    }
+
+    /// Clicking an unsplit page card: the page jumps to the
+    /// front of the split queue — the user's one explicit
+    /// priority entry — with visible feedback.
+    fn lazy_boost(&mut self, pending_id: &str, index: usize) {
+        self.lazy_ensure_worker();
+        self.lazy_send(LazyCmd::Boost(vec![(pending_id.to_string(), index)]));
+        let stem = self
+            .lazy_pendings
+            .get(pending_id)
+            .map(|p| p.stem.clone())
+            .unwrap_or_default();
+        self.msg = format!("已优先拆分「{stem}」第 {} 页，马上就好", index + 1);
+    }
+
+    fn lazy_on_progress(&mut self, info: LazyProgressInfo) {
+        if info.done {
+            let stem = self
+                .lazy_pendings
+                .get(&info.pending_id)
+                .map(|p| p.stem.clone())
+                .unwrap_or_default();
+            self.lazy_pendings.remove(&info.pending_id);
+            self.lazy_unit_page
+                .retain(|_, (p, _)| p != &info.pending_id);
+            self.msg = format!("「{stem}」分割完成");
+            self.refresh_all();
+            return;
+        }
+        if info.failed {
+            if let Some(p) = self.lazy_pendings.get_mut(&info.pending_id) {
+                p.failed = true;
+                p.error = info.error.clone();
+                p.split_count = info.split_count;
+            }
+            self.msg = format!("分割失败：{}", info.error);
+            return;
+        }
+        // The page that just split leaves the unusable set.
+        self.lazy_unit_page
+            .retain(|_, (p, idx)| !(p == &info.pending_id && *idx == info.index));
+        if let Some(p) = self.lazy_pendings.get_mut(&info.pending_id) {
+            p.split_count = info.split_count;
+            p.slide_count = info.slide_count;
+        }
+        if info.grouped {
+            // Folding absorbed wrappers into a block unit: the
+            // wall's unit set changed, and this deck's remaining
+            // map entries are rebuilt exactly.
+            self.lazy_sync_pending(&info.pending_id);
+            self.refresh_all();
+        }
+    }
+
+    /// Toolbar split status (shell tool row): present only
+    /// while some deck is still splitting (or one failed) —
+    /// aggregate progress, a thin bar, and the turbo toggle;
+    /// disappears on its own when the last deck finishes.
+    fn lazy_status_slot(&mut self, ui: &mut egui::Ui) {
+        if self.lazy_pendings.is_empty() {
+            return;
+        }
+        let total: usize = self.lazy_pendings.values().map(|p| p.slide_count).sum();
+        let done_n: usize = self.lazy_pendings.values().map(|p| p.split_count).sum();
+        let failed: Vec<String> = self
+            .lazy_pendings
+            .iter()
+            .filter(|(_, p)| p.failed)
+            .map(|(id, _)| id.clone())
+            .collect();
+        ui.add_space(10.0);
+        ui.separator();
+        if !failed.is_empty() {
+            let first_error = failed
+                .first()
+                .and_then(|id| self.lazy_pendings.get(id))
+                .map(|p| p.error.clone())
+                .unwrap_or_default();
+            ui.label(
+                egui::RichText::new("分割失败")
+                    .size(12.5)
+                    .color(egui::Color32::from_rgb(0xD9, 0x5F, 0x5F)),
+            )
+            .on_hover_text(first_error);
+            if ui.small_button("忽略").clicked() {
+                for pid in &failed {
+                    let _ = self.call_work(
+                        "POST",
+                        "/v1/import/lazy-forget",
+                        Some(json!({ "pending_id": pid })),
+                    );
+                    self.lazy_pendings.remove(pid);
+                    self.lazy_unit_page.retain(|_, (p, _)| p != pid);
+                }
+                self.msg = "已忽略分割失败的导入记录（已拆好的页不受影响）".into();
+            }
+            return;
+        }
+        ui.label(
+            egui::RichText::new(format!("分割中 {done_n}/{total} 页"))
+                .size(12.5)
+                .color(palette_color(TEXT_WEAK)),
+        );
+        let frac = if total > 0 {
+            done_n as f32 / total as f32
+        } else {
+            0.0
+        };
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(84.0, 5.0), egui::Sense::hover());
+        let painter = ui.painter();
+        painter.rect_filled(rect, 2.5, palette_color(CHIP_GRAY_BG));
+        let mut fill = rect;
+        fill.max.x = rect.min.x + rect.width() * frac.clamp(0.0, 1.0);
+        painter.rect_filled(fill, 2.5, ACCENT);
+        let turbo = self.lazy_turbo.load(std::sync::atomic::Ordering::Relaxed);
+        let label = if turbo { "极速分割·开" } else { "极速分割" };
+        if ui.small_button(label).clicked() {
+            let on = !turbo;
+            self.lazy_turbo
+                .store(on, std::sync::atomic::Ordering::Relaxed);
+            self.msg = if on {
+                "极速分割：全速拆分中".into()
+            } else {
+                "已退出极速分割".into()
+            };
         }
     }
 
@@ -12422,19 +14583,66 @@ impl App {
                     self.token.clone(),
                     self.import_tx.clone(),
                 );
+                let gen = self.import_gen;
                 self.importing = Some(name.clone());
+                if local.is_some() {
+                    // Lazy import (user ruling 2026-11-25): open
+                    // only — the deck lands on the wall at once,
+                    // backed by the whole file, and the split
+                    // worker turns its pages into entities in the
+                    // background. The REST path below is
+                    // unchanged (server imports stay staged
+                    // one-shot this round).
+                    self.msg = format!("正在打开「{name}」…");
+                    let wake = self.lazy_wake_ctx.clone();
+                    std::thread::spawn(move || {
+                        let body = json!({
+                            "filename": name,
+                            "data_base64": b64e(&bytes),
+                            "folder_id": folder_id,
+                            "group_id": group_id,
+                        });
+                        let r = work_call_thread(
+                            &local,
+                            &server,
+                            token.as_deref(),
+                            "POST",
+                            "/v1/import/lazy-open",
+                            Some(body),
+                        );
+                        match r {
+                            Ok(v) => {
+                                let _ = tx.send(ImportEvent::LazyOpened(s(&v, "pending_id")));
+                            }
+                            Err(e) => {
+                                let _ =
+                                    tx.send(ImportEvent::Done(gen, Err(format!("导入失败：{e}"))));
+                            }
+                        }
+                        if let Some(ctx) = &wake {
+                            ctx.request_repaint();
+                        }
+                    });
+                    if let Some(ctx) = &self.egui_ctx {
+                        ctx.request_repaint();
+                    }
+                    return;
+                }
                 self.msg = format!("正在导入「{name}」…");
+                let wake = self.egui_ctx.clone();
                 std::thread::spawn(move || {
                     let r = staged_import_thread(
                         &local,
                         &server,
                         token.as_deref(),
                         &tx,
+                        gen,
                         &name,
                         &bytes,
                         &folder_id,
                         &group_id,
                         None,
+                        wake.as_ref(),
                     );
                     let done = match r {
                         Ok(v) => Ok(format!(
@@ -12443,8 +14651,14 @@ impl App {
                         )),
                         Err(e) => Err(format!("导入失败：{e}")),
                     };
-                    let _ = tx.send(ImportEvent::Done(done));
+                    let _ = tx.send(ImportEvent::Done(gen, done));
+                    if let Some(ctx) = &wake {
+                        ctx.request_repaint();
+                    }
                 });
+                if let Some(ctx) = &self.egui_ctx {
+                    ctx.request_repaint();
+                }
             }
         }
     }
@@ -13062,6 +15276,12 @@ impl App {
             .unwrap_or(Value::Null);
         let title = s(&unit, "name");
         let cover = s(&latest, "id");
+        // Lazy import: a wrapper whose page has not split yet is
+        // display-only — it renders (its cover comes from the
+        // backing deck) but is not usable: no selection ring, no
+        // open, no insert; clicking it boosts its split.
+        let lazy_page = self.lazy_unit_page.get(&uid).cloned();
+        let unsplit = lazy_page.is_some();
         let outer = self.wall_card(
             ui,
             WallCard {
@@ -13069,7 +15289,8 @@ impl App {
                 min_height: card_h,
                 title: &title,
                 cover: &cover,
-                selected: w.selected.as_deref() == Some(uid.as_str()) || w.multi.contains(&uid),
+                selected: !unsplit
+                    && (w.selected.as_deref() == Some(uid.as_str()) || w.multi.contains(&uid)),
                 scope: None,
                 variant: if !my_name.is_empty() && s(&unit, "maintainer") == my_name {
                     CardVariant::Mine
@@ -13079,6 +15300,14 @@ impl App {
             },
             |app, ui| {
                 ui.horizontal(|ui| {
+                    if unsplit {
+                        chip(
+                            ui,
+                            "待拆分",
+                            palette_color(CHIP_ORANGE_FG),
+                            CHIP_ORANGE_BG,
+                        );
+                    }
                     if latest.is_object() {
                         chip(
                             ui,
@@ -13115,7 +15344,7 @@ impl App {
                         );
                     });
                 });
-                if matches!(app.pick, Some(PickState::Insert { .. })) {
+                if !unsplit && matches!(app.pick, Some(PickState::Insert { .. })) {
                     ui.add_space(8.0);
                     if ui
                         .add_sized(
@@ -13147,12 +15376,32 @@ impl App {
         // (James 2026-11-15). Single click selects, double
         // click opens the maintenance drill-down — the same
         // contract as the web prototype.
+        if unsplit {
+            // Viewport priority feed: this card was just
+            // rendered, i.e. it sits in (or near) the visible
+            // band — its page is queued ahead of the background
+            // order at the next drain, and its thumbnail was
+            // already requested by the cover draw above.
+            self.lazy_visible_boost.insert(uid.clone());
+        }
         let click = ui.interact(
             outer.response.rect,
             egui::Id::unique(("unit_card", &uid)),
             egui::Sense::click(),
         );
-        if click.double_clicked() {
+        let import_locked =
+            self.importing.is_some() && self.import_open_units.iter().any(|u| u == &uid);
+        if let Some((pid, idx)) = &lazy_page {
+            // Unsplit page: any click only moves the page to the
+            // front of the split queue (the user's one explicit
+            // priority entry) and says so. No selection, no open.
+            if click.clicked() || click.double_clicked() {
+                let (pid, idx) = (pid.clone(), *idx);
+                self.lazy_boost(&pid, idx);
+            }
+        } else if import_locked && (click.clicked() || click.double_clicked()) {
+            self.say("该页正在导入成块，完成后再操作");
+        } else if click.double_clicked() {
             if self.pick.is_none() {
                 self.open_unit_detail(&uid);
             }
@@ -13489,14 +15738,14 @@ impl App {
         ui.horizontal(|ui| {
             // Title (prototype data-dbl-edit): double-click turns
             // it into an inline editor; committing PATCHes the
-            // name — a meta change, never a version bump. The
-            // label carries the Heading text size (18px in the
-            // app style) so it reads exactly as the heading did.
+            // name — a meta change, never a version bump. Size
+            // follows the prototype's drill h2 (no explicit rule
+            // there: the UA 1.5em over the 13.5px base ≈ 20px).
             if matches!(&st.meta_edit, Some((MetaField::Name, _))) {
                 self.meta_edit_ui(ui, st, MetaField::Name);
             } else {
                 let title = ui.add(
-                    egui::Label::new(egui::RichText::new(s(&unit, "name")).size(18.0))
+                    egui::Label::new(egui::RichText::new(s(&unit, "name")).size(20.0))
                         .sense(egui::Sense::click()),
                 );
                 if title.double_clicked() {
@@ -13507,11 +15756,45 @@ impl App {
             if let Some(tag) = kind_tag {
                 chip(ui, tag, palette_color(CHIP_GRAY_FG), CHIP_GRAY_BG);
             }
-            ui.label(format!(
-                "内容修订 r{} · 维护人 {}",
-                i(&unit, "current_revision"),
-                s(&unit, "maintainer")
-            ));
+            // Header hint (prototype renderDetail): the intro
+            // rides the same baseline row as the title, followed
+            // by 当前 {version} · … — it no longer sits on its
+            // own line under the header. Double-click edits it
+            // in place (PATCH description, no version bump).
+            let mut hint_has_intro = false;
+            if matches!(&st.meta_edit, Some((MetaField::Description, _))) {
+                hint_has_intro = true;
+                self.meta_edit_ui(ui, st, MetaField::Description);
+            } else if !s(&unit, "description").is_empty() {
+                hint_has_intro = true;
+                let intro = ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(s(&unit, "description"))
+                            .color(palette_color(TEXT_WEAK)),
+                    )
+                    .sense(egui::Sense::click()),
+                );
+                if intro.double_clicked() {
+                    st.meta_edit = Some((MetaField::Description, s(&unit, "description")));
+                    st.meta_edit_focus = true;
+                }
+            }
+            let head_semver = s(&head_latest, "semver");
+            ui.label(if head_semver.is_empty() {
+                format!(
+                    "{}内容修订 r{} · 维护人 {}",
+                    if hint_has_intro { " · " } else { "" },
+                    i(&unit, "current_revision"),
+                    s(&unit, "maintainer")
+                )
+            } else {
+                format!(
+                    "{}当前 v{} · 维护人 {}",
+                    if hint_has_intro { " · " } else { "" },
+                    head_semver,
+                    s(&unit, "maintainer")
+                )
+            });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if btn_danger(ui, "删除内容块").clicked() {
                     let uid = s(&unit, "id");
@@ -13520,26 +15803,6 @@ impl App {
                 }
             });
         });
-        // 一句话介绍 (unit.description): the prototype's header
-        // hint line carries it right after the title; here it
-        // sits under the header row, double-click to edit in
-        // place (PATCH description, no version bump).
-        if matches!(&st.meta_edit, Some((MetaField::Description, _))) {
-            self.meta_edit_ui(ui, st, MetaField::Description);
-        } else if !s(&unit, "description").is_empty() {
-            let intro = ui.add(
-                egui::Label::new(
-                    egui::RichText::new(s(&unit, "description"))
-                        .color(palette_color(TEXT_WEAK)),
-                )
-                .sense(egui::Sense::click()),
-            );
-            if intro.double_clicked() {
-                st.meta_edit = Some((MetaField::Description, s(&unit, "description")));
-                st.meta_edit_focus = true;
-            }
-        }
-        ui.separator();
         egui::ScrollArea::vertical().show(ui, |ui| {
             // pick-pages mode: the entry's currently resolved version,
             // page by page with checkboxes (initial state = the entry's
@@ -13605,67 +15868,118 @@ impl App {
                 ui.add_space(6.0);
             }
             self.unit_pages_ui(ui, st);
+            // History (prototype .dsec 历史版本 + .vh-card):
+            // one section; each version is a card — 2px border
+            // (radius 14, panel fill, 10px padding), a head row
+            // with the version chip, the version's page thumbs,
+            // and a caption (author · time, then the note). The
+            // client's versions arrive grouped per rendition;
+            // the rendition name rides as a small subhead above
+            // its cards (declared grouping difference).
+            ui.add_space(16.0);
+            ui.label(egui::RichText::new("历史版本").strong().size(16.0));
+            ui.add_space(6.0);
             if let Some(rends) = detail.get("renditions").and_then(|r| r.as_array()) {
                 for r in rends.clone() {
                     let rend = r.get("rendition").cloned().unwrap_or(json!({}));
                     ui.label(
                         egui::RichText::new(format!("{} · {}", s(&rend, "form"), s(&rend, "lang")))
-                            .strong(),
+                            .size(13.0)
+                            .color(palette_color(TEXT_WEAK)),
                     );
+                    ui.add_space(4.0);
                     if let Some(versions) = r.get("versions").and_then(|v| v.as_array()) {
-                        for v in versions {
-                            ui.horizontal(|ui| {
-                                let vid = s(v, "id");
-                                // Version-row selection (views
-                                // unification, user ruling
-                                // 2026-11-25): a click selects this
-                                // version — the pages wall above
-                                // follows it and the bottom-bar
-                                // views open THIS frozen page
-                                // sequence. The selected rendering
-                                // is the thumb's existing selected
-                                // state; with nothing clicked the
-                                // rows keep their previous
-                                // rendition-level highlight.
-                                let row_selected = match &st.selected_version {
-                                    Some(sv) => *sv == vid,
-                                    None => {
-                                        st.selected_rendition.as_deref()
-                                            == Some(s(&rend, "id").as_str())
-                                    }
-                                };
-                                let thumb = self.thumb_response(ui, &vid, 0, 96.0, row_selected);
-                                if thumb.clicked() {
-                                    st.selected_version = Some(vid.clone());
-                                    st.selected_rendition = Some(s(&rend, "id"));
-                                    st.selected_page = None;
-                                    st.bind_pick = None;
-                                }
-                                if thumb.double_clicked() {
-                                    self.open_light(st, v, 0);
-                                }
-                                ui.label(format!(
-                                    "v{} · {} 页 · {} · {}",
-                                    s(v, "semver"),
-                                    i(v, "page_count"),
-                                    s(v, "author"),
-                                    fmt_time(i(v, "created_ms"))
-                                ));
-                                if s(v, "status") == "recalled" {
-                                    ui.label(
-                                        egui::RichText::new("已撤回").color(palette_color(ROSE)),
-                                    );
-                                }
-                                if s(v, "status") == "draft" {
-                                    ui.label(
-                                        egui::RichText::new("草稿")
-                                            .color(palette_color(CHIP_ORANGE_FG)),
-                                    );
-                                }
-                                if !s(v, "note").is_empty() {
-                                    ui.label(s(v, "note"));
-                                }
-                                if ui.button("下载片段").clicked() {
+                        for (vi, v) in versions.iter().enumerate() {
+                            // Versions arrive semver-desc: the
+                            // first is the rendition's current
+                            // (prototype .cur).
+                            let is_latest = vi == 0;
+                            let vid = s(v, "id");
+                            let is_draft = s(v, "status") == "draft";
+                            let is_recalled = s(v, "status") == "recalled";
+                            let picked =
+                                st.selected_version.as_deref() == Some(vid.as_str());
+                            let stroke_color = if is_draft {
+                                palette_color(CHIP_ORANGE_FG)
+                            } else if is_latest {
+                                ACCENT
+                            } else if picked {
+                                ACCENT_DEEP
+                            } else {
+                                palette_color(LINE_34)
+                            };
+                            egui::Frame::NONE
+                                .fill(palette_color(PANEL_BG))
+                                .stroke(egui::Stroke::new(2.0, stroke_color))
+                                .corner_radius(14)
+                                .inner_margin(10.0)
+                                .show(ui, |ui| {
+                                    ui.horizontal_wrapped(|ui| {
+                                        // .vh-bigver (final form):
+                                        // 12px, 24px tall, radius 6,
+                                        // --panel3 fill; the current
+                                        // version fills accent.
+                                        let ver_text = format!("v{}", s(v, "semver"));
+                                        let ver_font = egui::FontId::new(
+                                            12.0,
+                                            egui::FontFamily::Proportional,
+                                        );
+                                        let ver_fg = if is_latest {
+                                            egui::Color32::WHITE
+                                        } else {
+                                            palette_color(TEXT_MAIN)
+                                        };
+                                        let ver_bg = if is_latest {
+                                            ACCENT
+                                        } else {
+                                            palette_color(PRESSED_BG)
+                                        };
+                                        let galley = ui.painter().layout_no_wrap(
+                                            ver_text,
+                                            ver_font,
+                                            ver_fg,
+                                        );
+                                        let (rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(galley.size().x + 16.0, 24.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        ui.painter().rect_filled(rect, 6.0, ver_bg);
+                                        ui.painter().galley(
+                                            egui::pos2(
+                                                rect.min.x + 8.0,
+                                                rect.center().y - galley.size().y / 2.0,
+                                            ),
+                                            galley,
+                                            ver_fg,
+                                        );
+                                        if is_draft {
+                                            chip(
+                                                ui,
+                                                "草稿",
+                                                palette_color(CHIP_ORANGE_FG),
+                                                CHIP_ORANGE_BG,
+                                            );
+                                        }
+                                        if is_recalled {
+                                            chip(
+                                                ui,
+                                                "已撤回",
+                                                palette_color(ROSE),
+                                                ROSE_SOFT_BG,
+                                            );
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{} 页",
+                                                i(v, "page_count")
+                                            ))
+                                            .size(12.0)
+                                            .color(palette_color(TEXT_WEAK)),
+                                        );
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if ui.small_button("下载片段").clicked() {
                                     if let Ok(resp) = self.call_work(
                                         "GET",
                                         &format!("/v1/versions/{}/fragment", s(v, "id")),
@@ -13680,13 +15994,16 @@ impl App {
                                                     .set_file_name("fragment.pptx")
                                                     .save_file(),
                                             ) {
-                                                let _ = std::fs::write(path, bytes);
-                                                self.msg = "已保存".into();
+                                                // Audit2 E-M10: the write result decides the message — a failed write no longer reports success.
+                                                self.msg = match std::fs::write(path, bytes) {
+                                                    Ok(()) => "已保存".into(),
+                                                    Err(e) => format!("保存失败：{e}"),
+                                                };
                                             }
                                         }
                                     }
                                 }
-                                if ui.button("讲稿").clicked() {
+                                if ui.small_button("讲稿").clicked() {
                                     let mut scripts: Vec<String> = v
                                         .get("scripts")
                                         .and_then(|x| x.as_array())
@@ -13703,7 +16020,7 @@ impl App {
                                     st.scripts_edit = scripts;
                                     st.scripts_for = Some(s(v, "id"));
                                 }
-                                if s(v, "status") != "recalled" && ui.button("撤回").clicked() {
+                                if s(v, "status") != "recalled" && ui.small_button("撤回").clicked() {
                                     let _ = self.call_work(
                                         "POST",
                                         &format!("/v1/versions/{}/recall", s(v, "id")),
@@ -13711,18 +16028,66 @@ impl App {
                                     );
                                     self.reload_unit_detail(&st.unit_id.clone());
                                 }
-                                if s(v, "status") != "recalled" && ui.button("编辑页面").clicked()
-                                {
-                                    self.open_page_editor(&unit, v, 0);
-                                }
-                            });
+                                                if s(v, "status") != "recalled" && ui.small_button("编辑页面").clicked()
+                                                {
+                                                    self.open_page_editor(&unit, v, 0);
+                                                }
+                                            },
+                                        );
+                                    });
+                                    ui.add_space(8.0);
+                                    // .vh-thumbs: the version's
+                                    // pages. Click selects the
+                                    // version (views unification,
+                                    // user ruling 2026-11-25: the
+                                    // wall above and the bottom-bar
+                                    // views follow the pick);
+                                    // double-click opens the light
+                                    // view at that page.
+                                    ui.horizontal_wrapped(|ui| {
+                                        let page_count = i(v, "page_count").max(0) as usize;
+                                        for p in 0..page_count {
+                                            let thumb =
+                                                self.thumb_response(ui, &vid, p, 120.0, false);
+                                            if thumb.clicked() {
+                                                st.selected_version = Some(vid.clone());
+                                                st.selected_rendition = Some(s(&rend, "id"));
+                                                st.selected_page = None;
+                                                st.bind_pick = None;
+                                            }
+                                            if thumb.double_clicked() {
+                                                self.open_light(st, v, p);
+                                            }
+                                        }
+                                    });
+                                    ui.add_space(8.0);
+                                    // .vh-caption: author · time,
+                                    // then the version note.
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{} · {}",
+                                            s(v, "author"),
+                                            fmt_time(i(v, "created_ms"))
+                                        ))
+                                        .size(11.5)
+                                        .color(palette_color(TEXT_FAINT)),
+                                    );
+                                    if !s(v, "note").is_empty() {
+                                        ui.label(
+                                            egui::RichText::new(s(v, "note"))
+                                                .size(11.5)
+                                                .color(palette_color(TEXT_FAINT)),
+                                        );
+                                    }
+                                });
+                            ui.add_space(12.0);
                         }
                     }
                 }
             }
-            ui.separator();
+            ui.add_space(8.0);
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("AI 翻译（生成草稿）").strong());
+                ui.label(egui::RichText::new("AI 翻译（生成草稿）").strong().size(16.0));
                 // Configuration state from /v1/ai/status: a stub draft
                 // must never look like a real translation.
                 if let Some(st) = &self.ai_status {
@@ -13820,6 +16185,7 @@ impl App {
                                     let server = self.server.clone();
                                     let token = self.token.clone();
                                     let tx = self.translate_tx.clone();
+                                    let gen = self.translate_gen;
                                     std::thread::spawn(move || loop {
                                         match raw_call(
                                             &server,
@@ -13831,22 +16197,25 @@ impl App {
                                         ) {
                                             Ok(p) => {
                                                 let _ = tx.send(TranslateEvent::Progress(
+                                                    gen,
                                                     i(&p, "done") as usize,
                                                     i(&p, "total") as usize,
                                                 ));
                                                 match s(&p, "state").as_str() {
                                                     "succeeded" => {
-                                                        let _ =
-                                                            tx.send(TranslateEvent::Done(Ok(p
-                                                                .get("result")
+                                                        let _ = tx.send(TranslateEvent::Done(
+                                                            gen,
+                                                            Ok(p.get("result")
                                                                 .cloned()
-                                                                .unwrap_or(Value::Null))));
+                                                                .unwrap_or(Value::Null)),
+                                                        ));
                                                         break;
                                                     }
                                                     "failed" => {
-                                                        let _ = tx.send(TranslateEvent::Done(Err(
-                                                            s(&p, "error"),
-                                                        )));
+                                                        let _ = tx.send(TranslateEvent::Done(
+                                                            gen,
+                                                            Err(s(&p, "error")),
+                                                        ));
                                                         break;
                                                     }
                                                     _ => std::thread::sleep(
@@ -13855,7 +16224,8 @@ impl App {
                                                 }
                                             }
                                             Err(e) => {
-                                                let _ = tx.send(TranslateEvent::Done(Err(e)));
+                                                let _ =
+                                                    tx.send(TranslateEvent::Done(gen, Err(e)));
                                                 break;
                                             }
                                         }
@@ -13869,7 +16239,7 @@ impl App {
                 }
             });
             if let Some(vid) = st.scripts_for.clone() {
-                ui.separator();
+                ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("逐页讲稿（保存不升版本）").strong());
                     if ui.button("保存讲稿").clicked() {
@@ -13902,8 +16272,8 @@ impl App {
                     });
                 }
             }
-            ui.separator();
-            ui.label(egui::RichText::new("发布新版本").strong());
+            ui.add_space(20.0);
+            ui.label(egui::RichText::new("发布新版本").strong().size(16.0));
             ui.horizontal(|ui| {
                 if ui.button("选择片段文件").clicked() {
                     st.publish_file = rfd::FileDialog::new()
@@ -13961,7 +16331,7 @@ impl App {
                     self.msg = "先选择片段文件".into();
                 }
             }
-            ui.separator();
+            ui.add_space(20.0);
             self.unit_bindings_ui(ui, st);
         });
         self.attachments_ui(ui, "unit", &st.unit_id.clone());
@@ -14632,14 +17002,22 @@ impl App {
         if !self.need_identity_local("编辑文件夹") {
             return;
         }
+        // Validate BEFORE taking the edit state (audit L6): an
+        // empty-name commit used to consume the editor row along
+        // with the error, so the user lost the name they were
+        // typing along with the message. The row now survives a
+        // rejected commit.
+        let name = match self.folder_edit.as_ref() {
+            Some(edit) => edit.text.trim().to_string(),
+            None => return,
+        };
+        if name.is_empty() {
+            self.say("文件夹名不能为空");
+            return;
+        }
         let Some(edit) = self.folder_edit.take() else {
             return;
         };
-        let name = edit.text.trim().to_string();
-        if name.is_empty() {
-            self.msg = "文件夹名不能为空".into();
-            return;
-        }
         match &edit.target {
             Some(id) => {
                 match self.call_work(
@@ -14771,7 +17149,7 @@ impl App {
                 Some(Overlay::PickTemplate(_)) => {
                     self.overlays.pop();
                 }
-                Some(Overlay::AllVersions { entry_pos: _ }) => {
+                Some(Overlay::AllVersions { .. }) => {
                     self.overlays.pop();
                 }
                 Some(Overlay::DeckInfo(_)) => {
@@ -14800,7 +17178,17 @@ impl App {
     /// full-history Window, now an overlay above the detail frame.
     /// Data comes from the open Detail frame; picking a version
     /// commits through switch_entry_version and closes.
-    fn all_versions_ui(&mut self, ui: &mut egui::Ui, entry_pos: usize) -> bool {
+    fn all_versions_ui(&mut self, ui: &mut egui::Ui, entry_pos: usize, index_id: &str) -> bool {
+        // Opened against one index's detail frame; if that frame
+        // is no longer current, close instead of rebinding to
+        // whatever detail the user opened meanwhile (audit M2).
+        let frame_matches = matches!(
+            self.index.stack.top(),
+            IndexFrame::Detail(d) if d.index_id == index_id
+        );
+        if !frame_matches {
+            return false;
+        }
         let entries_now = self.current_entries();
         let rid = entries_now
             .get(entry_pos)
@@ -14875,9 +17263,9 @@ impl App {
     ) -> Option<Overlay> {
         match ov {
             Overlay::Confirm(c) => self.confirm_ui(ui, c),
-            Overlay::AllVersions { entry_pos } => {
-                if self.all_versions_ui(ui, entry_pos) {
-                    Some(Overlay::AllVersions { entry_pos })
+            Overlay::AllVersions { entry_pos, index_id } => {
+                if self.all_versions_ui(ui, entry_pos, &index_id) {
+                    Some(Overlay::AllVersions { entry_pos, index_id })
                 } else {
                     None
                 }
@@ -14974,8 +17362,34 @@ impl App {
                     self.refresh_all();
                 }
                 ConfirmAction::EmptyTrash => {
+                    // F6: rows merged from the server (marked
+                    // "org" at load) are not the local face's to
+                    // purge-all — purge them individually through
+                    // REST so the merged list really empties. In
+                    // REST-fallback mode (no local library) the
+                    // purge-all below already hit the server and
+                    // no row carries the mark.
+                    let org_ids: Vec<String> = if self.local.is_some() {
+                        self.trash
+                            .items
+                            .iter()
+                            .filter(|x| {
+                                x.get("org").and_then(|v| v.as_bool()) == Some(true)
+                            })
+                            .map(|x| s(x, "id"))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                     match self.call_work("POST", "/v1/trash/purge-all", Some(json!({}))) {
                         Ok(_) => {
+                            for id in &org_ids {
+                                let _ = self.call(
+                                    "POST",
+                                    &format!("/v1/trash/{id}/purge"),
+                                    Some(json!({})),
+                                );
+                            }
                             self.msg = "已清空回收站".into();
                             self.trash.stack = NavStack::new(TrashFrame::List(TrashListState {
                                 filter: 0,
@@ -14988,13 +17402,40 @@ impl App {
                     }
                 }
                 ConfirmAction::DeleteOldLibrary(path) => {
-                    match std::fs::remove_dir_all(&path) {
-                        Ok(()) => {
-                            self.msg = format!("旧库已删除：{}", path.display());
-                        }
-                        Err(e) => {
-                            self.msg =
-                                format!("旧库删除失败（{e}），旧库仍保留在：{}", path.display());
+                    // Execution-time revalidation (audit P2): the
+                    // prompt is a non-modal window that may have
+                    // sat open while the user changed the data
+                    // directory — never delete the directory the
+                    // client is using NOW, and never delete a
+                    // directory that no longer probes as a library.
+                    let current = self
+                        .local
+                        .as_ref()
+                        .map(|l| l.root.clone())
+                        .unwrap_or_else(local_store::library_dir);
+                    let configured = local_store::read_bootstrap()
+                        .data_dir
+                        .map(std::path::PathBuf::from);
+                    if path == current
+                        || configured.as_deref() == Some(path.as_path())
+                        || current.starts_with(&path)
+                    {
+                        self.say("已取消删除：该目录是当前正在使用的数据目录");
+                    } else if local_store::probe_library(&path).is_none() {
+                        self.say(
+                            "已取消删除：该目录已不是可识别的启幕库（可能已被移动或改作他用）",
+                        );
+                    } else {
+                        match std::fs::remove_dir_all(&path) {
+                            Ok(()) => {
+                                self.say(format!("旧库已删除：{}", path.display()));
+                            }
+                            Err(e) => {
+                                self.say(format!(
+                                    "旧库删除失败（{e}），旧库仍保留在：{}",
+                                    path.display()
+                                ));
+                            }
                         }
                     }
                 }
@@ -15008,16 +17449,34 @@ impl App {
                     }
                 }
                 ConfirmAction::MovePageBinding(req) => self.apply_page_binding(req),
-                ConfirmAction::PdfRasterFallback { item, form, page } => {
-                    let title = s(&item, "title");
-                    let stem = match (form.as_str(), page) {
-                        ("handout", _) => format!("{title}-讲义"),
-                        ("notes", _) => format!("{title}-备注页"),
-                        (_, Some(p)) => format!("{title}-第{}页", p + 1),
-                        _ => title.clone(),
-                    };
-                    if !self.try_pdf_local(&item, &form, page, &stem, false) {
-                        self.msg = "导出 PDF 失败：本地稿件已不可用".into();
+                ConfirmAction::PdfRasterFallback { deck, form, page, stem } => {
+                    // Audit2 E-L5: raster-export the deck bytes
+                    // captured when the TextLoss warning was raised.
+                    // The old handler re-ran the whole local export
+                    // against the CURRENT library, so a deck edited
+                    // (or replaced) between the warning and the
+                    // click was exported instead of the one the user
+                    // accepted the warning for.
+                    match local_render::export_pdf(&deck, &form, page, false) {
+                        Ok(bytes) => {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .set_file_name(format!("{stem}.pdf"))
+                                .save_file()
+                            {
+                                self.msg = match std::fs::write(path, bytes) {
+                                    Ok(()) => "已保存（纯图片版：文字不可搜索、复制）".into(),
+                                    Err(e) => format!("保存 PDF 失败：{e}"),
+                                };
+                            }
+                        }
+                        Err(local_render::PdfFail::TextLoss { count, sample }) => {
+                            self.msg = format!(
+                                "导出 PDF 失败：{count} 个字没有覆盖字体（首个：{sample}），纯图片导出也保留不了这些文字，已取消导出"
+                            );
+                        }
+                        Err(local_render::PdfFail::Other(e)) => {
+                            self.msg = format!("导出 PDF 失败：{e}");
+                        }
                     }
                 }
             }
@@ -17324,7 +19783,14 @@ impl App {
                                             });
                                         }
                                         if ui.button("更多").clicked() {
-                                            self.overlays.push(Overlay::AllVersions { entry_pos: pos });
+                                            let cur_index_id = match self.index.stack.top() {
+                                                IndexFrame::Detail(d) => d.index_id.clone(),
+                                                _ => String::new(),
+                                            };
+                                            self.overlays.push(Overlay::AllVersions {
+                                                entry_pos: pos,
+                                                index_id: cur_index_id,
+                                            });
                                         }
                                     });
                                 }
@@ -17887,12 +20353,12 @@ impl App {
                 .size(11.5)
                 .color(palette_color(TEXT_WEAK)),
         );
-        // 数据目录 (library-discovery line, 2026-11-25): where the
-        // local library lives, per the bootstrap config. Saving a
-        // new directory relocates the library with count
-        // verification and rewrites the config; the running process
-        // keeps the library it opened, so the new directory takes
-        // effect on the next launch — stated in the copy below.
+        // 数据目录 (library-discovery line, 2026-11-25; P1
+        // rework): where the local library lives, per the
+        // bootstrap config. Saving a new directory only registers
+        // the move; the relocation runs at the next launch, before
+        // the library opens, with count verification — stated in
+        // the copy below.
         ui.add_space(12.0);
         ui.label(
             egui::RichText::new("数据目录")
@@ -17903,7 +20369,7 @@ impl App {
         ui.add_space(4.0);
         ui.label(
             egui::RichText::new(
-                "本地库（内容块、索引、页面与演示数据）存放的目录。改选新目录后，软件会把当前库完整复制过去并核对内容，核对通过才写入配置文件；本次运行仍使用当前目录，新目录从下次启动生效。新目录里已有其他启幕库时不会覆盖或合并，保存会被拒绝。",
+                "本地库（内容块、索引、页面与演示数据）存放的目录。改选新目录后，本次运行继续使用当前目录不受影响；软件会在下次启动时把当前库完整复制到新目录并核对内容，核对通过才切换，失败则继续使用当前目录并给出提示。新目录里已有其他启幕库时不会覆盖或合并，保存会被拒绝。",
             )
             .size(11.5)
             .color(palette_color(TEXT_WEAK)),
@@ -17933,6 +20399,16 @@ impl App {
             .size(11.5)
             .color(palette_color(TEXT_WEAK)),
         );
+        if let Some(pend) = local_store::read_bootstrap().pending_relocate {
+            ui.label(
+                egui::RichText::new(format!(
+                    "已登记下次启动搬迁到：{}（重启软件后执行）",
+                    pend.to
+                ))
+                .size(11.5)
+                .color(palette_color(ACCENT_DEEP)),
+            );
+        }
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.add_sized(
@@ -17995,10 +20471,17 @@ impl App {
     }
 
     /// Settings 「保存并搬迁」/「恢复默认目录」 for the data
-    /// directory: copy the running library to `target` with count
-    /// verification, then point the bootstrap config at it. The
-    /// running process keeps the library it opened — the new
-    /// directory takes effect on the next launch.
+    /// directory (audit P1 rework): this only REGISTERS the move —
+    /// the target is validated by read-only probe and the intent
+    /// is stored in the bootstrap config; the relocation itself
+    /// runs at the next launch, inside library resolution, before
+    /// the store opens. Copying the *running* library (the old
+    /// behaviour) forked the session: the copy was taken from a
+    /// live database while this session kept writing to the old
+    /// directory, so everything done after the "move" vanished
+    /// from the user's view at the next launch. Deferred to
+    /// startup, the source is static, the counts check arbitrates
+    /// a complete copy, and this session is untouched.
     fn apply_data_dir_change(&mut self, target: std::path::PathBuf) {
         let current = self
             .local
@@ -18006,39 +20489,35 @@ impl App {
             .map(|l| l.root.clone())
             .unwrap_or_else(local_store::library_dir);
         if target == current {
-            self.msg = "所选目录就是当前数据目录，无需搬迁".into();
+            self.say("所选目录就是当前数据目录，无需搬迁");
             return;
         }
         if target.starts_with(&current) || current.starts_with(&target) {
-            self.msg = "新目录不能位于当前数据目录之内，也不能包含当前数据目录".into();
+            self.say("新目录不能位于当前数据目录之内，也不能包含当前数据目录");
             return;
         }
         if target.exists() && !target.is_dir() {
-            self.msg = "所选路径是一个文件，不能用作数据目录".into();
+            self.say("所选路径是一个文件，不能用作数据目录");
             return;
         }
         if local_store::probe_library(&target)
             .map(|c| c.has_content())
             .unwrap_or(false)
         {
-            self.msg = "新目录里已有另一个启幕库，不会覆盖或合并；请换一个空目录".into();
+            self.say("新目录里已有另一个启幕库，不会覆盖或合并；请换一个空目录");
             return;
         }
-        match local_store::relocate_library(&current, &target) {
-            Ok(_) => {
-                let mut b = local_store::read_bootstrap();
-                b.data_dir = Some(target.to_string_lossy().into_owned());
-                local_store::write_bootstrap(&b);
-                self.data_dir_input = target.to_string_lossy().into_owned();
-                self.msg = format!(
-                    "已把当前库搬迁到 {} 并核对通过；本次运行仍使用当前目录，下次启动起从新目录打开",
-                    target.display()
-                );
-            }
-            Err(e) => {
-                self.msg = format!("搬迁失败：{e}；仍在使用当前目录，配置文件未改动");
-            }
-        }
+        let mut b = local_store::read_bootstrap();
+        b.pending_relocate = Some(local_store::PendingRelocate {
+            from: current.to_string_lossy().into_owned(),
+            to: target.to_string_lossy().into_owned(),
+        });
+        local_store::write_bootstrap(&b);
+        self.say(format!(
+            "已登记：下次启动时把数据目录从 {} 搬迁到 {}；搬迁在启动时执行并核对内容，失败则继续使用当前目录。本次运行不受影响",
+            current.display(),
+            target.display()
+        ));
     }
 
     /// Settings nav frame body: the section list, unchanged.
@@ -18700,6 +21179,16 @@ impl App {
 fn startup_log(msg: &str) {
     let dir = qimu_home();
     let _ = std::fs::create_dir_all(&dir);
+    // Audit2 F-N6: the log used to grow without bound (one line per
+    // launch plus one per panic, forever). Rotate once past ~1 MB,
+    // keeping a single previous generation.
+    let log_path = dir.join("client-startup.log");
+    if std::fs::metadata(&log_path)
+        .map(|m| m.len() > 1_000_000)
+        .unwrap_or(false)
+    {
+        let _ = std::fs::rename(&log_path, dir.join("client-startup.log.1"));
+    }
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

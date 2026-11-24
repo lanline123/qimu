@@ -549,7 +549,11 @@ enum AssembliesCommand {
 // ---------------- session / HTTP ----------------
 
 fn session_path() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    // Audit2 X11: HOME alone left Windows without USERPROFILE set
+    // (services, some shells) writing the session into the CWD.
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".into());
     std::path::PathBuf::from(home)
         .join(".qimu")
         .join("session.json")
@@ -567,7 +571,10 @@ fn save_session(v: &Value) {
     if let Some(parent) = p.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(&p, serde_json::to_string_pretty(v).unwrap());
+    // Atomic like every other state file in the workspace, and no
+    // unwrap on the serialization (audit2 X11).
+    let text = serde_json::to_string_pretty(v).unwrap_or_default();
+    let _ = craft_atomic::atomic_write(&p, text.as_bytes());
 }
 
 struct Ctx {

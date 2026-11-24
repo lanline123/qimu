@@ -137,6 +137,17 @@ fn page_title(version: &Value, slot: usize) -> String {
         .unwrap_or_else(|| format!("第 {} 页", slot + 1))
 }
 
+/// The light view's bind head names the target language
+/// (prototype .lb-bind-head: 英语), not its code.
+fn lang_display_name(code: &str) -> String {
+    match code {
+        "en" => "英语".to_string(),
+        "zh" => "中文".to_string(),
+        "ja" => "日语".to_string(),
+        other => other.to_uppercase(),
+    }
+}
+
 fn page_note(version: &Value, slot: usize) -> String {
     version
         .get("scripts")
@@ -185,7 +196,16 @@ impl App {
         }
         let selected_id = st.selected_rendition.clone().unwrap_or_default();
         ui.horizontal_wrapped(|ui| {
+            // One chip per rendition: the wall switches
+            // renditions, not versions — iterating every version
+            // repeated the same form · lang chip once per version
+            // in the row.
+            let mut seen_renditions: Vec<&str> = Vec::new();
             for item in &versions {
+                if seen_renditions.contains(&item.rendition_id.as_str()) {
+                    continue;
+                }
+                seen_renditions.push(item.rendition_id.as_str());
                 if ui
                     .selectable_label(
                         selected_id == item.rendition_id,
@@ -220,7 +240,8 @@ impl App {
         let version_id = s(&selected.version, "id");
         let page_count = i(&selected.version, "page_count").max(0) as usize;
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("页面缩略图").strong());
+            // Section heading (prototype .dsec h3): 16px.
+            ui.label(egui::RichText::new("页面缩略图").strong().size(16.0));
             if let Some(pick) = &st.bind_pick {
                 ui.label(
                     egui::RichText::new(format!(
@@ -240,85 +261,125 @@ impl App {
         let mut request = None;
         ui.horizontal_wrapped(|ui| {
             for slot in 0..page_count {
-                ui.vertical(|ui| {
-                    let response = self.thumb_response(
-                        ui,
-                        &version_id,
-                        slot,
-                        200.0,
-                        st.selected_page == Some(slot),
-                    );
-                    if let Some(pick) = st.bind_pick.clone() {
-                        if response.clicked() {
-                            request = Some(PageBindingRequest {
-                                unit_id: st.unit_id.clone(),
-                                from_version_id: pick.from_version_id,
-                                from_slot: pick.from_slot,
-                                to_version_id: pick.to_version_id,
-                                to_slot: slot as i64,
-                            });
-                        }
-                    } else {
-                        if response.clicked() {
-                            st.selected_page = Some(slot);
-                        }
-                        if response.double_clicked() {
-                            self.open_light(st, &selected.version, slot);
-                        }
-                    }
-                    ui.label(egui::RichText::new(page_title(&selected.version, slot)).small());
-                    ui.horizontal(|ui| {
-                        for target in &targets {
-                            let bound = st.bindings.iter().any(|binding| {
-                                s(binding, "from_version_id") == version_id
-                                    && i(binding, "from_slot") == slot as i64
-                                    && s(binding, "to_version_id") == s(&target.version, "id")
-                            });
-                            let chip = egui::Button::new(
-                                egui::RichText::new(target.lang.to_uppercase()).color(if bound {
-                                    palette_color(CHIP_GREEN_FG)
-                                } else {
-                                    palette_color(TEXT_WEAK)
-                                }),
-                            )
-                            .fill(if bound {
-                                palette_color(CHIP_GREEN_BG)
+                // Prototype .thumb-cell / .thumb-frame: a 2px
+                // --line frame (radius 6, --panel fill) with the
+                // slide flush at the top and a toolbar strip
+                // below it (8 top / 10 sides / 10 bottom) holding
+                // the bind chips and the page caption. (The CSS
+                // grid's equal columns become the wrapped flow's
+                // fixed 200px cells — declared approximation.)
+                egui::Frame::NONE
+                    .fill(palette_color(PANEL_BG))
+                    .stroke(egui::Stroke::new(2.0, palette_color(LINE_34)))
+                    .corner_radius(6)
+                    .inner_margin(egui::Margin::same(0))
+                    .show(ui, |ui| {
+                        ui.vertical(|ui| {
+                            let response = self.thumb_response(
+                                ui,
+                                &version_id,
+                                slot,
+                                200.0,
+                                st.selected_page == Some(slot),
+                            );
+                            if let Some(pick) = st.bind_pick.clone() {
+                                if response.clicked() {
+                                    request = Some(PageBindingRequest {
+                                        unit_id: st.unit_id.clone(),
+                                        from_version_id: pick.from_version_id,
+                                        from_slot: pick.from_slot,
+                                        to_version_id: pick.to_version_id,
+                                        to_slot: slot as i64,
+                                    });
+                                }
                             } else {
-                                palette_color(HOVER_BG)
-                            })
-                            .corner_radius(5);
-                            if ui
-                                .add(chip)
-                                .on_hover_text(if bound {
-                                    format!("{}已绑定", target.lang)
-                                } else {
-                                    format!("绑定{}对应页", target.lang)
-                                })
-                                .clicked()
-                            {
-                                st.bind_pick = Some(PageBindingPick {
-                                    from_version_id: version_id.clone(),
-                                    from_slot: slot as i64,
-                                    to_version_id: s(&target.version, "id"),
-                                    target_lang: target.lang.clone(),
-                                });
+                                if response.clicked() {
+                                    st.selected_page = Some(slot);
+                                }
+                                if response.double_clicked() {
+                                    self.open_light(st, &selected.version, slot);
+                                }
                             }
-                        }
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                ui.add_space(10.0);
+                                for target in &targets {
+                                    let bound = st.bindings.iter().any(|binding| {
+                                        s(binding, "from_version_id") == version_id
+                                            && i(binding, "from_slot") == slot as i64
+                                            && s(binding, "to_version_id")
+                                                == s(&target.version, "id")
+                                    });
+                                    // Prototype .lang-chip: bound
+                                    // (.on) is the accent fill with
+                                    // white text; unbound rests on
+                                    // --panel2 with a --line2 border
+                                    // and muted text.
+                                    let chip = egui::Button::new(
+                                        egui::RichText::new(target.lang.to_uppercase())
+                                            .size(10.5)
+                                            .color(if bound {
+                                                egui::Color32::WHITE
+                                            } else {
+                                                palette_color(TEXT_WEAK)
+                                            }),
+                                    )
+                                    .fill(if bound {
+                                        ACCENT
+                                    } else {
+                                        palette_color(HOVER_BG)
+                                    })
+                                    .stroke(if bound {
+                                        egui::Stroke::new(1.0, ACCENT)
+                                    } else {
+                                        egui::Stroke::new(
+                                            1.0,
+                                            palette_color(FIELD_BORDER),
+                                        )
+                                    })
+                                    .corner_radius(6);
+                                    if ui
+                                        .add(chip)
+                                        .on_hover_text(if bound {
+                                            format!("{}已绑定", target.lang)
+                                        } else {
+                                            format!("绑定{}对应页", target.lang)
+                                        })
+                                        .clicked()
+                                    {
+                                        st.bind_pick = Some(PageBindingPick {
+                                            from_version_id: version_id.clone(),
+                                            from_slot: slot as i64,
+                                            to_version_id: s(&target.version, "id"),
+                                            target_lang: target.lang.clone(),
+                                        });
+                                    }
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.add_space(10.0);
+                                ui.label(
+                                    egui::RichText::new(page_title(&selected.version, slot))
+                                        .size(12.0)
+                                        .color(palette_color(TEXT_FAINT)),
+                                );
+                            });
+                            ui.add_space(10.0);
+                        });
                     });
-                });
             }
         });
         if let Some(request) = request {
             st.bind_pick = None;
             self.request_page_binding(request, &st.bindings);
         }
-        ui.add_space(10.0);
-        ui.separator();
-        ui.add_space(6.0);
+        // Sections divide by space alone (prototype .dsec
+        // margin), not rule lines.
+        ui.add_space(4.0);
     }
 
     pub(super) fn unit_bindings_ui(&mut self, ui: &mut egui::Ui, st: &mut UnitState) {
-        ui.label(egui::RichText::new("语言绑定（逐页）").strong());
+        ui.label(egui::RichText::new("语言绑定（逐页）").strong().size(16.0));
         let all_versions = unit_versions(&st.detail);
         if all_versions.len() < 2 {
             ui.label(egui::RichText::new("至少两个版本后可做逐页绑定").weak());
@@ -586,14 +647,22 @@ impl App {
                     .fill(palette_color(PANEL_BG))
                     .show(ui, |ui| {
                         ui.set_min_size(preview_screen.size());
-                        let side_width = if screen.width() < 900.0 { 280.0 } else { 330.0 };
-                        let left_width = (screen.width() - side_width - 54.0).max(260.0);
+                        // Prototype .lb-layout (lightDlg): the
+                        // detail shell pads 22px at the sides and
+                        // 16px at the top, the two columns sit
+                        // 14px apart, and the sidebar is a fixed
+                        // 300px (.lb-side). The stage takes the
+                        // remaining width and its height follows
+                        // the slide's own aspect — no height cap.
+                        let side_width = 300.0;
+                        let left_width =
+                            (screen.width() - 22.0 - 14.0 - side_width - 22.0).max(260.0);
                         ui.horizontal_top(|ui| {
-                            ui.add_space(18.0);
+                            ui.add_space(22.0);
                             ui.vertical(|ui| {
                                 ui.set_width(left_width);
-                                let image_width = left_width
-                                    .min((preview_screen.height() - 170.0).max(240.0) * 16.0 / 9.0);
+                                ui.add_space(16.0);
+                                let image_width = left_width;
                                 ui.with_layout(
                                     egui::Layout::top_down(egui::Align::Center),
                                     |ui| {
@@ -606,12 +675,21 @@ impl App {
                                     },
                                 );
                                 ui.add_space(10.0);
+                                // Prototype .note-box: --panel2
+                                // fill, 12px radius, 12/14 padding,
+                                // 10px below the stage (inline
+                                // margin in the lightDlg markup).
                                 egui::Frame::NONE
                                     .fill(palette_color(HOVER_BG))
-                                    .corner_radius(6)
-                                    .inner_margin(10.0)
+                                    .corner_radius(12)
+                                    .inner_margin(egui::Margin {
+                                        left: 14,
+                                        right: 14,
+                                        top: 12,
+                                        bottom: 12,
+                                    })
                                     .show(ui, |ui| {
-                                        ui.set_width(left_width - 20.0);
+                                        ui.set_width(left_width - 28.0);
                                         ui.label(
                                             egui::RichText::new("这一页的备注（讲稿）").strong(),
                                         );
@@ -619,106 +697,166 @@ impl App {
                                         ui.label(if note.is_empty() { "—" } else { &note });
                                     });
                             });
-                            ui.add_space(18.0);
+                            ui.add_space(14.0);
                             egui::ScrollArea::vertical()
-                                .max_height(preview_screen.height() - 36.0)
+                                .max_height(preview_screen.height() - 32.0)
                                 .show(ui, |ui| {
                                     ui.set_width(side_width);
-                                    egui::Frame::NONE
-                                        .fill(palette_color(HOVER_BG))
-                                        .corner_radius(8.0)
-                                        .inner_margin(12.0)
-                                        .show(ui, |ui| {
-                                            ui.set_width(side_width - 24.0);
-                                            if light.targets.is_empty() {
-                                                ui.label(
-                                                    egui::RichText::new("暂无其他语言版本").weak(),
-                                                );
-                                                return;
-                                            }
-                                            ui.horizontal_wrapped(|ui| {
-                                                for (index, target) in
-                                                    light.targets.iter().enumerate()
+                                    ui.add_space(16.0);
+                                    // Prototype .lb-side: a plain
+                                    // column on the page ground —
+                                    // no filled panel. Language
+                                    // head, candidate standard
+                                    // cards, then the full-width
+                                    // bind button.
+                                    if light.targets.is_empty() {
+                                        ui.label(
+                                            egui::RichText::new("暂无其他语言版本").weak(),
+                                        );
+                                        return;
+                                    }
+                                    let target = light.targets[light.target_index].clone();
+                                    ui.label(
+                                        egui::RichText::new(lang_display_name(&target.lang))
+                                            .strong()
+                                            .size(15.0),
+                                    );
+                                    if light.targets.len() > 1 {
+                                        ui.horizontal_wrapped(|ui| {
+                                            for (index, t) in
+                                                light.targets.iter().enumerate()
+                                            {
+                                                if ui
+                                                    .selectable_label(
+                                                        light.target_index == index,
+                                                        t.lang.to_uppercase(),
+                                                    )
+                                                    .clicked()
                                                 {
-                                                    if ui
-                                                        .selectable_label(
-                                                            light.target_index == index,
-                                                            target.lang.to_uppercase(),
-                                                        )
-                                                        .clicked()
-                                                    {
-                                                        light.target_index = index;
-                                                    }
+                                                    light.target_index = index;
                                                 }
-                                            });
-                                            let target = light.targets[light.target_index].clone();
-                                            ui.label(format!(
-                                                "{} · v{}",
-                                                target.lang,
-                                                s(&target.version, "semver")
-                                            ));
-                                            ui.add_space(6.0);
-                                            let target_id = s(&target.version, "id");
-                                            let pages =
-                                                i(&target.version, "page_count").max(0) as usize;
-                                            ui.horizontal_wrapped(|ui| {
-                                                for slot in 0..pages {
-                                                    let candidate = PageBindingRequest {
-                                                        unit_id: light.unit_id.clone(),
-                                                        from_version_id: s(&light.version, "id"),
-                                                        from_slot: light.slot as i64,
-                                                        to_version_id: target_id.clone(),
-                                                        to_slot: slot as i64,
-                                                    };
-                                                    let exact =
-                                                        exact_binding(&light.bindings, &candidate);
-                                                    let occupied = occupied_binding(
-                                                        &light.bindings,
-                                                        &candidate,
-                                                    );
-                                                    ui.vertical(|ui| {
-                                                        ui.set_width(132.0);
-                                                        let response = self.thumb_response(
-                                                            ui,
-                                                            &target_id,
-                                                            slot,
-                                                            132.0,
-                                                            exact.is_some(),
-                                                        );
-                                                        if response.clicked() && exact.is_none() {
-                                                            request = Some(candidate);
-                                                        }
-                                                        ui.label(
-                                                            egui::RichText::new(page_title(
-                                                                &target.version,
-                                                                slot,
-                                                            ))
-                                                            .small(),
-                                                        );
-                                                        if exact.is_some() {
-                                                            if ui.small_button("× 解绑").clicked()
-                                                            {
-                                                                unbind = exact.clone();
-                                                            }
-                                                        } else if occupied.is_some() {
-                                                            ui.label(
-                                                                egui::RichText::new(
-                                                                    "已被其他页占用",
+                                            }
+                                        });
+                                    }
+                                    ui.add_space(8.0);
+                                    let target_id = s(&target.version, "id");
+                                    let pages = i(&target.version, "page_count").max(0) as usize;
+                                    for slot in 0..pages {
+                                        let candidate = PageBindingRequest {
+                                            unit_id: light.unit_id.clone(),
+                                            from_version_id: s(&light.version, "id"),
+                                            from_slot: light.slot as i64,
+                                            to_version_id: target_id.clone(),
+                                            to_slot: slot as i64,
+                                        };
+                                        let exact = exact_binding(&light.bindings, &candidate);
+                                        let occupied =
+                                            occupied_binding(&light.bindings, &candidate);
+                                        // Prototype: the candidates
+                                        // are standard cards (the
+                                        // wall's own component),
+                                        // stacked at the sidebar's
+                                        // full width; the bound one
+                                        // takes the selected accent
+                                        // border and a × that
+                                        // unbinds (the prototype's
+                                        // cover-corner × sits at
+                                        // the title row's right end
+                                        // here — declared).
+                                        let clicked = standard_card_v(
+                                            ui,
+                                            exact.is_some(),
+                                            None,
+                                            true,
+                                            CardVariant::Normal,
+                                            |ui| {
+                                                ui.set_width(side_width - 2.0);
+                                                ui.spacing_mut().item_spacing.y = 0.0;
+                                                let response = self.thumb_response(
+                                                    ui,
+                                                    &target_id,
+                                                    slot,
+                                                    side_width - 2.0,
+                                                    false,
+                                                );
+                                                egui::Frame::NONE
+                                                    .inner_margin(egui::Margin {
+                                                        left: 12,
+                                                        right: 12,
+                                                        top: 11,
+                                                        bottom: 12,
+                                                    })
+                                                    .show(ui, |ui| {
+                                                        ui.horizontal(|ui| {
+                                                            ui.add(
+                                                                egui::Label::new(
+                                                                    egui::RichText::new(
+                                                                        page_title(
+                                                                            &target.version,
+                                                                            slot,
+                                                                        ),
+                                                                    )
+                                                                    .strong()
+                                                                    .size(13.0),
                                                                 )
-                                                                .small()
-                                                                .color(palette_color(
-                                                                    CHIP_ORANGE_FG,
-                                                                )),
+                                                                .truncate(),
+                                                            );
+                                                            if exact.is_some() {
+                                                                ui.with_layout(
+                                                                    egui::Layout::right_to_left(
+                                                                        egui::Align::Center,
+                                                                    ),
+                                                                    |ui| {
+                                                                        if ui
+                                                                            .small_button("×")
+                                                                            .on_hover_text(
+                                                                                "解除绑定",
+                                                                            )
+                                                                            .clicked()
+                                                                        {
+                                                                            unbind =
+                                                                                exact.clone();
+                                                                        }
+                                                                    },
+                                                                );
+                                                            }
+                                                        });
+                                                        if occupied.is_some() {
+                                                            chip(
+                                                                ui,
+                                                                "已被其他页占用",
+                                                                palette_color(CHIP_ORANGE_FG),
+                                                                CHIP_ORANGE_BG,
                                                             );
                                                         }
                                                     });
-                                                }
-                                            });
-                                            ui.add_space(10.0);
-                                            if btn_primary(ui, tr("绑定")).clicked() {
-                                                start_pick = true;
-                                            }
-                                        });
+                                                response.clicked()
+                                            },
+                                        )
+                                        .inner;
+                                        if clicked && exact.is_none() {
+                                            request = Some(candidate);
+                                        }
+                                        ui.add_space(8.0);
+                                    }
+                                    ui.add_space(2.0);
+                                    // Prototype #lbGoBind: primary,
+                                    // the sidebar's full width.
+                                    if ui
+                                        .add_sized(
+                                            egui::vec2(side_width, 28.0),
+                                            egui::Button::new(
+                                                egui::RichText::new(tr("绑定"))
+                                                    .size(12.5)
+                                                    .color(egui::Color32::WHITE),
+                                            )
+                                            .fill(ACCENT)
+                                            .corner_radius(6),
+                                        )
+                                        .clicked()
+                                    {
+                                        start_pick = true;
+                                    }
                                 });
                         });
                     });

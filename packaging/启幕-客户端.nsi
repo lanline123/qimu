@@ -39,7 +39,13 @@ RequestExecutionLevel admin
 !insertmacro MUI_LANGUAGE "SimpChinese"
 
 Function .onInit
-  ${If} ${FileExists} "D:\*.*"
+  ; 审计 X1: 已装过 (注册表有 InstallDir) 时绝不改道 —— 旧逻辑只要
+  ; D 盘存在就无条件改目录, 升级装进新目录后客户端找不到旧库。
+  ; D 盘默认只对全新安装生效。
+  ReadRegStr $0 HKLM "Software\QimuClient" "InstallDir"
+  ${If} $0 != ""
+    StrCpy $INSTDIR $0
+  ${ElseIf} ${FileExists} "D:\*.*"
     StrCpy $INSTDIR "D:\Program Files\启幕客户端"
   ${EndIf}
 FunctionEnd
@@ -47,8 +53,12 @@ FunctionEnd
 Section "启幕客户端" SEC_CLIENT
   SectionIn RO
   SetOutPath "$INSTDIR"
-  File "win/qimu-client.exe"
-  File "win/qimu.exe"
+  ; X13: 程序开着时装新版, 锁住的 exe 走重启替换而不是留混合版本
+  File /REBOOTOK "win/qimu-client.exe"
+  File /REBOOTOK "win/qimu.exe"
+  ; X8: 清理旧捆绑包遗留的 deckcraft.exe —— 它会遮蔽用户另行安装的
+  ; DeckCraft (客户端按 exe 同级优先解析), 本包早已不再捆绑它
+  Delete "$INSTDIR\deckcraft.exe"
   File "win/使用说明.txt"
   File "win/qimu.ico"
   ; 离线缓存目录预建 (客户端默认 cache 路径 = 安装目录\cache)
@@ -76,8 +86,9 @@ Section "Uninstall"
   Delete "$SMPROGRAMS\启幕\启幕.lnk"
   Delete "$SMPROGRAMS\启幕\使用说明.lnk"
   RMDir "$SMPROGRAMS\启幕"
-  Delete "$INSTDIR\qimu-client.exe"
-  Delete "$INSTDIR\qimu.exe"
+  Delete /REBOOTOK "$INSTDIR\qimu-client.exe"
+  Delete /REBOOTOK "$INSTDIR\qimu.exe"
+  Delete "$INSTDIR\deckcraft.exe"
   Delete "$INSTDIR\使用说明.txt"
   Delete "$INSTDIR\qimu.ico"
   RMDir /r "$INSTDIR\fonts"

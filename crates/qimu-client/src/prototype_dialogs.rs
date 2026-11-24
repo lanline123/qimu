@@ -743,6 +743,37 @@ impl App {
                 response["previous_entries"] = previous["resolved_entries"].clone();
             }
         }
+        if response["previous_entries"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+        {
+            // F8: a local index that landed through the P3 chain
+            // is named by its SUBMISSION's landed ids — the
+            // entry's source_index_id is the server-minted index,
+            // never the local id the lookup above tries — so the
+            // summary showed 「初次上架」 forever. Resolve through
+            // my landed submission for this source instead, then
+            // take that entry's pinned rows.
+            let landed_item_id = self
+                .my_submissions
+                .iter()
+                .find(|sub| {
+                    s(sub, "source_index_id") == id
+                        && s(sub, "state") == "landed"
+                        && !s(sub, "landed_showroom_id").is_empty()
+                })
+                .map(|sub| s(sub, "landed_showroom_id"));
+            if let Some(item_id) = landed_item_id {
+                if let Some(previous) = self
+                    .showroom_live
+                    .iter()
+                    .find(|item| s(item, "id") == item_id)
+                {
+                    response["previous_entries"] =
+                        previous["resolved_entries"].clone();
+                }
+            }
+        }
         let current_rows = response["current_entries"]
             .as_array()
             .map(Vec::as_slice)

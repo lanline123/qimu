@@ -167,10 +167,100 @@ fn collect_runs(pkg: &Package) -> Result<Vec<(String, String)>, String> {
     Ok(out)
 }
 
-fn replace_run(xml: &str, old: &str, new: &str) -> String {
-    let needle = format!("<a:t>{}</a:t>", xml_escape(old));
-    let replacement = format!("<a:t>{}</a:t>", xml_escape(new));
-    xml.replacen(&needle, &replacement, 1)
+/// Decode the XML entities a text node may carry (named,
+/// decimal and hex character references). Collection decodes
+/// run text through the XML parser, so replacement must
+/// compare against the decoded form too (audit L6).
+fn xml_unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(pos) = rest.find('&') {
+        out.push_str(&rest[..pos]);
+        let tail = &rest[pos..];
+        let Some(end) = tail.find(';') else {
+            out.push_str(tail);
+            return out;
+        };
+        let ent = &tail[1..end];
+        let decoded = match ent {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            _ => ent
+                .strip_prefix("#x")
+                .and_then(|h| u32::from_str_radix(h, 16).ok())
+                .or_else(|| {
+                    ent.strip_prefix('#')
+                        .and_then(|d| d.parse::<u32>().ok())
+                })
+                .and_then(char::from_u32),
+        };
+        match decoded {
+            Some(c) => {
+                out.push(c);
+                rest = &tail[end + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &tail[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Replace the `nth` (0-based) `<a:t>` element whose DECODED
+/// text equals `old`, writing `new` escaped. The old code
+/// string-replaced the first raw `<a:t>{escaped old}</a:t>`
+/// occurrence (audit L6): runs stored with character
+/// references or CDATA never matched (the run was silently
+/// counted as translated but left in the source language),
+/// and two identical runs on one slide — or a translation
+/// equal to a sibling run's source — collided on the first
+/// hit. Occurrence-exact, decode-aware matching fixes both.
+/// Returns the new xml and whether a replacement happened.
+fn replace_run_nth(xml: &str, old: &str, new: &str, nth: usize) -> (String, bool) {
+    let mut seen = 0usize;
+    let mut pos = 0usize;
+    while let Some(off) = xml[pos..].find("<a:t") {
+        let tag_start = pos + off;
+        let after = &xml[tag_start + 4..];
+        // Only `<a:t>` / `<a:t ...attrs>` is a text run: the
+        // next char must end or space the tag name, otherwise
+        // this is `<a:tbl>`, `<a:tc>`, … and not a run at all.
+        match after.chars().next() {
+            Some('>') | Some('/') => {}
+            Some(c) if c.is_whitespace() => {}
+            _ => {
+                pos = tag_start + 4;
+                continue;
+            }
+        }
+        // A self-closed `<a:t/>` carries no text and is skipped.
+        let Some(gt) = after.find('>') else { break };
+        if after.as_bytes().get(gt.saturating_sub(1)) == Some(&b'/') {
+            pos = tag_start + 4 + gt + 1;
+            continue;
+        }
+        let inner_start = tag_start + 4 + gt + 1;
+        let Some(close) = xml[inner_start..].find("</a:t>") else { break };
+        let inner_end = inner_start + close;
+        if xml_unescape(&xml[inner_start..inner_end]) == old {
+            if seen == nth {
+                let mut out = String::with_capacity(xml.len() + new.len());
+                out.push_str(&xml[..inner_start]);
+                out.push_str(&xml_escape(new));
+                out.push_str(&xml[inner_end..]);
+                return (out, true);
+            }
+            seen += 1;
+        }
+        pos = inner_end + 6;
+    }
+    (xml.to_string(), false)
 }
 
 fn xml_escape(s: &str) -> String {
@@ -243,14 +333,38 @@ pub fn translate_package_chunked(
                 .push((text.clone(), new));
         }
     }
+    let mut failed = 0usize;
+    // Occurrence counters per (slide, source text): the runs
+    // were collected in deck order, so the k-th pair for a
+    // given text targets the k-th matching element.
+    let mut occurrence: std::collections::HashMap<(String, String), usize> =
+        Default::default();
     for (part, pairs) in &by_slide {
         let mut xml = out.get_text(part)?;
         for (old, new) in pairs {
-            xml = replace_run(&xml, old, new);
+            let key = (part.clone(), old.clone());
+            let nth = {
+                let e = occurrence.entry(key).or_default();
+                let v = *e;
+                *e += 1;
+                v
+            };
+            let (next, applied) = replace_run_nth(&xml, old, new, nth);
+            xml = next;
+            if !applied {
+                failed += 1;
+            }
         }
         out.parts.insert(part.clone(), xml.into_bytes());
     }
-    Ok((out, idx, report))
+    // The returned count is runs actually translated: a run
+    // whose replacement could not be applied is not counted
+    // (and is visible on stderr) instead of being silently
+    // reported as translated (audit L6).
+    if failed > 0 {
+        eprintln!("translate: {failed} run replacement(s) could not be applied");
+    }
+    Ok((out, idx - failed, report))
 }
 
 #[cfg(test)]

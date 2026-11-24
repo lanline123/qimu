@@ -490,6 +490,12 @@ impl App {
                         Page::Settings => {}
                     }
                     self.index_toolbar(ui);
+                    // Lazy import split status (2026-11-25):
+                    // renders only while a deck is still
+                    // splitting — progress + the turbo toggle —
+                    // and removes itself when the last deck
+                    // finishes (see App::lazy_status_slot).
+                    self.lazy_status_slot(ui);
                 });
                 let r = ui.max_rect();
                 ui.painter().hline(
@@ -1044,9 +1050,13 @@ impl App {
             )
             .clicked()
         {
-            self.clip_copy_units(&wall_targets, true);
-            if let ContentFrame::Wall(w) = self.content.stack.top_mut() {
-                w.multi.clear();
+            // The selection clears only when the cut fully
+            // succeeded (audit N3): a gated or partial failure
+            // keeps the user's selection context.
+            if self.clip_copy_units(&wall_targets, true) {
+                if let ContentFrame::Wall(w) = self.content.stack.top_mut() {
+                    w.multi.clear();
+                }
             }
         }
         // 解除组合 — the inverse of 组合为内容块, sitting
@@ -1066,11 +1076,12 @@ impl App {
             .clicked()
         {
             if let Some(uid) = ungroup_target.clone() {
-                self.clip_ungroup_unit(&uid);
-                if let ContentFrame::Wall(w) = self.content.stack.top_mut() {
-                    w.multi.clear();
-                    if w.selected.as_deref() == Some(uid.as_str()) {
-                        w.selected = None;
+                if self.clip_ungroup_unit(&uid) {
+                    if let ContentFrame::Wall(w) = self.content.stack.top_mut() {
+                        w.multi.clear();
+                        if w.selected.as_deref() == Some(uid.as_str()) {
+                            w.selected = None;
+                        }
                     }
                 }
             }
@@ -1086,9 +1097,10 @@ impl App {
             )
             .clicked()
         {
-            self.clip_combine_index(&wall_multi);
-            if let ContentFrame::Wall(w) = self.content.stack.top_mut() {
-                w.multi.clear();
+            if self.clip_combine_index(&wall_multi) {
+                if let ContentFrame::Wall(w) = self.content.stack.top_mut() {
+                    w.multi.clear();
+                }
             }
         }
         if ChromeIcons
@@ -1102,9 +1114,10 @@ impl App {
             )
             .clicked()
         {
-            self.clip_combine_units(&wall_multi);
-            if let ContentFrame::Wall(w) = self.content.stack.top_mut() {
-                w.multi.clear();
+            if self.clip_combine_units(&wall_multi) {
+                if let ContentFrame::Wall(w) = self.content.stack.top_mut() {
+                    w.multi.clear();
+                }
             }
         }
         // sdDel — wired only where a clean delete target with an
@@ -1455,7 +1468,11 @@ impl App {
             },
             Page::Content => match self.content.stack.top() {
                 ContentFrame::Unit(_) => Some(if self.content_light_open() {
-                    "返回内容块详情"
+                    // Prototype updateBarAvail: while a full-page
+                    // view (#406) tops the stack, sdClose reads
+                    // 关闭当前整页视图 — the close still lands
+                    // back on the detail frame (T4).
+                    "关闭当前整页视图"
                 } else {
                     "返回上一层"
                 }),
@@ -1471,7 +1488,10 @@ impl App {
             },
             Page::Settings => {
                 if self.settings_sections().get(self.settings.section).copied() == Some("审批队列")
-                    && matches!(self.review.stack.top(), ReviewFrame::Detail(_))
+                    && matches!(
+                        self.review.stack.top(),
+                        ReviewFrame::Detail(_) | ReviewFrame::Submission(_)
+                    )
                 {
                     Some("返回上一层")
                 } else {
@@ -1538,7 +1558,10 @@ impl App {
             }
             Page::Settings => {
                 if self.settings_sections().get(self.settings.section).copied() == Some("审批队列")
-                    && matches!(self.review.stack.top(), ReviewFrame::Detail(_))
+                    && matches!(
+                        self.review.stack.top(),
+                        ReviewFrame::Detail(_) | ReviewFrame::Submission(_)
+                    )
                 {
                     self.review.stack.pop();
                 } else {

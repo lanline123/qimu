@@ -18,8 +18,60 @@ use std::path::{Path, PathBuf};
 
 pub type SResult<T> = Result<T, String>;
 
+/// The five sidebar folder trees (sidebar isolation, user ruling
+/// 2026-11-24). A root folder's scope must be one of these;
+/// anything else is refused instead of minting a folder that no
+/// sidebar lists (audit round-2 N4).
+pub const FOLDER_SCOPES: [&str; 5] = ["showroom", "library", "inbox", "content", "index"];
+
+fn validate_folder_scope(scope: &str) -> SResult<String> {
+    if FOLDER_SCOPES.contains(&scope) {
+        Ok(scope.to_string())
+    } else {
+        Err(format!("未知的文件夹作用域：{scope}"))
+    }
+}
+
+/// Attachment filenames are display names that clients save back
+/// to disk on download (audit L7): keep only the final path
+/// component, drop control characters, and never let the stored
+/// name be empty or a traversal spelling.
+fn sanitize_attachment_filename(name: &str) -> String {
+    let base = name
+        .rsplit(|c| c == '/' || c == '\\')
+        .next()
+        .unwrap_or("")
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>();
+    let trimmed = base.trim().trim_start_matches('.');
+    let mut out: String = trimmed.chars().take(200).collect();
+    if out.is_empty() {
+        out = "未命名附件".to_string();
+    }
+    out
+}
+
 fn db_err(e: rusqlite::Error) -> String {
-    e.to_string()
+    // Audit2 F-N8: rusqlite's raw messages name tables, columns and
+    // constraints — schema internals that API responses used to carry
+    // verbatim to any connected client. Callers get a generic
+    // database-error message; the original text stays available in
+    // the process log (stderr) for diagnosis.
+    eprintln!("[qimu] db error: {e}");
+    "数据库操作失败".to_string()
+}
+
+/// A real Argon2 hash of a throwaway password, computed once per
+/// process, so `login_with_ip` can spend the same verification
+/// cost on unknown usernames as on wrong passwords (audit M7
+/// timing equalization).
+fn dummy_hash() -> &'static str {
+    static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DUMMY.get_or_init(|| {
+        hash_password("qimu-timing-equalizer")
+            .unwrap_or_else(|_| "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string())
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +82,14 @@ pub struct UserRec {
     pub dept_id: Option<String>,
     pub role: String, // super | dept_admin | member
     pub disabled: bool,
+    /// First-login forced password change (audit round-2 H6):
+    /// set on the seeded super admin when its password came from
+    /// the built-in default. While set, the server refuses every
+    /// named endpoint except password change, logout and `me`
+    /// (see qimu-server's auth gate). Defaults to false so rows
+    /// and payloads from before the flag existed read cleanly.
+    #[serde(default)]
+    pub must_change_password: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,6 +224,59 @@ pub struct PageRec {
     pub title: String,
 }
 
+/// One page of a deck whose import is still splitting (lazy
+/// import, user ruling 2026-11-25): the wrapper unit presenting
+/// the page from the moment the deck was opened, and whether the
+/// background split has turned the page into a registered entity
+/// yet (`split`) or the wrapper vanished mid-split (`gone` — the
+/// page is then skipped by grouping and counts as resolved for
+/// progress).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingPage {
+    pub index: usize,
+    pub fp: String,
+    pub title: String,
+    pub text: String,
+    pub script: String,
+    pub unit_id: String,
+    pub rendition_id: String,
+    pub version_id: String,
+    pub semver: String,
+    pub split: bool,
+    pub gone: bool,
+}
+
+/// A deck that has been opened but not fully split (lazy import):
+/// the whole deck file sits in the file store under `deck_hash`
+/// as the pages' backing, and this row is the split's durable
+/// state — it survives restarts, so an interrupted split resumes
+/// where it stopped. The row is deleted when the split completes
+/// (`state` only ever reads "splitting" or "failed" on disk).
+/// `verified` records the deck-level half of the §3.1 gate (the
+/// split–reassemble equivalence over all pages), run when the
+/// last page splits; the per-page half runs inside each page's
+/// split. `grouped` holds the positions (in the effective block
+/// spec list) whose blocks have already been folded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingImportRec {
+    pub id: String,
+    pub filename: String,
+    pub stem: String,
+    pub deck_hash: String,
+    pub folder_id: Option<String>,
+    pub group_id: String,
+    pub author: String,
+    pub slide_count: usize,
+    pub sections: Option<Vec<crate::pptx::SectionSpan>>,
+    pub pages: Vec<PendingPage>,
+    pub blocks: Option<Vec<crate::import::ImportBlockSpec>>,
+    pub grouped: Vec<usize>,
+    pub verified: Option<bool>,
+    pub state: String,
+    pub error: String,
+    pub created_ms: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VersionRec {
     pub id: String,
@@ -229,6 +342,21 @@ pub struct MergePreview {
 /// entity, an out-of-range legacy index) select nothing — an
 /// excerpt pins exact pages, not positions, once it is written
 /// with ids.
+/// SemVer components are u64 in the model but i64 columns in
+/// storage (audit L7): saturate instead of wrapping to a
+/// negative, which would corrupt every ordering over versions.
+fn semver_part(v: u64) -> i64 {
+    i64::try_from(v).unwrap_or(i64::MAX)
+}
+
+/// Whether a stored SHA-256 hex digest has exactly the shape
+/// `file_put` produces (64 lowercase hex chars). Paths built
+/// from a hash are only ever safe to touch when this holds
+/// (audit H1/M1).
+fn is_sha256_hex(h: &str) -> bool {
+    h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
 pub fn excerpt_positions(version: &VersionRec, tokens: &[String]) -> Vec<usize> {
     let mut chosen: Vec<usize> = Vec::new();
     for tok in tokens {
@@ -507,6 +635,29 @@ pub const SCOPE_ORG_PUBLIC: &str = "org_public";
 /// visible set is never derived from any position in the org tree
 /// (DESIGN §2.3: the root-node reading would dissolve every
 /// scoped tier).
+/// Total byte size of a directory tree (0 when the path does not
+/// exist). Used by the submission staging quota: the staging
+/// directories are the staged truth, so usage is measured on disk
+/// rather than trusted from manifests.
+fn dir_tree_bytes(path: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if let Ok(md) = entry.metadata() {
+                total += md.len();
+            }
+        }
+    }
+    total
+}
+
 pub fn scope_allows_guest(scope: &str) -> bool {
     scope == SCOPE_ORG_PUBLIC
 }
@@ -654,7 +805,7 @@ pub struct SessionRec {
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS departments(id TEXT PRIMARY KEY, name TEXT NOT NULL, parent_id TEXT);
-CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, display_name TEXT NOT NULL, password_hash TEXT NOT NULL, dept_id TEXT, role TEXT NOT NULL DEFAULT 'member', disabled INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, display_name TEXT NOT NULL, password_hash TEXT NOT NULL, dept_id TEXT, role TEXT NOT NULL DEFAULT 'member', disabled INTEGER NOT NULL DEFAULT 0, must_change_password INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS user_depts(user_id TEXT NOT NULL, dept_id TEXT NOT NULL, PRIMARY KEY(user_id, dept_id));
 CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, user_id TEXT, created_ms INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'user', client_ip TEXT, last_seen_ms INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS folders(id TEXT PRIMARY KEY, name TEXT NOT NULL, parent_id TEXT, sort INTEGER NOT NULL DEFAULT 0, main_index_id TEXT, scope TEXT NOT NULL DEFAULT '', color TEXT, note TEXT NOT NULL DEFAULT '');
@@ -671,7 +822,7 @@ CREATE TABLE IF NOT EXISTS exports(id TEXT PRIMARY KEY, index_id TEXT NOT NULL, 
 CREATE TABLE IF NOT EXISTS attachments(id TEXT PRIMARY KEY, parent_type TEXT NOT NULL, parent_id TEXT NOT NULL, filename TEXT NOT NULL, hash TEXT NOT NULL, size INTEGER NOT NULL, uploader TEXT NOT NULL, created_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS version_tags(id TEXT PRIMARY KEY, version_id TEXT NOT NULL, dim TEXT NOT NULL, value TEXT NOT NULL, strength TEXT NOT NULL DEFAULT 'fits', author TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS showroom(id TEXT PRIMARY KEY, title TEXT NOT NULL, intro TEXT NOT NULL DEFAULT '', source_index_id TEXT, commit_id TEXT, submitted_by TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending', created_ms INTEGER NOT NULL, scope TEXT NOT NULL DEFAULT 'org_public');
-CREATE TABLE IF NOT EXISTS showroom_pins(showroom_id TEXT NOT NULL, pos INTEGER NOT NULL, version_id TEXT NOT NULL, PRIMARY KEY(showroom_id, pos));
+CREATE TABLE IF NOT EXISTS showroom_pins(showroom_id TEXT NOT NULL, pos INTEGER NOT NULL, version_id TEXT NOT NULL, commit_id TEXT NOT NULL DEFAULT '', PRIMARY KEY(showroom_id, pos));
 CREATE TABLE IF NOT EXISTS submissions(id TEXT PRIMARY KEY, title TEXT NOT NULL, intro TEXT NOT NULL DEFAULT '', submitter_id TEXT NOT NULL, submitter_name TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending', note TEXT NOT NULL DEFAULT '', review_note TEXT NOT NULL DEFAULT '', reviewed_by TEXT NOT NULL DEFAULT '', reviewed_ms INTEGER NOT NULL DEFAULT 0, created_ms INTEGER NOT NULL, supersedes TEXT, source_index_id TEXT, landed_index_id TEXT, landed_showroom_id TEXT, entry_count INTEGER NOT NULL DEFAULT 0, page_count INTEGER NOT NULL DEFAULT 0, land_error TEXT NOT NULL DEFAULT '', manifest_json TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS trash_items(id TEXT PRIMARY KEY, kind TEXT NOT NULL, object_id TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', origin TEXT NOT NULL DEFAULT '', deleted_by TEXT NOT NULL DEFAULT '', deleted_ms INTEGER NOT NULL DEFAULT 0, UNIQUE(kind, object_id));
 CREATE TABLE IF NOT EXISTS assemblies(id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, entries_json TEXT NOT NULL, created_ms INTEGER NOT NULL);
@@ -684,6 +835,7 @@ CREATE TABLE IF NOT EXISTS library_entries(id TEXT PRIMARY KEY, user_id TEXT NOT
 CREATE TABLE IF NOT EXISTS profile_fields(user_id TEXT NOT NULL, field TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(user_id, field));
 CREATE TABLE IF NOT EXISTS company_profile(field TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS pending_imports(id TEXT PRIMARY KEY, filename TEXT NOT NULL, stem TEXT NOT NULL DEFAULT '', deck_hash TEXT NOT NULL, folder_id TEXT, group_id TEXT NOT NULL DEFAULT '', author TEXT NOT NULL DEFAULT '', slide_count INTEGER NOT NULL DEFAULT 0, sections_json TEXT NOT NULL DEFAULT '', pages_json TEXT NOT NULL DEFAULT '[]', blocks_json TEXT NOT NULL DEFAULT '', grouped_json TEXT NOT NULL DEFAULT '[]', verified INTEGER, state TEXT NOT NULL DEFAULT 'splitting', error TEXT NOT NULL DEFAULT '', created_ms INTEGER NOT NULL DEFAULT 0);
 ";
 
 pub struct Store {
@@ -695,7 +847,24 @@ impl Store {
     pub fn open(root: &Path) -> SResult<Store> {
         std::fs::create_dir_all(root.join("files")).map_err(|e| e.to_string())?;
         let conn = Connection::open(root.join("qimu.db")).map_err(db_err)?;
+        // Concurrency posture (audit L5): several processes may
+        // legitimately open one data directory (the server, the
+        // CLI, a second Store in-process). Without a busy timeout
+        // every write contention failed instantly with "database
+        // is locked"; WAL lets readers and one writer coexist.
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(db_err)?;
+        let _ = conn.pragma_update(None, "journal_mode", "WAL");
         conn.execute_batch(SCHEMA).map_err(db_err)?;
+        // Version-number uniqueness (audit L1): one row per
+        // (rendition, semver). Best-effort index — a legacy
+        // database that already carries duplicate numbers keeps
+        // opening (the index simply is not created there); the
+        // insert paths enforce the same rule in code, so new
+        // duplicates cannot form either way.
+        let _ = conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_versions_rendition_semver ON versions(rendition_id, major, minor, patch);",
+        );
         // Sessions rebuild (org-model G1): guest sessions carry a
         // NULL user_id, which the original `user_id TEXT NOT NULL`
         // shape forbids, so a pre-G1 sessions table is rebuilt in
@@ -712,19 +881,25 @@ impl Store {
                 )
                 .unwrap_or(0);
             if user_id_notnull == 1 {
-                conn.execute_batch(
+                // One transaction (audit L9): the previous
+                // batch-by-batch rebuild could lose the whole
+                // sessions table to a crash between DROP and
+                // RENAME.
+                let tx = conn.unchecked_transaction().map_err(db_err)?;
+                tx.execute_batch(
                     "CREATE TABLE sessions_new(token TEXT PRIMARY KEY, user_id TEXT, created_ms INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'user', client_ip TEXT, last_seen_ms INTEGER NOT NULL DEFAULT 0);",
                 )
                 .map_err(db_err)?;
-                conn.execute(
+                tx.execute(
                     "INSERT INTO sessions_new(token, user_id, created_ms, kind, client_ip, last_seen_ms) SELECT token, user_id, created_ms, 'user', NULL, ?1 FROM sessions",
                     params![now_ms()],
                 )
                 .map_err(db_err)?;
-                conn.execute_batch(
+                tx.execute_batch(
                     "DROP TABLE sessions; ALTER TABLE sessions_new RENAME TO sessions;",
                 )
                 .map_err(db_err)?;
+                tx.commit().map_err(db_err)?;
             }
         }
         // migrations for databases created before these columns existed
@@ -749,6 +924,8 @@ impl Store {
             ("shares", "note", "TEXT NOT NULL DEFAULT ''"),
             ("page_bindings", "from_page_id", "TEXT NOT NULL DEFAULT ''"),
             ("page_bindings", "to_page_id", "TEXT NOT NULL DEFAULT ''"),
+            ("showroom_pins", "commit_id", "TEXT NOT NULL DEFAULT ''"),
+            ("users", "must_change_password", "INTEGER NOT NULL DEFAULT 0"),
         ] {
             let has: bool = conn
                 .prepare(&format!("PRAGMA table_info({table})"))
@@ -770,7 +947,14 @@ impl Store {
             root: root.to_path_buf(),
         };
         store.backfill_folder_scopes()?;
-        store.migrate_page_entities()?;
+        // The page-entity migration is best-effort by design
+        // (audit N6): a content-layer failure in one version, or
+        // a transient DB error inside the migration, must never
+        // make the whole library unopenable — un-migrated
+        // versions keep reading through the fragment fallback.
+        if let Err(e) = store.migrate_page_entities() {
+            eprintln!("page entity migration skipped: {e}");
+        }
         Ok(store)
     }
 
@@ -1007,6 +1191,189 @@ impl Store {
         self.file_get(&version.fragment_hash)
     }
 
+    /// Point a version at a stored fragment after the fact. The
+    /// lazy import inserts a wrapper version with no fragment at
+    /// open time (the page is not split yet); when the page's
+    /// split lands, its version adopts the page entity's package
+    /// — the same content-addressed file `register_page` stored —
+    /// and from then on the wrapper is indistinguishable from a
+    /// staged import's stage-1 version.
+    pub fn set_version_fragment_hash(&self, version_id: &str, hash: &str) -> SResult<()> {
+        self.conn
+            .execute(
+                "UPDATE versions SET fragment_hash=?2 WHERE id=?1",
+                params![version_id, hash],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    // ---------- pending imports (lazy import) ----------
+
+    fn row_to_pending_import(r: &rusqlite::Row) -> rusqlite::Result<PendingImportRec> {
+        let sections_json: String = r.get(8)?;
+        let pages_json: String = r.get(9)?;
+        let blocks_json: String = r.get(10)?;
+        let grouped_json: String = r.get(11)?;
+        let verified: Option<i64> = r.get(12)?;
+        Ok(PendingImportRec {
+            id: r.get(0)?,
+            filename: r.get(1)?,
+            stem: r.get(2)?,
+            deck_hash: r.get(3)?,
+            folder_id: r.get(4)?,
+            group_id: r.get(5)?,
+            author: r.get(6)?,
+            slide_count: r.get::<_, i64>(7)? as usize,
+            sections: serde_json::from_str(&sections_json).unwrap_or_default(),
+            pages: serde_json::from_str(&pages_json).unwrap_or_default(),
+            blocks: if blocks_json.is_empty() {
+                None
+            } else {
+                serde_json::from_str(&blocks_json).unwrap_or_default()
+            },
+            grouped: serde_json::from_str(&grouped_json).unwrap_or_default(),
+            verified: verified.map(|v| v != 0),
+            state: r.get(13)?,
+            error: r.get(14)?,
+            created_ms: r.get(15)?,
+        })
+    }
+
+    const PENDING_IMPORT_COLS: &'static str = "id, filename, stem, deck_hash, folder_id, group_id, author, slide_count, sections_json, pages_json, blocks_json, grouped_json, verified, state, error, created_ms";
+
+    pub fn insert_pending_import(&self, rec: &PendingImportRec) -> SResult<()> {
+        self.conn
+            .execute(
+                "INSERT INTO pending_imports(id, filename, stem, deck_hash, folder_id, group_id, author, slide_count, sections_json, pages_json, blocks_json, grouped_json, verified, state, error, created_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                params![
+                    rec.id,
+                    rec.filename,
+                    rec.stem,
+                    rec.deck_hash,
+                    rec.folder_id,
+                    rec.group_id,
+                    rec.author,
+                    rec.slide_count as i64,
+                    serde_json::to_string(&rec.sections).unwrap_or_default(),
+                    serde_json::to_string(&rec.pages).unwrap_or_default(),
+                    rec.blocks
+                        .as_ref()
+                        .map(|b| serde_json::to_string(b).unwrap_or_default())
+                        .unwrap_or_default(),
+                    serde_json::to_string(&rec.grouped).unwrap_or_default(),
+                    rec.verified.map(|v| v as i64),
+                    rec.state,
+                    rec.error,
+                    rec.created_ms,
+                ],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn get_pending_import(&self, id: &str) -> SResult<Option<PendingImportRec>> {
+        self.conn
+            .query_row(
+                &format!(
+                    "SELECT {} FROM pending_imports WHERE id=?1",
+                    Self::PENDING_IMPORT_COLS
+                ),
+                params![id],
+                Self::row_to_pending_import,
+            )
+            .optional()
+            .map_err(db_err)
+    }
+
+    /// Every import still splitting (or failed mid-split),
+    /// oldest first — the resume list a starting client works
+    /// from.
+    pub fn list_pending_imports(&self) -> SResult<Vec<PendingImportRec>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "SELECT {} FROM pending_imports ORDER BY created_ms, id",
+                Self::PENDING_IMPORT_COLS
+            ))
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], Self::row_to_pending_import)
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(rows)
+    }
+
+    /// Rewrite a pending import's mutable state (per-page split
+    /// flags, folded blocks, the deck-level verdict, lifecycle).
+    pub fn update_pending_import(&self, rec: &PendingImportRec) -> SResult<()> {
+        self.conn
+            .execute(
+                "UPDATE pending_imports SET pages_json=?2, grouped_json=?3, verified=?4, state=?5, error=?6 WHERE id=?1",
+                params![
+                    rec.id,
+                    serde_json::to_string(&rec.pages).unwrap_or_default(),
+                    serde_json::to_string(&rec.grouped).unwrap_or_default(),
+                    rec.verified.map(|v| v as i64),
+                    rec.state,
+                    rec.error,
+                ],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn delete_pending_import(&self, id: &str) -> SResult<()> {
+        self.conn
+            .execute("DELETE FROM pending_imports WHERE id=?1", params![id])
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// The whole-deck backing of a not-yet-split wrapper version:
+    /// (deck file hash, slide index, page entity id). The client
+    /// renders such a page's thumbnail straight from the deck —
+    /// rendering is not "using" the page — while every other
+    /// consumer only ever meets the page after its split.
+    pub fn lazy_backing_for_version(
+        &self,
+        version_id: &str,
+    ) -> SResult<Option<(String, usize, String)>> {
+        for rec in self.list_pending_imports()? {
+            for p in &rec.pages {
+                if p.version_id == version_id && !p.split && !p.gone {
+                    return Ok(Some((
+                        rec.deck_hash.clone(),
+                        p.index,
+                        crate::store::page_id_for_fp(&p.fp),
+                    )));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// The same backing, addressed by page entity id (the
+    /// thumbnail resolver's key): (deck file hash, slide index)
+    /// for a page that is still waiting for its split.
+    pub fn lazy_backing_for_page(
+        &self,
+        page_id: &str,
+    ) -> SResult<Option<(String, usize)>> {
+        for rec in self.list_pending_imports()? {
+            for p in &rec.pages {
+                if !p.split
+                    && !p.gone
+                    && crate::store::page_id_for_fp(&p.fp) == page_id
+                {
+                    return Ok(Some((rec.deck_hash.clone(), p.index)));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Page entity-ization migration (Store::open): versions
     /// written before page entities carry PageInfo rows without
     /// ids. For each such version, split its stored fragment,
@@ -1018,10 +1385,24 @@ impl Store {
     /// Page bindings gain their page-id addressing the same way:
     /// (version, slot) resolves to the version's page reference.
     fn migrate_page_entities(&self) -> SResult<()> {
+        // Incremental posture (audit N6): the scan below only
+        // selects versions that still carry id-less pages, and
+        // versions whose migration already failed once are
+        // remembered by id (settings) and not retried on every
+        // launch — a single corrupt version must not tax every
+        // startup with a full fragment parse forever. Failed
+        // versions keep reading through the fragment fallback.
+        let mut failed: Vec<String> = self
+            .get_setting("page_entity_migration_failed")
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        let failed_before = failed.clone();
         let pending: Vec<(String, String, String)> = {
             let mut stmt = self
                 .conn
-                .prepare("SELECT id, fragment_hash, pages_json FROM versions")
+                .prepare("SELECT id, fragment_hash, pages_json FROM versions WHERE pages_json LIKE '%\"id\":\"\"%'")
                 .map_err(db_err)?;
             let rows = stmt
                 .query_map([], |r| {
@@ -1037,21 +1418,28 @@ impl Store {
             rows
         };
         for (version_id, fragment_hash, pages_json) in &pending {
+            if failed.contains(version_id) {
+                continue;
+            }
             let mut pages: Vec<PageInfo> =
                 serde_json::from_str(pages_json).unwrap_or_default();
             if pages.iter().all(|p| !p.id.is_empty()) {
                 continue;
             }
             let Ok(bytes) = self.file_get(fragment_hash) else {
+                failed.push(version_id.clone());
                 continue;
             };
             let Ok(pkg) = Package::load(&bytes) else {
+                failed.push(version_id.clone());
                 continue;
             };
             let Ok(singles) = crate::pptx::split(&pkg) else {
+                failed.push(version_id.clone());
                 continue;
             };
             if singles.len() != pages.len() {
+                failed.push(version_id.clone());
                 continue;
             }
             let mut filled = true;
@@ -1072,9 +1460,11 @@ impl Store {
                 }
             }
             if !filled {
+                failed.push(version_id.clone());
                 continue;
             }
-            self.conn
+            if self
+                .conn
                 .execute(
                     "UPDATE versions SET pages_json=?2 WHERE id=?1",
                     params![
@@ -1082,7 +1472,17 @@ impl Store {
                         serde_json::to_string(&pages).unwrap_or_default()
                     ],
                 )
-                .map_err(db_err)?;
+                .is_err()
+            {
+                failed.push(version_id.clone());
+                continue;
+            }
+        }
+        if failed != failed_before {
+            let _ = self.set_setting(
+                "page_entity_migration_failed",
+                &serde_json::to_string(&failed).unwrap_or_default(),
+            );
         }
         // Page bindings: fill page-id addressing from (version, slot).
         let bindings: Vec<(String, String, i64, String, i64)> = {
@@ -1122,12 +1522,12 @@ impl Store {
             if from_pid.is_empty() && to_pid.is_empty() {
                 continue;
             }
-            self.conn
-                .execute(
-                    "UPDATE page_bindings SET from_page_id=?2, to_page_id=?3 WHERE id=?1",
-                    params![binding_id, from_pid, to_pid],
-                )
-                .map_err(db_err)?;
+            // Best-effort like the rest of this migration: one
+            // binding's write failure must not fail the open.
+            let _ = self.conn.execute(
+                "UPDATE page_bindings SET from_page_id=?2, to_page_id=?3 WHERE id=?1",
+                params![binding_id, from_pid, to_pid],
+            );
         }
         Ok(())
     }
@@ -1148,6 +1548,20 @@ impl Store {
         dept_id: Option<&str>,
         role: &str,
     ) -> SResult<UserRec> {
+        // Role is an enum, never free text (audit H1): an unknown
+        // role string must not land in the table, where the
+        // negative `role == "member"` checks elsewhere would
+        // silently treat it as an administrator. The caller's own
+        // ceiling (who may mint which role) is enforced by the
+        // server handler; this is the last-line invariant.
+        if !matches!(role, "super" | "dept_admin" | "member") {
+            return Err(format!("未知角色：{role}"));
+        }
+        // Minimal password policy (audit M7): no empty or short
+        // passwords on any creation path.
+        if password.chars().count() < 8 {
+            return Err("口令至少需要 8 位".into());
+        }
         let id = new_id("usr");
         let hash = hash_password(password)?;
         self.conn
@@ -1175,13 +1589,14 @@ impl Store {
             dept_id: r.get(3)?,
             role: r.get(4)?,
             disabled: r.get::<_, i64>(5)? != 0,
+            must_change_password: r.get::<_, i64>(6)? != 0,
         })
     }
 
     pub fn user_by_id(&self, id: &str) -> SResult<UserRec> {
         self.conn
             .query_row(
-                "SELECT id, username, display_name, dept_id, role, disabled FROM users WHERE id=?1",
+                "SELECT id, username, display_name, dept_id, role, disabled, must_change_password FROM users WHERE id=?1",
                 params![id],
                 Self::row_to_user,
             )
@@ -1191,7 +1606,7 @@ impl Store {
     pub fn user_by_username(&self, username: &str) -> SResult<UserRec> {
         self.conn
             .query_row(
-                "SELECT id, username, display_name, dept_id, role, disabled FROM users WHERE username=?1",
+                "SELECT id, username, display_name, dept_id, role, disabled, must_change_password FROM users WHERE username=?1",
                 params![username],
                 Self::row_to_user,
             )
@@ -1201,7 +1616,7 @@ impl Store {
     pub fn list_users(&self) -> SResult<Vec<UserRec>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, username, display_name, dept_id, role, disabled FROM users ORDER BY username")
+            .prepare("SELECT id, username, display_name, dept_id, role, disabled, must_change_password FROM users ORDER BY username")
             .map_err(db_err)?;
         let rows = stmt
             .query_map([], Self::row_to_user)
@@ -1221,10 +1636,10 @@ impl Store {
         password: &str,
         client_ip: Option<&str>,
     ) -> SResult<(String, UserRec)> {
-        let (user, hash) = self
+        let found = self
             .conn
             .query_row(
-                "SELECT id, username, display_name, dept_id, role, disabled, password_hash FROM users WHERE username=?1",
+                "SELECT id, username, display_name, dept_id, role, disabled, must_change_password, password_hash FROM users WHERE username=?1",
                 params![username],
                 |r| {
                     Ok((
@@ -1235,17 +1650,36 @@ impl Store {
                             dept_id: r.get(3)?,
                             role: r.get(4)?,
                             disabled: r.get::<_, i64>(5)? != 0,
+                            must_change_password: r.get::<_, i64>(6)? != 0,
                         },
-                        r.get::<_, String>(6)?,
+                        r.get::<_, String>(7)?,
                     ))
                 },
             )
-            .map_err(|_| "用户名或密码不正确".to_string())?;
-        if user.disabled {
-            return Err("账号已停用".into());
-        }
+            .optional()
+            .map_err(db_err)?;
+        let (user, hash) = match found {
+            Some(pair) => pair,
+            None => {
+                // Timing equalization (audit M7): an unknown
+                // username runs the same Argon2 verification
+                // against a dummy hash, so it costs what a wrong
+                // password costs and cannot be enumerated by
+                // response time.
+                let _ = verify_password(password, dummy_hash());
+                return Err("用户名或密码不正确".into());
+            }
+        };
+        // Verify first, report disabled second (audit M7): the
+        // old order answered "account disabled" to any password,
+        // an oracle for which usernames exist and are disabled.
+        // Now the disabled state is revealed only to a caller who
+        // proved knowledge of the password.
         if !verify_password(password, &hash) {
             return Err("用户名或密码不正确".into());
+        }
+        if user.disabled {
+            return Err("账号已停用".into());
         }
         let token = new_token();
         let now = now_ms();
@@ -1353,7 +1787,7 @@ impl Store {
     pub fn seed_owner(&self) -> SResult<UserRec> {
         self.conn
             .query_row(
-                "SELECT id, username, display_name, dept_id, role, disabled FROM users WHERE role='super' ORDER BY rowid LIMIT 1",
+                "SELECT id, username, display_name, dept_id, role, disabled, must_change_password FROM users WHERE role='super' ORDER BY rowid LIMIT 1",
                 [],
                 Self::row_to_user,
             )
@@ -1400,6 +1834,69 @@ impl Store {
     pub fn logout(&self, token: &str) -> SResult<()> {
         self.conn
             .execute("DELETE FROM sessions WHERE token=?1", params![token])
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Set or clear the first-login forced-change flag (audit
+    /// H6). The server sets it on the seeded super admin when the
+    /// seed password came from the built-in default.
+    pub fn set_must_change_password(&self, id: &str, flag: bool) -> SResult<()> {
+        self.conn
+            .execute(
+                "UPDATE users SET must_change_password=?2 WHERE id=?1",
+                params![id, flag as i64],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Change a user's password after proving the current one
+    /// (audit H6's change door). Clears the forced-change flag.
+    /// Session revocation is the caller's move (the server keeps
+    /// the calling session and drops the user's others).
+    pub fn change_password(
+        &self,
+        user_id: &str,
+        current: &str,
+        new_password: &str,
+    ) -> SResult<()> {
+        let hash: String = self
+            .conn
+            .query_row(
+                "SELECT password_hash FROM users WHERE id=?1",
+                params![user_id],
+                |r| r.get(0),
+            )
+            .map_err(|_| "用户不存在".to_string())?;
+        if !verify_password(current, &hash) {
+            return Err("当前口令不正确".into());
+        }
+        if new_password.chars().count() < 8 {
+            return Err("新口令至少需要 8 位".into());
+        }
+        if new_password == current {
+            return Err("新口令不能与当前口令相同".into());
+        }
+        let new_hash = hash_password(new_password)?;
+        self.conn
+            .execute(
+                "UPDATE users SET password_hash=?2, must_change_password=0 WHERE id=?1",
+                params![user_id, new_hash],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Drop every session of a user except one (used after a
+    /// password change: the caller's own session survives, any
+    /// session an attacker may hold does not).
+    pub fn delete_other_sessions(&self, user_id: &str, keep_token: &str) -> SResult<()> {
+        self.conn
+            .execute(
+                "DELETE FROM sessions WHERE user_id=?1 AND token<>?2",
+                params![user_id, keep_token],
+            )
             .map_err(db_err)?;
         Ok(())
     }
@@ -1501,15 +1998,24 @@ impl Store {
         // parent, the scope is always the parent's scope, so a
         // tree can never grow a branch into another surface's
         // sidebar (sidebar isolation, user ruling 2026-11-24).
-        let scope = match parent_id {
+        // A root folder's scope is caller-supplied, so it is
+        // validated against the five sidebar trees (audit
+        // round-2 N4): free text here would mint a folder that
+        // hangs on no tree at all. The same validation covers a
+        // child whose parent predates scoping (empty scope) and
+        // therefore falls back to the supplied value.
+        let parent_scope = match parent_id {
             Some(pid) => self
                 .list_folders()?
                 .into_iter()
                 .find(|f| f.id == pid)
                 .map(|f| f.scope)
-                .filter(|sc| !sc.is_empty())
-                .unwrap_or_else(|| scope.to_string()),
-            None => scope.to_string(),
+                .filter(|sc| !sc.is_empty()),
+            None => None,
+        };
+        let scope = match parent_scope {
+            Some(sc) => sc,
+            None => validate_folder_scope(scope)?,
         };
         let sort: i64 = self
             .conn
@@ -1578,9 +2084,13 @@ impl Store {
     }
 
     pub fn rename_folder(&self, id: &str, name: &str) -> SResult<()> {
-        self.conn
+        let n = self
+            .conn
             .execute("UPDATE folders SET name=?2 WHERE id=?1", params![id, name])
             .map_err(db_err)?;
+        if n == 0 {
+            return Err("文件夹不存在".into());
+        }
         Ok(())
     }
 
@@ -1588,9 +2098,13 @@ impl Store {
     /// （备注）. The content page's folder-flow header edits it in
     /// place; the sidebar tree does not surface it.
     pub fn set_folder_note(&self, id: &str, note: &str) -> SResult<()> {
-        self.conn
+        let n = self
+            .conn
             .execute("UPDATE folders SET note=?2 WHERE id=?1", params![id, note])
             .map_err(db_err)?;
+        if n == 0 {
+            return Err("文件夹不存在".into());
+        }
         Ok(())
     }
 
@@ -1901,12 +2415,16 @@ impl Store {
     /// Designate (or clear, with None) the folder's main index. The
     /// caller validates that the index's home folder is this folder.
     pub fn set_folder_main_index(&self, folder_id: &str, index_id: Option<&str>) -> SResult<()> {
-        self.conn
+        let n = self
+            .conn
             .execute(
                 "UPDATE folders SET main_index_id=?2 WHERE id=?1",
                 params![folder_id, index_id],
             )
             .map_err(db_err)?;
+        if n == 0 {
+            return Err("文件夹不存在".into());
+        }
         Ok(())
     }
 
@@ -2164,6 +2682,13 @@ impl Store {
             u.name = n.into();
         }
         if let Some(f) = folder_id {
+            // Moving a unit is a home change like creating one
+            // (audit N3): the create-side scope gate must hold
+            // here too, or sidebar isolation is creation-time
+            // discipline only and the unit lands in another
+            // surface's tree (or a dangling folder) and vanishes
+            // from every wall.
+            self.check_home_folder(f, "content", "内容块")?;
             u.folder_id = f.map(|s| s.to_string());
         }
         if let Some(m) = maintainer {
@@ -2323,6 +2848,7 @@ impl Store {
         status: &str,
         scripts_override: Option<&[String]>,
     ) -> SResult<VersionRec> {
+        self.check_semver_free(rendition_id, semver, None)?;
         let pkg = Package::load(fragment)?;
         let slide_refs = crate::pptx::slides(&pkg)?;
         let mut pages = Vec::new();
@@ -2353,17 +2879,36 @@ impl Store {
         // reference untouched. If the split disagrees with the
         // slide listing (exotic package), the version degrades to
         // id-less pages, which read through the fragment fallback.
-        if let Ok(singles) = crate::pptx::split(&pkg) {
-            if singles.len() == pages.len() {
+        // Registration failures are no longer swallowed whole
+        // (audit N8): a version whose pages all failed to
+        // register would carry an id-less reference sequence,
+        // and id-addressed excerpts over it (notably a landed
+        // version's) silently resolve to nothing. A published
+        // (normal) version in that state is refused outright;
+        // partial failure keeps the version — reads fall back
+        // to the fragment — but is reported on stderr.
+        let mut entity_failures = 0usize;
+        match crate::pptx::split(&pkg) {
+            Ok(singles) if singles.len() == pages.len() => {
                 for (i, page) in pages.iter_mut().enumerate() {
-                    if let Ok(single_bytes) = singles[i].to_bytes() {
-                        if let Ok(rec) =
-                            self.register_page(&page.fp, &page.title, &single_bytes)
-                        {
-                            page.id = rec.id;
-                        }
+                    match singles[i]
+                        .to_bytes()
+                        .and_then(|b| self.register_page(&page.fp, &page.title, &b))
+                    {
+                        Ok(rec) => page.id = rec.id,
+                        Err(_) => entity_failures += 1,
                     }
                 }
+            }
+            _ => entity_failures = pages.len(),
+        }
+        if entity_failures > 0 {
+            eprintln!(
+                "insert_version: {entity_failures}/{} pages failed entity registration (rendition {rendition_id})",
+                pages.len()
+            );
+            if entity_failures == pages.len() && status == "normal" {
+                return Err("页面实体登记全部失败，已发布的版本未写入".into());
             }
         }
         let hash = self.file_put(fragment)?;
@@ -2375,9 +2920,9 @@ impl Store {
                     id,
                     rendition_id,
                     semver.to_string(),
-                    semver.major as i64,
-                    semver.minor as i64,
-                    semver.patch as i64,
+                    semver_part(semver.major),
+                    semver_part(semver.minor),
+                    semver_part(semver.patch),
                     basis_revision,
                     author,
                     note,
@@ -2429,9 +2974,30 @@ impl Store {
         if texts.len() != pages.len() {
             return Err("页面文本数量与页面数量不匹配".into());
         }
+        // This API's whole contract is the reference sequence:
+        // a page without an entity id is not a reference
+        // (audit N8) — refuse instead of storing a sequence
+        // excerpt resolution will silently read as empty.
+        if pages.iter().any(|p| p.id.is_empty()) {
+            return Err("页引用缺少实体 id，版本未写入".into());
+        }
+        self.check_semver_free(rendition_id, semver, None)?;
+        // N8 (chain line): a None fragment used to land as
+        // fragment_hash = "" and only failed much later, far
+        // from the cause — at submission-package build, where
+        // the byte chain reads the hash back and finds nothing.
+        // Fail here, at the version's birth, with the cause
+        // named: every current caller has the bytes, and a
+        // caller with nothing byte-facing must not create
+        // byte-chained versions.
         let hash = match fragment {
             Some(bytes) => self.file_put(bytes)?,
-            None => String::new(),
+            None => {
+                return Err(
+                    "建版本缺少片段字节：无字节的版本会让投稿组包在远处失败，请传入片段"
+                        .into(),
+                )
+            }
         };
         let id = new_id("ver");
         self.conn
@@ -2441,9 +3007,9 @@ impl Store {
                     id,
                     rendition_id,
                     semver.to_string(),
-                    semver.major as i64,
-                    semver.minor as i64,
-                    semver.patch as i64,
+                    semver_part(semver.major),
+                    semver_part(semver.minor),
+                    semver_part(semver.patch),
                     basis_revision,
                     author,
                     note,
@@ -2463,7 +3029,8 @@ impl Store {
     /// Replace a version's per-page scripts. Editing scripts never bumps
     /// the version or the content revision (§3.16).
     pub fn set_version_scripts(&self, version_id: &str, scripts: &[String]) -> SResult<()> {
-        self.conn
+        let n = self
+            .conn
             .execute(
                 "UPDATE versions SET scripts_json=?2 WHERE id=?1",
                 params![
@@ -2472,6 +3039,9 @@ impl Store {
                 ],
             )
             .map_err(db_err)?;
+        if n == 0 {
+            return Err("版本不存在".into());
+        }
         Ok(())
     }
 
@@ -2486,11 +3056,44 @@ impl Store {
     }
 
     /// Versions of a rendition, newest (highest semver) first.
+    /// One version number per rendition (audit L1): inserting or
+    /// renumbering onto an existing (major, minor, patch) is
+    /// refused, so "the latest" and every resolution over the
+    /// rendition stay deterministic. A best-effort unique index
+    /// (Store::open) backs this on databases that can take it.
+    fn check_semver_free(
+        &self,
+        rendition_id: &str,
+        semver: SemVer,
+        exclude_id: Option<&str>,
+    ) -> SResult<()> {
+        let clash: bool = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM versions WHERE rendition_id=?1 AND major=?2 AND minor=?3 AND patch=?4 AND id IS NOT ?5)",
+                params![
+                    rendition_id,
+                    semver_part(semver.major),
+                    semver_part(semver.minor),
+                    semver_part(semver.patch),
+                    exclude_id
+                ],
+                |r| r.get(0),
+            )
+            .map_err(db_err)?;
+        if clash {
+            return Err(format!(
+                "该形态版本已存在版本号 {semver}，不能重复使用"
+            ));
+        }
+        Ok(())
+    }
+
     pub fn list_versions(&self, rendition_id: &str) -> SResult<Vec<VersionRec>> {
         let mut stmt = self
             .conn
             .prepare(&format!(
-                "SELECT {} FROM versions WHERE rendition_id=?1 ORDER BY major DESC, minor DESC, patch DESC",
+                "SELECT {} FROM versions WHERE rendition_id=?1 ORDER BY major DESC, minor DESC, patch DESC, created_ms DESC, rowid DESC",
                 Self::VERSION_COLS
             ))
             .map_err(db_err)?;
@@ -2502,6 +3105,14 @@ impl Store {
         Ok(rows)
     }
 
+    /// The newest surviving version, drafts included: this is
+    /// the working-copy accessor the editing faces use (a draft
+    /// IS the latest work). Published resolution — what an
+    /// index entry, a showroom item or a guest may see — is
+    /// `resolve_entry_version`, whose follow-latest arm only
+    /// ever lands on a formally published (normal) version
+    /// (audit M2). Callers must not serve content to a
+    /// distribution face from this accessor.
     pub fn latest_version(&self, rendition_id: &str) -> SResult<Option<VersionRec>> {
         Ok(self
             .list_versions(rendition_id)?
@@ -2510,35 +3121,83 @@ impl Store {
     }
 
     pub fn set_version_status(&self, id: &str, status: &str) -> SResult<()> {
-        self.conn
+        let n = self
+            .conn
             .execute(
                 "UPDATE versions SET status=?2 WHERE id=?1",
                 params![id, status],
             )
             .map_err(db_err)?;
+        if n == 0 {
+            return Err("版本不存在".into());
+        }
         Ok(())
     }
 
     pub fn delete_version(&self, id: &str) -> SResult<()> {
+        // Publish-pin guard (pin audit N1): a version a live
+        // showroom item pins as its formal version is not
+        // deletable — deleting it would silently re-resolve the
+        // item onto a substitute. The caller must re-push the
+        // item or take it down first. Pins of non-live items do
+        // not block: their items are not publishing anything.
+        let pinned_live: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM showroom_pins p JOIN showroom s ON s.id = p.showroom_id WHERE p.version_id = ?1 AND s.state = 'live'",
+                params![id],
+                |r| r.get(0),
+            )
+            .map_err(db_err)?;
+        if pinned_live > 0 {
+            return Err(
+                "该版本正被演示厅条目钉为正式版，不能删除；请先更新该条目的演示推送或将其下架"
+                    .into(),
+            );
+        }
+        // Cascade (audit L8): the version's tags and the page
+        // bindings addressed at it die with it, instead of
+        // lingering as orphans consumers trip over. (Whether a
+        // version pinned by a live showroom item may be deleted
+        // at all is the pin line's guard, applied separately.)
         self.conn
+            .execute("DELETE FROM version_tags WHERE version_id=?1", params![id])
+            .map_err(db_err)?;
+        self.conn
+            .execute(
+                "DELETE FROM page_bindings WHERE from_version_id=?1 OR to_version_id=?1",
+                params![id],
+            )
+            .map_err(db_err)?;
+        let n = self
+            .conn
             .execute("DELETE FROM versions WHERE id=?1", params![id])
             .map_err(db_err)?;
+        if n == 0 {
+            return Err("版本不存在".into());
+        }
         Ok(())
     }
 
     pub fn renumber_version(&self, id: &str, semver: SemVer) -> SResult<()> {
-        self.conn
+        let cur = self.get_version(id)?;
+        self.check_semver_free(&cur.rendition_id, semver, Some(id))?;
+        let n = self
+            .conn
             .execute(
                 "UPDATE versions SET semver=?2, major=?3, minor=?4, patch=?5 WHERE id=?1",
                 params![
                     id,
                     semver.to_string(),
-                    semver.major as i64,
-                    semver.minor as i64,
-                    semver.patch as i64
+                    semver_part(semver.major),
+                    semver_part(semver.minor),
+                    semver_part(semver.patch)
                 ],
             )
             .map_err(db_err)?;
+        if n == 0 {
+            return Err("版本不存在".into());
+        }
         Ok(())
     }
 
@@ -2699,12 +3358,16 @@ impl Store {
     }
 
     pub fn delete_page_binding(&self, unit_id: &str, binding_id: &str) -> SResult<()> {
-        self.conn
+        let n = self
+            .conn
             .execute(
                 "DELETE FROM page_bindings WHERE id=?1 AND unit_id=?2",
                 params![binding_id, unit_id],
             )
             .map_err(db_err)?;
+        if n == 0 {
+            return Err("页绑定不存在".into());
+        }
         Ok(())
     }
 
@@ -2837,16 +3500,33 @@ impl Store {
     }
 
     pub fn set_index_lifecycle(&self, id: &str, lifecycle: &str) -> SResult<()> {
-        self.conn
+        // Lifecycle is a closed vocabulary (audit L2): anything
+        // else would strand the index outside the state machine
+        // its readers match on.
+        if !matches!(lifecycle, "active" | "history" | "void") {
+            return Err(format!("未知的索引生命周期：{lifecycle}"));
+        }
+        let n = self
+            .conn
             .execute(
                 "UPDATE indexes_tbl SET lifecycle=?2 WHERE id=?1",
                 params![id, lifecycle],
             )
             .map_err(db_err)?;
+        if n == 0 {
+            return Err("索引不存在".into());
+        }
         Ok(())
     }
 
     pub fn branch_head(&self, index_id: &str, branch: &str) -> SResult<Option<String>> {
+        // A missing branch row is a legitimate None (the branch
+        // has no commits yet — or does not exist; callers that
+        // must tell the two apart, like create_commit, check
+        // existence separately). A database error is NOT
+        // (audit M6): the old `.ok()` folded both into None,
+        // which let create_commit report success for a commit
+        // no branch head would ever point at.
         let head: Option<Option<String>> = self
             .conn
             .query_row(
@@ -2854,7 +3534,8 @@ impl Store {
                 params![index_id, branch],
                 |r| r.get(0),
             )
-            .ok();
+            .optional()
+            .map_err(db_err)?;
         Ok(head.flatten())
     }
 
@@ -2934,15 +3615,34 @@ impl Store {
     pub fn move_index_to_folder(&self, id: &str, folder_id: Option<&str>) -> SResult<()> {
         let tx = self.conn.unchecked_transaction().map_err(db_err)?;
         if let Some(folder_id) = folder_id {
-            let exists = tx
+            // Existence AND scope (audit N3): create_index gates
+            // the home folder through check_home_folder; moving
+            // an index is the same home change and must hold the
+            // same line, or the index lands in another surface's
+            // tree and vanishes from the index walls.
+            let scope: Option<String> = tx
                 .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM folders WHERE id=?1)",
+                    "SELECT scope FROM folders WHERE id=?1",
                     params![folder_id],
-                    |row| row.get::<_, bool>(0),
+                    |row| row.get(0),
                 )
+                .optional()
                 .map_err(db_err)?;
-            if !exists {
-                return Err("目标文件夹不存在".into());
+            match scope {
+                None => return Err("目标文件夹不存在".into()),
+                Some(s) if s == "index" => {}
+                Some(s) => {
+                    let area = match s.as_str() {
+                        "showroom" => "演示·公共",
+                        "library" => "演示·我的",
+                        "inbox" => "演示·分享",
+                        "content" => "页面",
+                        _ => "其他",
+                    };
+                    return Err(format!(
+                        "索引不能移到这个文件夹下：该文件夹属于「{area}」目录"
+                    ));
+                }
             }
         }
         if tx
@@ -2999,6 +3699,24 @@ impl Store {
         message: &str,
         entries: Vec<IndexEntry>,
     ) -> SResult<CommitRec> {
+        // Existence first (audit M6): committing to an index or
+        // branch that does not exist used to insert an orphan
+        // commit, update zero branch rows and still report
+        // success — the save looked done and was unreachable.
+        if self.get_index(index_id).is_err() {
+            return Err("索引不存在".into());
+        }
+        let branch_exists: bool = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM index_branches WHERE index_id=?1 AND name=?2)",
+                params![index_id, branch],
+                |r| r.get(0),
+            )
+            .map_err(db_err)?;
+        if !branch_exists {
+            return Err("分支不存在".into());
+        }
         let parent = self.branch_head(index_id, branch)?;
         let id = new_id("cmt");
         let rec = CommitRec {
@@ -3011,8 +3729,13 @@ impl Store {
             created_ms: now_ms(),
             entries,
         };
-        self.conn
-            .execute(
+        // Insert + head update atomically: a crash between
+        // them used to leave the same orphan commit. When the
+        // caller already runs inside a transaction
+        // (land_submission, create_english_index), join it —
+        // a nested BEGIN would fail outright.
+        let write = |conn: &Connection| -> SResult<()> {
+            conn.execute(
                 "INSERT INTO index_commits(id, index_id, branch, parent_id, author, message, created_ms, entries_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
                 params![
                     rec.id,
@@ -3026,12 +3749,24 @@ impl Store {
                 ],
             )
             .map_err(db_err)?;
-        self.conn
-            .execute(
-                "UPDATE index_branches SET head_commit=?3 WHERE index_id=?1 AND name=?2",
-                params![index_id, branch, id],
-            )
-            .map_err(db_err)?;
+            let n = conn
+                .execute(
+                    "UPDATE index_branches SET head_commit=?3 WHERE index_id=?1 AND name=?2",
+                    params![index_id, branch, id],
+                )
+                .map_err(db_err)?;
+            if n == 0 {
+                return Err("分支不存在".into());
+            }
+            Ok(())
+        };
+        if self.conn.is_autocommit() {
+            let tx = self.conn.unchecked_transaction().map_err(db_err)?;
+            write(&tx)?;
+            tx.commit().map_err(db_err)?;
+        } else {
+            write(&self.conn)?;
+        }
         Ok(rec)
     }
 
@@ -3067,7 +3802,11 @@ impl Store {
             out.push(cid);
             cur = c.parent_id.clone();
             if out.len() > 1000 {
-                break;
+                // Silent truncation made merge_base quietly
+                // miss the true common ancestor and report a
+                // wall of phantom conflicts (audit L4); an
+                // explicit error is the honest failure mode.
+                return Err("提交祖先链超过 1000 层，无法完整遍历".into());
             }
         }
         Ok(out)
@@ -3175,6 +3914,21 @@ impl Store {
     }
 
     pub fn create_tag(&self, index_id: &str, branch: &str, name: &str) -> SResult<IndexTagRec> {
+        // One name, one tag (audit L8): a duplicate (index,
+        // branch, name) would let a publisher silently re-point
+        // what "the published version" means, since readers pick
+        // among same-named tags by list order.
+        let dup: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM index_tags WHERE index_id=?1 AND branch=?2 AND name=?3",
+                params![index_id, branch, name],
+                |r| r.get(0),
+            )
+            .map_err(db_err)?;
+        if dup > 0 {
+            return Err(format!("标签「{name}」已存在"));
+        }
         let head = self.branch_head(index_id, branch)?.ok_or("分支尚无提交")?;
         let id = new_id("tag");
         self.conn
@@ -3214,9 +3968,14 @@ impl Store {
     }
 
     /// Resolve an index entry to the version it currently points at.
-    /// Follow-latest → newest surviving version; locked → the locked one,
+    /// Follow-latest → newest PUBLISHED version; locked → the locked one,
     /// with deletion substitution (nearest surviving version of the same
     /// rendition, searching upward from the locked number).
+    /// Substitution candidates are formally published (normal)
+    /// versions only (pin audit N1): a draft never substitutes
+    /// for a locked or pinned version — when no published
+    /// candidate exists the entry resolves to nothing rather than
+    /// drifting onto unreviewed content.
     pub fn resolve_entry_version(&self, entry: &IndexEntry) -> SResult<Option<VersionRec>> {
         let versions = self.list_versions(&entry.rendition_id.0)?;
         let surviving: Vec<VersionRec> = versions
@@ -3224,16 +3983,32 @@ impl Store {
             .filter(|v| v.status != "recalled")
             .collect();
         match &entry.policy {
-            crate::model::EntryPolicy::FollowLatest => Ok(surviving.into_iter().next()),
+            // Follow-latest follows PUBLISHED versions only
+            // (audit M2): a draft is by definition "not yet
+            // formally published", so a newer draft must never
+            // become what an entry, an export or a guest sees
+            // merely by existing. (The locked arm's deletion
+            // substitution is likewise restricted to published
+            // versions — see below; the direct locked hit is an
+            // explicit pin and keeps resolving as pinned.)
+            crate::model::EntryPolicy::FollowLatest => Ok(surviving
+                .into_iter()
+                .find(|v| v.status == "normal")),
             crate::model::EntryPolicy::Locked { version_id } => {
                 if let Some(v) = surviving.iter().find(|v| v.id == version_id.0) {
                     return Ok(Some(v.clone()));
                 }
-                // deletion substitution: nearest surviving version at or
-                // above the locked display number, else the latest.
+                // deletion substitution over published versions
+                // only: nearest normal version at or above the
+                // locked display number, else the latest normal
+                // one, else nothing.
+                let published: Vec<VersionRec> = surviving
+                    .into_iter()
+                    .filter(|v| v.status == "normal")
+                    .collect();
                 if let Some(ls) = &entry.locked_semver {
                     if let Ok(want) = SemVer::parse(ls) {
-                        let mut above: Vec<(SemVer, &VersionRec)> = surviving
+                        let mut above: Vec<(SemVer, &VersionRec)> = published
                             .iter()
                             .filter_map(|v| {
                                 SemVer::parse(&v.semver)
@@ -3248,7 +4023,7 @@ impl Store {
                         }
                     }
                 }
-                Ok(surviving.into_iter().next())
+                Ok(published.into_iter().next())
             }
         }
     }
@@ -3272,40 +4047,109 @@ impl Store {
     /// position of the item's pinned commit, in entry order).
     /// Called at publish / landing time with exactly the versions
     /// the confirmation summary displayed.
-    pub fn set_showroom_pins(&self, item_id: &str, version_ids: &[String]) -> SResult<()> {
+    ///
+    /// The replacement is atomic (pin audit N2): a savepoint
+    /// wraps the delete + inserts, so a failure mid-set can no
+    /// longer leave a torn set of half-old, half-missing pins —
+    /// standalone callers get a transaction of their own, and
+    /// callers already inside one (the landing transaction) just
+    /// nest. Every row also records the commit it belongs to:
+    /// the pin set and the item's pinned commit are written as
+    /// one fact, and readers verify the pairing instead of
+    /// applying a stale set to a newer commit by position.
+    pub fn set_showroom_pins(
+        &self,
+        item_id: &str,
+        commit_id: &str,
+        version_ids: &[String],
+    ) -> SResult<()> {
         self.conn
-            .execute(
-                "DELETE FROM showroom_pins WHERE showroom_id=?1",
-                params![item_id],
-            )
+            .execute_batch("SAVEPOINT qimu_set_showroom_pins")
             .map_err(db_err)?;
-        for (pos, vid) in version_ids.iter().enumerate() {
+        let attempt = (|| -> SResult<()> {
             self.conn
                 .execute(
-                    "INSERT INTO showroom_pins(showroom_id, pos, version_id) VALUES(?1,?2,?3)",
-                    params![item_id, pos as i64, vid],
+                    "DELETE FROM showroom_pins WHERE showroom_id=?1",
+                    params![item_id],
                 )
                 .map_err(db_err)?;
+            for (pos, vid) in version_ids.iter().enumerate() {
+                self.conn
+                    .execute(
+                        "INSERT INTO showroom_pins(showroom_id, pos, version_id, commit_id) VALUES(?1,?2,?3,?4)",
+                        params![item_id, pos as i64, vid, commit_id],
+                    )
+                    .map_err(db_err)?;
+            }
+            Ok(())
+        })();
+        match attempt {
+            Ok(()) => {
+                self.conn
+                    .execute_batch("RELEASE qimu_set_showroom_pins")
+                    .map_err(db_err)?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self
+                    .conn
+                    .execute_batch("ROLLBACK TO qimu_set_showroom_pins");
+                let _ = self.conn.execute_batch("RELEASE qimu_set_showroom_pins");
+                Err(e)
+            }
         }
-        Ok(())
     }
 
     /// An item's pins, ordered by entry position. Empty when the
     /// item predates publish pinning (legacy rows resolve exactly
     /// as they always did).
     pub fn showroom_pins(&self, item_id: &str) -> SResult<Vec<String>> {
+        Ok(self
+            .showroom_pin_rows(item_id)?
+            .into_iter()
+            .map(|(vid, _)| vid)
+            .collect())
+    }
+
+    /// An item's pin rows as (version id, recorded commit id)
+    /// pairs, ordered by entry position. Rows written before pin
+    /// sets recorded their commit carry an empty commit id.
+    pub fn showroom_pin_rows(&self, item_id: &str) -> SResult<Vec<(String, String)>> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT version_id FROM showroom_pins WHERE showroom_id=?1 ORDER BY pos",
+                "SELECT version_id, commit_id FROM showroom_pins WHERE showroom_id=?1 ORDER BY pos",
             )
             .map_err(db_err)?;
         let rows = stmt
-            .query_map(params![item_id], |r| r.get::<_, String>(0))
+            .query_map(params![item_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
             .map_err(db_err)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(db_err)?;
         Ok(rows)
+    }
+
+    /// Verify an item's pin set belongs to `commit_id` (pin
+    /// audit N2). A row bound to a different commit means the
+    /// item's commit and its pins were written out of step —
+    /// applying that set to this commit by position would
+    /// silently publish wrong versions, so it is an error, not a
+    /// fallback. Rows with an empty recorded commit predate the
+    /// binding and pass unverifiable (the declared legacy seam).
+    fn check_pin_commit(&self, item_id: &str, commit_id: &str) -> SResult<()> {
+        let rows = self.showroom_pin_rows(item_id)?;
+        if rows
+            .iter()
+            .any(|(_, c)| !c.is_empty() && c != commit_id)
+        {
+            return Err(
+                "演示条目的钉版与条目版本不一致（钉版集与提交失同步），请重新推送或重新落地"
+                    .into(),
+            );
+        }
+        Ok(())
     }
 
     /// An entry with its policy materialized onto a pinned
@@ -3347,6 +4191,7 @@ impl Store {
         item: &ShowroomRec,
         commit: &CommitRec,
     ) -> SResult<Vec<IndexEntry>> {
+        self.check_pin_commit(&item.id, &commit.id)?;
         let pins = self.showroom_pins(&item.id)?;
         Ok(commit
             .entries
@@ -3385,44 +4230,88 @@ impl Store {
     }
 
     pub fn list_exports(&self, index_id: Option<&str>) -> SResult<Vec<ExportRec>> {
+        // The unfiltered list keeps its 500-row recency window
+        // (it backs list faces). A per-index query must NOT be
+        // windowed (audit L3): filtering after the window made
+        // an index's older exports silently invisible.
         let sql = "SELECT id, index_id, branch, commit_id, tag, user_id, created_ms, deck_hash, page_count, kind, deck_id, manifest_json FROM exports";
-        let mut stmt = self
-            .conn
-            .prepare(&format!("{sql} ORDER BY created_ms DESC LIMIT 500"))
-            .map_err(db_err)?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok(ExportRec {
-                    id: r.get(0)?,
-                    index_id: r.get(1)?,
-                    branch: r.get(2)?,
-                    commit_id: r.get(3)?,
-                    tag: r.get(4)?,
-                    user_id: r.get(5)?,
-                    created_ms: r.get(6)?,
-                    deck_hash: r.get(7)?,
-                    page_count: r.get(8)?,
-                    kind: r.get(9)?,
-                    deck_id: r.get(10)?,
-                    manifest_json: r.get(11)?,
-                })
+        let row = |r: &rusqlite::Row| {
+            Ok(ExportRec {
+                id: r.get(0)?,
+                index_id: r.get(1)?,
+                branch: r.get(2)?,
+                commit_id: r.get(3)?,
+                tag: r.get(4)?,
+                user_id: r.get(5)?,
+                created_ms: r.get(6)?,
+                deck_hash: r.get(7)?,
+                page_count: r.get(8)?,
+                kind: r.get(9)?,
+                deck_id: r.get(10)?,
+                manifest_json: r.get(11)?,
             })
-            .map_err(db_err)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(db_err)?;
-        Ok(match index_id {
-            None => rows,
-            Some(iid) => rows.into_iter().filter(|e| e.index_id == iid).collect(),
-        })
+        };
+        let rows = match index_id {
+            None => {
+                let mut stmt = self
+                    .conn
+                    .prepare(&format!("{sql} ORDER BY created_ms DESC LIMIT 500"))
+                    .map_err(db_err)?;
+                let rows = stmt
+                    .query_map([], row)
+                    .map_err(db_err)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(db_err)?;
+                rows
+            }
+            Some(iid) => {
+                let mut stmt = self
+                    .conn
+                    .prepare(&format!(
+                        "{sql} WHERE index_id=?1 ORDER BY created_ms DESC"
+                    ))
+                    .map_err(db_err)?;
+                let rows = stmt
+                    .query_map(params![iid], row)
+                    .map_err(db_err)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(db_err)?;
+                rows
+            }
+        };
+        Ok(rows)
     }
 
     /// The export record for a manifest deck_id (editor-stripped deck
-    /// recovery). Latest export wins.
+    /// recovery). Latest export wins. Queried directly (audit L3):
+    /// routing through the 500-row list window made recovery of an
+    /// older deck silently fail once 500 newer exports existed.
     pub fn export_by_deck_id(&self, deck_id: &str) -> SResult<Option<ExportRec>> {
-        let all = self.list_exports(None)?;
-        Ok(all
-            .into_iter()
-            .find(|e| e.deck_id == deck_id && !e.manifest_json.is_empty()))
+        let rec = self
+            .conn
+            .query_row(
+                "SELECT id, index_id, branch, commit_id, tag, user_id, created_ms, deck_hash, page_count, kind, deck_id, manifest_json FROM exports WHERE deck_id=?1 AND manifest_json<>'' ORDER BY created_ms DESC, rowid DESC LIMIT 1",
+                params![deck_id],
+                |r| {
+                    Ok(ExportRec {
+                        id: r.get(0)?,
+                        index_id: r.get(1)?,
+                        branch: r.get(2)?,
+                        commit_id: r.get(3)?,
+                        tag: r.get(4)?,
+                        user_id: r.get(5)?,
+                        created_ms: r.get(6)?,
+                        deck_hash: r.get(7)?,
+                        page_count: r.get(8)?,
+                        kind: r.get(9)?,
+                        deck_id: r.get(10)?,
+                        manifest_json: r.get(11)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db_err)?;
+        Ok(rec)
     }
 
     pub fn insert_attachment(
@@ -3439,7 +4328,7 @@ impl Store {
             id: id.clone(),
             parent_type: parent_type.into(),
             parent_id: parent_id.into(),
-            filename: filename.into(),
+            filename: sanitize_attachment_filename(filename),
             hash,
             size: bytes.len() as i64,
             uploader: uploader.into(),
@@ -3597,22 +4486,38 @@ impl Store {
         note: &str,
         reviewed_by: &str,
     ) -> SResult<()> {
-        self.conn
+        // Showroom state is a closed vocabulary (audit L2).
+        if !matches!(state, "pending" | "live" | "rejected") {
+            return Err(format!("未知的演示状态：{state}"));
+        }
+        let n = self
+            .conn
             .execute(
                 "UPDATE showroom SET state=?2, review_note=?3, reviewed_by=?4, reviewed_ms=?5 WHERE id=?1",
                 params![id, state, note, reviewed_by, now_ms()],
             )
             .map_err(db_err)?;
+        if n == 0 {
+            return Err("演示条目不存在".into());
+        }
         Ok(())
     }
 
     pub fn set_showroom_state(&self, id: &str, state: &str) -> SResult<()> {
-        self.conn
+        // Same closed vocabulary as review_showroom (audit L2).
+        if !matches!(state, "pending" | "live" | "rejected") {
+            return Err(format!("未知的演示状态：{state}"));
+        }
+        let n = self
+            .conn
             .execute(
                 "UPDATE showroom SET state=?2 WHERE id=?1",
                 params![id, state],
             )
             .map_err(db_err)?;
+        if n == 0 {
+            return Err("演示条目不存在".into());
+        }
         Ok(())
     }
 
@@ -3768,31 +4673,58 @@ impl Store {
     }
 
     pub fn set_submission_rejected(&self, id: &str, note: &str, by: &str) -> SResult<()> {
-        self.conn
+        // State-machine guard (audit M5 / chain F4): only a
+        // pending submission can be rejected — a stale or
+        // double-fired review must not rewrite a landed/rejected
+        // row's decision record. (Merge note: the G5 wording is
+        // authoritative for this function per the chain line's
+        // junction note; the state guard itself is identical in
+        // both lines.)
+        let n = self
+            .conn
             .execute(
-                "UPDATE submissions SET state='rejected', review_note=?2, reviewed_by=?3, reviewed_ms=?4, land_error='' WHERE id=?1",
+                "UPDATE submissions SET state='rejected', review_note=?2, reviewed_by=?3, reviewed_ms=?4, land_error='' WHERE id=?1 AND state='pending'",
                 params![id, note, by, now_ms()],
             )
             .map_err(db_err)?;
+        if n == 0 {
+            return Err("该提交已处理，不能重复审批".into());
+        }
         Ok(())
     }
 
     /// Record why a landing attempt rolled back. The submission
     /// itself stays pending; only the error note changes.
     pub fn set_submission_land_error(&self, id: &str, err: &str) -> SResult<()> {
-        self.conn
+        let n = self
+            .conn
             .execute(
                 "UPDATE submissions SET land_error=?2 WHERE id=?1",
                 params![id, err],
             )
             .map_err(db_err)?;
+        if n == 0 {
+            return Err("提交不存在".into());
+        }
         Ok(())
     }
 
     /// Delete a submission row and its staged package. Landed
     /// content (if any) is a separate object by then and is not
     /// touched — this removes the submission record only.
+    ///
+    /// A LANDED row is never deleted (F2): the row itself is the
+    /// lineage mapping `landed_source_target` reads, so removing
+    /// one breaks the mapping — and removing only the newest
+    /// landed row silently re-points the mapping at an older
+    /// landed index, forking the source's lineage into two index /
+    /// entry lines. The server handler refuses the same way.
     pub fn delete_submission(&self, id: &str) -> SResult<()> {
+        if let Some(rec) = self.get_submission(id)? {
+            if rec.state == "landed" {
+                return Err("已落地的提交记录是落地谱系凭证，不能删除".into());
+            }
+        }
         self.conn
             .execute("DELETE FROM submissions WHERE id=?1", params![id])
             .map_err(db_err)?;
@@ -3804,8 +4736,31 @@ impl Store {
     /// `<root>/staging/<id>/`, deliberately outside `files/` (the
     /// landed CAS) so staged bytes are unreachable through every
     /// content-addressed read path.
+    ///
+    /// The id segment is sanitized (audit H1): submission ids are
+    /// server-minted, but this is a destructive-path API
+    /// (`clear_submission_staging` runs `remove_dir_all` on the
+    /// result), so the data layer never lets a caller-supplied
+    /// id become a path traversal. A plain id (the only shape
+    /// the system mints) maps to itself; anything containing a
+    /// separator, a dot segment or a NUL maps to a hash-derived
+    /// name inside the same staging root — consistent across
+    /// stage / get / clear, and never outside it.
     pub fn submission_staging_dir(&self, id: &str) -> PathBuf {
-        self.root.join("staging").join(id)
+        let plain = !id.is_empty()
+            && id != "."
+            && id != ".."
+            && !id.contains('/')
+            && !id.contains('\\')
+            && !id.contains('\0');
+        let name = if plain {
+            id.to_string()
+        } else {
+            let mut h = Sha256::new();
+            h.update(id.as_bytes());
+            format!("invalid-{:x}", h.finalize())
+        };
+        self.root.join("staging").join(name)
     }
 
     /// Store one package file in the staging zone, verifying the
@@ -3831,17 +4786,58 @@ impl Store {
     }
 
     pub fn staged_file_get(&self, id: &str, hash: &str) -> SResult<Vec<u8>> {
-        let sub = if hash.len() >= 2 { &hash[..2] } else { "00" };
+        // The hash comes from the client-supplied manifest
+        // (audit M1): it must have exactly the stored-digest
+        // shape before it may become a path, and the bytes read
+        // back are re-verified against it. Without this, a
+        // crafted fragment_hash could walk out of the staging
+        // zone into the landed CAS and land content the package
+        // never uploaded.
+        if !is_sha256_hex(hash) {
+            return Err(format!("待审包文件哈希不合法: {hash}"));
+        }
         let path = self
             .submission_staging_dir(id)
             .join("files")
-            .join(sub)
+            .join(&hash[..2])
             .join(format!("{hash}.bin"));
-        std::fs::read(&path).map_err(|e| format!("待审包文件 {hash}: {e}"))
+        let bytes = std::fs::read(&path).map_err(|e| format!("待审包文件 {hash}: {e}"))?;
+        let mut h = Sha256::new();
+        h.update(&bytes);
+        let actual = format!("{:x}", h.finalize());
+        if actual != hash {
+            return Err(format!(
+                "待审包文件 {hash} 哈希复验不符（实际 {actual}）"
+            ));
+        }
+        Ok(bytes)
     }
 
     pub fn clear_submission_staging(&self, id: &str) {
         let _ = std::fs::remove_dir_all(self.submission_staging_dir(id));
+    }
+
+    /// Bytes one submission's staged package occupies on disk
+    /// (0 once its staging has been cleared).
+    pub fn submission_staged_bytes(&self, id: &str) -> u64 {
+        dir_tree_bytes(&self.submission_staging_dir(id))
+    }
+
+    /// (pending count, staged bytes) a submitter currently holds
+    /// in the staging zone — the create-submission quota (F5)
+    /// reads this. Bytes are measured on disk: the staging
+    /// directories are the staged truth.
+    pub fn pending_submission_usage(&self, submitter_id: &str) -> SResult<(usize, u64)> {
+        let mut count = 0usize;
+        let mut bytes = 0u64;
+        for sub in self.list_submissions_by_submitter(submitter_id)? {
+            if sub.state != "pending" {
+                continue;
+            }
+            count += 1;
+            bytes += self.submission_staged_bytes(&sub.id);
+        }
+        Ok((count, bytes))
     }
 
     /// The server index (and showroom entry) a submitter's local
@@ -3881,6 +4877,60 @@ impl Store {
         Ok(Some((index_id, showroom_id)))
     }
 
+    /// The showroom entry a submitter's source index most recently
+    /// landed as — the entry half of the lineage mapping, read
+    /// WITHOUT the index-side validity checks
+    /// `landed_source_target` applies (F3). Landing uses it when
+    /// the landed index itself is no longer reusable (trashed or
+    /// deleted): the entry may still exist and must be refreshed
+    /// onto the new landing rather than duplicated, or the source
+    /// ends up owning two live entries.
+    pub fn landed_source_entry(
+        &self,
+        submitter_id: &str,
+        source_index_id: &str,
+    ) -> SResult<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT landed_showroom_id FROM submissions WHERE submitter_id=?1 AND source_index_id=?2 AND state='landed' AND landed_showroom_id IS NOT NULL ORDER BY created_ms DESC, rowid DESC LIMIT 1",
+                params![submitter_id, source_index_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(db_err)
+    }
+
+    /// One showroom row by id, WITHOUT the trash overlay filter
+    /// `get_showroom` applies (F3): landing needs the row even
+    /// while it is trashed, so it can refresh (and un-trash) the
+    /// single entry a source owns instead of inserting a second
+    /// one that would collide with it on restore.
+    pub fn get_showroom_any(&self, id: &str) -> SResult<Option<ShowroomRec>> {
+        self.conn
+            .query_row(
+                "SELECT id, title, intro, source_index_id, commit_id, submitted_by, state, created_ms, scope, review_note, reviewed_by, reviewed_ms FROM showroom WHERE id=?1",
+                params![id],
+                |r| {
+                    Ok(ShowroomRec {
+                        id: r.get(0)?,
+                        title: r.get(1)?,
+                        intro: r.get(2)?,
+                        source_index_id: r.get(3)?,
+                        commit_id: r.get(4)?,
+                        submitted_by: r.get(5)?,
+                        state: r.get(6)?,
+                        created_ms: r.get(7)?,
+                        scope: r.get(8)?,
+                        review_note: r.get(9)?,
+                        reviewed_by: r.get(10)?,
+                        reviewed_ms: r.get(11)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db_err)
+    }
+
     /// The landing transaction (design §6.3): rebuild a pending
     /// submission's package as organization content — units,
     /// renditions, versions, an index with its pinned commit, and
@@ -3900,9 +4950,15 @@ impl Store {
     /// submitter's local index already landed once (see
     /// `landed_source_target`), the package lands as a new
     /// commit on that same server index and refreshes its
-    /// single showroom entry — unpinned, so the entry follows
-    /// the index's current main head — instead of minting a
-    /// duplicate index and entry.
+    /// single showroom entry, explicitly re-pinning it to the
+    /// landing's new commit and its reviewed version set — so
+    /// the entry's formal version only ever changes through a
+    /// reviewed landing, never by following the head — instead
+    /// of minting a duplicate index and entry. When the landed
+    /// index is no longer reusable (trashed or deleted), the
+    /// package lands on a fresh index but still refreshes the
+    /// source's existing entry (see `landed_source_entry`), so
+    /// a source never owns two entries.
     pub fn land_submission(
         &self,
         id: &str,
@@ -3926,6 +4982,23 @@ impl Store {
         let unit_ids: HashSet<&str> = manifest.units.iter().map(|u| u.id.as_str()).collect();
         let rendition_ids: HashSet<&str> =
             manifest.renditions.iter().map(|r| r.id.as_str()).collect();
+        // No duplicate ids inside the manifest itself (audit
+        // N7): the landing maps below key on id, so a repeated
+        // unit id would mint a second block the map overwrites
+        // — an empty orphan in the landing group — and a
+        // repeated version id would land the same number twice
+        // on one rendition.
+        if unit_ids.len() != manifest.units.len() {
+            return Err("提交包清单不一致：内容块 id 重复".into());
+        }
+        if rendition_ids.len() != manifest.renditions.len() {
+            return Err("提交包清单不一致：rendition id 重复".into());
+        }
+        let version_ids: HashSet<&str> =
+            manifest.versions.iter().map(|v| v.id.as_str()).collect();
+        if version_ids.len() != manifest.versions.len() {
+            return Err("提交包清单不一致：版本 id 重复".into());
+        }
         for r in &manifest.renditions {
             if !unit_ids.contains(r.unit_id.as_str()) {
                 return Err(format!(
@@ -4022,6 +5095,20 @@ impl Store {
 
         self.conn.execute_batch("BEGIN IMMEDIATE").map_err(db_err)?;
         let attempt = || -> SResult<(String, String)> {
+            // State re-check under the write lock (F4): the
+            // pending check before the transaction cannot see a
+            // concurrent review that landed this same submission
+            // first. BEGIN IMMEDIATE serializes landings, so the
+            // state read here is the committed truth — a second
+            // approval of the same submission fails and rolls
+            // back instead of landing a full duplicate set of
+            // units / versions / entries.
+            let fresh = self
+                .get_submission(id)?
+                .ok_or_else(|| "提交不存在".to_string())?;
+            if fresh.state != "pending" {
+                return Err("该提交已处理，不能重复落地".into());
+            }
             // Landing group: created once with root-department
             // view/use grants, reused afterwards (later grant
             // edits by an admin are never re-asserted).
@@ -4234,22 +5321,61 @@ impl Store {
             // changes through a reviewed landing, never by drift:
             // the item always points at a commit it confirmed,
             // with the pins to match. A first landing (or an
-            // entry deleted since) inserts the entry the same
-            // way.
-            let prior_entry = prior
+            // entry permanently deleted since) inserts the entry
+            // the same way.
+            //
+            // The existing entry is resolved independently of
+            // the index-side reuse above (F3): when the landed
+            // index was trashed or deleted, `prior` is None but
+            // the lineage's entry half still names the one entry
+            // this source owns — refreshing it onto the new
+            // index/commit replaces the old live row instead of
+            // leaving it live next to a second inserted entry.
+            // The lookup also bypasses the trash overlay: a
+            // trashed entry is refreshed in place and un-trashed
+            // below, never shadowed by a duplicate that would
+            // collide with it when restored.
+            let prior_entry_id = match &prior {
+                Some((_, entry)) => entry.clone(),
+                None => match sub.source_index_id.as_deref() {
+                    Some(src_id) if !src_id.is_empty() => {
+                        self.landed_source_entry(&sub.submitter_id, src_id)?
+                    }
+                    _ => None,
+                },
+            };
+            let prior_entry = prior_entry_id
                 .as_ref()
-                .and_then(|(_, entry)| entry.clone())
-                .filter(|eid| self.get_showroom(eid).ok().flatten().is_some());
+                .and_then(|eid| self.get_showroom_any(eid).ok().flatten());
             let item_id = match &prior_entry {
-                Some(entry_id) => {
+                Some(entry) => {
+                    // Refresh content, pins and the source pointer
+                    // (the entry may still name the trashed /
+                    // deleted index it first landed with). State
+                    // is NOT unconditionally revived (F3): a
+                    // rejected entry stays rejected — a submission
+                    // approval refreshes content, it does not
+                    // overrule the showroom face's own takedown;
+                    // re-publishing a rejected entry goes through
+                    // showroom review. Any other state publishes
+                    // as before.
                     self.conn
                         .execute(
-                            "UPDATE showroom SET title=?2, intro=?3, commit_id=?4, state='live' WHERE id=?1",
-                            params![entry_id.as_str(), sub.title, sub.intro, commit.id],
+                            "UPDATE showroom SET title=?2, intro=?3, source_index_id=?4, commit_id=?5, state=CASE WHEN state='rejected' THEN 'rejected' ELSE 'live' END WHERE id=?1",
+                            params![entry.id, sub.title, sub.intro, index_id, commit.id],
                         )
                         .map_err(db_err)?;
-                    self.set_showroom_pins(entry_id, &landed_pins)?;
-                    entry_id.clone()
+                    self.set_showroom_pins(&entry.id, &commit.id, &landed_pins)?;
+                    // A trashed entry comes back as the source's
+                    // single entry carrying this landing's
+                    // content; leaving the overlay row in place
+                    // would hide the refreshed entry and invite
+                    // the duplicate this resolution exists to
+                    // prevent.
+                    if let Some(t) = self.trash_find("showroom", &entry.id)? {
+                        self.trash_restore(&t.id)?;
+                    }
+                    entry.id.clone()
                 }
                 None => {
                     let rec = self.insert_showroom(
@@ -4260,7 +5386,7 @@ impl Store {
                         &sub.submitter_id,
                         "live",
                     )?;
-                    self.set_showroom_pins(&rec.id, &landed_pins)?;
+                    self.set_showroom_pins(&rec.id, &commit.id, &landed_pins)?;
                     rec.id
                 }
             };
@@ -4300,26 +5426,61 @@ impl Store {
     /// pages no block covers. Page ENTITIES are not touched: a
     /// page outlives every wrapper that referenced it.
     pub fn delete_unit_permanent(&self, unit_id: &str) -> SResult<()> {
-        self.conn
-            .execute(
-                "DELETE FROM version_tags WHERE version_id IN (SELECT v.id FROM versions v JOIN renditions r ON v.rendition_id = r.id WHERE r.unit_id = ?1)",
+        // Same publish-pin guard as delete_version (pin audit
+        // N1): permanently deleting a unit whose version a live
+        // showroom item pins would silently re-resolve the item
+        // onto a substitute. The staged import's wrapper units
+        // are never published, so they never trip this.
+        let pinned_live: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM showroom_pins p JOIN showroom s ON s.id = p.showroom_id JOIN versions v ON v.id = p.version_id JOIN renditions r ON r.id = v.rendition_id WHERE r.unit_id = ?1 AND s.state = 'live'",
                 params![unit_id],
+                |r| r.get(0),
             )
             .map_err(db_err)?;
-        self.conn
-            .execute(
-                "DELETE FROM versions WHERE rendition_id IN (SELECT id FROM renditions WHERE unit_id = ?1)",
-                params![unit_id],
-            )
+        if pinned_live > 0 {
+            return Err(
+                "该内容块的版本正被演示厅条目钉为正式版，不能彻底删除；请先更新该条目的演示推送或将其下架"
+                    .into(),
+            );
+        }
+        if self.conn.is_autocommit() {
+            let tx = self.conn.unchecked_transaction().map_err(db_err)?;
+            Self::delete_unit_rows(&tx, unit_id)?;
+            tx.commit().map_err(db_err)
+        } else {
+            Self::delete_unit_rows(&self.conn, unit_id)
+        }
+    }
+
+    /// The unit cascade itself, on a caller-provided
+    /// connection handle so `trash_purge` can run it inside its
+    /// own transaction. Attachments die with the unit (audit
+    /// M3): their CAS files are content-addressed and shared,
+    /// so only the rows go — a purged unit must not leave
+    /// attachment rows pointing at nothing.
+    fn delete_unit_rows(conn: &Connection, unit_id: &str) -> SResult<()> {
+        conn.execute(
+            "DELETE FROM version_tags WHERE version_id IN (SELECT v.id FROM versions v JOIN renditions r ON v.rendition_id = r.id WHERE r.unit_id = ?1)",
+            params![unit_id],
+        )
+        .map_err(db_err)?;
+        conn.execute(
+            "DELETE FROM versions WHERE rendition_id IN (SELECT id FROM renditions WHERE unit_id = ?1)",
+            params![unit_id],
+        )
+        .map_err(db_err)?;
+        conn.execute("DELETE FROM renditions WHERE unit_id = ?1", params![unit_id])
             .map_err(db_err)?;
-        self.conn
-            .execute("DELETE FROM renditions WHERE unit_id = ?1", params![unit_id])
+        conn.execute("DELETE FROM page_bindings WHERE unit_id = ?1", params![unit_id])
             .map_err(db_err)?;
-        self.conn
-            .execute("DELETE FROM page_bindings WHERE unit_id = ?1", params![unit_id])
-            .map_err(db_err)?;
-        self.conn
-            .execute("DELETE FROM units WHERE id = ?1", params![unit_id])
+        conn.execute(
+            "DELETE FROM attachments WHERE parent_type = 'unit' AND parent_id = ?1",
+            params![unit_id],
+        )
+        .map_err(db_err)?;
+        conn.execute("DELETE FROM units WHERE id = ?1", params![unit_id])
             .map_err(db_err)?;
         Ok(())
     }
@@ -4423,52 +5584,113 @@ impl Store {
     pub fn trash_purge(&self, id: &str) -> SResult<TrashRec> {
         let rec = self.trash_get(id)?;
         let oid = rec.object_id.as_str();
+        // One transaction for the whole cascade (audit M3): a
+        // failure midway used to leave the object half-deleted
+        // but still listed. Pin bookkeeping (pin audit N1) is
+        // part of the cascade: a unit whose version a live item
+        // pins is refused (the same guard delete_unit_permanent
+        // carries — the baseline purge reached it through that
+        // call; the row-level split must not lose the guard),
+        // and a dying showroom item's pin rows die with it
+        // (whole pin sets of a removed item have no positional
+        // side effects on other items).
+        let tx = self.conn.unchecked_transaction().map_err(db_err)?;
         match rec.kind.as_str() {
             "unit" => {
-                self.delete_unit_permanent(oid)?;
+                let pinned_live: i64 = tx
+                    .query_row(
+                        "SELECT COUNT(*) FROM showroom_pins p JOIN showroom s ON s.id = p.showroom_id JOIN versions v ON v.id = p.version_id JOIN renditions r ON r.id = v.rendition_id WHERE r.unit_id = ?1 AND s.state = 'live'",
+                        params![oid],
+                        |r| r.get(0),
+                    )
+                    .map_err(db_err)?;
+                if pinned_live > 0 {
+                    return Err(
+                        "该内容块的版本正被演示厅条目钉为正式版，不能彻底删除；请先更新该条目的演示推送或将其下架"
+                            .into(),
+                    );
+                }
+                Self::delete_unit_rows(&tx, oid)?;
             }
             "index" => {
-                self.conn
-                    .execute(
-                        "DELETE FROM index_branches WHERE index_id = ?1",
-                        params![oid],
-                    )
+                // Showroom items sourced from this index can
+                // never resolve again; they die with it, along
+                // with their library / share rows.
+                tx.execute(
+                    "DELETE FROM showroom_pins WHERE showroom_id IN (SELECT id FROM showroom WHERE source_index_id = ?1)",
+                    params![oid],
+                )
+                .map_err(db_err)?;
+                tx.execute(
+                    "DELETE FROM library_entries WHERE item_kind = 'showroom' AND item_id IN (SELECT id FROM showroom WHERE source_index_id = ?1)",
+                    params![oid],
+                )
+                .map_err(db_err)?;
+                tx.execute(
+                    "DELETE FROM shares WHERE item_kind = 'showroom' AND item_id IN (SELECT id FROM showroom WHERE source_index_id = ?1)",
+                    params![oid],
+                )
+                .map_err(db_err)?;
+                tx.execute(
+                    "DELETE FROM showroom WHERE source_index_id = ?1",
+                    params![oid],
+                )
+                .map_err(db_err)?;
+                // Folder main-index pointers at the purged
+                // index clear (the same cleanup
+                // move_index_to_folder performs), its exports
+                // and attachments go too.
+                tx.execute(
+                    "UPDATE folders SET main_index_id=NULL WHERE main_index_id = ?1",
+                    params![oid],
+                )
+                .map_err(db_err)?;
+                tx.execute("DELETE FROM exports WHERE index_id = ?1", params![oid])
                     .map_err(db_err)?;
-                self.conn
-                    .execute(
-                        "DELETE FROM index_commits WHERE index_id = ?1",
-                        params![oid],
-                    )
+                tx.execute(
+                    "DELETE FROM attachments WHERE parent_type = 'index' AND parent_id = ?1",
+                    params![oid],
+                )
+                .map_err(db_err)?;
+                tx.execute(
+                    "DELETE FROM index_branches WHERE index_id = ?1",
+                    params![oid],
+                )
+                .map_err(db_err)?;
+                tx.execute(
+                    "DELETE FROM index_commits WHERE index_id = ?1",
+                    params![oid],
+                )
+                .map_err(db_err)?;
+                tx.execute("DELETE FROM index_tags WHERE index_id = ?1", params![oid])
                     .map_err(db_err)?;
-                self.conn
-                    .execute("DELETE FROM index_tags WHERE index_id = ?1", params![oid])
-                    .map_err(db_err)?;
-                self.conn
-                    .execute("DELETE FROM indexes_tbl WHERE id = ?1", params![oid])
+                tx.execute("DELETE FROM indexes_tbl WHERE id = ?1", params![oid])
                     .map_err(db_err)?;
             }
             "showroom" => {
-                self.conn
-                    .execute(
-                        "DELETE FROM library_entries WHERE item_kind = 'showroom' AND item_id = ?1",
-                        params![oid],
-                    )
-                    .map_err(db_err)?;
-                self.conn
-                    .execute(
-                        "DELETE FROM shares WHERE item_kind = 'showroom' AND item_id = ?1",
-                        params![oid],
-                    )
-                    .map_err(db_err)?;
-                self.conn
-                    .execute("DELETE FROM showroom WHERE id = ?1", params![oid])
+                tx.execute(
+                    "DELETE FROM showroom_pins WHERE showroom_id = ?1",
+                    params![oid],
+                )
+                .map_err(db_err)?;
+                tx.execute(
+                    "DELETE FROM library_entries WHERE item_kind = 'showroom' AND item_id = ?1",
+                    params![oid],
+                )
+                .map_err(db_err)?;
+                tx.execute(
+                    "DELETE FROM shares WHERE item_kind = 'showroom' AND item_id = ?1",
+                    params![oid],
+                )
+                .map_err(db_err)?;
+                tx.execute("DELETE FROM showroom WHERE id = ?1", params![oid])
                     .map_err(db_err)?;
             }
             other => return Err(format!("unknown trash kind: {other}")),
         }
-        self.conn
-            .execute("DELETE FROM trash_items WHERE id=?1", params![rec.id])
+        tx.execute("DELETE FROM trash_items WHERE id=?1", params![rec.id])
             .map_err(db_err)?;
+        tx.commit().map_err(db_err)?;
         Ok(rec)
     }
 
@@ -4516,6 +5738,23 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()
             .map_err(db_err)?;
         Ok(rows)
+    }
+
+    /// Who owns an assembly (audit H3): the export door checks
+    /// ownership before resolving a single entry, so one member's
+    /// saved assembly can never be exported under another's
+    /// session. None when the assembly does not exist.
+    pub fn assembly_owner(&self, id: &str) -> SResult<Option<String>> {
+        let owner = self
+            .conn
+            .query_row(
+                "SELECT user_id FROM assemblies WHERE id=?1",
+                params![id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(db_err)?;
+        Ok(owner)
     }
 
     pub fn assembly_entries(&self, id: &str) -> SResult<Vec<IndexEntry>> {
@@ -4888,11 +6127,27 @@ impl Store {
             // The published version set of an item is its pinned
             // resolution: a newer block version the item does not
             // publish is not guest-reachable through it.
-            let pins = self.showroom_pins(&item.id)?;
+            let pin_rows = self.showroom_pin_rows(&item.id)?;
+            // Pins bound to a different commit than the item's
+            // current one are a write-side desync: the item
+            // publishes nothing through them — never guess a
+            // version set at the guest boundary.
+            if pin_rows
+                .iter()
+                .any(|(_, c)| !c.is_empty() && c != &commit.id)
+            {
+                continue;
+            }
+            let pins: Vec<String> = pin_rows.into_iter().map(|(vid, _)| vid).collect();
             for (pos, e) in commit.entries.iter().enumerate() {
                 let pin = pins.get(pos).map(|s| s.as_str());
                 if let Some(v) = self.resolve_showroom_entry(e, pin)? {
-                    if v.id == version_id {
+                    // Published means formally published: a
+                    // resolution landing on a draft (a legacy
+                    // unpinned entry following latest onto an
+                    // unreviewed draft) is not a publication and
+                    // never enters the guest-reachable set.
+                    if v.id == version_id && v.status == "normal" {
                         return Ok(true);
                     }
                 }

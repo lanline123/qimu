@@ -146,7 +146,21 @@ pub fn assemble(fragments: &[Package]) -> Result<Package, String> {
         .collect();
 
     for (i, frag) in fragments.iter().enumerate().skip(1) {
-        let prefix = format!("q{i}_");
+        let mut prefix = format!("q{i}_");
+        // Collision guard (audit L10): if the base is itself an
+        // assembled deck it may already carry parts under this
+        // fragment's renamed names; inserting over them would
+        // silently replace a base page with the fragment's.
+        // Fall back to a distinct prefix for the whole fragment
+        // (the rename map, rels and content types all follow).
+        if frag
+            .parts
+            .keys()
+            .filter(|name| !is_shared(name))
+            .any(|name| out.parts.contains_key(&renamed(name, &prefix)))
+        {
+            prefix = format!("q{i}x_");
+        }
         // rename map for this fragment
         let mut map: BTreeMap<String, String> = BTreeMap::new();
         for name in frag.parts.keys() {

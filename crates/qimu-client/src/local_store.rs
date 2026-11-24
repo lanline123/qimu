@@ -31,9 +31,9 @@ use std::sync::Mutex;
 /// Library root resolution (design §6.2, extended by the
 /// library-discovery line, user ruling 2026-11-25): the bootstrap
 /// config's `data_dir` wins (see `read_bootstrap`); then the legacy
-/// `library_dir` client setting; then an explicit `QIMU_DATA_DIR`
-/// (the data dir the bundled server would use — naming the same
-/// store keeps takeover exact); finally the standard directory
+/// `library_dir` client setting; then an explicit data-dir
+/// environment variable (`QIMU_CLIENT_DATA_DIR`, falling back to
+/// the legacy shared `QIMU_DATA_DIR` — audit2 F-N2); finally the standard directory
 /// `~/.qimu/library`, with a first-run discovery step in front of
 /// it: when the standard directory holds no content yet, libraries
 /// left behind by older versions in their historical locations are
@@ -93,11 +93,28 @@ impl OldLibraryPolicy {
     }
 }
 
+/// A settings-registered data-directory move (audit P1): the
+/// settings page only *registers* the intent; the relocation
+/// itself runs inside the next launch's library resolution,
+/// before the store opens, when the source library is static.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct PendingRelocate {
+    pub from: String,
+    pub to: String,
+}
+
 /// The bootstrap config's contents; absent fields read as `None`.
 #[derive(Clone, Default)]
 pub struct Bootstrap {
     pub data_dir: Option<String>,
     pub old_library_policy: Option<OldLibraryPolicy>,
+    /// A data-directory move registered in settings, awaiting
+    /// execution at the next launch (see `PendingRelocate`).
+    pub pending_relocate: Option<PendingRelocate>,
+    /// One-shot outcome note of a startup relocation, written by
+    /// library resolution and surfaced (then cleared) by the app
+    /// so a failed or cancelled move is never silent.
+    pub relocate_notice: Option<String>,
 }
 
 impl Bootstrap {
@@ -130,7 +147,26 @@ pub fn read_bootstrap() -> Bootstrap {
             .get("old_library_policy")
             .and_then(|x| x.as_str())
             .map(OldLibraryPolicy::parse),
+        pending_relocate: v.get("pending_relocate").and_then(|p| {
+            Some(PendingRelocate {
+                from: p.get("from")?.as_str()?.to_string(),
+                to: p.get("to")?.as_str()?.to_string(),
+            })
+        }),
+        relocate_notice: v
+            .get("relocate_notice")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
     }
+}
+
+/// Take (and clear) the one-shot relocation notice, if one is
+/// pending. Called once by the app at startup.
+pub fn take_relocate_notice() -> Option<String> {
+    let mut b = read_bootstrap();
+    let notice = b.relocate_notice.take()?;
+    write_bootstrap(&b);
+    Some(notice)
 }
 
 pub fn write_bootstrap(b: &Bootstrap) {
@@ -140,6 +176,15 @@ pub fn write_bootstrap(b: &Bootstrap) {
     }
     if let Some(p) = &b.old_library_policy {
         obj.insert("old_library_policy".to_string(), json!(p.as_str()));
+    }
+    if let Some(p) = &b.pending_relocate {
+        obj.insert(
+            "pending_relocate".to_string(),
+            json!({ "from": p.from, "to": p.to }),
+        );
+    }
+    if let Some(n) = &b.relocate_notice {
+        obj.insert("relocate_notice".to_string(), json!(n));
     }
     let dir = crate::qimu_home();
     let _ = std::fs::create_dir_all(&dir);
@@ -158,12 +203,17 @@ pub fn write_bootstrap(b: &Bootstrap) {
 // backfills — a probe must not mutate the library it inspects).
 
 /// Core content counts of a library: (content blocks, versions,
-/// indexes). The verification currency of every relocation.
+/// indexes) plus the page-entity and submission counts (audit
+/// P3: the verification must cover the tables a relocation can
+/// silently lose, not only the original three). The verification
+/// currency of every relocation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct LibraryCounts {
     pub units: usize,
     pub versions: usize,
     pub indexes: usize,
+    pub pages: usize,
+    pub submissions: usize,
 }
 
 impl LibraryCounts {
@@ -195,6 +245,10 @@ pub fn probe_library(dir: &std::path::Path) -> Option<LibraryCounts> {
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .ok()?;
+    // A library another process is mid-write on should read as
+    // "busy", not "not a library": wait out short transactions
+    // (audit2 X2, same timeout as Store::open).
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
     let tables: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' \
@@ -210,24 +264,53 @@ pub fn probe_library(dir: &std::path::Path) -> Option<LibraryCounts> {
         conn.query_row(&format!("SELECT COUNT(*) FROM \"{t}\""), [], |r| r.get(0))
             .ok()
     };
+    // The page-entity and submission tables postdate the core
+    // three; a library from before them reads as 0 here (and so
+    // does its copy — the comparison stays apples-to-apples).
+    let count_or_zero = |t: &str| -> usize {
+        conn.query_row(&format!("SELECT COUNT(*) FROM \"{t}\""), [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .map(|n| n as usize)
+        .unwrap_or(0)
+    };
     Some(LibraryCounts {
         units: count("units")? as usize,
         versions: count("versions")? as usize,
         indexes: count("indexes_tbl")? as usize,
+        pages: count_or_zero("pages"),
+        submissions: count_or_zero("submissions"),
     })
 }
 
 /// Files a relocation never copies: the client advisory lock (a
 /// copied lock would point at a stale pid — and the target must
-/// take its own) and SQLite sidecars (the `.db` file alone carries
-/// the last committed state; a journal/wal belongs to the source's
-/// last writer, not to the copy).
-const COPY_SKIP: [&str; 4] = [
-    "qimu-local.lock",
-    "qimu.db-journal",
-    "qimu.db-wal",
-    "qimu.db-shm",
-];
+/// take its own) and the SQLite shared-memory sidecar (transient
+/// index state, rebuilt on open). The write-ahead log and the
+/// rollback journal DO travel (audit P3): `relocate_library`
+/// checkpoints the source first, which normally folds them into
+/// the `.db`; when checkpointing is impossible (read-only media,
+/// a locked source), the copied sidecars are what let SQLite
+/// recover the last committed state at the target instead of
+/// silently presenting an older database.
+const COPY_SKIP: [&str; 2] = ["qimu-local.lock", "qimu.db-shm"];
+
+/// Best-effort fold of a library's write-ahead log (and rollback
+/// of any hot journal) into its `qimu.db`. A plain open performs
+/// journal recovery; the checkpoint then truncates the wal. Used
+/// on relocation sources and targets so probes and copies see the
+/// last committed state. Failures are ignored by design: a source
+/// that cannot be opened read-write is still copied verbatim
+/// (sidecars included) and the counts check arbitrates.
+fn checkpoint_db(dir: &std::path::Path) {
+    let db = dir.join("qimu.db");
+    if !db.is_file() {
+        return;
+    }
+    if let Ok(conn) = rusqlite::Connection::open(&db) {
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    }
+}
 
 /// Copy the library at `src` into `dst` and verify the copy by
 /// core counts. The source is never modified. On any failure the
@@ -239,6 +322,11 @@ pub fn relocate_library(
     src: &std::path::Path,
     dst: &std::path::Path,
 ) -> Result<LibraryCounts, String> {
+    // Settle the source first (audit P3): an old version killed
+    // mid-write can leave committed rows only in its wal — the
+    // read-only probe alone could count (and the copy carry) an
+    // older state and still "verify".
+    checkpoint_db(src);
     let src_counts = probe_library(src)
         .ok_or_else(|| "源目录不是可识别的启幕库（缺少 qimu.db 或核心表）".to_string())?;
     if src == dst {
@@ -266,16 +354,25 @@ pub fn relocate_library(
         }
         Ok(())
     })();
+    // Settle the copy the same way before verifying it, so the
+    // probe reads the recovered, checkpointed state.
+    if attempt.is_ok() {
+        checkpoint_db(dst);
+    }
     let verified = attempt.and_then(|()| match probe_library(dst) {
         Some(c) if c == src_counts => Ok(c),
         Some(c) => Err(format!(
-            "搬迁后计数不一致（源：{} 内容块 / {} 版本 / {} 索引；目标：{} / {} / {}）",
+            "搬迁后计数不一致（源：{} 内容块 / {} 版本 / {} 索引 / {} 页面 / {} 投稿；目标：{} / {} / {} / {} / {}）",
             src_counts.units,
             src_counts.versions,
             src_counts.indexes,
+            src_counts.pages,
+            src_counts.submissions,
             c.units,
             c.versions,
-            c.indexes
+            c.indexes,
+            c.pages,
+            c.submissions
         )),
         None => Err("搬迁后目标目录无法识别为启幕库".to_string()),
     });
@@ -360,7 +457,8 @@ pub enum LibraryOrigin {
     Bootstrap,
     /// The legacy `library_dir` client setting.
     LegacySetting,
-    /// The `QIMU_DATA_DIR` environment variable.
+    /// A data-dir environment variable (`QIMU_CLIENT_DATA_DIR`,
+    /// or the legacy `QIMU_DATA_DIR`).
     Env,
     /// The standard directory (already populated, or fresh).
     Standard,
@@ -395,15 +493,74 @@ fn resolve_library() -> LibraryResolution {
             migrated_from,
         }
     };
+    // 0. A settings-registered data-directory move executes
+    //    first (audit P1): this is the one moment the source
+    //    library is guaranteed static — no store is open yet —
+    //    so the copy can never fork away from the running
+    //    session's writes the way a live copy did. A move whose
+    //    target meanwhile gained a library of its own is
+    //    cancelled, never forced over it; a failed move keeps the
+    //    old directory and leaves a notice for the user.
+    let mut boot = read_bootstrap();
+    if let Some(pend) = boot.pending_relocate.clone() {
+        let from = PathBuf::from(&pend.from);
+        let to = PathBuf::from(&pend.to);
+        let target_taken = probe_library(&to)
+            .map(|c| c.has_content())
+            .unwrap_or(false);
+        if target_taken {
+            boot.pending_relocate = None;
+            boot.relocate_notice = Some(format!(
+                "数据目录搬迁已取消：目标目录 {} 里已有另一个启幕库，未做任何改动",
+                to.display()
+            ));
+            write_bootstrap(&boot);
+        } else {
+            match relocate_library(&from, &to) {
+                Ok(_) => {
+                    boot.data_dir = Some(to.to_string_lossy().into_owned());
+                    boot.pending_relocate = None;
+                    boot.relocate_notice = Some(format!(
+                        "数据目录已搬迁到 {}（内容核对通过）",
+                        to.display()
+                    ));
+                    write_bootstrap(&boot);
+                    return res(to, LibraryOrigin::Bootstrap, None);
+                }
+                Err(e) => {
+                    boot.pending_relocate = None;
+                    if boot.data_dir.is_none() {
+                        boot.data_dir = Some(from.to_string_lossy().into_owned());
+                    }
+                    boot.relocate_notice = Some(format!(
+                        "数据目录搬迁失败：{e}；仍在使用原目录 {}",
+                        from.display()
+                    ));
+                    write_bootstrap(&boot);
+                }
+            }
+        }
+    }
     // 1. The bootstrap config wins outright and skips all scanning.
     //    A configured path that exists as a *file* is invalid and
     //    falls through to discovery; a not-yet-existing directory is
-    //    valid (a fresh library at the configured place).
-    let boot = read_bootstrap();
+    //    valid (a fresh library at the configured place). A path
+    //    that exists, is non-empty and holds no `qimu.db` is NOT
+    //    adopted as a library root (audit P4): it may be a stray
+    //    folder sitting where the library used to live, and
+    //    silently opening a fresh library there is exactly the
+    //    "upgrade lost my data" symptom — discovery runs instead,
+    //    and the configured path only gets its fresh library when
+    //    discovery finds nothing anywhere.
+    let mut configured_stray: Option<PathBuf> = None;
     if let Some(d) = boot.data_dir.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         let p = PathBuf::from(d);
-        if !p.exists() || p.is_dir() {
+        if p.exists() && !p.is_dir() {
+            // a file: invalid, fall through
+        } else if !p.exists() || p.join("qimu.db").is_file() || dir_is_empty(&p) {
             return res(p, LibraryOrigin::Bootstrap, None);
+        } else {
+            configured_stray = Some(p);
         }
     }
     // 2. The legacy client setting (design §6.2 hook; predates the
@@ -415,10 +572,17 @@ fn resolve_library() -> LibraryResolution {
     {
         return res(PathBuf::from(p), LibraryOrigin::LegacySetting, None);
     }
-    // 3. An explicit QIMU_DATA_DIR.
-    if let Ok(d) = std::env::var("QIMU_DATA_DIR") {
-        if !d.trim().is_empty() {
-            return res(PathBuf::from(d), LibraryOrigin::Env, None);
+    // 3. An explicit data-dir environment variable: the
+    //    client-specific QIMU_CLIENT_DATA_DIR first, the legacy
+    //    QIMU_DATA_DIR as fallback (audit2 F-N2: the legacy name is
+    //    shared with the server's data root, so a machine-wide
+    //    setting could collide the two onto one directory; the
+    //    specific names win whenever both are set).
+    for var in ["QIMU_CLIENT_DATA_DIR", "QIMU_DATA_DIR"] {
+        if let Ok(d) = std::env::var(var) {
+            if !d.trim().is_empty() {
+                return res(PathBuf::from(d), LibraryOrigin::Env, None);
+            }
         }
     }
     // 4. The standard directory — unless it is still empty, in
@@ -453,10 +617,9 @@ fn resolve_library() -> LibraryResolution {
     if let Some((_, _, src)) = best {
         match relocate_library(&src, &standard) {
             Ok(_) => {
-                write_bootstrap(&Bootstrap {
-                    data_dir: Some(standard.to_string_lossy().into_owned()),
-                    old_library_policy: boot.old_library_policy,
-                });
+                let mut nb = boot.clone();
+                nb.data_dir = Some(standard.to_string_lossy().into_owned());
+                write_bootstrap(&nb);
                 return res(standard, LibraryOrigin::Migrated, Some(src));
             }
             Err(e) => {
@@ -467,15 +630,28 @@ fn resolve_library() -> LibraryResolution {
                     "[qimu] 旧库搬迁失败（{e}），改按原目录打开：{}",
                     src.display()
                 );
-                write_bootstrap(&Bootstrap {
-                    data_dir: Some(src.to_string_lossy().into_owned()),
-                    old_library_policy: boot.old_library_policy,
-                });
+                let mut nb = boot.clone();
+                nb.data_dir = Some(src.to_string_lossy().into_owned());
+                write_bootstrap(&nb);
                 return res(src, LibraryOrigin::FallbackSource, None);
             }
         }
     }
+    if let Some(p) = configured_stray {
+        // Discovery found nothing anywhere: the configured path
+        // gets the fresh library after all (it held no library,
+        // so nothing is orphaned by opening one there).
+        return res(p, LibraryOrigin::Bootstrap, None);
+    }
     res(standard, LibraryOrigin::Standard, None)
+}
+
+/// Whether a directory holds no entries at all. An unreadable
+/// directory counts as non-empty (never adopted sight unseen).
+fn dir_is_empty(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir)
+        .map(|mut it| it.next().is_none())
+        .unwrap_or(false)
 }
 
 /// Serialize a record list into the `Vec<Value>` shape the UI consumes
@@ -714,6 +890,28 @@ impl LocalStore {
     pub fn list_indexes(&self) -> Vec<Value> {
         let store = self.store.lock().unwrap();
         store.list_indexes(None).map(values_of).unwrap_or_default()
+    }
+
+    /// One-lock snapshot of the four working-data lists
+    /// (folders / groups / units / indexes — the same shapes the
+    /// individual list methods return), taken with `try_lock`:
+    /// when the store is busy — an import worker holding it
+    /// through a stage — this returns None instead of queueing
+    /// behind the lock. The import `Opened` beat refreshes
+    /// through here so the UI thread never parks on the import's
+    /// lock (see `App::refresh_opened` in main.rs).
+    pub fn try_snapshot(&self) -> Option<(Vec<Value>, Vec<Value>, Vec<Value>, Vec<Value>)> {
+        let store = self.store.try_lock().ok()?;
+        let folders = store.list_folders().map(values_of).unwrap_or_default();
+        let groups = store.list_groups().map(values_of).unwrap_or_default();
+        let units: Vec<Value> = store
+            .list_units(None)
+            .unwrap_or_default()
+            .iter()
+            .map(|u| unit_json(&store, u))
+            .collect();
+        let indexes = store.list_indexes(None).map(values_of).unwrap_or_default();
+        Some((folders, groups, units, indexes))
     }
 
     /// GET /v1/units shape: the server's `unit_json` wrapper —
@@ -1140,6 +1338,21 @@ impl LocalStore {
         store.file_get(&rec.hash).ok()
     }
 
+    /// The whole-deck backing of a page whose lazy-import split
+    /// has not landed yet: (deck file hash, slide index). None
+    /// once the page is an entity (or was never lazily imported).
+    pub fn lazy_backing_for_page(&self, page_id: &str) -> Option<(String, usize)> {
+        let store = self.store.lock().unwrap();
+        store.lazy_backing_for_page(page_id).ok().flatten()
+    }
+
+    /// Raw file-store bytes by content hash (the lazy backing's
+    /// deck file, among other callers).
+    pub fn file_bytes(&self, hash: &str) -> Option<Vec<u8>> {
+        let store = self.store.lock().unwrap();
+        store.file_get(hash).ok()
+    }
+
     /// (units, folders, indexes) counts for the settings diagnostic.
     pub fn counts(&self) -> (usize, usize, usize) {
         let store = self.store.lock().unwrap();
@@ -1318,6 +1531,51 @@ impl LocalStore {
                         "units": outcome.units,
                     }))
                 }
+                // Lazy import (user ruling 2026-11-25): open the
+                // deck WITHOUT splitting — wrappers land on the
+                // wall immediately, backed by the whole deck — and
+                // split it afterwards, one page per call. Local
+                // face only; the server's import routes stay
+                // one-shot this round.
+                ("POST", ["v1", "import", "lazy-open"]) => {
+                    let bytes = b64_field(&body, "data_base64")?;
+                    let blocks = import_block_specs(&body);
+                    let store = self.store.lock().unwrap();
+                    let opened = store.lazy_open(
+                        &str_field(&body, "filename").unwrap_or_default(),
+                        &bytes,
+                        opt_str_field(&body, "folder_id"),
+                        &str_field(&body, "group_id").unwrap_or_default(),
+                        &self.owner.display_name,
+                        blocks.as_deref(),
+                    )?;
+                    Ok(serde_json::to_value(&opened).unwrap_or_default())
+                }
+                ("POST", ["v1", "import", "lazy-list"]) => {
+                    let store = self.store.lock().unwrap();
+                    let states = store.lazy_states()?;
+                    Ok(serde_json::to_value(&states).unwrap_or_default())
+                }
+                // One page per call: the store lock is held for a
+                // single page's split, never across a whole deck,
+                // so the UI thread never parks behind the worker
+                // (the freeze line's F3 discipline).
+                ("POST", ["v1", "import", "lazy-split"]) => {
+                    let index = body.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    let store = self.store.lock().unwrap();
+                    let outcome = store.lazy_split_page(
+                        &str_field(&body, "pending_id").unwrap_or_default(),
+                        index,
+                    )?;
+                    Ok(serde_json::to_value(&outcome).unwrap_or_default())
+                }
+                ("POST", ["v1", "import", "lazy-forget"]) => {
+                    let store = self.store.lock().unwrap();
+                    store.delete_pending_import(
+                        &str_field(&body, "pending_id").unwrap_or_default(),
+                    )?;
+                    Ok(json!({ "ok": true }))
+                }
                 ("POST", ["v1", "import"]) => {
                     let bytes = b64_field(&body, "data_base64")?;
                     let blocks = import_block_specs(&body);
@@ -1352,8 +1610,18 @@ impl LocalStore {
                     Ok(serde_json::to_value(&u).unwrap_or(Value::Null))
                 }
                 ("GET", ["v1", "units", id]) => {
+                    // A unit this library does not hold may be an
+                    // organization unit (merged search hits, F7,
+                    // open through here): per the P4 discipline
+                    // the local face must not answer for objects
+                    // it does not own — fall through to REST,
+                    // which serves it, or 404s in its own words
+                    // when the unit truly does not exist.
                     let store = self.store.lock().unwrap();
-                    let unit = store.get_unit(id).map_err(|_| NOT_FOUND.to_string())?;
+                    let unit = match store.get_unit(id) {
+                        Ok(u) => u,
+                        Err(_) => return Err(UNHANDLED.to_string()),
+                    };
                     Ok(unit_json(&store, &unit))
                 }
                 ("PATCH", ["v1", "units", id]) => {
