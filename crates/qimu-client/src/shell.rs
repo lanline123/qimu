@@ -426,9 +426,7 @@ impl App {
                         Page::Home | Page::Trash => {}
                         Page::Settings => {}
                     }
-                    if self.page == Page::Index {
-                        self.index_toolbar(ui);
-                    }
+                    self.index_toolbar(ui);
                 });
                 let r = ui.max_rect();
                 ui.painter().hline(

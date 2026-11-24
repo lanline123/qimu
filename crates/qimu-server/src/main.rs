@@ -2192,6 +2192,183 @@ async fn set_lifecycle(
     Ok(Json(json!({ "ok": true })))
 }
 
+#[derive(Deserialize)]
+struct IndexGraphQuery {
+    index_id: Option<String>,
+}
+
+async fn index_graphs(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Query(query): Query<IndexGraphQuery>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let visible = visible_set(&st, &user)?;
+    let store = st.store.lock().unwrap();
+    let mut graphs = std::collections::BTreeMap::new();
+    if let Some(id) = query.index_id {
+        let index = store.get_index(&id).map_err(|_| not_found())?;
+        if !store.can_see_group(&user, &index.group_id).map_err(bad)? {
+            return Err(not_found());
+        }
+        graphs.insert(id.clone(), store.index_graph(&id).map_err(bad)?);
+    } else {
+        for index in store.list_indexes(visible.as_ref()).map_err(bad)? {
+            let graph = store.index_graph(&index.id).map_err(bad)?;
+            graphs.insert(index.id, graph);
+        }
+    }
+    Ok(Json(json!({ "graphs": graphs })))
+}
+
+#[derive(Deserialize)]
+struct MoveIndexReq {
+    folder_id: Option<String>,
+}
+
+async fn move_index_to_folder(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<MoveIndexReq>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let index = st
+        .store
+        .lock()
+        .unwrap()
+        .get_index(&id)
+        .map_err(|_| not_found())?;
+    need_cap(&st, &user, &index.group_id, "manage")?;
+    st.store
+        .lock()
+        .unwrap()
+        .move_index_to_folder(&id, req.folder_id.as_deref())
+        .map_err(bad)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct EnglishIndexReq {
+    branch: String,
+    name: String,
+}
+
+async fn create_english_index(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<EnglishIndexReq>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let index = st
+        .store
+        .lock()
+        .unwrap()
+        .get_index(&id)
+        .map_err(|_| not_found())?;
+    need_cap(&st, &user, &index.group_id, "publish")?;
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err(bad("请输入英文版索引名称"));
+    }
+    let store = st.store.lock().unwrap();
+    let head = store
+        .branch_head(&id, &req.branch)
+        .map_err(bad)?
+        .ok_or_else(|| bad("当前分支没有可派生的提交"))?;
+    let source = store.get_commit(&head).map_err(bad)?;
+    let mut entries = Vec::with_capacity(source.entries.len());
+    let mut missing = Vec::new();
+    for entry in source.entries {
+        let unit = store.get_unit(&entry.unit_id.0).map_err(bad)?;
+        if !store.can_see_group(&user, &unit.group_id).map_err(bad)? {
+            return Err(bad("没有权限读取索引中的内容块"));
+        }
+        let original = store.get_rendition(&entry.rendition_id.0).map_err(bad)?;
+        if original.unit_id != unit.id {
+            return Err(bad("条目的形态版本不属于该内容块"));
+        }
+        let source_version = store.resolve_entry_version(&entry).map_err(bad)?;
+        let mut selected = None;
+        if lang_code_of(&original.lang)
+            .to_ascii_lowercase()
+            .split(['-', '_'])
+            .next()
+            == Some("en")
+        {
+            selected = match entry.policy {
+                EntryPolicy::FollowLatest => store
+                    .list_versions(&original.id)
+                    .map_err(bad)?
+                    .into_iter()
+                    .find(|version| version.status == "normal"),
+                EntryPolicy::Locked { .. } => {
+                    source_version.filter(|version| version.status == "normal")
+                }
+            };
+        } else {
+            for rendition in store.list_renditions(&unit.id).map_err(bad)? {
+                let lang = lang_code_of(&rendition.lang).to_ascii_lowercase();
+                if rendition.form != original.form || lang.split(['-', '_']).next() != Some("en") {
+                    continue;
+                }
+                let matches_excerpt = |version: &qimu_core::store::VersionRec| {
+                    entry.excerpt_slots.as_ref().is_none_or(|slots| {
+                        source_version.as_ref().is_some_and(|source| {
+                            source.basis_revision == version.basis_revision
+                                && source.page_count == version.page_count
+                                && slots.iter().all(|slot| {
+                                    slot.parse::<usize>()
+                                        .is_ok_and(|slot| slot < version.pages.len())
+                                })
+                        })
+                    })
+                };
+                selected = store
+                    .list_versions(&rendition.id)
+                    .map_err(bad)?
+                    .into_iter()
+                    .find(|version| version.status == "normal" && matches_excerpt(version));
+                if selected.is_some() {
+                    break;
+                }
+            }
+        }
+        if let Some(version) = selected {
+            entries.push(IndexEntry {
+                rendition_id: Id(version.rendition_id),
+                policy: EntryPolicy::Locked {
+                    version_id: Id(version.id),
+                },
+                locked_semver: Some(version.semver),
+                ..entry
+            });
+        } else {
+            missing.push(unit.name);
+        }
+    }
+    if !missing.is_empty() {
+        missing.sort();
+        missing.dedup();
+        return Err(bad(format!(
+            "请先为这些内容块发布同形态的英文版本，并核对摘页：{}",
+            missing.join("、")
+        )));
+    }
+    let derived = store
+        .create_english_index(
+            &index,
+            &req.branch,
+            &head,
+            name,
+            &user.display_name,
+            entries,
+        )
+        .map_err(bad)?;
+    Ok(Json(json!(derived)))
+}
+
 // ---------------- export engine ----------------
 
 /// Resolve entries to pages and assemble a deck with an embedded
@@ -4101,6 +4278,9 @@ async fn main() {
         .route("/v1/units/:id/page-bindings/:bid/delete", post(delete_page_binding))
         .route("/v1/search", get(search))
         .route("/v1/indexes", get(list_indexes).post(create_index))
+        .route("/v1/index-graphs", get(index_graphs))
+        .route("/v1/indexes/:id/folder", post(move_index_to_folder))
+        .route("/v1/indexes/:id/english", post(create_english_index))
         .route("/v1/indexes/:id", get(get_index))
         .route("/v1/indexes/:id/commits", get(list_commits).post(post_commit))
         .route("/v1/indexes/:id/branches", post(create_branch))

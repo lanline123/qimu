@@ -32,6 +32,14 @@ pub(super) fn palette_color(dark: egui::Color32) -> egui::Color32 {
         0x767681
     } else if dark == ACCENT_DEEP {
         0x1d4ed8
+    } else if dark == CHIP_GREEN_BG {
+        0xdcfce7
+    } else if dark == CHIP_ORANGE_BG {
+        0xfef3c7
+    } else if dark == CHIP_BLUE_BG {
+        0xdbeafe
+    } else if dark == ROSE_SOFT_BG {
+        0xffe4e6
     } else if dark == CHIP_GREEN_FG {
         0x166534
     } else if dark == CHIP_ORANGE_FG {
@@ -190,8 +198,30 @@ impl App {
     }
 
     pub(super) fn workspace_preferences(&mut self, ui: &mut egui::Ui) {
-        if ui
-            .button(egui::RichText::new("◐").size(16.0))
+        use craft_ui::buttons::{ButtonVisuals, IconButton, IconButtonStyle};
+        let icons = self.chrome_icons(ui);
+        let rest = ButtonVisuals {
+            fill: egui::Color32::TRANSPARENT,
+            stroke: egui::Stroke::NONE,
+            icon: palette_color(ICON_TINT),
+        };
+        let hovered = ButtonVisuals {
+            fill: palette_color(PRESSED_BG),
+            icon: palette_color(TEXT_MAIN),
+            ..rest
+        };
+        let style = IconButtonStyle {
+            normal: rest,
+            hovered,
+            pressed: Some(hovered),
+            selected: hovered,
+            corner_radius: egui::CornerRadius::same(6),
+            focus_stroke: egui::Stroke::new(1.0, ACCENT),
+        };
+        if IconButton::new(tr("切换主题"), egui::vec2(29.0, 24.0), &style)
+            .show(ui, |ui, rect, tint| {
+                icons.paint(ui, ChromeIcon::Theme, rect.center(), 15.0, tint)
+            })
             .on_hover_text(tr("切换主题"))
             .clicked()
         {
@@ -201,39 +231,105 @@ impl App {
             save_client_settings(json!({ "theme": if light { "light" } else { "dark" } }));
             ui.ctx().request_repaint();
         }
+
+        let label = ui.painter().layout_no_wrap(
+            tr("消息").into(),
+            egui::FontId::proportional(12.0),
+            palette_color(TEXT_WEAK),
+        );
         let unread = self.workspace_controls.unread;
-        let label = if unread == 0 {
-            tr("消息").into()
-        } else {
-            format!("{} {unread}", tr("消息"))
-        };
-        if ui.button(label).on_hover_text(tr("消息中心")).clicked() {
+        let count = (unread > 0).then(|| {
+            ui.painter().layout_no_wrap(
+                unread.to_string(),
+                egui::FontId::proportional(10.5),
+                egui::Color32::WHITE,
+            )
+        });
+        let count_width = count.as_ref().map_or(0.0, |count| count.size().x + 15.0);
+        let width = 35.0 + label.size().x + count_width;
+        if IconButton::new(tr("消息中心"), egui::vec2(width, 24.0), &style)
+            .selected(self.workspace_controls.messages_open)
+            .show(ui, |ui, rect, tint| {
+                let y = rect.center().y;
+                icons.paint(
+                    ui,
+                    ChromeIcon::Bell,
+                    egui::pos2(rect.left() + 14.5, y),
+                    15.0,
+                    tint,
+                );
+                let x = rect.left() + 28.0;
+                ui.painter().galley_with_override_text_color(
+                    egui::pos2(x, y - label.size().y / 2.0),
+                    label.clone(),
+                    tint,
+                );
+                if let Some(count) = count {
+                    let x = x + label.size().x + 3.0;
+                    let bubble = egui::Rect::from_min_size(
+                        egui::pos2(x, y - 7.5),
+                        egui::vec2(count_width - 3.0, 15.0),
+                    );
+                    ui.painter().rect_filled(bubble, 255.0, palette_color(ROSE));
+                    ui.painter().galley(
+                        bubble.center() - count.size() / 2.0,
+                        count,
+                        egui::Color32::WHITE,
+                    );
+                }
+            })
+            .on_hover_text(if unread == 0 {
+                tr("消息中心").to_owned()
+            } else {
+                format!("{} · {unread}", tr("消息中心"))
+            })
+            .clicked()
+        {
             self.workspace_controls.messages_open = !self.workspace_controls.messages_open;
             self.workspace_controls.unread = 0;
         }
-        ui.horizontal(|ui| {
-            if let Some(next) = segmented(
-                ui,
-                &["English", "中文"],
-                usize::from(!ENGLISH_UI.get()),
-                SegStyle::Solid,
-            ) {
-                ENGLISH_UI.set(next == 0);
-                save_client_settings(
-                    json!({ "locale": if next == 0 { "en-us" } else { "zh-hans" } }),
-                );
-                ui.ctx().request_repaint();
-            }
-        });
+
+        egui::Frame::NONE
+            .fill(palette_color(FIELD_BG))
+            .stroke(egui::Stroke::new(1.0, palette_color(SEPARATOR)))
+            .corner_radius(6)
+            .inner_margin(2)
+            .show(ui, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    ui.spacing_mut().interact_size.y = 22.0;
+                    ui.spacing_mut().button_padding = egui::vec2(10.0, 3.0);
+                    for (english, label) in [(true, "English"), (false, "中文")] {
+                        let selected = ENGLISH_UI.get() == english;
+                        let button = egui::Button::new(
+                            egui::RichText::new(label)
+                                .size(11.5)
+                                .strong()
+                                .color(palette_color(if selected { TEXT_MAIN } else { TEXT_WEAK })),
+                        )
+                        .fill(if selected {
+                            palette_color(PRESSED_BG)
+                        } else {
+                            egui::Color32::TRANSPARENT
+                        })
+                        .stroke(egui::Stroke::NONE)
+                        .corner_radius(6);
+                        if ui.add(button).clicked() && !selected {
+                            ENGLISH_UI.set(english);
+                            save_client_settings(
+                                json!({ "locale": if english { "en-us" } else { "zh-hans" } }),
+                            );
+                            ui.ctx().request_repaint();
+                        }
+                    }
+                });
+            });
     }
 
     pub(super) fn workspace_search_box(&mut self, ui: &mut egui::Ui) {
-        let width = if ui.ctx().content_rect().width() < 1120.0 {
-            142.0
-        } else {
-            222.0
-        };
-        let response = ui.add(
+        let width = (ui.ctx().content_rect().width() - 650.0).clamp(110.0, 250.0);
+        let response = ui.add_sized(
+            [width, 26.0],
             egui::TextEdit::singleline(&mut self.workspace_controls.search_text)
                 .desired_width(width)
                 .hint_text(tr("搜索页面、标签、维护人…")),
@@ -241,10 +337,9 @@ impl App {
         if std::mem::take(&mut self.workspace_controls.focus_search) {
             response.request_focus();
         }
-        let enter = (response.has_focus() || response.lost_focus())
-            && ui.input(|input| input.key_pressed(egui::Key::Enter));
-        let submitted = ui.button(tr("搜索")).clicked();
-        if enter || submitted {
+        if (response.has_focus() || response.lost_focus())
+            && ui.input(|input| input.key_pressed(egui::Key::Enter))
+        {
             self.run_workspace_search();
         }
     }

@@ -79,116 +79,148 @@ impl IndexOverviewControls {
                 .is_none_or(|scope| scope == IndexScope::of(index))
     }
 
-    pub(super) fn ui(&mut self, ui: &mut egui::Ui) {
-        let rtl = ui.layout().main_dir() == egui::Direction::RightToLeft;
-        if rtl {
-            self.view_buttons(ui, true);
-            tool_vsep(ui);
-            self.scope_buttons(ui, true);
-            tool_vsep(ui);
-            self.status_buttons(ui, true);
-        } else {
-            self.status_buttons(ui, false);
-            tool_vsep(ui);
-            self.scope_buttons(ui, false);
-            tool_vsep(ui);
-            self.view_buttons(ui, false);
+    fn ui(&mut self, ui: &mut egui::Ui, icons: ChromeIcons, enabled: bool) {
+        for (relationship, icon, label) in [
+            (true, ChromeIcon::Lineage, "派生关系"),
+            (false, ChromeIcon::Directory, "按目录"),
+        ] {
+            if icons
+                .tool(
+                    ui,
+                    icon,
+                    label,
+                    enabled,
+                    self.relationships == relationship,
+                    false,
+                )
+                .clicked()
+            {
+                self.relationships = relationship;
+            }
         }
-    }
-
-    fn status_buttons(&mut self, ui: &mut egui::Ui, rtl: bool) {
-        let mut states = [IndexStatus::Active, IndexStatus::History, IndexStatus::All];
-        let mut labels = ["使用中", "历史", "全部"];
-        if rtl {
-            states.reverse();
-            labels.reverse();
-        }
-        let selected = states
-            .iter()
-            .position(|state| *state == self.status)
-            .unwrap_or(0);
-        if let Some(next) = segmented(ui, &labels, selected, SegStyle::Soft) {
-            self.status = states[next];
-        }
-    }
-
-    fn scope_buttons(&mut self, ui: &mut egui::Ui, rtl: bool) {
-        let mut scopes = IndexScope::ALL;
-        if rtl {
-            scopes.reverse();
-        }
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 3.0;
-            ui.spacing_mut().button_padding.x = 5.0;
-            for scope in scopes {
-                let selected = self.scope == Some(scope);
-                let button = egui::Button::new(egui::RichText::new("●").color(scope.color()))
-                    .selected(selected)
-                    .min_size(egui::vec2(22.0, 24.0));
-                let response = ui.add(button).on_hover_text(tr(scope.label()));
-                if response.clicked() {
+        tool_vsep(ui);
+        ui.add_enabled_ui(enabled, |ui| {
+            for scope in IndexScope::ALL.into_iter().rev() {
+                let selected = enabled && self.scope == Some(scope);
+                let (rect, response) =
+                    ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+                response.widget_info(|| {
+                    egui::WidgetInfo::selected(
+                        egui::Role::Button,
+                        enabled,
+                        selected,
+                        tr(scope.label()),
+                    )
+                });
+                if selected || response.hovered() || response.has_focus() {
+                    ui.painter().rect_stroke(
+                        rect,
+                        5.0,
+                        egui::Stroke::new(1.0, ACCENT),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+                let color = if enabled {
+                    scope.color()
+                } else {
+                    palette_color(TEXT_WEAK)
+                };
+                ui.painter().circle_filled(rect.center(), 5.0, color);
+                if response.on_hover_text(tr(scope.label())).clicked() {
                     self.scope = (!selected).then_some(scope);
                 }
             }
         });
-    }
-
-    fn view_buttons(&mut self, ui: &mut egui::Ui, rtl: bool) {
-        let mut labels = ["按目录", "派生关系"];
-        if rtl {
-            labels.reverse();
-        }
-        if let Some(next) = segmented(
-            ui,
-            &labels,
-            usize::from(self.relationships ^ rtl),
-            SegStyle::Soft,
-        ) {
-            self.relationships = (next == 1) ^ rtl;
+        tool_vsep(ui);
+        for (status, icon, label) in [
+            (IndexStatus::All, ChromeIcon::All, "全部"),
+            (IndexStatus::History, ChromeIcon::History, "历史"),
+            (IndexStatus::Active, ChromeIcon::Active, "使用中"),
+        ] {
+            if icons
+                .tool(ui, icon, label, enabled, self.status == status, false)
+                .clicked()
+            {
+                self.status = status;
+            }
         }
     }
 }
 
-pub(super) struct BranchLineage {
-    name: String,
-    head: String,
-    inherited: Option<(String, String)>,
+pub(super) enum IndexMoreAction {
+    English(String),
+    Move(Option<String>),
+    History,
+    Delete,
 }
 
 impl App {
     pub(super) fn index_toolbar(&mut self, ui: &mut egui::Ui) {
+        let editor =
+            self.page == Page::Index && matches!(self.index.stack.top(), IndexFrame::Detail(_));
+        let overview =
+            self.page == Page::Index && matches!(self.index.stack.top(), IndexFrame::Overview(_));
+        let can_merge = editor
+            && matches!(self.index.stack.top(), IndexFrame::Detail(st)
+            if st.detail["branches"].as_array().is_some_and(|branches| branches.len() > 1));
+        let icons = self.chrome_icons(ui);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.horizontal(|ui| match self.index.stack.top() {
-                IndexFrame::Overview(_) => self.index.overview_controls.ui(ui),
-                IndexFrame::Detail(st) => {
-                    let can_merge = st.detail["branches"]
-                        .as_array()
-                        .is_some_and(|branches| branches.len() > 1);
-                    let merge = ui
-                        .add_enabled(can_merge, egui::Button::new(tr("发起合并")))
-                        .on_disabled_hover_text(tr("需要至少两个分支"))
-                        .clicked();
-                    let publish = ui.button(tr("发布版本")).clicked();
-                    let push = ui.button(tr("推送到演示厅")).clicked();
-                    if let IndexFrame::Detail(st) = self.index.stack.top_mut() {
-                        if merge {
-                            st.view = IndexDetailView::Commits;
-                            st.focus_merge = true;
-                        }
-                        if publish {
-                            st.focus_tag = true;
-                        }
-                    }
-                    if push {
-                        if let IndexFrame::Detail(st) = self.index.stack.top() {
-                            let id = st.index_id.clone();
-                            let title = s(&st.detail["index"], "name");
-                            self.push_index_to_showroom(&id, &title);
+            let more = icons.tool(ui, ChromeIcon::More, "更多操作", editor, false, true);
+            let mut selected = None;
+            if editor {
+                egui::Popup::menu(&more).show(|ui| {
+                    ui.set_min_width(156.0);
+                    for (index, label) in ["制作英文版", "移动到其他文件夹", "转为历史", "删除索引"]
+                        .iter()
+                        .enumerate()
+                    {
+                        let enabled = index != 2
+                            || matches!(self.index.stack.top(), IndexFrame::Detail(st)
+                            if st.detail["index"]["lifecycle"] == "active");
+                        if ui
+                            .add_enabled(enabled, egui::Button::new(tr(label)))
+                            .clicked()
+                        {
+                            selected = Some(index);
+                            ui.close();
                         }
                     }
+                });
+            }
+            let merge = icons
+                .tool(ui, ChromeIcon::Merge, "发起合并", can_merge, false, true)
+                .clicked();
+            let publish = icons
+                .tool(ui, ChromeIcon::Publish, "发布版本", editor, false, true)
+                .clicked();
+            let push = icons
+                .tool(ui, ChromeIcon::Push, "推送到演示厅", editor, false, true)
+                .clicked();
+            if let IndexFrame::Detail(st) = self.index.stack.top_mut() {
+                if let Some(selected) = selected {
+                    let index = &st.detail["index"];
+                    st.more_action = Some(match selected {
+                        0 => IndexMoreAction::English(format!("{} · EN", s(index, "name"))),
+                        1 => IndexMoreAction::Move(index["folder_id"].as_str().map(str::to_owned)),
+                        2 => IndexMoreAction::History,
+                        _ => IndexMoreAction::Delete,
+                    });
                 }
-                IndexFrame::Create(_) => {}
-            });
+                if merge {
+                    st.view = IndexDetailView::Commits;
+                    st.focus_merge = true;
+                }
+                if publish {
+                    st.focus_tag = true;
+                }
+                if push {
+                    let id = st.index_id.clone();
+                    let title = s(&st.detail["index"], "name");
+                    self.push_index_to_showroom(&id, &title);
+                }
+            }
+            tool_vsep(ui);
+            self.index.overview_controls.ui(ui, icons, overview);
         });
     }
 
@@ -206,154 +238,135 @@ impl App {
         };
     }
 
-    pub(super) fn load_index_lineage(
-        &self,
-        id: &str,
-        detail: &Value,
-    ) -> Result<Vec<BranchLineage>, String> {
-        let mut lineage = Vec::new();
-        for branch in detail["branches"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-        {
-            let response = self.call(
-                "GET",
-                &format!(
-                    "/v1/indexes/{id}/commits?branch={}",
-                    query_component(branch)
-                ),
-                None,
-            )?;
-            let commits = response["commits"]
-                .as_array()
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-            // A branch with no commits of its own still points to the
-            // inherited commit. Use recorded commit ownership for the edge.
-            let inherited = commits.iter().find(|commit| commit["branch"] != branch);
-            lineage.push(BranchLineage {
-                name: branch.to_owned(),
-                head: commits
-                    .first()
-                    .map(|commit| s(commit, "id"))
-                    .unwrap_or_default(),
-                inherited: inherited.map(|commit| (s(commit, "branch"), s(commit, "id"))),
-            });
-        }
-        Ok(lineage)
-    }
-
-    pub(super) fn index_overview_relationships(
+    pub(super) fn index_more_dialog(
         &mut self,
-        ui: &mut egui::Ui,
-        ov: &mut OverviewState,
-        items: &[Value],
-    ) -> Option<String> {
-        let mut open = None;
-        egui::ScrollArea::vertical()
-            .id_salt("index-overview-relationships")
-            .show(ui, |ui| {
-                for item in items {
-                    let id = s(item, "id");
-                    let name = s(item, "name");
-                    egui::Frame::NONE
-                        .fill(palette_color(CARD_BG))
-                        .stroke(egui::Stroke::new(1.0, IndexScope::of(item).color()))
-                        .corner_radius(6)
-                        .inner_margin(12)
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            egui::CollapsingHeader::new(&name)
-                                .id_salt(&id)
-                                .show(ui, |ui| {
-                                    if ui.button(tr("打开索引")).clicked() {
-                                        open = Some(id.clone());
-                                    }
-                                    if ui.button(tr("刷新关系")).clicked() {
-                                        ov.lineages.remove(&id);
-                                    }
-                                    let result =
-                                        ov.lineages.entry(id.clone()).or_insert_with(|| {
-                                            let detail = self.call(
-                                                "GET",
-                                                &format!("/v1/indexes/{id}"),
-                                                None,
-                                            )?;
-                                            self.load_index_lineage(&id, &detail)
-                                        });
-                                    show_lineage(ui, result, None);
-                                });
-                        });
-                    ui.add_space(8.0);
-                }
-            });
-        open
-    }
-
-    pub(super) fn index_detail_lineage(
-        &self,
-        ui: &mut egui::Ui,
+        ctx: &egui::Context,
         st: &mut IndexDetailState,
         action: &mut Option<IndexDetailAction>,
     ) {
-        ui.horizontal(|ui| {
-            ui.heading(tr("派生关系"));
-            if ui.button(tr("刷新关系")).clicked() {
-                st.lineage = None;
-            }
-        });
-        let result = st
-            .lineage
-            .get_or_insert_with(|| self.load_index_lineage(&st.index_id, &st.detail));
-        if let Some(branch) = show_lineage(ui, result, Some(&st.branch)) {
-            *action = Some(IndexDetailAction::ChangeBranch(branch));
-        }
-    }
-}
-
-fn show_lineage(
-    ui: &mut egui::Ui,
-    result: &Result<Vec<BranchLineage>, String>,
-    current: Option<&str>,
-) -> Option<String> {
-    let branches = match result {
-        Ok(branches) if !branches.is_empty() => branches,
-        Ok(_) => {
-            ui.label(tr("没有可显示的分支"));
-            return None;
-        }
-        Err(error) => {
-            ui.label(egui::RichText::new(error).color(palette_color(TEXT_WEAK)));
-            return None;
-        }
-    };
-    let mut next = None;
-    for branch in branches {
-        ui.horizontal_wrapped(|ui| {
-            if let Some((source, commit)) = &branch.inherited {
-                ui.label(egui::RichText::new(source).strong());
-                ui.label(egui::RichText::new(commit).monospace().weak());
-                ui.label("→");
-            }
-            if current.is_some() {
-                if ui
-                    .selectable_label(current == Some(branch.name.as_str()), &branch.name)
-                    .clicked()
-                    && current != Some(branch.name.as_str())
-                {
-                    next = Some(branch.name.clone());
+        let Some(mut pending) = st.more_action.take() else {
+            return;
+        };
+        let title = match pending {
+            IndexMoreAction::English(_) => "制作英文版",
+            IndexMoreAction::Move(_) => "移动到其他文件夹",
+            IndexMoreAction::History => "转为历史",
+            IndexMoreAction::Delete => "删除索引",
+        };
+        let mut submit = false;
+        let mut cancel = false;
+        let dialog = egui::Modal::new(egui::Id::unique("index-more-action")).show(ctx, |ui| {
+            ui.heading(tr(title));
+            ui.set_min_width(330.0);
+            let can_submit = match &mut pending {
+                IndexMoreAction::English(name) => {
+                    ui.label(tr("使用各内容块已发布的英文版本创建独立索引。"));
+                    ui.text_edit_singleline(name);
+                    !name.trim().is_empty()
                 }
-            } else {
-                ui.label(egui::RichText::new(&branch.name).strong());
-            }
-            if branch.head.is_empty() {
-                ui.label(egui::RichText::new(tr("暂无提交")).weak());
-            } else {
-                ui.label(egui::RichText::new(&branch.head).monospace().weak());
-            }
+                IndexMoreAction::Move(folder) => {
+                    let mut selected = folder
+                        .as_deref()
+                        .map(|id| self.folder_name(id))
+                        .unwrap_or_else(|| tr("根目录").into());
+                    if selected.is_empty() {
+                        selected = tr("根目录").into();
+                    }
+                    egui::ComboBox::from_id_salt("move-index-folder")
+                        .width(240.0)
+                        .selected_text(selected)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(folder, None, tr("根目录"));
+                            for item in &self.folders {
+                                let id = s(item, "id");
+                                let mut names = vec![s(item, "name")];
+                                let mut parent = item["parent_id"].as_str();
+                                for _ in 0..self.folders.len() {
+                                    let Some(next) = parent.and_then(|id| {
+                                        self.folders.iter().find(|item| item["id"] == id)
+                                    }) else {
+                                        break;
+                                    };
+                                    names.push(s(next, "name"));
+                                    parent = next["parent_id"].as_str();
+                                }
+                                names.reverse();
+                                ui.selectable_value(folder, Some(id), names.join(" / "));
+                            }
+                        });
+                    folder.as_deref() != st.detail["index"]["folder_id"].as_str()
+                }
+                IndexMoreAction::History => {
+                    ui.label(tr("索引将移到「历史」筛选结果。"));
+                    true
+                }
+                IndexMoreAction::Delete => {
+                    ui.label(tr("索引将移到回收站，可从回收站恢复。"));
+                    true
+                }
+            };
+            ui.horizontal(|ui| {
+                if ui.button(tr("取消")).clicked() {
+                    cancel = true;
+                }
+                if ui
+                    .add_enabled(can_submit, egui::Button::new(tr("确认")))
+                    .clicked()
+                {
+                    submit = true;
+                }
+            });
         });
+        if !submit {
+            if !cancel && !dialog.should_close() {
+                st.more_action = Some(pending);
+            }
+            return;
+        }
+        let id = &st.index_id;
+        let response = match &pending {
+            IndexMoreAction::English(name) => self.call(
+                "POST",
+                &format!("/v1/indexes/{id}/english"),
+                Some(json!({ "branch": if st.branch.is_empty() { "main" } else { &st.branch }, "name": name.trim() })),
+            ),
+            IndexMoreAction::Move(folder) => self.call(
+                "POST",
+                &format!("/v1/indexes/{id}/folder"),
+                Some(json!({ "folder_id": folder })),
+            ),
+            IndexMoreAction::History => self.call(
+                "POST",
+                &format!("/v1/indexes/{id}/lifecycle"),
+                Some(json!({ "lifecycle": "history" })),
+            ),
+            IndexMoreAction::Delete => {
+                if self.trash_add("index", id) {
+                    st.closed = true;
+                } else {
+                    st.more_action = Some(pending);
+                }
+                return;
+            }
+        };
+        match response {
+            Ok(result) => {
+                self.refresh_all();
+                self.msg = format!("{} · {}", tr(title), tr("已完成"));
+                if matches!(pending, IndexMoreAction::English(_)) {
+                    *action = Some(IndexDetailAction::OpenGraphTarget {
+                        index: s(&result, "id"),
+                        branch: "main".into(),
+                        commit: None,
+                    });
+                } else {
+                    *action = Some(IndexDetailAction::Reload);
+                }
+            }
+            Err(error) => {
+                self.msg = error;
+                st.more_action = Some(pending);
+            }
+        }
     }
-    next
 }

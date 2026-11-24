@@ -251,6 +251,29 @@ pub struct CommitRec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexBranchLineage {
+    pub name: String,
+    pub head_commit: Option<String>,
+    pub source_index_id: Option<String>,
+    pub source_branch: Option<String>,
+    pub fork_commit_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexGraphCommit {
+    pub id: String,
+    pub branch: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexGraph {
+    pub branches: Vec<IndexBranchLineage>,
+    pub commits: Vec<IndexGraphCommit>,
+    pub tags: Vec<IndexTagRec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexTagRec {
     pub id: String,
     pub index_id: String,
@@ -472,6 +495,9 @@ impl Store {
             ("exports", "manifest_json", "TEXT NOT NULL DEFAULT ''"),
             ("versions", "scripts_json", "TEXT NOT NULL DEFAULT '[]'"),
             ("folders", "main_index_id", "TEXT"),
+            ("index_branches", "source_index_id", "TEXT"),
+            ("index_branches", "source_branch", "TEXT"),
+            ("index_branches", "fork_commit_id", "TEXT"),
             ("showroom", "scope", "TEXT NOT NULL DEFAULT 'org_public'"),
             ("sessions", "kind", "TEXT NOT NULL DEFAULT 'user'"),
             ("sessions", "client_ip", "TEXT"),
@@ -1748,14 +1774,121 @@ impl Store {
     }
 
     pub fn create_branch(&self, index_id: &str, name: &str, from_branch: &str) -> SResult<()> {
-        let head = self.branch_head(index_id, from_branch)?;
-        self.conn
-            .execute(
-                "INSERT INTO index_branches(index_id, name, head_commit) VALUES(?1,?2,?3)",
-                params![index_id, name, head],
+        let inserted = self.conn.execute(
+            "INSERT INTO index_branches(index_id, name, head_commit, source_index_id, source_branch, fork_commit_id)
+             SELECT index_id, ?2, head_commit, index_id, name, head_commit
+             FROM index_branches WHERE index_id=?1 AND name=?3",
+            params![index_id, name, from_branch],
+        ).map_err(db_err)?;
+        if inserted == 0 {
+            return Err("来源分支不存在".into());
+        }
+        Ok(())
+    }
+
+    pub fn index_graph(&self, index_id: &str) -> SResult<IndexGraph> {
+        let mut branches = self
+            .conn
+            .prepare(
+                "SELECT name, head_commit, source_index_id, source_branch, fork_commit_id
+             FROM index_branches WHERE index_id=?1 ORDER BY name <> 'main', rowid",
             )
             .map_err(db_err)?;
-        Ok(())
+        let branches = branches
+            .query_map(params![index_id], |row| {
+                Ok(IndexBranchLineage {
+                    name: row.get(0)?,
+                    head_commit: row.get(1)?,
+                    source_index_id: row.get(2)?,
+                    source_branch: row.get(3)?,
+                    fork_commit_id: row.get(4)?,
+                })
+            })
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        let mut commits = self
+            .conn
+            .prepare(
+                "SELECT id, branch, message FROM index_commits WHERE index_id=?1 ORDER BY rowid",
+            )
+            .map_err(db_err)?;
+        let commits = commits
+            .query_map(params![index_id], |row| {
+                Ok(IndexGraphCommit {
+                    id: row.get(0)?,
+                    branch: row.get(1)?,
+                    message: row.get(2)?,
+                })
+            })
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(IndexGraph {
+            branches,
+            commits,
+            tags: self.list_tags(index_id)?,
+        })
+    }
+
+    pub fn move_index_to_folder(&self, id: &str, folder_id: Option<&str>) -> SResult<()> {
+        let tx = self.conn.unchecked_transaction().map_err(db_err)?;
+        if let Some(folder_id) = folder_id {
+            let exists = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM folders WHERE id=?1)",
+                    params![folder_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(db_err)?;
+            if !exists {
+                return Err("目标文件夹不存在".into());
+            }
+        }
+        if tx
+            .execute(
+                "UPDATE indexes_tbl SET folder_id=?2 WHERE id=?1",
+                params![id, folder_id],
+            )
+            .map_err(db_err)?
+            == 0
+        {
+            return Err("索引不存在".into());
+        }
+        tx.execute(
+            "UPDATE folders SET main_index_id=NULL WHERE main_index_id=?1 AND id IS NOT ?2",
+            params![id, folder_id],
+        )
+        .map_err(db_err)?;
+        tx.commit().map_err(db_err)
+    }
+
+    pub fn create_english_index(
+        &self,
+        source: &IndexRec,
+        source_branch: &str,
+        source_commit: &str,
+        name: &str,
+        maintainer: &str,
+        entries: Vec<IndexEntry>,
+    ) -> SResult<IndexRec> {
+        let tx = self.conn.unchecked_transaction().map_err(db_err)?;
+        let derived = self.create_index(
+            name,
+            source.folder_id.as_deref(),
+            &source.group_id,
+            maintainer,
+            &source.scope,
+            entries,
+        )?;
+        tx.execute(
+            "UPDATE index_branches SET source_index_id=?2, source_branch=?3, fork_commit_id=?4
+             WHERE index_id=?1 AND name='main'",
+            params![derived.id, source.id, source_branch, source_commit],
+        )
+        .map_err(db_err)?;
+        tx.commit().map_err(db_err)?;
+        Ok(derived)
     }
 
     pub fn create_commit(

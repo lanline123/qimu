@@ -4,12 +4,17 @@
 //! exactly like the CLI (spec §4.4 parity).
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+mod chrome_icons;
 mod index_controls;
+mod index_lineage;
 mod index_history;
 mod shell;
 mod workspace_controls;
 
-use index_controls::{BranchLineage, IndexOverviewControls, IndexScope};
+use chrome_icons::{ChromeIcon, ChromeIcons};
+use index_controls::{IndexMoreAction, IndexOverviewControls, IndexScope};
+use index_lineage::IndexGraphs;
+use qimu_core::store::IndexGraph;
 use workspace_controls::{palette_color, query_component, WorkspaceControls, ENGLISH_UI, LIGHT_THEME};
 
 use base64::Engine;
@@ -466,7 +471,7 @@ fn chip(ui: &mut egui::Ui, text: &str, fg: egui::Color32, bg: egui::Color32) {
     let size = egui::vec2(galley.size().x + 14.0, 20.0);
     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
     let painter = ui.painter();
-    painter.rect_filled(rect, 4.0, bg);
+    painter.rect_filled(rect, 4.0, palette_color(bg));
     painter.galley(
         egui::pos2(rect.min.x + 7.0, rect.center().y - galley.size().y / 2.0),
         galley,
@@ -1241,6 +1246,7 @@ enum IndexDetailAction {
     Reload,
     ChangeBranch(String),
     FocusCommit { branch: String, id: String },
+    OpenGraphTarget { index: String, branch: String, commit: Option<String> },
     Export(&'static str),
     Commit(Vec<Value>, &'static str),
     Insert(usize),
@@ -1252,7 +1258,7 @@ enum IndexDetailAction {
 #[derive(Default)]
 struct OverviewState {
     selected: Option<String>,
-    lineages: BTreeMap<String, Result<Vec<BranchLineage>, String>>,
+    graphs: Option<Result<IndexGraphs, String>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1271,7 +1277,8 @@ struct IndexDetailState {
     branch: String,
     commits: Option<Value>,
     exports: Option<Value>,
-    lineage: Option<Result<Vec<BranchLineage>, String>>,
+    lineage: Option<Result<IndexGraph, String>>,
+    more_action: Option<IndexMoreAction>,
     view: IndexDetailView,
     selected_commit: Option<String>,
     /// rendition_id -> versions, semver desc（打开时预取）。
@@ -1297,6 +1304,7 @@ impl IndexDetailState {
             commits: None,
             exports: None,
             lineage: None,
+            more_action: None,
             view: IndexDetailView::Wall,
             selected_commit: None,
             unit_versions: Default::default(),
@@ -3900,7 +3908,7 @@ impl App {
         }
         if let Ok(v) = self.call("GET", "/v1/indexes", None) {
             if let IndexFrame::Overview(overview) = self.index.stack.root_mut() {
-                overview.lineages.clear();
+                overview.graphs = None;
             }
             self.indexes = v.get("indexes").and_then(|f| f.as_array()).cloned().unwrap_or_default();
         }
@@ -4393,6 +4401,9 @@ impl App {
         };
         match self.call("GET", &format!("/v1/indexes/{id}?branch={}", query_component(&branch)), None) {
             Ok(v) => {
+                if let IndexFrame::Overview(overview) = self.index.stack.root_mut() {
+                    overview.graphs = None;
+                }
                 self.remember_index_tags(&id, &v);
                 if let IndexFrame::Detail(d) = self.index.stack.top_mut() {
                     d.detail = v;
@@ -5771,7 +5782,7 @@ impl App {
 
     /// Move an object to the trash (soft delete) — the producers:
     /// unit detail, index detail, showroom cards.
-    fn trash_add(&mut self, kind: &str, object_id: &str) {
+    fn trash_add(&mut self, kind: &str, object_id: &str) -> bool {
         match self.call(
             "POST",
             "/v1/trash",
@@ -5781,8 +5792,12 @@ impl App {
                 self.msg = "已移入回收站，可随时恢复".into();
                 self.trash.loaded = false;
                 self.refresh_all();
+                true
             }
-            Err(e) => self.msg = format!("删除失败：{e}"),
+            Err(e) => {
+                self.msg = format!("删除失败：{e}");
+                false
+            }
         }
     }
 
@@ -11526,13 +11541,14 @@ impl App {
                     }
                     if !st.closed {
                         self.index_detail(ui, st, &mut action);
+                        self.index_more_dialog(ui.ctx(), st, &mut action);
                     }
                     if st.closed {
                         outcome = Some(None);
                     }
                 }
                 IndexFrame::Overview(ov) => {
-                    if let Some(id) = self.index_overview(ui, ov) {
+                    if let Some(id) = self.index_overview(ui, ov, &mut action) {
                         outcome = Some(Some(id));
                     }
                 }
@@ -11562,6 +11578,15 @@ impl App {
                         if st.branch == branch {
                             st.view = IndexDetailView::Commits;
                             st.selected_commit = Some(id);
+                        }
+                    }
+                }
+                Some(IndexDetailAction::OpenGraphTarget { index, branch, commit }) => {
+                    self.open_index_detail_as(&index, branch.clone());
+                    if let IndexFrame::Detail(st) = self.index.stack.top_mut() {
+                        if st.index_id == index && st.branch == branch {
+                            st.view = if commit.is_some() { IndexDetailView::Commits } else { IndexDetailView::Lineage };
+                            st.selected_commit = commit;
                         }
                     }
                 }
@@ -11595,7 +11620,12 @@ impl App {
 
     /// Index overview: standard cards for the indexes living in the
     /// selected folder. Single click selects, double click opens.
-    fn index_overview(&mut self, ui: &mut egui::Ui, ov: &mut OverviewState) -> Option<String> {
+    fn index_overview(
+        &mut self,
+        ui: &mut egui::Ui,
+        ov: &mut OverviewState,
+        action: &mut Option<IndexDetailAction>,
+    ) -> Option<String> {
         let filter = self.index.overview_folder.clone();
         let title = match &filter {
             None => "全部索引".to_string(),
@@ -11616,11 +11646,7 @@ impl App {
             });
             ui.add_space(6.0);
         }
-        ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new(title).size(18.0).strong());
-            ui.add_space(8.0);
-            self.index.overview_controls.ui(ui);
-        });
+        ui.label(egui::RichText::new(title).size(18.0).strong());
         ui.add_space(14.0);
         let items: Vec<Value> = self
             .indexes
@@ -11635,7 +11661,8 @@ impl App {
             return None;
         }
         if self.index.overview_controls.relationships {
-            return self.index_overview_relationships(ui, ov, &items);
+            self.index_overview_relationships(ui, ov, &items, action);
+            return None;
         }
         let mut open = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -11949,11 +11976,6 @@ impl App {
                 *action = Some(IndexDetailAction::Export("company"));
             }
             ui.add_space(24.0);
-            if text_action(ui, "删除索引", palette_color(BADGE_BAD_FG), 13.0) {
-                let iid = s(&index, "id");
-                self.trash_add("index", &iid);
-                st.closed = true;
-            }
             ui.add_space(24.0);
             ui.add(
                 egui::TextEdit::singleline(&mut st.new_branch)
