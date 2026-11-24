@@ -317,27 +317,23 @@ async fn org(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
     Ok(Json(json!({ "departments": departments, "users": users })))
 }
 
-async fn org_contacts(
-    State(st): State<St>,
-    headers: HeaderMap,
-    Query(q): Query<HashMap<String, String>>,
-) -> Api<Value> {
-    let _ = auth(&st, &headers)?;
-    let store = st.store.lock().unwrap();
-    let departments = store.list_departments().map_err(bad)?;
-    let query = q
-        .get("q")
-        .map(|q| q.trim().to_lowercase())
-        .unwrap_or_default();
-    let mut users = store.list_users().map_err(bad)?;
+fn contact_rows(
+    role: &str,
+    departments: &[DeptRec],
+    mut users: Vec<UserRec>,
+    query: &str,
+) -> Vec<Value> {
+    if role == "member" {
+        return Vec::new();
+    }
     users.retain(|user| {
         !user.disabled
             && (query.is_empty()
-                || user.display_name.to_lowercase().contains(&query)
-                || user.username.to_lowercase().contains(&query))
+                || user.display_name.to_lowercase().contains(query)
+                || user.username.to_lowercase().contains(query))
     });
     users.truncate(50);
-    let users = users
+    users
         .into_iter()
         .map(|user| {
             let dept_name = user
@@ -354,7 +350,27 @@ async fn org_contacts(
                 "dept_name": dept_name,
             })
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+async fn org_contacts(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let store = st.store.lock().unwrap();
+    let departments = store.list_departments().map_err(bad)?;
+    let query = q
+        .get("q")
+        .map(|q| q.trim().to_lowercase())
+        .unwrap_or_default();
+    let users = contact_rows(
+        &user.role,
+        &departments,
+        store.list_users().map_err(bad)?,
+        &query,
+    );
     Ok(Json(json!({ "users": users })))
 }
 
@@ -2914,6 +2930,26 @@ struct ShowroomReq {
     published_tag_id: Option<String>,
 }
 
+fn showroom_source_commit(
+    store: &Store,
+    index_id: &str,
+    published_tag_id: Option<&str>,
+) -> SResult<String> {
+    let tag = match published_tag_id {
+        Some(tag_id) => store
+            .list_tags(index_id)?
+            .into_iter()
+            .find(|tag| tag.id == tag_id)
+            .ok_or("发布版本不存在或不属于该索引")?,
+        None => latest_published_tag(store, index_id, "main")?
+            .ok_or("请先发布索引版本，再推送到演示厅")?,
+    };
+    if tag.branch != "main" {
+        return Err("只能推送主分支的发布版本".into());
+    }
+    Ok(store.get_commit(&tag.commit_id)?.id)
+}
+
 async fn submit_showroom(
     State(st): State<St>,
     headers: HeaderMap,
@@ -2933,18 +2969,7 @@ async fn submit_showroom(
     let store = st.store.lock().unwrap();
     let commit_id = match &req.source_index_id {
         Some(iid) => {
-            let tag = match &req.published_tag_id {
-                Some(tag_id) => store
-                    .list_tags(iid)
-                    .map_err(bad)?
-                    .into_iter()
-                    .find(|tag| tag.id == *tag_id)
-                    .ok_or_else(|| bad("发布版本不存在或不属于该索引"))?,
-                None => latest_published_tag(&store, iid, "main")
-                    .map_err(bad)?
-                    .ok_or_else(|| bad("请先发布索引版本，再推送到演示厅"))?,
-            };
-            store.get_commit(&tag.commit_id).map_err(bad)?.id
+            showroom_source_commit(&store, iid, req.published_tag_id.as_deref()).map_err(bad)?
         }
         None => String::new(),
     };
@@ -4608,6 +4633,97 @@ mod discovery_tests {
         assert!(discovery_reply(b"QIMU_DISCOVER_V2", 8730).is_none());
         assert!(discovery_reply(b"", 8730).is_none());
         assert!(discovery_reply(b" QIMU_DISCOVER_V1", 8730).is_none());
+    }
+}
+
+#[cfg(test)]
+mod collaboration_tests {
+    use super::*;
+
+    fn user(id: &str, name: &str, role: &str, disabled: bool) -> UserRec {
+        UserRec {
+            id: id.into(),
+            username: name.into(),
+            display_name: name.into(),
+            dept_id: Some("dept".into()),
+            role: role.into(),
+            disabled,
+        }
+    }
+
+    #[test]
+    fn members_cannot_enumerate_org_contacts() {
+        let departments = vec![DeptRec {
+            id: "dept".into(),
+            name: "技术部".into(),
+            parent_id: None,
+        }];
+        let users = vec![user("u1", "alice", "member", false)];
+        assert!(contact_rows("member", &departments, users, "").is_empty());
+    }
+
+    #[test]
+    fn admins_get_filtered_enabled_contacts() {
+        let departments = vec![DeptRec {
+            id: "dept".into(),
+            name: "技术部".into(),
+            parent_id: None,
+        }];
+        let users = vec![
+            user("u1", "alice", "member", false),
+            user("u2", "bob", "member", true),
+        ];
+        let rows = contact_rows("dept_admin", &departments, users, "ali");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], "u1");
+        assert_eq!(rows[0]["dept_name"], "技术部");
+    }
+
+    struct TestDir(std::path::PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            Self(
+                std::env::temp_dir()
+                    .join(format!("qimu-server-test-{}-{nonce}", std::process::id())),
+            )
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn showroom_rejects_tags_from_non_main_branches() {
+        let dir = TestDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        let group = store.create_group("技术").unwrap();
+        let index = store
+            .create_index("索引", None, &group.id, "admin", "private", Vec::new())
+            .unwrap();
+        let main_tag = store.create_tag(&index.id, "main", "1.0.0").unwrap();
+        store.create_branch(&index.id, "draft", "main").unwrap();
+        let draft_tag = store.create_tag(&index.id, "draft", "1.0.0").unwrap();
+
+        assert_eq!(
+            showroom_source_commit(&store, &index.id, Some(&main_tag.id)).unwrap(),
+            main_tag.commit_id
+        );
+        assert_eq!(
+            showroom_source_commit(&store, &index.id, None).unwrap(),
+            main_tag.commit_id
+        );
+        assert_eq!(
+            showroom_source_commit(&store, &index.id, Some(&draft_tag.id)),
+            Err("只能推送主分支的发布版本".into())
+        );
     }
 }
 
