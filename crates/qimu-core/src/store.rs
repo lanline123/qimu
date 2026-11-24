@@ -1817,6 +1817,14 @@ impl Store {
     const INDEX_COLS: &'static str =
         "id, name, folder_id, group_id, maintainer, lifecycle, scope, created_ms";
 
+    /// Create an index. `folder_id` None means the index's home is
+    /// 未分类 — the system collection of folder-less indexes
+    /// (indexes_tbl.folder_id IS NULL), and it is the default home
+    /// of every new index: the server handler and the client's
+    /// local dispatch both funnel into this function, so the
+    /// default is identical on both paths. Callers pass an explicit
+    /// folder only when the user created the index from inside
+    /// that folder.
     pub fn create_index(
         &self,
         name: &str,
@@ -1973,6 +1981,8 @@ impl Store {
         })
     }
 
+    /// Move an index into a folder; `folder_id` None moves it into
+    /// 未分类 (folder_id set to NULL).
     pub fn move_index_to_folder(&self, id: &str, folder_id: Option<&str>) -> SResult<()> {
         let tx = self.conn.unchecked_transaction().map_err(db_err)?;
         if let Some(folder_id) = folder_id {

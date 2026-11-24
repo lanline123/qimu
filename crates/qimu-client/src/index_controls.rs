@@ -303,15 +303,15 @@ impl App {
                     let mut selected = folder
                         .as_deref()
                         .map(|id| self.folder_name(id))
-                        .unwrap_or_else(|| tr("根目录").into());
+                        .unwrap_or_else(|| tr("未分类").into());
                     if selected.is_empty() {
-                        selected = tr("根目录").into();
+                        selected = tr("未分类").into();
                     }
                     egui::ComboBox::from_id_salt("move-index-folder")
                         .width(240.0)
                         .selected_text(selected)
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(folder, None, tr("根目录"));
+                            ui.selectable_value(folder, None, tr("未分类"));
                             for item in &self.folders {
                                 let id = s(item, "id");
                                 let mut names = vec![s(item, "name")];

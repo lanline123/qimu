@@ -1355,6 +1355,12 @@ impl IndexDetailState {
 struct CreateState {
     new_name: String,
     new_group: String,
+    /// Home folder captured when the create flow was entered:
+    /// Some(id) when a real folder was selected in the index
+    /// sidebar (an explicit choice, which wins); None = the
+    /// default home, 未分类 (the create call sends folder_id
+    /// None and the index lands folder-less).
+    folder: Option<String>,
     /// unit_id, rendition_id, checked
     pick: Vec<(String, String, bool)>,
     /// Set by 取消/创建成功；the dispatcher pops.
@@ -6128,7 +6134,7 @@ impl App {
             _ => {
                 ui.label(egui::RichText::new("公共目录").size(12.0).color(palette_color(TEXT_WEAK)));
                 let mut selected = self.showroom.folder.clone();
-                self.folder_tree(ui, &mut selected);
+                self.folder_tree(ui, &mut selected, false);
                 if selected != self.showroom.folder {
                     self.showroom.stack.pop_to(0);
                     self.showroom.selected_card = None;
@@ -6178,7 +6184,7 @@ impl App {
         });
         ui.add_space(2.0);
         let mut selected = self.content.folder_filter.clone();
-        self.folder_tree(ui, &mut selected);
+        self.folder_tree(ui, &mut selected, false);
         if self.content.folder_filter != selected
             && self.pick.is_none()
             && self.content.stack.depth() > 1
@@ -6192,12 +6198,15 @@ impl App {
         let (in_detail, mut selected) = match self.index.stack.top() {
             IndexFrame::Detail(detail) => {
                 let folder = self.index_folder_of(&detail.index_id);
-                (true, (!folder.is_empty()).then_some(folder))
+                // A folder-less index's home is 未分类: keep the
+                // Some("") sentinel so the tree highlights the
+                // 未分类 node rather than 全部.
+                (true, Some(folder))
             }
             _ => (false, self.index.overview_folder.clone()),
         };
         let previous = selected.clone();
-        self.folder_tree(ui, &mut selected);
+        self.folder_tree(ui, &mut selected, true);
         if in_detail && selected != previous {
             self.index.stack.pop_to(0);
         }
@@ -11850,7 +11859,7 @@ impl App {
     /// lives in the selected folder. `selected` None = 全部. Folder rows
     /// carry a right-click menu （新建子文件夹 / 新建文件夹 / 重命名 / 删除）;
     /// right-clicking the blank area below the tree offers 新建文件夹.
-    fn folder_tree(&mut self, ui: &mut egui::Ui, selected: &mut Option<String>) {
+    fn folder_tree(&mut self, ui: &mut egui::Ui, selected: &mut Option<String>, uncat: bool) {
         ui.spacing_mut().item_spacing.y = 2.0;
         enum Act {
             NewChild(String),
@@ -11867,6 +11876,23 @@ impl App {
         if matches!(&self.folder_edit, Some(e) if e.target.is_none() && e.parent.is_none()) {
             self.folder_edit_row(ui, 0.0);
             ui.add_space(2.0);
+        }
+        // Index page only (uncat): 未分类, the home of every index
+        // whose folder_id is NULL — where every new index lands by
+        // default. It is a filter sentinel (selected == Some("")),
+        // not a folder row: it sits with 全部 above the user's own
+        // folders, carries the folder icon like its neighbours, and
+        // has no context menu, so it cannot be renamed or deleted.
+        if uncat {
+            let uncat_sel = selected.as_deref() == Some("");
+            let uncat_icon = if uncat_sel {
+                ChromeIcon::FolderOpen
+            } else {
+                ChromeIcon::Folder
+            };
+            if tree_row(ui, uncat_sel, 0.0, Some(uncat_icon), "未分类", 12.5).clicked() {
+                *selected = Some(String::new());
+            }
         }
         let mut folders = self.folders.clone();
         folders.sort_by_key(|f| i(f, "sort"));
@@ -13651,6 +13677,8 @@ impl App {
     }
 
     /// Does an item whose home is `folder_id` pass the folder filter?
+    /// The filter Some("") is the index page's 未分类 node: it
+    /// matches exactly the items whose folder_id is empty (NULL).
     fn folder_filter_ok(&self, filter: &Option<String>, folder_id: &str) -> bool {
         match filter {
             None => true,
@@ -13688,8 +13716,18 @@ impl App {
             .first()
             .map(|g| s(g, "id"))
             .unwrap_or_default();
+        // Folder context, captured at entry: a real folder selected
+        // in the index sidebar is an explicit choice and becomes
+        // the new index's home; 全部 / 未分类 (None / Some(""))
+        // fall through to None — the default home, 未分类.
+        let folder = self
+            .index
+            .overview_folder
+            .clone()
+            .filter(|f| !f.is_empty());
         self.index.stack.push(IndexFrame::Create(CreateState {
             new_group,
+            folder,
             pick,
             ..Default::default()
         }));
@@ -13820,6 +13858,7 @@ impl App {
         let filter = self.index.overview_folder.clone();
         let title = match &filter {
             None => "全部索引".to_string(),
+            Some(fid) if fid.is_empty() => "未分类".to_string(),
             Some(fid) => self
                 .folders
                 .iter()
@@ -13995,6 +14034,7 @@ impl App {
                         Some(json!({
                             "name": st.new_name,
                             "group_id": st.new_group,
+                            "folder_id": st.folder,
                             "scope": "company",
                             "entries": entries,
                         })),
