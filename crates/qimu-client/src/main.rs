@@ -3553,6 +3553,12 @@ impl App {
                 };
                 self.active = Some(idx);
                 self.persist_conns();
+                // A fresh identity was just established: reset the
+                // account context before loading this account's
+                // surfaces, so nothing of a previous identity
+                // (another user, another server, a guest session)
+                // survives the login.
+                self.clear_account_state();
                 self.refresh_all();
                 self.check_lan_update(false);
             }
@@ -3669,9 +3675,11 @@ impl App {
             self.clear_account_state();
         }
         self.active = Some(i);
-        if let Some(user) = self.validate_conn(i) {
-            self.user = Some(user);
-        }
+        // The validated identity replaces whatever was there —
+        // unconditionally: a failed validation (or an anonymous
+        // connection, which validates to None) must never leave
+        // the previous account's user object on screen.
+        self.user = self.validate_conn(i);
         self.sync_from_active();
         self.persist_conns();
         if self.conns[i].status == ConnStatus::Connected {
@@ -4076,17 +4084,51 @@ impl App {
         }
     }
 
-    /// Drop every server-scoped list tied to the previous identity.
+    /// Account-context reset — THE single point every identity
+    /// change routes through (activate, do_login, logout,
+    /// disconnect_conn, anonymous entry, active-server deletion).
+    /// Boundary (local-first): everything the *organization*
+    /// surface fed is dropped — the org tree and org settings,
+    /// showroom and review data, team / inbox / library lists,
+    /// the share / pull / push dialogs, server-derived caches.
+    /// Everything the *local library* owns is NOT touched: the
+    /// working lists while it is open, the offline cache, the
+    /// PPT clipboard, the trash — local content belongs to this
+    /// machine, not to whichever account happens to be active.
+    /// Only in the REST-fallback mode (the local library failed
+    /// to open, so the working lists are server-fed) do the
+    /// working lists clear here too.
     fn clear_account_state(&mut self) {
+        // Credential drafts typed for the previous context.
+        self.password.clear();
+        self.add_pass.clear();
+        // Settings: org-fed sections and org admin form drafts
+        // (the section navigation position itself is kept).
         self.settings.profile.clear();
-        self.folders.clear();
-        self.groups.clear();
-        self.units.clear();
-        self.indexes.clear();
-        self.index.stack = NavStack::new(IndexFrame::Overview(OverviewState::default()));
-        self.index.overview_folder = None;
-        self.workspace_controls = WorkspaceControls::default();
+        self.settings.company.clear();
+        self.settings.languages_text.clear();
+        self.settings.glossary_text.clear();
+        self.settings.ai_provider.clear();
+        self.settings.ai_endpoint.clear();
+        self.settings.ai_model.clear();
+        self.settings.ai_key.clear();
+        self.settings.ai_has_key = false;
+        self.settings.ai_loaded = false;
+        self.settings.dept_name.clear();
+        self.settings.user_name.clear();
+        self.settings.user_display.clear();
+        self.settings.user_password.clear();
+        self.settings.group_name.clear();
+        self.settings.grant_group.clear();
+        self.settings.grant_subject_type.clear();
+        self.settings.grant_subject_id.clear();
+        self.settings.grant_capability.clear();
+        // Org data proper.
         self.org = json!({});
+        self.grants.clear();
+        self.cache_policy = json!({ "allowed": true, "max_mb": 500 });
+        self.ai_status = None;
+        self.lang_options.clear();
         self.showroom_live.clear();
         self.showroom_pending.clear();
         self.submissions_pending.clear();
@@ -4097,11 +4139,44 @@ impl App {
         self.group_spaces.clear();
         self.my_teams.clear();
         self.library_refs.clear();
+        self.new_team_name.clear();
+        self.team_member_pick.clear();
+        self.my_id.clear();
+        // Review face: processed records and any open detail
+        // frame (its deck is an org submission's source index).
+        self.review = ReviewState::new();
+        // Dialogs and previews carrying org content.
+        self.share_dialog = None;
+        self.pull_dialog = None;
+        self.push_dialog = None;
+        self.pdf_view = None;
+        // The DeckInfo overlay snapshots an org showroom item;
+        // other overlays are local work (page editor) and stay.
+        self.overlays.retain(|o| !matches!(o, Overlay::DeckInfo(_)));
+        // Showroom navigation: back to the wall, no stale
+        // selection of the previous account's items.
+        self.showroom.stack.pop_to(0);
+        self.showroom.selected_card = None;
+        self.showroom.group_id = None;
+        self.showroom.folder = None;
+        // Derived caches (refetched / rebuilt on next refresh).
         self.index_covers.clear();
         self.index_tags.clear();
         self.index_search_tags.clear();
-        self.showroom.stack.pop_to(0);
-        self.my_id.clear();
+        self.att_cache.clear();
+        // Navigation hygiene for the index and workspace faces
+        // (view state only — the data itself is local, below).
+        self.index.stack = NavStack::new(IndexFrame::Overview(OverviewState::default()));
+        self.index.overview_folder = None;
+        self.workspace_controls = WorkspaceControls::default();
+        // Working lists: local-library property while it is open
+        // (refresh_local owns them); server-fed in the fallback.
+        if self.local.is_none() {
+            self.folders.clear();
+            self.groups.clear();
+            self.units.clear();
+            self.indexes.clear();
+        }
     }
 
     /// Refresh dispatcher (local-first P0/P4): working data
@@ -15330,26 +15405,29 @@ impl App {
                 "disconnect" => self.disconnect_conn(i),
                 "delete" => {
                     if i < self.conns.len() {
+                        let was_active = self.active == Some(i);
                         self.conns.remove(i);
-                        match self.active {
-                            Some(a) if a == i => {
-                                self.active = (0..self.conns.len())
-                                    .find(|&j| self.conns[j].status == ConnStatus::Connected);
-                                self.sync_from_active();
-                                if matches!(
-                                    self.active.and_then(|a| self.conns.get(a)),
-                                    Some(c) if c.status == ConnStatus::Connected
-                                ) {
-                                    self.refresh_all();
-                                } else {
-                                    self.user = None;
-                                    if self.anon_active() {
-                                        self.refresh_guest();
-                                    }
-                                }
+                        if was_active {
+                            // The active identity's server is gone:
+                            // reset the account context (the old code
+                            // kept the deleted server's user object
+                            // and every org surface on screen), then
+                            // re-enter through the first still-connected
+                            // saved server, if any — activate()
+                            // revalidates it and loads that account.
+                            self.active = None;
+                            self.user = None;
+                            self.token = None;
+                            self.clear_account_state();
+                            if let Some(j) = (0..self.conns.len())
+                                .find(|&j| self.conns[j].status == ConnStatus::Connected)
+                            {
+                                self.activate(j);
                             }
-                            Some(a) if a > i => self.active = Some(a - 1),
-                            _ => {}
+                        } else if let Some(a) = self.active {
+                            if a > i {
+                                self.active = Some(a - 1);
+                            }
                         }
                         self.persist_conns();
                         self.msg = "已删除该服务器".into();
