@@ -13,6 +13,7 @@ mod page_editor;
 
 use page_editor::*;
 mod workspace_controls;
+mod local_store;
 
 use chrome_icons::{ChromeIcon, ChromeIcons};
 use index_controls::{IndexMoreAction, IndexOverviewControls, IndexScope};
@@ -2513,6 +2514,11 @@ struct App {
     login_open: bool,
     /// About dialog visibility.
     about_open: bool,
+    /// Local-first foundation (P0): the in-process local library,
+    /// opened in App::new before any connection restore when the
+    /// QIMU_LOCAL_FIRST gray switch is on; None on the legacy path,
+    /// where behavior is unchanged.
+    local: Option<local_store::LocalStore>,
 }
 
 enum ThumbState {
@@ -2995,6 +3001,11 @@ impl App {
         init_i18n();
         apply_modern_style(&cc.egui_ctx);
         migrate_cache_dir_once();
+        // Local-first P0: open the in-process local library before
+        // any connection is restored — its availability must not
+        // depend on the connection state machine. No-op (None)
+        // unless the QIMU_LOCAL_FIRST gray switch is on.
+        let local = local_store::LocalStore::open_if_enabled();
         let (thumb_tx, thumb_rx) = std::sync::mpsc::channel();
         let (pdf_tx, pdf_rx) = std::sync::mpsc::channel();
         let (upd_tx, upd_rx) = std::sync::mpsc::channel();
@@ -3093,6 +3104,7 @@ impl App {
             dc_auto_quit: load_dc_auto_quit(),
             login_open: false,
             about_open: false,
+            local,
         };
         if std::env::var("QIMU_AUTOLOGIN").is_ok() && !app.password.is_empty() {
             app.do_login();
@@ -3449,6 +3461,15 @@ impl App {
     fn restore_connections(&mut self) {
         self.conns = load_conns();
         if self.conns.is_empty() {
+            if self.local.is_some() {
+                // Local-first gray mode: the working library lives in
+                // this process. Do not spawn the bundled server
+                // against the same data root (design §8.1 dual-open
+                // guard); organization surfaces stay empty until the
+                // user adds a server.
+                self.refresh_all();
+                return;
+            }
             self.autostart_local_server();
             if !self.try_adopt_local_owner() {
                 self.refresh_guest();
@@ -3812,7 +3833,139 @@ impl App {
         self.my_id.clear();
     }
 
+    /// Refresh dispatcher (local-first P0): with the gray switch on,
+    /// working data (folders/groups/units/indexes) is fed by the
+    /// in-process local library and only the organization surfaces go
+    /// over REST; with it off, the legacy all-REST refresh runs
+    /// verbatim (refresh_all_rest below).
     fn refresh_all(&mut self) {
+        if self.local.is_some() {
+            self.refresh_local();
+            self.refresh_org();
+        } else {
+            self.refresh_all_rest();
+        }
+    }
+
+    /// Working data from the local library (P0 skeleton: the read
+    /// side; P1 moves the write paths onto the same store). The
+    /// per-index detail pass (covers/tags) still belongs to the REST
+    /// path in this phase.
+    fn refresh_local(&mut self) {
+        let Some(local) = &self.local else {
+            return;
+        };
+        self.folders = local.list_folders();
+        self.groups = local.list_groups();
+        self.units = local.list_units();
+        if let IndexFrame::Overview(overview) = self.index.stack.root_mut() {
+            overview.graphs = None;
+        }
+        self.indexes = local.list_indexes();
+    }
+
+    /// Organization surfaces over REST: the org-facing half of the
+    /// legacy refresh (same calls, same order) — org tree, showroom,
+    /// assemblies, cache policy, inbox, group spaces, teams, library,
+    /// profile/company/languages/AI status.
+    fn refresh_org(&mut self) {
+        if let Ok(v) = self.call("GET", "/v1/org", None) {
+            self.org = v;
+        }
+        if let Ok(v) = self.call("GET", "/v1/showroom?state=live", None) {
+            self.showroom_live = v.get("items").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+            self.index_covers.retain(|_, v| !v.is_empty());
+            self.resolve_showroom_covers();
+        }
+        if let Ok(v) = self.call("GET", "/v1/showroom?state=pending", None) {
+            self.showroom_pending = v.get("items").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+        }
+        if let Ok(v) = self.call("GET", "/v1/assemblies", None) {
+            self.my_assemblies = v
+                .get("assemblies")
+                .and_then(|f| f.as_array())
+                .cloned()
+                .unwrap_or_default();
+        }
+        if let Ok(v) = self.call("GET", "/v1/settings/cache-policy", None) {
+            self.cache_policy = v;
+        }
+        if let Ok(v) = self.call("GET", "/v1/shares/inbox", None) {
+            self.inbox = v.get("shares").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+        }
+        if let Ok(v) = self.call("GET", "/v1/group-space", None) {
+            self.group_spaces = v.get("spaces").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+        }
+        if let Ok(v) = self.call("GET", "/v1/custom-groups", None) {
+            self.my_teams = v.get("groups").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+        }
+        if let Ok(v) = self.call("GET", "/v1/library", None) {
+            self.library_refs = v.get("entries").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+        }
+        self.cache_entries = load_cache_index();
+        if let Ok(v) = self.call("GET", "/v1/me", None) {
+            if let Some(u) = v.get("user") {
+                self.my_id = s(u, "id");
+            }
+            if let Some(p) = v.get("profile").and_then(|p| p.as_object()) {
+                self.settings.profile = p
+                    .iter()
+                    .map(|(k, val)| (k.clone(), val.as_str().unwrap_or("").to_string()))
+                    .collect();
+            }
+        }
+        if let Ok(v) = self.call("GET", "/v1/company-profile", None) {
+            if let Some(p) = v.get("fields").and_then(|p| p.as_object()) {
+                self.settings.company = p
+                    .iter()
+                    .map(|(k, val)| (k.clone(), val.as_str().unwrap_or("").to_string()))
+                    .collect();
+            }
+        }
+        if let Ok(v) = self.call("GET", "/v1/settings/languages", None) {
+            if let Some(l) = v.get("languages").and_then(|p| p.as_array()) {
+                self.settings.languages_text = l
+                    .iter()
+                    .filter_map(|x| x.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let codes: Vec<String> = v
+                    .get("codes")
+                    .and_then(|p| p.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !codes.is_empty() {
+                    self.lang_options = codes
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, code)| {
+                            let label = l
+                                .get(idx)
+                                .and_then(|x| x.as_str())
+                                .unwrap_or(code.as_str())
+                                .to_string();
+                            (code.clone(), label)
+                        })
+                        .collect();
+                }
+            }
+        }
+        if let Ok(v) = self.call("GET", "/v1/ai/status", None) {
+            self.ai_status = Some(v);
+        }
+        if self.content.import_group.is_empty() {
+            if let Some(g) = self.groups.first() {
+                self.content.import_group =
+                    g.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            }
+        }
+    }
+
+    fn refresh_all_rest(&mut self) {
         if let Ok(v) = self.call("GET", "/v1/folders", None) {
             self.folders = v.get("folders").and_then(|f| f.as_array()).cloned().unwrap_or_default();
         }
@@ -13503,6 +13656,40 @@ impl App {
                 self.msg = "缓存路径已恢复默认".into();
             }
         });
+        ui.add_space(12.0);
+        ui.label(
+            egui::RichText::new("本地库（本地优先 · 灰度诊断）")
+                .strong()
+                .size(13.0)
+                .color(palette_color(TEXT_MAIN)),
+        );
+        ui.add_space(4.0);
+        let local_diag = match &self.local {
+            Some(local) => {
+                let (units, folders, indexes) = local.counts();
+                format!(
+                    "已启用：{} · 所有者 {} · 内容块 {} · 目录 {} · 索引 {}",
+                    local.root.display(),
+                    local.owner.display_name,
+                    units,
+                    folders,
+                    indexes
+                )
+            }
+            None if local_store::local_first_enabled() => format!(
+                "开关已开，但本地库打开失败（原因见控制台日志）；库根解析为 {}",
+                local_store::library_dir().display()
+            ),
+            None => format!(
+                "未启用（环境变量 QIMU_LOCAL_FIRST 未开）；库根将解析为 {}",
+                local_store::library_dir().display()
+            ),
+        };
+        ui.label(
+            egui::RichText::new(local_diag)
+                .size(11.5)
+                .color(palette_color(TEXT_WEAK)),
+        );
     }
 
     /// Settings nav frame body: the section list, unchanged.
