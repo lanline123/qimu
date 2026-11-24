@@ -49,6 +49,9 @@ Section "启幕客户端" SEC_CLIENT
   SetOutPath "$INSTDIR"
   File "win/qimu-client.exe"
   File "win/qimu.exe"
+  ; DeckCraft 桌面应用 (present handoff stage 0): 演示厅三视图的
+  ; 呈现/放映引擎, 客户端经控制通道调用; 与 qimu-client.exe 同目录。
+  File "win/deckcraft.exe"
   File "win/使用说明.txt"
   File "win/qimu.ico"
   ; 随包字体 (craft-fonts 简中+拉丁清单, CI 逐文件校验 SHA-256 后暂存到
@@ -84,6 +87,7 @@ Section "Uninstall"
   RMDir "$SMPROGRAMS\启幕"
   Delete "$INSTDIR\qimu-client.exe"
   Delete "$INSTDIR\qimu.exe"
+  Delete "$INSTDIR\deckcraft.exe"
   Delete "$INSTDIR\使用说明.txt"
   Delete "$INSTDIR\qimu.ico"
   RMDir /r "$INSTDIR\fonts"

@@ -805,6 +805,247 @@ fn spawn_open(path: &std::path::Path) -> std::io::Result<std::process::Child> {
     }
 }
 
+// ================= DeckCraft handoff (present migration) ===============
+// Design: ~/workspace/qimu-present-handoff/DESIGN.md. The showroom
+// drill-down's three consumption views (play, reading, presenter)
+// run in the DeckCraft desktop app; qimu only exports the deck
+// (with notes), jumps, and takes the return. The control channel is
+// DeckCraft's documented JSON-lines protocol (docs/control-protocol.md):
+// one request object per line, one reply per line, `ok` + `result`/`error`.
+
+/// Which DeckCraft view a jump asks for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DcMode {
+    /// Full-screen slide show (`show.start {reading: false}`).
+    Play,
+    /// Windowed reading view (`show.start {reading: true}`).
+    Reading,
+    /// Full-screen show + presenter window (`show.presenter {on: true}`).
+    Presenter,
+}
+
+/// Events the DeckCraft watcher thread reports back to the UI thread.
+enum DcEvent {
+    /// The show was observed running and then ended.
+    ShowEnded,
+    /// The control channel is dead (instance closed or crashed).
+    Gone,
+}
+
+/// The managed DeckCraft instance (one per client, never the user's
+/// own DeckCraft if they run one separately).
+struct DcSession {
+    child: std::process::Child,
+    port: u16,
+    /// DeckCraft's presenter_view flag before our jump, restored on
+    /// the auto-quit return path (it is a persisted DeckCraft
+    /// preference; our jump must not leak into the user's own use).
+    presenter_before: Option<bool>,
+    /// The disposable copy handed to DeckCraft for this jump.
+    file: std::path::PathBuf,
+    auto_quit: bool,
+}
+
+/// Locate the DeckCraft desktop app: $QIMU_DECKCRAFT_APP, then a
+/// deckcraft executable next to this client, then PATH. This mirrors
+/// the server's deckcraft-cli convention (deckcraft_cli_bin).
+fn deckcraft_app_path() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("QIMU_DECKCRAFT_APP") {
+        if !p.is_empty() {
+            return Some(std::path::PathBuf::from(p));
+        }
+    }
+    let name = format!("deckcraft{}", std::env::consts::EXE_SUFFIX);
+    if let Ok(exe) = std::env::current_exe() {
+        let p = exe.with_file_name(&name);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    if let Ok(paths) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let p = dir.join(&name);
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// Free loopback port for a fresh DeckCraft control channel.
+fn dc_free_port() -> Option<u16> {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .ok()
+        .and_then(|l| l.local_addr().ok())
+        .map(|a| a.port())
+}
+
+/// Content stamp for disposable present copies: FNV-1a of the deck
+/// bytes, 8 hex chars. The export response carries no commit id, so
+/// the stamp stands in for the design's "{commit 短戳}" — the name
+/// changes exactly when the content does.
+fn dc_content_stamp(bytes: &[u8]) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{:08x}", (h ^ (h >> 32)) as u32)
+}
+
+/// The auto-quit preference: present.json beside servers.json in
+/// qimu_home(); default true (a finished show closes DeckCraft and
+/// hands the user back to the deck frame they left).
+fn load_dc_auto_quit() -> bool {
+    std::fs::read_to_string(qimu_home().join("present.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| v.get("auto_quit").and_then(|x| x.as_bool()))
+        .unwrap_or(true)
+}
+
+fn save_dc_auto_quit(on: bool) {
+    let dir = qimu_home();
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(
+        dir.join("present.json"),
+        serde_json::to_string(&json!({ "auto_quit": on })).unwrap_or_default(),
+    );
+}
+
+/// One JSON-lines control connection to a DeckCraft instance.
+struct DcControl {
+    reader: std::io::BufReader<std::net::TcpStream>,
+    writer: std::net::TcpStream,
+    next_id: u64,
+}
+
+impl DcControl {
+    fn connect(port: u16) -> std::io::Result<DcControl> {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let stream = std::net::TcpStream::connect_timeout(
+            &addr,
+            std::time::Duration::from_millis(600),
+        )?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(3)))?;
+        stream.set_write_timeout(Some(std::time::Duration::from_secs(3)))?;
+        let _ = stream.set_nodelay(true);
+        let writer = stream.try_clone()?;
+        Ok(DcControl {
+            reader: std::io::BufReader::new(stream),
+            writer,
+            next_id: 0,
+        })
+    }
+
+    /// Send one request and wait for the reply with the same id.
+    /// Non-matching lines are skipped (the protocol keeps one reply
+    /// per request; nothing unsolicited is expected).
+    fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        use std::io::{BufRead, Write};
+        self.next_id += 1;
+        let id = self.next_id;
+        let req = json!({ "id": id, "method": method, "params": params });
+        let mut line = serde_json::to_string(&req).map_err(|e| e.to_string())?;
+        line.push('\n');
+        self.writer
+            .write_all(line.as_bytes())
+            .map_err(|e| format!("控制通道写入失败：{e}"))?;
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            let n = self
+                .reader
+                .read_line(&mut buf)
+                .map_err(|e| format!("控制通道读取失败：{e}"))?;
+            if n == 0 {
+                return Err("控制通道已断开".into());
+            }
+            let v: Value = match serde_json::from_str(&buf) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if v.get("id").and_then(|x| x.as_i64()) != Some(id as i64) {
+                continue;
+            }
+            return match v.get("ok").and_then(|x| x.as_bool()) {
+                Some(true) => Ok(v.get("result").cloned().unwrap_or(Value::Null)),
+                _ => Err(v
+                    .get("error")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("控制命令被拒绝")
+                    .to_string()),
+            };
+        }
+    }
+}
+
+/// Wait for a freshly launched DeckCraft to answer `ui.inspect` on
+/// its control port (bounded ~12s). Returns the connection plus the
+/// first inspect payload.
+fn dc_wait_ready(port: u16) -> Option<(DcControl, Value)> {
+    for _ in 0..48 {
+        if let Ok(mut ctl) = DcControl::connect(port) {
+            if let Ok(v) = ctl.call("ui.inspect", json!({})) {
+                return Some((ctl, v));
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    None
+}
+
+/// Watcher thread (auto-quit sessions only): polls `ui.inspect`
+/// every ~1.2s. Once a show has been seen running, its end is
+/// reported exactly once; five consecutive channel failures mean
+/// the instance is gone. The generation counter kills watchers from
+/// superseded sessions.
+fn dc_watch(
+    port: u16,
+    gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    my_gen: u64,
+    tx: std::sync::mpsc::Sender<DcEvent>,
+) {
+    let mut ctl: Option<DcControl> = None;
+    let mut seen_showing = false;
+    let mut sent_end = false;
+    let mut errors = 0usize;
+    loop {
+        if gen.load(std::sync::atomic::Ordering::SeqCst) != my_gen {
+            return;
+        }
+        if ctl.is_none() {
+            ctl = DcControl::connect(port).ok();
+        }
+        let res = match &mut ctl {
+            Some(c) => c.call("ui.inspect", json!({})),
+            None => Err("connect".into()),
+        };
+        match res {
+            Ok(v) => {
+                errors = 0;
+                let showing = v.get("showing").map(|s| !s.is_null()).unwrap_or(false);
+                if showing {
+                    seen_showing = true;
+                } else if seen_showing && !sent_end {
+                    sent_end = true;
+                    let _ = tx.send(DcEvent::ShowEnded);
+                }
+            }
+            Err(_) => {
+                ctl = None;
+                errors += 1;
+                if errors >= 5 {
+                    let _ = tx.send(DcEvent::Gone);
+                    return;
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+    }
+}
+
 fn save_cache_index(entries: &[Value]) {
     let dir = cache_dir();
     let _ = std::fs::create_dir_all(&dir);
@@ -2254,6 +2495,14 @@ struct App {
     /// (code, label) target-language options from the server's
     /// languages setting; codes are what renditions store.
     lang_options: Vec<(String, String)>,
+    /// DeckCraft handoff (present migration): the managed DeckCraft
+    /// desktop instance, its watcher channel and generation counter,
+    /// and the auto-quit preference (persisted in present.json).
+    dc: Option<DcSession>,
+    dc_tx: std::sync::mpsc::Sender<DcEvent>,
+    dc_rx: std::sync::mpsc::Receiver<DcEvent>,
+    dc_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    dc_auto_quit: bool,
     /// Toast state (the framework has no status bar): the message
     /// currently floating and when it appeared, in egui time.
     workspace_controls: WorkspaceControls,
@@ -2827,6 +3076,7 @@ impl App {
         let (pdf_tx, pdf_rx) = std::sync::mpsc::channel();
         let (upd_tx, upd_rx) = std::sync::mpsc::channel();
         let (translate_tx, translate_rx) = std::sync::mpsc::channel();
+        let (dc_tx, dc_rx) = std::sync::mpsc::channel();
         let mut app = App {
             server: std::env::var("QIMU_SERVER").unwrap_or_else(|_| "http://127.0.0.1:8730".into()),
             username: std::env::var("QIMU_USERNAME").unwrap_or_else(|_| "admin".into()),
@@ -2912,6 +3162,11 @@ impl App {
             workspace_controls: WorkspaceControls::default(),
             toast_msg: String::new(),
             toast_since: 0.0,
+            dc: None,
+            dc_tx,
+            dc_rx,
+            dc_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            dc_auto_quit: load_dc_auto_quit(),
             login_open: false,
             about_open: false,
         };
@@ -6135,6 +6390,12 @@ impl eframe::App for App {
             }
             ctx.request_repaint();
         }
+        // DeckCraft handoff: watcher events (show ended /
+        // instance gone) and child-exit bookkeeping.
+        self.dc_poll();
+        if self.dc.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        }
         // Self-screenshot mode for headless verification (QIMU_SCREENSHOT).
         // egui 0.37 delivers screenshots to a callback instead of an
         // input event; request at frame 240, close a few frames later
@@ -6453,6 +6714,12 @@ impl App {
         } else {
             stored
         };
+        // Local decks jump into DeckCraft when it is available
+        // (offline presenting is a handoff capability gain); the
+        // system app stays as the fallback.
+        if self.present_local_via_deckcraft(&path, &s(&e, "title")) {
+            return;
+        }
         let r = if cfg!(target_os = "windows") {
             std::process::Command::new("cmd")
                 .args(["/C", "start", ""])
@@ -6469,36 +6736,300 @@ impl App {
         };
     }
 
-    /// 开始演示 (§3.17/场景 38): materialize the deck and open it in the
-    /// system presentation app. (DeckCraft fullscreen takes over here
-    /// once it is deployed on the machine.)
-    fn present_showroom(&mut self, item_id: &str, title: &str) {
-        match self.call(
+    /// Materialize a showroom deck for a DeckCraft jump (or for the
+    /// system-app path): the export always carries the speaker
+    /// scripts as PPTX notes (`include_notes`) — without them the
+    /// DeckCraft presenter view has an empty notes pane (the design's
+    /// §1.5 finding: the pre-handoff client never sent this flag, so
+    /// exported decks had no notes). The file is a disposable copy
+    /// under ~/.qimu/present/, named by item id + a content stamp so
+    /// a same-title re-export never reads back a stale deck; older
+    /// copies in the directory are swept (best effort — a copy still
+    /// open in DeckCraft simply fails to delete on Windows).
+    fn export_for_present(&mut self, item_id: &str) -> Result<(std::path::PathBuf, i64), String> {
+        let v = self.call(
             "POST",
             &format!("/v1/showroom/{item_id}/export"),
-            Some(json!({ "kind": "personal" })),
-        ) {
-            Ok(v) => {
-                if let Some(data) = v.get("data_base64").and_then(|x| x.as_str()) {
-                    if let Ok(bytes) = b64d(data) {
-                        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-                        let dir = std::path::Path::new(&home).join(".qimu").join("present");
-                        let _ = std::fs::create_dir_all(&dir);
-                        let path = dir.join(format!("{title}.pptx"));
-                        match std::fs::write(&path, bytes) {
-                            Ok(_) => match spawn_open(&path) {
-                                Ok(_) => {
-                                    self.msg = format!("已打开演示：{title}（系统默认演示应用）")
-                                }
-                                Err(e) => {
-                                    self.msg = format!("演示文件已生成（{}），打开失败：{e}", path.display())
-                                }
-                            },
-                            Err(e) => self.msg = format!("生成演示文件失败：{e}"),
+            Some(json!({ "kind": "personal", "include_notes": true })),
+        )?;
+        let data = v
+            .get("data_base64")
+            .and_then(|x| x.as_str())
+            .ok_or("导出响应缺少稿件数据")?;
+        let bytes = b64d(data)?;
+        let page_count = i(&v, "page_count");
+        let dir = qimu_home().join("present");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let path = dir.join(format!("{item_id}-{}.pptx", dc_content_stamp(&bytes)));
+        std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p != path && p.extension().map(|x| x == "pptx").unwrap_or(false) {
+                    let _ = std::fs::remove_file(p);
+                }
+            }
+        }
+        Ok((path, page_count))
+    }
+
+    /// Jump a showroom item into DeckCraft (present handoff stages
+    /// 1–2). Returns false only when no DeckCraft desktop app is
+    /// available on this machine — the caller then falls back to the
+    /// pre-handoff path. Export failures are reported here and count
+    /// as handled: permission refusals arrive as export errors, so a
+    /// refused item never jumps (contract §2.2).
+    fn present_via_deckcraft(
+        &mut self,
+        item_id: &str,
+        title: &str,
+        mode: DcMode,
+        from: usize,
+    ) -> bool {
+        if deckcraft_app_path().is_none() {
+            return false;
+        }
+        match self.export_for_present(item_id) {
+            Ok((path, page_count)) => {
+                let from = if page_count > 0 {
+                    from.min(page_count as usize - 1)
+                } else {
+                    0
+                };
+                self.dc_jump(&path, title, mode, from);
+                true
+            }
+            Err(e) => {
+                self.msg = format!("演示失败：{e}");
+                true
+            }
+        }
+    }
+
+    /// Jump an already-local deck file into DeckCraft (offline
+    /// cached decks). Same availability contract as above.
+    fn present_local_via_deckcraft(&mut self, path: &std::path::Path, title: &str) -> bool {
+        if deckcraft_app_path().is_none() {
+            return false;
+        }
+        self.dc_jump(path, title, DcMode::Play, 0);
+        true
+    }
+
+    /// Orchestrate one jump into the managed DeckCraft instance
+    /// (design §2.3): reuse the instance when its control channel
+    /// answers, otherwise launch it with `--control` on a free port;
+    /// if the channel never comes up, degrade to a plain
+    /// `deckcraft --show` launch and say so. The jump sequence is
+    /// `app.open` → presenter flag for this mode → `show.start` →
+    /// `ui.focus`; the presenter flag is set explicitly every jump
+    /// because it is a persisted DeckCraft preference.
+    fn dc_jump(&mut self, path: &std::path::Path, title: &str, mode: DcMode, from: usize) {
+        let Some(bin) = deckcraft_app_path() else {
+            self.msg = "未找到 DeckCraft 桌面应用".into();
+            return;
+        };
+        // Reuse probe: a fresh connection + inspect on the managed port.
+        let mut live: Option<(DcControl, Value)> = None;
+        if let Some(sess) = &mut self.dc {
+            if let Ok(mut ctl) = DcControl::connect(sess.port) {
+                if let Ok(v) = ctl.call("ui.inspect", json!({})) {
+                    if sess.presenter_before.is_none() {
+                        sess.presenter_before = v
+                            .get("ui")
+                            .and_then(|u| u.get("presenter_view"))
+                            .and_then(|x| x.as_bool());
+                    }
+                    sess.file = path.to_path_buf();
+                    sess.auto_quit = self.dc_auto_quit;
+                    live = Some((ctl, v));
+                }
+            }
+            if live.is_none() {
+                self.dc_forget(false);
+            }
+        }
+        if live.is_none() {
+            let Some(port) = dc_free_port() else {
+                self.msg = "无法分配本地控制端口".into();
+                return;
+            };
+            let child = match std::process::Command::new(&bin)
+                .arg("--control")
+                .arg(port.to_string())
+                .spawn()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    self.msg = format!("无法启动 DeckCraft：{e}");
+                    return;
+                }
+            };
+            match dc_wait_ready(port) {
+                Some((ctl, v)) => {
+                    let presenter_before = v
+                        .get("ui")
+                        .and_then(|u| u.get("presenter_view"))
+                        .and_then(|x| x.as_bool());
+                    self.dc = Some(DcSession {
+                        child,
+                        port,
+                        presenter_before,
+                        file: path.to_path_buf(),
+                        auto_quit: self.dc_auto_quit,
+                    });
+                    live = Some((ctl, v));
+                }
+                None => {
+                    // The channel never answered (e.g. the port was
+                    // taken and DeckCraft only logged the failed
+                    // bind): drop our instance and degrade to the
+                    // plain command-line show.
+                    let mut child = child;
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    match std::process::Command::new(&bin)
+                        .arg("--show")
+                        .arg(path)
+                        .spawn()
+                    {
+                        Ok(_) => {
+                            self.msg =
+                                "已以降级模式在 DeckCraft 打开演示（控制通道不可用）".into()
                         }
+                        Err(e) => self.msg = format!("无法启动 DeckCraft：{e}"),
+                    }
+                    return;
+                }
+            }
+        }
+        let (mut ctl, _inspect) = live.unwrap();
+        let port = self.dc.as_ref().map(|s| s.port).unwrap_or(0);
+        let run = (|| -> Result<(), String> {
+            ctl.call("app.open", json!({ "path": path.to_string_lossy().into_owned() }))?;
+            match mode {
+                DcMode::Play => {
+                    ctl.call(
+                        "command",
+                        json!({ "command": "show.presenter", "params": { "on": false } }),
+                    )?;
+                }
+                DcMode::Presenter => {
+                    ctl.call(
+                        "command",
+                        json!({ "command": "show.presenter", "params": { "on": true } }),
+                    )?;
+                }
+                DcMode::Reading => {}
+            }
+            ctl.call(
+                "show.start",
+                json!({ "from": from, "reading": mode == DcMode::Reading }),
+            )?;
+            let _ = ctl.call("ui.focus", json!({}));
+            Ok(())
+        })();
+        match run {
+            Ok(()) => {
+                self.msg = match mode {
+                    DcMode::Play => format!("已在 DeckCraft 开始演示：{title}"),
+                    DcMode::Reading => format!("已在 DeckCraft 打开普通视图：{title}"),
+                    DcMode::Presenter => format!(
+                        "已在 DeckCraft 开始演示：{title}（演示者视图需第二显示器，将在副屏打开）"
+                    ),
+                };
+                // A fresh watcher for this jump (auto-quit sessions
+                // only); bumping the generation retires any watcher
+                // from an earlier session.
+                if self.dc_auto_quit {
+                    let gen = self.dc_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    let gen_arc = self.dc_gen.clone();
+                    let tx = self.dc_tx.clone();
+                    std::thread::spawn(move || dc_watch(port, gen_arc, gen, tx));
+                }
+            }
+            Err(e) => {
+                self.msg = format!("DeckCraft 跳转失败：{e}");
+            }
+        }
+    }
+
+    /// Drop the managed-session record (retires its watcher via the
+    /// generation counter). The DeckCraft process itself is left
+    /// alone unless `kill` is set — dropping the Child handle does
+    /// not kill it.
+    fn dc_forget(&mut self, kill: bool) {
+        self.dc_gen
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(mut sess) = self.dc.take() {
+            if kill {
+                let _ = sess.child.kill();
+            }
+        }
+    }
+
+    /// Drain watcher events and child-exit bookkeeping; called once
+    /// per frame from `eframe::App::ui` (next to the other channel
+    /// drains). On show end with auto-quit on, the presenter flag is
+    /// restored first, then `app.quit` closes DeckCraft gracefully —
+    /// the frame stack underneath was never touched, so the user is
+    /// back on the deck frame they left.
+    fn dc_poll(&mut self) {
+        while let Ok(ev) = self.dc_rx.try_recv() {
+            match ev {
+                DcEvent::ShowEnded => {
+                    let auto = self.dc.as_ref().map(|s| s.auto_quit).unwrap_or(false);
+                    if auto {
+                        if let Some(sess) = &self.dc {
+                            if let Ok(mut ctl) = DcControl::connect(sess.port) {
+                                if let Some(prev) = sess.presenter_before {
+                                    let _ = ctl.call(
+                                        "command",
+                                        json!({ "command": "show.presenter", "params": { "on": prev } }),
+                                    );
+                                }
+                                let _ = ctl.call("app.quit", json!({}));
+                            }
+                        }
+                        self.dc_forget(false);
+                        self.msg = "放映结束，已回到启幕".into();
+                    } else if self.dc.is_some() {
+                        self.msg = "放映已结束（DeckCraft 仍开着这份稿件）".into();
+                    }
+                }
+                DcEvent::Gone => {
+                    let dead = match &self.dc {
+                        Some(sess) => DcControl::connect(sess.port).is_err(),
+                        None => false,
+                    };
+                    if dead {
+                        self.dc_forget(false);
+                        self.msg = "演示已结束（DeckCraft 已退出）".into();
                     }
                 }
             }
+        }
+        let exited = match &mut self.dc {
+            Some(sess) => matches!(sess.child.try_wait(), Ok(Some(_))),
+            None => false,
+        };
+        if exited {
+            self.dc_forget(false);
+            self.msg = "演示已结束（DeckCraft 已退出）".into();
+        }
+    }
+
+    /// 用系统应用打开 (§3.17/场景 38): materialize the deck and open
+    /// it in the system presentation app. Secondary entry — the
+    /// primary presentation path jumps into DeckCraft
+    /// (present_via_deckcraft); this stays for PowerPoint/WPS, and
+    /// now shares the notes-carrying export with the jump path.
+    fn present_showroom(&mut self, item_id: &str, title: &str) {
+        match self.export_for_present(item_id) {
+            Ok((path, _)) => match spawn_open(&path) {
+                Ok(_) => self.msg = format!("已打开演示：{title}（系统默认演示应用）"),
+                Err(e) => self.msg = format!("演示文件已生成（{}），打开失败：{e}", path.display()),
+            },
             Err(e) => self.msg = format!("演示失败：{e}"),
         }
     }
@@ -6863,6 +7394,17 @@ impl App {
         if text_action(ui, "用系统应用打开", palette_color(TEXT_WEAK), 11.5) {
             self.present_showroom(&s(&item, "id"), &s(&item, "title"));
         }
+        // DeckCraft views (present handoff): the reading view and
+        // the presenter view live in DeckCraft; qimu only exports
+        // (with notes), jumps and takes the return.
+        ui.horizontal(|ui| {
+            if ui.small_button("普通视图（DeckCraft）").clicked() {
+                act = Some("reading");
+            }
+            if ui.small_button("演示者视图（DeckCraft）").clicked() {
+                act = Some("presenter");
+            }
+        });
         // PDF export (Q21): whole deck in the three DeckCraft forms.
         // The single-page variant lives in the page preview window
         // below. Anonymous (guest) sessions take the same path — the
@@ -6882,7 +7424,41 @@ impl App {
         ui.add_space(8.0);
         match act {
             Some("play") => {
-                self.start_presentation(ui, &item, &st.pages);
+                let from = st.selected_page.unwrap_or(0);
+                if !self.present_via_deckcraft(
+                    &s(&item, "id"),
+                    &s(&item, "title"),
+                    DcMode::Play,
+                    from,
+                ) {
+                    self.start_presentation(ui, &item, &st.pages);
+                }
+            }
+            Some("reading") => {
+                let from = st.selected_page.unwrap_or(0);
+                if !self.present_via_deckcraft(
+                    &s(&item, "id"),
+                    &s(&item, "title"),
+                    DcMode::Reading,
+                    from,
+                ) {
+                    // No DeckCraft on this machine: the system app is
+                    // the reading fallback (it opens the same deck).
+                    self.present_showroom(&s(&item, "id"), &s(&item, "title"));
+                }
+            }
+            Some("presenter") => {
+                let from = st.selected_page.unwrap_or(0);
+                if !self.present_via_deckcraft(
+                    &s(&item, "id"),
+                    &s(&item, "title"),
+                    DcMode::Presenter,
+                    from,
+                ) {
+                    // Fallback is the built-in presenter; the user
+                    // can switch its speaker mode on from the menu.
+                    self.start_presentation(ui, &item, &st.pages);
+                }
             }
             Some("export") => {
                 match self.call(
@@ -6939,6 +7515,11 @@ impl App {
                 };
             }
             ui.label(egui::RichText::new(format!("{} 页", st.pages.len())).color(palette_color(TEXT_WEAK)));
+            let mut auto_quit = self.dc_auto_quit;
+            if ui.checkbox(&mut auto_quit, "放映结束自动关闭 DeckCraft").changed() {
+                self.dc_auto_quit = auto_quit;
+                save_dc_auto_quit(auto_quit);
+            }
             if ui
                 .add_enabled(st.selected_page.is_some(), egui::Button::new("预览所选页"))
                 .clicked()
@@ -8046,8 +8627,14 @@ impl App {
                     app.open_showroom_deck(item);
                 }
                 if ui.small_button("开始演示").clicked() {
+                    // The deck frame stays as the return context;
+                    // presenting now jumps into DeckCraft (the
+                    // built-in presenter is the fallback when no
+                    // DeckCraft desktop app is on this machine).
                     app.open_showroom_deck(item);
-                    app.start_present_from_deck(ui);
+                    if !app.present_via_deckcraft(&id, &title, DcMode::Play, 0) {
+                        app.start_present_from_deck(ui);
+                    }
                 }
                 if !s(item, "source_index_id").is_empty() {
                     let key = format!("sr_{id}");
