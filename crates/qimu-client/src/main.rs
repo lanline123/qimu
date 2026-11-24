@@ -6248,7 +6248,7 @@ impl App {
             return;
         }
         egui::Area::new(egui::Id::new("qimu_toast"))
-            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 114.0))
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 82.0))
             .order(egui::Order::Foreground)
             .show(ui.ctx(), |ui| {
                 egui::Frame::NONE

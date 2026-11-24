@@ -152,58 +152,20 @@ impl App {
     }
 
     fn shell_chrome(&mut self, ui: &mut egui::Ui) {
-        // ==== Main-window chrome, following the HTML prototype's
-        // shell: title bar 32 + menu bar 32 + toolbar 36 = the
-        // prototype's --chrome-h 100px;
+        // ==== Main-window chrome: menu bar 32 + toolbar 36 = 68px.
+        // (User ruling 2026-11-24: no in-app title bar — the HTML
+        // prototype's .titlebar was a web-page imitation of a
+        // desktop title bar; the client window uses the OS title
+        // bar, which already shows the app title and the window
+        // controls. The version string lives in the About dialog
+        // and the update section; the current page is marked in
+        // the toolbar tabs.)
         // no status bar — the message channel floats as a toast.
-        // The title and menu bars sit on --panel, the toolbar on
-        // --bg, each closed by a 1px --line (drawn by hand — the
-        // panels' own separator lines stay off).
+        // The menu bar sits on --panel, the toolbar on --bg, each
+        // closed by a 1px --line (drawn by hand — the panels' own
+        // separator lines stay off).
         // ====
-        // Row 1 — title bar (.titlebar): 18px logo, the brand, and
-        // the current page as the dim document label. The window
-        // controls on the prototype's right side are the OS
-        // window's own in the client.
-        egui::Panel::top("title_row")
-            .exact_size(32.0)
-            .frame(
-                egui::Frame::NONE
-                    .fill(palette_color(PANEL_BG))
-                    .inner_margin(egui::Margin::symmetric(10, 0)),
-            )
-            .show_separator_line(false)
-            .show(ui, |ui| {
-                ui.horizontal_centered(|ui| {
-                    ui.spacing_mut().item_spacing.x = 7.0;
-                    self.logo_ui(ui, 18.0);
-                    ui.label(
-                        egui::RichText::new("启幕")
-                            .size(12.0)
-                            .strong()
-                            .color(palette_color(TEXT_MAIN)),
-                    );
-                    ui.label(egui::RichText::new("·").size(12.0).color(palette_color(TEXT_WEAK)));
-                    ui.label(
-                        egui::RichText::new(tr(self.page.label()))
-                            .size(12.0)
-                            .color(palette_color(TEXT_WEAK)),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                                .size(11.5)
-                                .color(palette_color(TEXT_FAINT)),
-                        );
-                    });
-                });
-                let r = ui.max_rect();
-                ui.painter().hline(
-                    r.x_range(),
-                    r.max.y - 0.5,
-                    egui::Stroke::new(1.0, palette_color(SEPARATOR)),
-                );
-            });
-        // Row 2 — menu bar (.menubar-row): the text menus on the
+        // Row 1 — menu bar (.menubar-row): the text menus on the
         // left; on the right, the session cluster in the
         // prototype's slots — the server and the user as quiet
         // icon-btn text, sign-in as the .pill-primary, sign-out as
