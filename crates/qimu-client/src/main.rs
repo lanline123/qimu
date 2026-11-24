@@ -7933,6 +7933,37 @@ impl App {
         }
     }
 
+    /// Organization-face reachability (T3): the active
+    /// connection is in a live session state — a named session or
+    /// an anonymous guest session, the same condition
+    /// `sync_from_active` mirrors the token on. Anything else (no
+    /// active connection, a failed probe, a logged-out session)
+    /// means the showroom's server-backed walls cannot be reached
+    /// right now.
+    fn org_online(&self) -> bool {
+        self.active
+            .and_then(|i| self.conns.get(i))
+            .is_some_and(|c| {
+                matches!(c.status, ConnStatus::Connected | ConnStatus::Anonymous)
+            })
+    }
+
+    /// True when the item's offline cache is the complete bundle
+    /// (T1 cache payload: index + blocks): the entry carries its
+    /// source index file, the same marker `cached_index_detail`
+    /// keys on, and its `blocks` array rides along in the same
+    /// entry. A deck-only entry (an older snapshot, an assembly
+    /// export) does not count — offline it cannot open its
+    /// detail or drill into blocks. The entry's `bytes` is the
+    /// whole bundle's total, so capacity and the cache manager
+    /// already account for the bundle as one unit.
+    fn sr_bundle_cached(&self, item_id: &str) -> bool {
+        let key = format!("sr_{item_id}");
+        self.cache_entries
+            .iter()
+            .any(|e| s(e, "key") == key && !s(e, "index_file").is_empty())
+    }
+
     /// The cached index detail for a showroom item, when its
     /// offline bundle carries one (T1 cache payload): this is
     /// what lets a cached deck's detail — its page list and
@@ -9307,6 +9338,18 @@ impl App {
                                 if !folder.is_empty() {
                                     ui.label(egui::RichText::new(folder).small().weak());
                                 }
+                                if s(&e, "item_kind") == "showroom"
+                                    && !app.org_online()
+                                    && !app.sr_bundle_cached(&s(&e, "item_id"))
+                                {
+                                    // Offline with no complete local
+                                    // bundle (T3 ruling): status
+                                    // label instead of the actions.
+                                    ui.label(
+                                        egui::RichText::new("离线不可用").small().weak(),
+                                    );
+                                    return;
+                                }
                                 if s(&e, "item_kind") == "showroom" {
                                     if ui.small_button("看整稿").clicked() {
                                         app.open_deck_for_ref(
@@ -9477,30 +9520,44 @@ impl App {
                 .small()
                 .weak(),
             );
-            ui.horizontal_wrapped(|ui| {
-                if item["item_kind"] == "showroom" && ui.small_button("打开详情").clicked() {
-                    app.open_deck_for_ref("showroom", &id, &title);
-                }
-                if saved {
-                    ui.label(egui::RichText::new("已在我的库").small().weak());
-                } else if ui.small_button("保存到我的库").clicked() {
-                    let sid = s(item, "id");
-                    match app.call("POST", &format!("/v1/shares/{sid}/accept"), Some(json!({}))) {
-                        Ok(_) => {
-                            app.msg = "已保存到我的库".into();
-                            app.refresh_all();
-                        }
-                        Err(e) => app.msg = format!("保存失败：{e}"),
+            if item["item_kind"] == "showroom"
+                && !app.org_online()
+                && !app.sr_bundle_cached(&id)
+            {
+                // Offline with no complete local bundle (T3
+                // ruling): a status label instead of the action
+                // row. Non-showroom shares keep their save action —
+                // the bundle test only speaks for showroom decks.
+                ui.label(egui::RichText::new("离线不可用").small().weak());
+            } else {
+                ui.horizontal_wrapped(|ui| {
+                    if item["item_kind"] == "showroom" && ui.small_button("打开详情").clicked() {
+                        app.open_deck_for_ref("showroom", &id, &title);
                     }
-                }
-            });
+                    if saved {
+                        ui.label(egui::RichText::new("已在我的库").small().weak());
+                    } else if ui.small_button("保存到我的库").clicked() {
+                        let sid = s(item, "id");
+                        match app.call("POST", &format!("/v1/shares/{sid}/accept"), Some(json!({}))) {
+                            Ok(_) => {
+                                app.msg = "已保存到我的库".into();
+                                app.refresh_all();
+                            }
+                            Err(e) => app.msg = format!("保存失败：{e}"),
+                        }
+                    }
+                });
+            }
         });
         let response = ui.interact(
             cover_response,
             ui.scope_id().with(("share", s(item, "id"))),
             egui::Sense::click(),
         );
-        if response.double_clicked() && item["item_kind"] == "showroom" {
+        if response.double_clicked()
+            && item["item_kind"] == "showroom"
+            && (self.org_online() || self.sr_bundle_cached(&id))
+        {
             self.open_deck_for_ref("showroom", &id, &title);
         }
     }
@@ -10540,6 +10597,15 @@ impl App {
             if !intro.is_empty() {
                 ui.add(egui::Label::new(egui::RichText::new(intro).small().weak()).truncate());
             }
+            if !app.org_online() && !app.sr_bundle_cached(&id) {
+                // Offline with no complete local bundle (T3
+                // ruling): the action row is a status label, not
+                // buttons — every action here would land on an
+                // empty deck or a failed request. The cover and
+                // title stay as they are.
+                ui.label(egui::RichText::new("离线不可用").small().weak());
+                return;
+            }
             ui.horizontal_wrapped(|ui| {
                 if ui.small_button("打开详情").clicked() {
                     app.open_showroom_deck(item);
@@ -10592,7 +10658,9 @@ impl App {
         if response.clicked() {
             self.showroom.selected_card = Some(id);
         }
-        if response.double_clicked() {
+        if response.double_clicked()
+            && (self.org_online() || self.sr_bundle_cached(&id))
+        {
             self.open_showroom_deck(item);
         }
     }
