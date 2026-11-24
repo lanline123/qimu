@@ -6963,38 +6963,49 @@ impl App {
     }
 
     fn trash_nav_body(&mut self, ui: &mut egui::Ui) {
-        // Sidebar sections per the prototype's trash tree
-        // (演示 / 索引 / 页面, each with its count). The trash is
-        // local-first — locally deleted items are this page's main
-        // content — so the sidebar renders with or without a
-        // server connection (user ruling 2026-11-24). The filter
-        // values are trash_list_ui's positional filters.
+        // Sidebar (user rulings 2026-11-24): a 目录 header at the
+        // top, then the three sections as folder rows — 演示 /
+        // 索引 / 页面, each with its count. The trash is
+        // local-first, so the sidebar renders with or without a
+        // server connection. Clicking a section filters; clicking
+        // the active section again clears back to all (the
+        // prototype's toggle). Filter values are trash_list_ui's
+        // positional filters.
+        ui.label(
+            egui::RichText::new("目录")
+                .size(12.0)
+                .color(palette_color(TEXT_WEAK)),
+        );
+        ui.add_space(2.0);
         let active = match self.trash.stack.top() {
             TrashFrame::List(state) => state.filter,
             TrashFrame::Preview(_) => usize::MAX,
         };
-        for (filter, kind, label, icon) in [
-            (0, "", "全部", ChromeIcon::Settings),
-            (3, "showroom", "演示", ChromeIcon::Showroom),
-            (1, "index", "索引", ChromeIcon::Index),
-            (2, "unit", "页面", ChromeIcon::Content),
+        for (filter, kind, label) in [
+            (3, "showroom", "演示"),
+            (1, "index", "索引"),
+            (2, "unit", "页面"),
         ] {
             let count = self
                 .trash
                 .items
                 .iter()
-                .filter(|item| kind.is_empty() || s(item, "kind") == kind)
+                .filter(|item| s(item, "kind") == kind)
                 .count();
             let text = format!("{} {}", tr(label), count);
+            let icon = if active == filter {
+                ChromeIcon::FolderOpen
+            } else {
+                ChromeIcon::Folder
+            };
             if tree_row(ui, active == filter, 0.0, Some(icon), &text, 12.5).clicked() {
                 self.trash.stack.pop_to(0);
                 if let TrashFrame::List(state) = self.trash.stack.top_mut() {
-                    state.filter = filter;
+                    state.filter = if active == filter { 0 } else { filter };
                 }
             }
         }
     }
-
     fn confirm_empty_trash(&mut self) {
         self.overlays.push(Overlay::Confirm(ConfirmState {
             title: tr("清空回收站").to_string(),
@@ -7393,12 +7404,8 @@ impl App {
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(tr("回收站"))
-                        .size(18.0)
-                        .color(palette_color(TEXT_MAIN)),
-                );
-                ui.add_space(12.0);
+                // No page title here (user ruling 2026-11-24): the
+                // content area starts with the count hint directly.
                 ui.label(
                     egui::RichText::new(format!(
                         "{} {} · {}",
@@ -7638,7 +7645,7 @@ impl App {
         let mut do_purge = false;
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.add_space(10.0);
-            if let Some(d) = crumb_bar(ui, &[tr("回收站"), &title]) {
+            if let Some(d) = crumb_bar(ui, &[&title]) {
                 if d == 0 {
                     go_back = true;
                 }
@@ -11453,8 +11460,8 @@ impl App {
         }
     }
 
-    /// The maintenance wall (root frame body): search, the import
-    /// toolbar and the block card grid.
+    /// The maintenance wall (root frame body): the block card
+    /// grid (plus the deep-jump back link when arriving from Home).
     fn content_wall(&mut self, ui: &mut egui::Ui, w: &mut WallState) {
         body_frame().show(ui, |ui| {
             if self.pick.is_some() {
@@ -11468,46 +11475,11 @@ impl App {
                             self.page = Page::Home;
                         }
                     }
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut w.search_text)
-                            .hint_text("搜索")
-                            .desired_width(300.0)
-                            .margin(egui::vec2(14.0, 7.0)),
-                    );
-                    if resp.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
-                        match self.call_work(
-                            "GET",
-                            &format!("/v1/search?q={}", query_component(&w.search_text)),
-                            None,
-                        ) {
-                            Ok(v) => w.search_hits = Some(v),
-                            Err(e) => self.msg = e,
-                        }
-                    }
-                    if text_action(ui, "智能分块导入", palette_color(TEXT_MAIN), 13.0) {
-                        self.act_import_split();
-                    }
-                    if text_action(ui, "导入 PPT", palette_color(TEXT_MAIN), 13.0) {
-                        self.act_import_ppt();
-                    }
-                    ui.label(
-                        egui::RichText::new("导入到组")
-                            .size(13.0)
-                            .color(palette_color(TEXT_WEAK)),
-                    );
-                    let cur_group = self.group_name(&self.content.import_group.clone());
-                    egui::ComboBox::from_id_salt("import_group")
-                        .width(150.0)
-                        .selected_text(cur_group)
-                        .show_ui(ui, |ui| {
-                            for g in self.groups.clone() {
-                                ui.selectable_value(
-                                    &mut self.content.import_group,
-                                    s(&g, "id"),
-                                    s(&g, "name"),
-                                );
-                            }
-                        });
+                    // No search box, no import actions and no
+                    // import-group picker on the wall (user ruling
+                    // 2026-11-24): the wall is the block grid only.
+                    // Imports stay on the home / sidebar entries
+                    // (act_import_ppt is wired there).
                 });
             } // pick.is_none() toolbar block
             ui.add_space(12.0);
@@ -11675,11 +11647,8 @@ impl App {
                             w.selected = Some(uid.clone());
                         }
                     }
-                    // grid-end add card (I): same footprint as a content
-                    // card; two entries — blank block / paste PPT pages
-                    if self.pick.is_none() {
-                        self.content_add_card(ui, card_w, card_h);
-                    }
+                    // No grid-end add card (user ruling 2026-11-24):
+                    // the wall shows existing blocks only.
                 });
             });
         });
