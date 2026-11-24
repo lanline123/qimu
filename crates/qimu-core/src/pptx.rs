@@ -26,7 +26,7 @@ use editor_extended::{
 pub use editor_extended::{append_blank_slides, editor_preset_allowed, NewSlideElement};
 
 use craft_xml::{El, Local, Node};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -289,7 +289,7 @@ pub fn slides(pkg: &Package) -> PptxResult<Vec<SlideRef>> {
 
 /// One PowerPoint section of a deck: its name and the 0-based
 /// slide indices that belong to it, in presentation order.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SectionSpan {
     pub name: String,
     pub pages: Vec<usize>,
@@ -736,9 +736,22 @@ pub struct VerifyReport {
 /// The §3.1 import safety net: split the deck, reassemble it from the
 /// fragments alone, and compare page-by-page against the source.
 pub fn split_reassemble_verify(source: &Package) -> PptxResult<VerifyReport> {
-    let src_slides = slides(source)?;
     let fragments = split(source)?;
-    let reassembled = reassemble(&fragments)?;
+    verify_from_singles(source, &fragments)
+}
+
+/// The §3.1 check itself, run over fragments the caller already
+/// split: reassemble them and compare page-by-page against the
+/// source. The staged import (line ⑤) splits the source exactly
+/// once and feeds those very fragments here — the check must never
+/// split a second time on its own, or the single-pass guarantee is
+/// fiction (analysis line ⑦, point S6a).
+pub fn verify_from_singles(
+    source: &Package,
+    fragments: &[Package],
+) -> PptxResult<VerifyReport> {
+    let src_slides = slides(source)?;
+    let reassembled = reassemble(fragments)?;
     let re_slides = slides(&reassembled)?;
 
     let source_fps: Vec<String> = src_slides.iter().map(|s| s.fingerprint.clone()).collect();

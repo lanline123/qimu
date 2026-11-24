@@ -87,17 +87,25 @@ pub fn render_edit_preview(pptx_bytes: &[u8], page: usize) -> Result<Vec<u8>, St
     Ok(png)
 }
 
-/// Resolve one thumbnail page for a version in the local library:
-/// serve the shared deckcraft-v2 cache, rendering the whole
-/// fragment in-process on a miss. Returns None when the version is
-/// not in the local library (or the local render failed) — the
-/// caller then falls back to the server path, whose renderer and
-/// cache layout are the same.
+/// Resolve one thumbnail page for a version in the local library.
+/// Since the staged-import line (⑤) the disk cache is keyed by
+/// PAGE ENTITY id, not by version: a page that appears in a new
+/// version, another block, or a re-imported deck reuses the one
+/// render the library already paid for. Returns None when the
+/// version is not in the local library (or the local render
+/// failed) — the caller then falls back to the server path, whose
+/// renderer and cache layout are the same.
 pub fn local_thumb(
     local: &crate::local_store::LocalStore,
     version_id: &str,
     page: usize,
 ) -> Option<Vec<u8>> {
+    if let Some(page_id) = local.version_page_id(version_id, page) {
+        return page_thumb(local, &page_id);
+    }
+    // Legacy fallback: a version whose pages carry no entity ids
+    // (the page-entity migration could not split its fragment)
+    // keeps the version-keyed whole-fragment render it always had.
     let cache_dir = local.thumb_cache_dir(version_id);
     let cache_file = cache_dir.join(format!("{page}.png"));
     if cache_file.exists() {
@@ -105,6 +113,27 @@ pub fn local_thumb(
     }
     let frag = local.version_fragment(version_id)?;
     cached_thumb(&frag, &cache_dir, page)
+}
+
+/// Resolve one page entity's thumbnail. The entity is a
+/// single-page package, so its cache directory holds exactly one
+/// image (`0.png`) under the entity's own key; a miss renders
+/// just that page's package, never a whole version fragment.
+/// Pages whose thumbnail already exists return from disk — the
+/// post-import warm-up walks the imported pages in order through
+/// here, so cards light up one by one in page order.
+pub fn page_thumb(
+    local: &crate::local_store::LocalStore,
+    page_id: &str,
+) -> Option<Vec<u8>> {
+    let cache_dir = local.thumb_cache_dir(page_id);
+    let cache_file = cache_dir.join("0.png");
+    if cache_file.exists() {
+        return std::fs::read(&cache_file).ok();
+    }
+    let bytes = local.page_package_bytes(page_id)?;
+    render_frag_thumbs(&bytes, &cache_dir).ok()?;
+    std::fs::read(&cache_file).ok()
 }
 
 /// Render one thumbnail page from a fragment byte string into

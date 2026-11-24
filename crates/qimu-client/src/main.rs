@@ -1345,6 +1345,73 @@ struct WallState {
     /// to (outer None = never positioned). In the folder-flow
     /// view the selection is a scroll anchor, never a filter.
     flow_anchor: Option<Option<String>>,
+    /// Measured layout heights for the folder-flow
+    /// virtualization (see FlowMetrics).
+    flow_metrics: FlowMetrics,
+    /// The pixels-per-point `flow_metrics` was measured at; a
+    /// zoom change rescales every font metric and invalidates
+    /// the measurements.
+    flow_metrics_ppp: f32,
+}
+
+/// Card count at which the content wall's folder flow switches
+/// to virtualized rendering (see `App::content_wall`).
+const FLOW_VIRTUALIZE_MIN: usize = 200;
+
+/// Layout heights the folder-flow virtualization measured from
+/// real widgets. Fonts come from the system provider, so a
+/// header's height and a card's body height are runtime facts,
+/// not constants the code can hard-code. A metric is only
+/// trusted after a real widget produced it; until then the wall
+/// builds the real widget (the pre-virtualization path), which
+/// is also what keeps the first frames pixel-identical.
+#[derive(Default)]
+struct FlowMetrics {
+    /// Total cursor advance of one folder header (name row +
+    /// gap + rule, including the layout's trailing item
+    /// spacing), by folder id.
+    header_by_folder: std::collections::HashMap<String, f32>,
+    /// The same advance per depth bucket (0 / 1 / 2+), for
+    /// folders whose own header has not been measured yet.
+    header_by_depth: [Option<f32>; 3],
+    /// Effective card height minus the cover height, per
+    /// [pick-insert mode][lead rendition has a latest version].
+    /// A card's height over its cover does not depend on the
+    /// card's width (the title truncates to one line and the
+    /// meta row is fixed-height), so this one number sizes a
+    /// card at any width: height = cover height + this (the
+    /// stored value already includes the 89pt body floor of
+    /// `card_h`, since it is measured off a real card).
+    card_body: [[Option<f32>; 2]; 2],
+}
+
+impl FlowMetrics {
+    fn header_adv_for(&self, folder_id: &str, depth: usize) -> Option<f32> {
+        self.header_by_folder
+            .get(folder_id)
+            .copied()
+            .or(self.header_by_depth[depth.min(2)])
+    }
+
+    fn record_header(&mut self, folder_id: &str, depth: usize, adv: f32) {
+        self.header_by_folder.insert(folder_id.to_string(), adv);
+        self.header_by_depth[depth.min(2)] = Some(adv);
+    }
+
+    fn card_h(&self, insert: bool, has_version: bool, cover_h: f32) -> Option<f32> {
+        self.card_body[insert as usize][has_version as usize].map(|body| cover_h + body)
+    }
+}
+
+/// Whether a wall item's lead rendition has a latest version —
+/// the card-variant key of the flow metrics. Must agree with
+/// the `latest` extraction in `App::flow_unit_card`.
+fn flow_item_has_version(item: &Value) -> bool {
+    item.get("renditions")
+        .and_then(|r| r.as_array())
+        .and_then(|a| a.first())
+        .and_then(|r| r.get("latest"))
+        .is_some_and(|l| l.is_object())
 }
 
 /// Which header meta field the inline editor is standing in
@@ -2760,12 +2827,16 @@ enum TranslateEvent {
     Done(Result<Value, String>),
 }
 
-/// Terminal event from the import worker thread: the finished
-/// import's user-facing message — Ok is the success wording the
-/// caller's flow computed from the import payload (the UI thread
-/// then refreshes), Err the failure wording. Exactly one event
-/// is sent per import.
+/// Events from the import worker thread. `Opened` is the staged
+/// import's (line ⑤) intermediate beat: stage 1 has landed every
+/// page as a one-page unit, so the UI refreshes and shows the
+/// deck while grouping still runs on the worker — the import is
+/// NOT finished, `importing` stays set, and exactly one terminal
+/// `Done` still follows per import (Ok is the success wording
+/// the caller's flow computed from the import payload, Err the
+/// failure wording).
 enum ImportEvent {
+    Opened(String),
     Done(Result<String, String>),
 }
 
@@ -3425,6 +3496,99 @@ fn work_call_thread(
         }
     }
     raw_call(server, token, method, path, body, false)
+}
+
+/// The staged import sequence (line ⑤) shared by the import
+/// actions, run on the caller's worker thread: stage 1 "open"
+/// lands every page as a one-page unit — an `Opened` beat tells
+/// the UI to refresh onto the new cards — then stage 2 groups
+/// the pages into section / supplied blocks while a warm-up
+/// thread renders the imported pages' thumbnails in page order
+/// (page-entity keyed: a page renders at most once per library,
+/// cached pages return from disk). With no local library open,
+/// the one-shot /v1/import runs the same two core stages
+/// composed server-side. Returns the group stage's payload
+/// (`slide_count`, `units`, …).
+#[allow(clippy::too_many_arguments)]
+fn staged_import_thread(
+    local: &Option<std::sync::Arc<local_store::LocalStore>>,
+    server: &str,
+    token: Option<&str>,
+    tx: &std::sync::mpsc::Sender<ImportEvent>,
+    name: &str,
+    bytes: &[u8],
+    folder_id: &Option<String>,
+    group_id: &str,
+    blocks: Option<Value>,
+) -> Result<Value, String> {
+    let data = b64e(bytes);
+    if local.is_none() {
+        let mut body = json!({
+            "filename": name,
+            "data_base64": data,
+            "folder_id": folder_id,
+            "group_id": group_id,
+        });
+        if let Some(b) = blocks {
+            body["blocks"] = b;
+        }
+        return work_call_thread(local, server, token, "POST", "/v1/import", Some(body));
+    }
+    let mut open_body = json!({
+        "filename": name,
+        "data_base64": data,
+        "folder_id": folder_id,
+        "group_id": group_id,
+    });
+    if let Some(b) = &blocks {
+        open_body["blocks"] = b.clone();
+    }
+    let opened = work_call_thread(
+        local,
+        server,
+        token,
+        "POST",
+        "/v1/import/open",
+        Some(open_body),
+    )?;
+    let slide_count = opened
+        .get("slide_count")
+        .and_then(|x| x.as_i64())
+        .unwrap_or(0);
+    let _ = tx.send(ImportEvent::Opened(format!(
+        "已打开「{name}」：{slide_count} 页，正在成块…"
+    )));
+    if let (Some(local_arc), Some(pages)) = (
+        local.clone(),
+        opened.get("pages").and_then(|p| p.as_array()),
+    ) {
+        let page_ids: Vec<String> = pages
+            .iter()
+            .map(|p| s(p, "page_id"))
+            .filter(|id| !id.is_empty())
+            .collect();
+        std::thread::spawn(move || {
+            for pid in &page_ids {
+                let _ = local_render::page_thumb(&local_arc, pid);
+            }
+        });
+    }
+    let mut group_body = json!({
+        "opened": opened,
+        "folder_id": folder_id,
+        "group_id": group_id,
+    });
+    if let Some(b) = blocks {
+        group_body["blocks"] = b;
+    }
+    work_call_thread(
+        local,
+        server,
+        token,
+        "POST",
+        "/v1/import/group",
+        Some(group_body),
+    )
 }
 
 /// LAN discovery: broadcast QIMU_DISCOVER_V1 on UDP 8731 and collect the
@@ -8397,16 +8561,26 @@ impl eframe::App for App {
             }
             ctx.request_repaint();
         }
-        // Collect a finished import (worker thread — the import
-        // never runs on the UI thread; see act_import_ppt).
+        // Collect import events (worker thread — the import
+        // never runs on the UI thread; see act_import_ppt). An
+        // `Opened` beat refreshes the wall onto the freshly
+        // landed pages but leaves the import marked as running;
+        // only `Done` clears it.
         while let Ok(ev) = self.import_rx.try_recv() {
-            self.importing = None;
             match ev {
-                ImportEvent::Done(Ok(m)) => {
+                ImportEvent::Opened(m) => {
                     self.msg = m;
                     self.refresh_all();
                 }
-                ImportEvent::Done(Err(m)) => self.msg = m,
+                ImportEvent::Done(Ok(m)) => {
+                    self.importing = None;
+                    self.msg = m;
+                    self.refresh_all();
+                }
+                ImportEvent::Done(Err(m)) => {
+                    self.importing = None;
+                    self.msg = m;
+                }
             }
             ctx.request_repaint();
         }
@@ -11854,19 +12028,16 @@ impl App {
                             .as_array()
                             .map(|arr| arr.iter().map(|b| s(b, "name")).collect())
                             .unwrap_or_default();
-                        work_call_thread(
+                        staged_import_thread(
                             &local,
                             &server,
                             token.as_deref(),
-                            "POST",
-                            "/v1/import",
-                            Some(json!({
-                                "filename": name,
-                                "data_base64": data,
-                                "folder_id": folder_id,
-                                "group_id": group_id,
-                                "blocks": blocks,
-                            })),
+                            &tx,
+                            &name,
+                            &bytes,
+                            &folder_id,
+                            &group_id,
+                            Some(blocks),
                         )
                         .map_err(|e| format!("导入失败：{e}"))?;
                         Ok(format!(
@@ -11914,18 +12085,16 @@ impl App {
                 self.importing = Some(name.clone());
                 self.msg = format!("正在导入「{name}」…");
                 std::thread::spawn(move || {
-                    let r = work_call_thread(
+                    let r = staged_import_thread(
                         &local,
                         &server,
                         token.as_deref(),
-                        "POST",
-                        "/v1/import",
-                        Some(json!({
-                            "filename": name,
-                            "data_base64": b64e(&bytes),
-                            "folder_id": folder_id,
-                            "group_id": group_id,
-                        })),
+                        &tx,
+                        &name,
+                        &bytes,
+                        &folder_id,
+                        &group_id,
+                        None,
                     );
                     let done = match r {
                         Ok(v) => Ok(format!(
@@ -12101,6 +12270,33 @@ impl App {
                     if do_scroll && want_anchor.is_none() {
                         ui.scroll_to_cursor(Some(egui::Align::TOP));
                     }
+                    // Folder-flow virtualization (2026-11-25): once
+                    // the wall holds FLOW_VIRTUALIZE_MIN blocks or
+                    // more, a folder header or a card row whose rect
+                    // misses the visible band (the scroll viewport,
+                    // widened by one screenful above and below) is
+                    // replaced by an equal-height spacer instead of
+                    // built widgets. Positions, the total content
+                    // height and the scrollbar are unchanged: every
+                    // spacer advances the cursor by exactly the
+                    // amount the real widgets would have (see
+                    // FlowMetrics for where the heights come from,
+                    // and flow_grid_virtual for the row geometry).
+                    // Anything not yet measured builds for real, so
+                    // the first frames render exactly like the
+                    // un-virtualized wall; below the threshold the
+                    // wall takes the original path verbatim.
+                    let virt = all_units.len() >= FLOW_VIRTUALIZE_MIN;
+                    let clip = ui.clip_rect();
+                    let band = egui::Rect::from_min_max(
+                        egui::pos2(clip.min.x, clip.min.y - clip.height()),
+                        egui::pos2(clip.max.x, clip.max.y + clip.height()),
+                    );
+                    if (w.flow_metrics_ppp - ui.ctx().pixels_per_point()).abs() > 0.001 {
+                        w.flow_metrics = FlowMetrics::default();
+                        w.flow_metrics_ppp = ui.ctx().pixels_per_point();
+                    }
+                    let per_row_n = (per_row as usize).max(1);
                     let mut first_block = true;
                     for f in &ordered {
                         let fid = s(f, "id");
@@ -12114,13 +12310,44 @@ impl App {
                             ui.add_space(14.0);
                         }
                         first_block = false;
-                        self.flow_folder_header(
-                            ui,
-                            w,
-                            f,
-                            depth,
-                            do_scroll && want_anchor.as_deref() == Some(fid.as_str()),
-                        );
+                        let is_anchor =
+                            do_scroll && want_anchor.as_deref() == Some(fid.as_str());
+                        let editing_this =
+                            matches!(&w.flow_edit, Some(e) if e.folder_id == fid);
+                        // On the virtualized path a header fully
+                        // outside the band becomes one spacer
+                        // allocation whose advance equals the
+                        // header's measured advance (a single
+                        // allocation advances by its height plus
+                        // the layout's trailing item spacing,
+                        // hence the −12). The scroll-anchor target
+                        // and the folder under edit always build
+                        // for real: the anchor needs the header's
+                        // rect, and the editor must not be dropped.
+                        let header_spacer = if virt && !is_anchor && !editing_this {
+                            let top = ui.cursor().min.y;
+                            w.flow_metrics.header_adv_for(&fid, depth).filter(|adv| {
+                                !band.intersects(egui::Rect::from_min_size(
+                                    egui::pos2(band.min.x, top),
+                                    egui::vec2(band.width(), *adv),
+                                ))
+                            })
+                        } else {
+                            None
+                        };
+                        if let Some(adv) = header_spacer {
+                            ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), (adv - 12.0).max(0.0)),
+                                egui::Sense::hover(),
+                            );
+                        } else {
+                            let y0 = ui.cursor().min.y;
+                            self.flow_folder_header(ui, w, f, depth, is_anchor);
+                            if !editing_this {
+                                let adv = ui.cursor().min.y - y0;
+                                w.flow_metrics.record_header(&fid, depth, adv);
+                            }
+                        }
                         if items.is_empty() {
                             // Empty folder: a one-card-high frame
                             // where its cards would be (the
@@ -12135,6 +12362,19 @@ impl App {
                                 6.0,
                                 egui::Stroke::new(1.0, palette_color(CARD_BORDER)),
                                 egui::StrokeKind::Middle,
+                            );
+                        } else if virt {
+                            self.flow_grid_virtual(
+                                ui,
+                                w,
+                                &items,
+                                card_w,
+                                card_h,
+                                cover_h,
+                                per_row_n,
+                                &my_name,
+                                band,
+                                is_anchor,
                             );
                         } else {
                             ui.horizontal_wrapped(|ui| {
@@ -12163,17 +12403,112 @@ impl App {
                         if !first_block {
                             ui.add_space(14.0);
                         }
-                        ui.horizontal_wrapped(|ui| {
-                            for item in &root_items {
-                                self.flow_unit_card(ui, w, item, card_w, card_h, &my_name);
-                            }
-                        });
+                        if virt {
+                            self.flow_grid_virtual(
+                                ui,
+                                w,
+                                &root_items,
+                                card_w,
+                                card_h,
+                                cover_h,
+                                per_row_n,
+                                &my_name,
+                                band,
+                                false,
+                            );
+                        } else {
+                            ui.horizontal_wrapped(|ui| {
+                                for item in &root_items {
+                                    self.flow_unit_card(ui, w, item, card_w, card_h, &my_name);
+                                }
+                            });
+                        }
                     }
                     if do_scroll {
                         w.flow_anchor = Some(want_anchor);
                     }
                 });
         });
+    }
+
+    /// The folder-flow card grid on the virtualized path: the
+    /// same rows `horizontal_wrapped` would form — fluid columns
+    /// of `card_w` with 12pt gaps, a row's height the tallest
+    /// card in it, cards centred within their row (`ui.horizontal`
+    /// is the wrapped row's own layout, minus the wrap) — but a
+    /// row whose rect misses `band` is one equal-height spacer
+    /// allocation instead of built cards. A spacer row advances
+    /// the cursor by its height plus the layout's trailing item
+    /// spacing, exactly the advance of the real row widget, so
+    /// rows below it land at the same positions either way. Row
+    /// heights come from the measured per-variant card heights
+    /// (FlowMetrics); a row holding an unmeasured variant builds
+    /// for real, as does every row of the scroll-anchor target
+    /// block (`force_real`).
+    #[allow(clippy::too_many_arguments)]
+    fn flow_grid_virtual(
+        &mut self,
+        ui: &mut egui::Ui,
+        w: &mut WallState,
+        items: &[Value],
+        card_w: f32,
+        card_h: f32,
+        cover_h: f32,
+        per_row: usize,
+        my_name: &str,
+        band: egui::Rect,
+        force_real: bool,
+    ) {
+        let insert = matches!(self.pick, Some(PickState::Insert { .. }));
+        for row in items.chunks(per_row) {
+            let row_h: Option<f32> = if force_real {
+                None
+            } else {
+                let mut acc = 0.0f32;
+                let mut measured = true;
+                for item in row {
+                    match w
+                        .flow_metrics
+                        .card_h(insert, flow_item_has_version(item), cover_h)
+                    {
+                        Some(h) => acc = acc.max(h),
+                        None => {
+                            measured = false;
+                            break;
+                        }
+                    }
+                }
+                if measured {
+                    Some(acc)
+                } else {
+                    None
+                }
+            };
+            let top = ui.cursor().min.y;
+            let spacer = match row_h {
+                Some(h)
+                    if !band.intersects(egui::Rect::from_min_size(
+                        egui::pos2(band.min.x, top),
+                        egui::vec2(band.width(), h),
+                    )) =>
+                {
+                    Some(h)
+                }
+                _ => None,
+            };
+            if let Some(h) = spacer {
+                ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), h),
+                    egui::Sense::hover(),
+                );
+            } else {
+                ui.horizontal(|ui| {
+                    for item in row {
+                        self.flow_unit_card(ui, w, item, card_w, card_h, my_name);
+                    }
+                });
+            }
+        }
     }
 
     /// One folder block header in the content wall's folder flow:
@@ -12460,6 +12795,12 @@ impl App {
                 }
             },
         );
+        // Feed the folder-flow virtualization's card metric:
+        // this card's height over its cover, filed under its
+        // variant (pick-insert mode × has a latest version).
+        let insert = matches!(self.pick, Some(PickState::Insert { .. }));
+        w.flow_metrics.card_body[insert as usize][latest.is_object() as usize] =
+            Some(outer.response.rect.height() - card_w * 9.0 / 16.0);
         // Click handling rides on an explicit interact over
         // the card rect: allocate_ui's own response carries no
         // click sense, which is why double-click never fired

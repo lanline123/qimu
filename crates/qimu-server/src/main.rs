@@ -1820,7 +1820,7 @@ async fn version_thumb(
     Path((id, page)): Path<(String, usize)>,
 ) -> Api<Value> {
     let auth_res = auth(&st, &headers);
-    let (root, frag) = {
+    let (root, ver) = {
         let (ver, group_id) = {
             let store = st.store.lock().unwrap();
             let ver = store.get_version(&id).map_err(|_| not_found())?;
@@ -1835,13 +1835,50 @@ async fn version_thumb(
             });
         }
         let store = st.store.lock().unwrap();
-        let frag = store.version_fragment_bytes(&ver).map_err(bad)?;
-        (store.root().to_path_buf(), frag)
+        (store.root().to_path_buf(), ver)
     };
-    let cache_dir = root.join("thumbs").join("deckcraft-v2").join(&id);
-    let cache_file = cache_dir.join(format!("{page}.png"));
+    // Thumbnail cache key (line ⑤, matching the client's
+    // local_render): the PAGE ENTITY id, not the version id — one
+    // render per page per library, shared by every version that
+    // references the page. A page entity is a single-page package,
+    // so its cache holds exactly one image (`0.png`) and a miss
+    // renders just that page's package. Versions whose pages
+    // carry no entity id keep the version-keyed whole-fragment
+    // render below.
+    let page_id = ver
+        .pages
+        .get(page)
+        .map(|p| p.id.clone())
+        .filter(|s| !s.is_empty());
+    let (cache_dir, cache_file, render_bytes) = match page_id {
+        Some(pid) => {
+            let cache_dir = root.join("thumbs").join("deckcraft-v2").join(&pid);
+            let cache_file = cache_dir.join("0.png");
+            let render_bytes = if cache_file.exists() {
+                Vec::new()
+            } else {
+                let store = st.store.lock().unwrap();
+                store
+                    .version_page_package(&ver, page)
+                    .and_then(|p| p.to_bytes().map_err(|e| e.to_string()))
+                    .map_err(|_| not_found())?
+            };
+            (cache_dir, cache_file, render_bytes)
+        }
+        None => {
+            let cache_dir = root.join("thumbs").join("deckcraft-v2").join(&id);
+            let cache_file = cache_dir.join(format!("{page}.png"));
+            let render_bytes = if cache_file.exists() {
+                Vec::new()
+            } else {
+                let store = st.store.lock().unwrap();
+                store.version_fragment_bytes(&ver).map_err(bad)?
+            };
+            (cache_dir, cache_file, render_bytes)
+        }
+    };
     if !cache_file.exists() {
-        tokio::task::spawn_blocking(move || render_thumbs_deckcraft(&cache_dir, &frag))
+        tokio::task::spawn_blocking(move || render_thumbs_deckcraft(&cache_dir, &render_bytes))
             .await
             .map_err(|e| bad(e.to_string()))?
             .map_err(bad)?;

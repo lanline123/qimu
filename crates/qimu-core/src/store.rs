@@ -2394,6 +2394,72 @@ impl Store {
         self.get_version(&id)
     }
 
+    /// Insert a version directly from a page-reference sequence:
+    /// `pages` already carry their page entity ids, and the caller
+    /// supplies the per-page searchable texts and speaker scripts
+    /// aligned with them. Unlike `insert_version_with_scripts`
+    /// this performs NO package work at all — no load, no split,
+    /// no fingerprinting — because the staged import (line ⑤) has
+    /// already registered every page as an entity in its single
+    /// pass over the source; the version's structure IS this
+    /// reference sequence. `fragment` is the version's
+    /// materialized fragment bytes (for a one-page version, the
+    /// page's own single-page package; for a grouped version, the
+    /// one assembly of the member singles) — the byte-exact chains
+    /// downstream (submission staging verifies SHA-256 against
+    /// `fragment_hash`) require it to exist, so only a caller with
+    /// nothing byte-facing may pass None.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_version_from_pages(
+        &self,
+        rendition_id: &str,
+        semver: SemVer,
+        basis_revision: i64,
+        author: &str,
+        note: &str,
+        status: &str,
+        pages: &[PageInfo],
+        texts: &[String],
+        scripts: &[String],
+        fragment: Option<&[u8]>,
+    ) -> SResult<VersionRec> {
+        if scripts.len() != pages.len() {
+            return Err("讲稿数量与页面数量不匹配".into());
+        }
+        if texts.len() != pages.len() {
+            return Err("页面文本数量与页面数量不匹配".into());
+        }
+        let hash = match fragment {
+            Some(bytes) => self.file_put(bytes)?,
+            None => String::new(),
+        };
+        let id = new_id("ver");
+        self.conn
+            .execute(
+                "INSERT INTO versions(id, rendition_id, semver, major, minor, patch, basis_revision, author, note, created_ms, fragment_hash, page_count, pages_json, text_all, status, scripts_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                params![
+                    id,
+                    rendition_id,
+                    semver.to_string(),
+                    semver.major as i64,
+                    semver.minor as i64,
+                    semver.patch as i64,
+                    basis_revision,
+                    author,
+                    note,
+                    now_ms(),
+                    hash,
+                    pages.len() as i64,
+                    serde_json::to_string(&pages).unwrap_or_default(),
+                    texts.join("\n"),
+                    status,
+                    serde_json::to_string(&scripts).unwrap_or_default()
+                ],
+            )
+            .map_err(db_err)?;
+        self.get_version(&id)
+    }
+
     /// Replace a version's per-page scripts. Editing scripts never bumps
     /// the version or the content revision (§3.16).
     pub fn set_version_scripts(&self, version_id: &str, scripts: &[String]) -> SResult<()> {
@@ -4225,6 +4291,39 @@ impl Store {
         }
     }
 
+    /// Permanently delete a unit and everything it owns (versions
+    /// and their tags, renditions, page bindings) — the cascade
+    /// `trash_purge` runs for kind "unit", exposed for callers
+    /// that remove a unit which was never trashed: the staged
+    /// import (line ⑤) drops the one-page wrapper units of pages
+    /// a section (or a caller-supplied block) absorbs, and of
+    /// pages no block covers. Page ENTITIES are not touched: a
+    /// page outlives every wrapper that referenced it.
+    pub fn delete_unit_permanent(&self, unit_id: &str) -> SResult<()> {
+        self.conn
+            .execute(
+                "DELETE FROM version_tags WHERE version_id IN (SELECT v.id FROM versions v JOIN renditions r ON v.rendition_id = r.id WHERE r.unit_id = ?1)",
+                params![unit_id],
+            )
+            .map_err(db_err)?;
+        self.conn
+            .execute(
+                "DELETE FROM versions WHERE rendition_id IN (SELECT id FROM renditions WHERE unit_id = ?1)",
+                params![unit_id],
+            )
+            .map_err(db_err)?;
+        self.conn
+            .execute("DELETE FROM renditions WHERE unit_id = ?1", params![unit_id])
+            .map_err(db_err)?;
+        self.conn
+            .execute("DELETE FROM page_bindings WHERE unit_id = ?1", params![unit_id])
+            .map_err(db_err)?;
+        self.conn
+            .execute("DELETE FROM units WHERE id = ?1", params![unit_id])
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     pub fn trash_add(
         &self,
         kind: &str,
@@ -4326,27 +4425,7 @@ impl Store {
         let oid = rec.object_id.as_str();
         match rec.kind.as_str() {
             "unit" => {
-                self.conn
-                    .execute(
-                        "DELETE FROM version_tags WHERE version_id IN (SELECT v.id FROM versions v JOIN renditions r ON v.rendition_id = r.id WHERE r.unit_id = ?1)",
-                        params![oid],
-                    )
-                    .map_err(db_err)?;
-                self.conn
-                    .execute(
-                        "DELETE FROM versions WHERE rendition_id IN (SELECT id FROM renditions WHERE unit_id = ?1)",
-                        params![oid],
-                    )
-                    .map_err(db_err)?;
-                self.conn
-                    .execute("DELETE FROM renditions WHERE unit_id = ?1", params![oid])
-                    .map_err(db_err)?;
-                self.conn
-                    .execute("DELETE FROM page_bindings WHERE unit_id = ?1", params![oid])
-                    .map_err(db_err)?;
-                self.conn
-                    .execute("DELETE FROM units WHERE id = ?1", params![oid])
-                    .map_err(db_err)?;
+                self.delete_unit_permanent(oid)?;
             }
             "index" => {
                 self.conn

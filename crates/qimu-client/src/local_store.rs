@@ -596,16 +596,41 @@ impl LocalStore {
         Some(run())
     }
 
-    /// Thumbnail cache directory for one version, in the server's
-    /// exact layout (`<root>/thumbs/deckcraft-v2/<version id>`), so
-    /// a library previously served by the bundled server hands its
-    /// cache over verbatim — and the server fallback path keeps
-    /// finding the pages this process rendered.
-    pub fn thumb_cache_dir(&self, version_id: &str) -> PathBuf {
-        self.root
-            .join("thumbs")
-            .join("deckcraft-v2")
-            .join(version_id)
+    /// Thumbnail cache directory for one cache key, in the
+    /// shared layout (`<root>/thumbs/deckcraft-v2/<key>`). Since
+    /// the staged-import line (⑤, analysis point on thumbnail
+    /// keying) the key is the PAGE ENTITY id: one page renders
+    /// once per library and is reused by every version, block and
+    /// re-import that references it. Directories keyed by version
+    /// id from before the change are simply never found again —
+    /// the page re-renders once under its entity key and the old
+    /// directory is orphaned (no migration, by design). Only
+    /// legacy versions whose pages carry no entity id still key
+    /// by version id, through `local_render`'s fallback.
+    pub fn thumb_cache_dir(&self, key: &str) -> PathBuf {
+        self.root.join("thumbs").join("deckcraft-v2").join(key)
+    }
+
+    /// The page entity id of one page of a version in this
+    /// library, or None when the version is not local or the page
+    /// carries no entity id (a legacy version the migration could
+    /// not split).
+    pub fn version_page_id(&self, version_id: &str, page: usize) -> Option<String> {
+        let store = self.store.lock().unwrap();
+        let ver = store.get_version(version_id).ok()?;
+        let info = ver.pages.get(page)?;
+        if info.id.is_empty() {
+            None
+        } else {
+            Some(info.id.clone())
+        }
+    }
+
+    /// The stored single-page package bytes of a page entity.
+    pub fn page_package_bytes(&self, page_id: &str) -> Option<Vec<u8>> {
+        let store = self.store.lock().unwrap();
+        let rec = store.get_page(page_id).ok()??;
+        store.file_get(&rec.hash).ok()
     }
 
     /// (units, folders, indexes) counts for the settings diagnostic.
@@ -743,26 +768,52 @@ impl LocalStore {
                     let report = qimu_core::propose::propose_blocks(&pkg)?;
                     Ok(serde_json::to_value(&report).unwrap_or_default())
                 }
+                // Staged import, stage 1 (line ⑤): open the deck —
+                // pages land as one-page units and the wall can
+                // refresh before grouping runs. Local face only:
+                // the server's /v1/import stays the one-shot
+                // composition of the same two core stages.
+                ("POST", ["v1", "import", "open"]) => {
+                    let bytes = b64_field(&body, "data_base64")?;
+                    let blocks = import_block_specs(&body);
+                    let store = self.store.lock().unwrap();
+                    let opened = store.import_open(
+                        &str_field(&body, "filename").unwrap_or_default(),
+                        &bytes,
+                        opt_str_field(&body, "folder_id"),
+                        &str_field(&body, "group_id").unwrap_or_default(),
+                        &self.owner.display_name,
+                        blocks.as_deref(),
+                    )?;
+                    Ok(serde_json::to_value(&opened).unwrap_or_default())
+                }
+                // Staged import, stage 2: fold the opened deck's
+                // wrappers into section / supplied blocks. The
+                // opened state travels in the request body (it is
+                // plain data; the store keeps no session state).
+                ("POST", ["v1", "import", "group"]) => {
+                    let opened: qimu_core::import::ImportOpened =
+                        serde_json::from_value(body.get("opened").cloned().unwrap_or_default())
+                            .map_err(|e| format!("打开状态无效：{e}"))?;
+                    let blocks = import_block_specs(&body);
+                    let store = self.store.lock().unwrap();
+                    let outcome = store.import_group(
+                        &opened,
+                        opt_str_field(&body, "folder_id"),
+                        &str_field(&body, "group_id").unwrap_or_default(),
+                        &self.owner.display_name,
+                        blocks,
+                    )?;
+                    Ok(json!({
+                        "ok": true,
+                        "slide_count": outcome.slide_count,
+                        "fingerprints_match": outcome.fingerprints_match,
+                        "units": outcome.units,
+                    }))
+                }
                 ("POST", ["v1", "import"]) => {
                     let bytes = b64_field(&body, "data_base64")?;
-                    let blocks = body.get("blocks").and_then(|b| b.as_array()).map(|arr| {
-                        arr.iter()
-                            .map(|b| qimu_core::import::ImportBlockSpec {
-                                name: str_field(b, "name").unwrap_or_default(),
-                                pages: b
-                                    .get("pages")
-                                    .and_then(|v| v.as_array())
-                                    .map(|a| {
-                                        a.iter()
-                                            .filter_map(|x| x.as_u64().map(|n| n as usize))
-                                            .collect()
-                                    })
-                                    .unwrap_or_default(),
-                                form: str_field(b, "form"),
-                                lang: str_field(b, "lang"),
-                            })
-                            .collect()
-                    });
+                    let blocks = import_block_specs(&body);
                     let store = self.store.lock().unwrap();
                     let outcome = store.import_blocks(
                         &str_field(&body, "filename").unwrap_or_default(),
@@ -1559,6 +1610,30 @@ fn opt_str_field<'a>(body: &'a Value, key: &str) -> Option<&'a str> {
 
 /// Decode a base64 body field, with the server handler's error
 /// wording.
+/// The `blocks` array of an import request body, in core's
+/// `ImportBlockSpec` shape (shared by the one-shot import arm
+/// and the staged open arm's plan hint).
+fn import_block_specs(body: &Value) -> Option<Vec<qimu_core::import::ImportBlockSpec>> {
+    body.get("blocks").and_then(|b| b.as_array()).map(|arr| {
+        arr.iter()
+            .map(|b| qimu_core::import::ImportBlockSpec {
+                name: str_field(b, "name").unwrap_or_default(),
+                pages: b
+                    .get("pages")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_u64().map(|n| n as usize))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                form: str_field(b, "form"),
+                lang: str_field(b, "lang"),
+            })
+            .collect()
+    })
+}
+
 fn b64_field(body: &Value, key: &str) -> Result<Vec<u8>, String> {
     let s = str_field(body, key).unwrap_or_default();
     crate::b64d(&s).map_err(|e| format!("base64 解码失败: {e}"))
