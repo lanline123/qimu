@@ -104,11 +104,20 @@ impl HostedShow {
         displays: Option<Box<dyn FnMut() -> Option<usize>>>,
     ) -> Result<Self, String> {
         // Every other service stays None: no file pickers, no
-        // read/write bridges, no web presenter-popup host, and no
-        // audio output (show media then renders but plays silently —
-        // a declared spike degradation, see SPIKE.md Q4).
+        // read/write bridges and no web presenter-popup host. Audio
+        // is the one service the shell does provide, through the
+        // cpal output ported from DeckCraft's desktop app (see
+        // hosted_audio.rs), wired the way that app wires it —
+        // `QIMU_NO_AUDIO` plays silently instead. A missing or
+        // failing device never blocks the show: the player drops
+        // the output and carries on silently (deckcraft-media's
+        // Player contract, SPIKE.md Q4 item 12 — degradation
+        // retired by user ruling 2026-11-24 16:39).
         let mut services = Services::default();
         services.displays = displays;
+        services.audio_out = std::env::var_os("QIMU_NO_AUDIO")
+            .is_none()
+            .then(|| Box::new(crate::hosted_audio::CpalOut::default()) as Box<dyn deckcraft_media::AudioOut>);
         let mut app = SlideApp::new(Session::new(), services);
 
         // Load by bytes. `file.openBytes` parses with damage

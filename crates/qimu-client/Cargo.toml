@@ -82,6 +82,13 @@ deckcraft-text   = { path = "../../vendor/deckcraft/crates/text" }
 #   for the client prompt instead of a subprocess stderr line.
 deckcraft-pdf    = { path = "../../vendor/deckcraft/crates/pdf" }
 deckcraft-ui-egui = { path = "../../vendor/deckcraft/crates/ui-egui" }
+# - T2 audio (hosted-show sound, 2026-11-24): media carries the
+#   AudioOut trait the hosting shell now implements (the CpalOut
+#   port in src/hosted_audio.rs); cpal is the output backend, the
+#   same version DeckCraft's desktop app pins
+#   (apps/deckcraft/Cargo.toml: cpal = "0.16").
+deckcraft-media  = { path = "../../vendor/deckcraft/crates/media" }
+cpal = "0.16"
 # ---------------------------------------------------------------------------
 
 # build.rs embeds the brand logo as the Windows executable icon.

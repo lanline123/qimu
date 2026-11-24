@@ -18,6 +18,7 @@ mod local_store;
 mod local_render;
 #[allow(dead_code)] // T2 spike: hosted-show shell, no call sites yet
 mod hosted_show;
+mod hosted_audio;
 
 use chrome_icons::{ChromeIcon, ChromeIcons};
 use index_controls::{IndexMoreAction, IndexOverviewControls, IndexScope};
