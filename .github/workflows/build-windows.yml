@@ -24,6 +24,20 @@ jobs:
         with:
           submodules: true
 
+      # craft-fonts (transplant T0): the client now links
+      # deckcraft-fonts in-process, and that crate's build script
+      # embeds the font set named by CRAFT_FONTS_DIR (latin +
+      # presentation + simplified-chinese manifests — the
+      # 2026-11-23 fonts ruling: Chinese + Latin only). Checked
+      # out here because it is not a submodule of this repo;
+      # pinned to the fork's current main — bump it alongside the
+      # other storytold pins.
+      - uses: actions/checkout@v4
+        with:
+          repository: lanline123/craft-fonts
+          ref: 26a79230872f9b2acd3dd68500677e294350ab94
+          path: vendor/craft-fonts
+
       - name: Install mingw + NSIS
         run: |
           sudo apt-get update
@@ -40,6 +54,14 @@ jobs:
           targets: x86_64-pc-windows-gnu
 
       - name: Build client + server + cli (release, windows-gnu)
+        env:
+          # deckcraft-fonts embedding for the client's in-process
+          # renderer (transplant T0): REQUIRED turns a missing
+          # manifest into a build failure instead of silently
+          # shipping .notdef CJK. Only the client's graph links
+          # the fonts crate; server/cli are unaffected.
+          CRAFT_FONTS_DIR: ${{ github.workspace }}/vendor/craft-fonts
+          CRAFT_FONTS_REQUIRED: "1"
         run: cargo build --release --target x86_64-pc-windows-gnu -p qimu-client -p qimu-server -p qimu-cli
 
       # deckcraft-cli: the server's thumbnail renderer (and the PDF
