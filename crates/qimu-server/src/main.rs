@@ -4013,6 +4013,29 @@ async fn create_share(
     Ok(Json(json!({ "share_id": id })))
 }
 
+/// Revalidate a share's payload at read / accept time: the share
+/// record alone is not proof the content is still there. Showroom
+/// items must still exist and pass the same access funnel the read
+/// surfaces use (`showroom_item_access` — a rejected, deleted or
+/// no-longer-reachable item fails it); assemblies must still exist
+/// in their owner's list (the share itself is the access grant).
+fn share_item_still_valid(store: &Store, user: &UserRec, share: &Value) -> SResult<bool> {
+    let item_id = share["item_id"].as_str().unwrap_or("");
+    match share["item_kind"].as_str() {
+        Some("assembly") => {
+            let from = share["from_user"].as_str().unwrap_or("");
+            Ok(store
+                .list_assemblies(from)?
+                .iter()
+                .any(|a| a["id"] == item_id))
+        }
+        _ => match store.get_showroom(item_id)? {
+            Some(item) => store.showroom_item_access(user, &item),
+            None => Ok(false),
+        },
+    }
+}
+
 /// Shares landing in my inbox: targeted at me directly, or at a
 /// department I belong to (incl. sub-department reach). Group shares
 /// live in the group space instead.
@@ -4041,7 +4064,7 @@ async fn list_inbox(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
             }
             _ => false,
         };
-        if visible {
+        if visible && share_item_still_valid(&store, &user, &s).map_err(bad)? {
             let mut s = s;
             s["in_library"] = json!(library.iter().any(|e| e["item_id"] == s["item_id"]));
             out.push(s);
@@ -4050,16 +4073,20 @@ async fn list_inbox(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
     Ok(Json(json!({ "shares": out })))
 }
 
-fn group_space_items(store: &Store, user_id: &str) -> SResult<Vec<Value>> {
-    let groups = store.list_custom_groups_for(user_id)?;
+fn group_space_items(store: &Store, user: &UserRec) -> SResult<Vec<Value>> {
+    let groups = store.list_custom_groups_for(&user.id)?;
     let shares = store.list_shares()?;
     let mut out = Vec::new();
     for g in &groups {
-        let items: Vec<Value> = shares
-            .iter()
-            .filter(|s| s["target_kind"] == "group" && s["target_id"] == g["id"])
-            .cloned()
-            .collect();
+        let mut items = Vec::new();
+        for s in &shares {
+            if s["target_kind"] == "group"
+                && s["target_id"] == g["id"]
+                && share_item_still_valid(store, user, s)?
+            {
+                items.push(s.clone());
+            }
+        }
         out.push(json!({ "group": g, "items": items }));
     }
     Ok(out)
@@ -4069,7 +4096,7 @@ fn group_space_items(store: &Store, user_id: &str) -> SResult<Vec<Value>> {
 async fn group_space(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
     let user = auth(&st, &headers)?;
     let store = st.store.lock().unwrap();
-    let out = group_space_items(&store, &user.id).map_err(bad)?;
+    let out = group_space_items(&store, &user).map_err(bad)?;
     Ok(Json(json!({ "spaces": out })))
 }
 
@@ -4116,6 +4143,24 @@ async fn accept_share(
     };
     if !recipient {
         return Err(forbidden());
+    }
+    // The share record alone is not proof: revalidate the payload
+    // the way save_to_library does — gone is 404, unreachable is 403.
+    match share["item_kind"].as_str() {
+        Some("assembly") => {
+            if !share_item_still_valid(&store, &user, &share).map_err(bad)? {
+                return Err(not_found());
+            }
+        }
+        _ => {
+            let item = store
+                .get_showroom(share["item_id"].as_str().unwrap_or(""))
+                .map_err(bad)?
+                .ok_or_else(|| not_found())?;
+            if !store.showroom_item_access(&user, &item).map_err(bad)? {
+                return Err(forbidden());
+            }
+        }
     }
     let lib_id = store
         .add_library_entry(
@@ -4694,7 +4739,7 @@ mod collaboration_tests {
         assert_eq!(denied.0, StatusCode::FORBIDDEN);
 
         let item = store
-            .insert_showroom("演示稿", "", None, None, "Alice", "pending")
+            .insert_showroom("演示稿", "", None, None, "Alice", "live")
             .unwrap();
         store
             .create_share(
@@ -4708,12 +4753,12 @@ mod collaboration_tests {
             )
             .unwrap();
 
-        let bob_spaces = group_space_items(&store, &bob.id).unwrap();
+        let bob_spaces = group_space_items(&store, &bob).unwrap();
         assert_eq!(bob_spaces.len(), 1);
         assert_eq!(bob_spaces[0]["group"]["id"], group_id);
         assert_eq!(bob_spaces[0]["items"][0]["item_id"], item.id);
         assert_eq!(bob_spaces[0]["items"][0]["note"], "请查收");
-        assert!(group_space_items(&store, &outsider.id)
+        assert!(group_space_items(&store, &outsider)
             .unwrap()
             .is_empty());
     }
