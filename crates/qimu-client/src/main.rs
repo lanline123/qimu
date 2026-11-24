@@ -403,6 +403,19 @@ fn chip(ui: &mut egui::Ui, text: &str, fg: egui::Color32, bg: egui::Color32) {
     );
 }
 
+/// Type tag from the unified content model (user ruling
+/// 2026-11-25): a unit holding exactly one page IS a 单页; a
+/// unit holding more is a 内容块 (pages composed in order).
+/// Presentation only — storage and behavior treat both
+/// identically; the tag just makes the atom visible in the UI.
+fn unit_kind_tag(page_count: i64) -> Option<&'static str> {
+    match page_count {
+        1 => Some("单页"),
+        n if n > 1 => Some("内容块"),
+        _ => None,
+    }
+}
+
 /// Status chips: the prototype's semantic pairs (fg over its *-soft
 /// bg; gray = --muted on --panel2).
 pub const CHIP_GREEN_FG: egui::Color32 = egui::Color32::from_rgb(0x3F, 0xAE, 0x74);
@@ -2594,6 +2607,7 @@ enum Overlay {
 struct DeckInfoState {
     title: String,
     pages: String,
+    source_index: String,
     version: String,
     submitter: String,
     scope: String,
@@ -2680,6 +2694,36 @@ struct ShowroomPage {
     note: String,
 }
 
+/// Resolve excerpt tokens to page positions in a version's JSON:
+/// page entity ids match the version's page references, legacy
+/// numeric tokens match positionally — the client's mirror of
+/// qimu_core::store::excerpt_positions (the one compat read).
+fn excerpt_positions_json(version: &Value, tokens: &[Value]) -> Vec<usize> {
+    let total = i(version, "page_count").max(0) as usize;
+    let pages = version.get("pages").and_then(|p| p.as_array());
+    let mut out: Vec<usize> = Vec::new();
+    for slot in tokens {
+        let Some(tok) = slot.as_str() else { continue };
+        if tok.starts_with("pg_") {
+            if let Some(pages) = pages {
+                for (pos, p) in pages.iter().enumerate() {
+                    if p.get("id").and_then(|x| x.as_str()) == Some(tok)
+                        && pos < total
+                        && !out.contains(&pos)
+                    {
+                        out.push(pos);
+                    }
+                }
+            }
+        } else if let Ok(n) = tok.parse::<usize>() {
+            if n < total && !out.contains(&n) {
+                out.push(n);
+            }
+        }
+    }
+    out
+}
+
 fn showroom_pages(deck: &Value) -> Vec<ShowroomPage> {
     let mut pages = Vec::new();
     for entry in deck["resolved_entries"].as_array().into_iter().flatten() {
@@ -2690,11 +2734,7 @@ fn showroom_pages(deck: &Value) -> Vec<ShowroomPage> {
         }
         let total = i(version, "page_count").max(0) as usize;
         let slots = match entry["entry"]["excerpt_slots"].as_array() {
-            Some(slots) => slots
-                .iter()
-                .filter_map(|slot| slot.as_str()?.parse::<usize>().ok())
-                .filter(|slot| *slot < total)
-                .collect::<Vec<_>>(),
+            Some(slots) => excerpt_positions_json(version, slots),
             None => (0..total).collect(),
         };
         pages.extend(slots.into_iter().map(|slot| {
@@ -5560,6 +5600,42 @@ impl App {
         }
     }
 
+    /// Page entity ids of a version, in reference order, from the
+    /// data the client already holds: the open unit detail's
+    /// version lists first, then the index detail's. Empty when
+    /// the version is not loaded anywhere.
+    fn version_page_ids(&self, version_id: &str) -> Vec<String> {
+        fn ids_of(versions: &[Value], version_id: &str) -> Option<Vec<String>> {
+            let v = versions.iter().find(|v| s(v, "id") == version_id)?;
+            let pages = v.get("pages")?.as_array()?;
+            Some(
+                pages
+                    .iter()
+                    .map(|p| p.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string())
+                    .collect(),
+            )
+        }
+        if let ContentFrame::Unit(st) = self.content.stack.top() {
+            if let Some(rends) = st.detail.get("renditions").and_then(|r| r.as_array()) {
+                for r in rends {
+                    if let Some(vs) = r.get("versions").and_then(|v| v.as_array()) {
+                        if let Some(ids) = ids_of(vs, version_id) {
+                            return ids;
+                        }
+                    }
+                }
+            }
+        }
+        if let IndexFrame::Detail(d) = self.index.stack.top() {
+            for vs in d.unit_versions.values() {
+                if let Some(ids) = ids_of(vs, version_id) {
+                    return ids;
+                }
+            }
+        }
+        Vec::new()
+    }
+
     fn cancel_pick(&mut self) {
         self.pick = None;
         self.close_unit_detail();
@@ -5567,7 +5643,13 @@ impl App {
     }
 
     fn confirm_pick_pages(&mut self) {
-        let Some(PickState::Pages { entry_pos, sel, .. }) = self.pick.clone() else {
+        let Some(PickState::Pages {
+            entry_pos,
+            sel,
+            version_id,
+            ..
+        }) = self.pick.clone()
+        else {
             return;
         };
         let chosen: Vec<usize> = sel
@@ -5589,8 +5671,19 @@ impl App {
         if chosen.len() == sel.len() {
             es[entry_pos]["excerpt_slots"] = Value::Null;
         } else {
-            es[entry_pos]["excerpt_slots"] =
-                json!(chosen.iter().map(|n| n.to_string()).collect::<Vec<_>>());
+            // Excerpts address pages by entity id (the version's
+            // reference sequence), so a later insert/delete in the
+            // block can no longer shift what the excerpt means.
+            let page_ids = self.version_page_ids(&version_id);
+            if page_ids.len() == sel.len() && page_ids.iter().all(|id| !id.is_empty()) {
+                es[entry_pos]["excerpt_slots"] = json!(chosen
+                    .iter()
+                    .map(|n| page_ids[*n].clone())
+                    .collect::<Vec<_>>());
+            } else {
+                es[entry_pos]["excerpt_slots"] =
+                    json!(chosen.iter().map(|n| n.to_string()).collect::<Vec<_>>());
+            }
         }
         self.pick = None;
         self.close_unit_detail();
@@ -5769,13 +5862,28 @@ impl App {
     /// paste path. Returns the new unit id; failures land in
     /// `self.msg`.
     fn publish_bytes_as_unit(&mut self, bytes: &[u8], name: &str, note: &str) -> Option<String> {
+        let folder = self.content.folder_filter.clone();
+        self.publish_bytes_as_unit_to(bytes, name, note, folder)
+    }
+
+    /// publish_bytes_as_unit with an explicit home folder
+    /// (None = the library root): 解除组合 lands the split
+    /// single-page blocks in the original block's own folder,
+    /// not in whatever folder the wall happens to target.
+    fn publish_bytes_as_unit_to(
+        &mut self,
+        bytes: &[u8],
+        name: &str,
+        note: &str,
+        folder_id: Option<String>,
+    ) -> Option<String> {
         let created = self.call_work(
             "POST",
             "/v1/units",
             Some(json!({
                 "name": name,
                 "group_id": self.content.import_group,
-                "folder_id": self.content.folder_filter,
+                "folder_id": folder_id,
             })),
         );
         let uid = match created {
@@ -5976,6 +6084,88 @@ impl App {
         self.refresh_all();
     }
 
+    /// 解除组合：split one multi-page block back into one
+    /// single-page block per page — the inverse of 组合为内容块.
+    /// The split/publish machinery is clip_paste's （逐页成块）:
+    /// pptx::split into single-page packages, each published as
+    /// its own block, named like a per-page paste, but homed in
+    /// the ORIGINAL block's folder. The original goes to the
+    /// recycle bin (trash_add, the same path cut uses) only
+    /// after every page landed as a new block — a partial
+    /// failure keeps the original untouched.
+    fn clip_ungroup_unit(&mut self, uid: &str) {
+        if !self.need_identity_local("解除组合") {
+            return;
+        }
+        let name = self.unit_name(uid);
+        let Some(vid) = self.unit_latest_version_id(uid) else {
+            self.msg = format!("解除组合失败：「{name}」没有可用的版本");
+            return;
+        };
+        let frag = match self.version_fragment_bytes(&vid) {
+            Ok(b) => b,
+            Err(e) => {
+                self.msg = format!("解除组合失败：{e}");
+                return;
+            }
+        };
+        let pkg = match qimu_core::pptx::Package::load(&frag) {
+            Ok(p) => p,
+            Err(e) => {
+                self.msg = format!("解除组合失败：{e}");
+                return;
+            }
+        };
+        let singles = match qimu_core::pptx::split(&pkg) {
+            Ok(v) => v,
+            Err(e) => {
+                self.msg = format!("解除组合失败：{e}");
+                return;
+            }
+        };
+        if singles.len() < 2 {
+            self.msg = format!("「{name}」只有一页，无需解除组合");
+            return;
+        }
+        // The original block's home folder (empty = root).
+        let folder: Option<String> = self
+            .units
+            .iter()
+            .find_map(|item| {
+                let unit = item.get("unit")?;
+                if s(unit, "id") == uid {
+                    Some(s(unit, "folder_id"))
+                } else {
+                    None
+                }
+            })
+            .filter(|f| !f.is_empty());
+        let total = singles.len();
+        let mut made = 0usize;
+        for (idx, one) in singles.iter().enumerate() {
+            let pname = clip_page_name(one, idx);
+            let Ok(b) = one.to_bytes() else { continue };
+            if self
+                .publish_bytes_as_unit_to(&b, &pname, "解除组合", folder.clone())
+                .is_some()
+            {
+                made += 1;
+            }
+        }
+        if made == total {
+            self.trash_add("unit", uid);
+            self.msg =
+                format!("已解除组合「{name}」：拆为 {made} 个单页内容块，原内容块已移入回收站");
+        } else if made > 0 {
+            self.msg = format!(
+                "解除组合未完成：已新建 {made}/{total} 个单页内容块，原内容块「{name}」保留未动"
+            );
+        } else {
+            self.msg = format!("解除组合失败：未能新建任何单页内容块，原内容块「{name}」保留未动");
+        }
+        self.refresh_all();
+    }
+
     // ---------------- copy / cut sources ----------------
 
     fn unit_name(&self, uid: &str) -> String {
@@ -6003,6 +6193,28 @@ impl App {
                 return None;
             }
             return Some(id);
+        }
+        None
+    }
+
+    /// Page count of a block's lead rendition's latest version,
+    /// from the wall list payload (the same `latest.page_count`
+    /// the wall cards print). None when the block or its version
+    /// is unknown.
+    fn unit_latest_page_count(&self, uid: &str) -> Option<i64> {
+        for item in &self.units {
+            let Some(unit) = item.get("unit") else {
+                continue;
+            };
+            if s(unit, "id") != uid {
+                continue;
+            }
+            let rends = item.get("renditions")?.as_array()?;
+            let latest = rends.first()?.get("latest")?;
+            if !latest.is_object() {
+                return None;
+            }
+            return Some(i(latest, "page_count"));
         }
         None
     }
@@ -6120,9 +6332,9 @@ impl App {
             Ok(v) => match v.get("data_base64").and_then(|x| x.as_str()) {
                 Some(data) => match b64d(data) {
                     Ok(bytes) => self.clip_store(&bytes, &s(item, "title"), true),
-                    Err(_) => self.msg = "复制失败：成品数据损坏".into(),
+                    Err(_) => self.msg = "复制失败：演示稿数据损坏".into(),
                 },
-                None => self.msg = "复制失败：服务器未返回成品".into(),
+                None => self.msg = "复制失败：服务器未返回演示稿".into(),
             },
             Err(e) => self.msg = format!("复制失败：{e}"),
         }
@@ -6277,54 +6489,15 @@ impl App {
         }
     }
 
-    /// The content wall's clipboard/combine action strip: visible
-    /// while a multi-selection or clipboard content exists.
-    fn content_clip_bar(&mut self, ui: &mut egui::Ui, w: &mut WallState) {
-        let multi: Vec<String> = w.multi.clone();
-        let clip_pages = self.ppt_clip.as_ref().map(|m| i(m, "pages")).unwrap_or(0);
-        if multi.is_empty() && self.ppt_clip.is_none() {
-            return;
-        }
-        ui.horizontal_wrapped(|ui| {
-            if !multi.is_empty() {
-                ui.label(egui::RichText::new(format!("已选 {} 个内容块", multi.len())).strong());
-                if ui.small_button("复制").clicked() {
-                    self.clip_copy_units(&multi, false);
-                }
-                if ui.small_button("剪切").clicked() {
-                    self.clip_copy_units(&multi, true);
-                    w.multi.clear();
-                }
-                if ui.small_button("组合为新内容块").clicked() {
-                    self.clip_combine_units(&multi);
-                    w.multi.clear();
-                }
-                if ui.small_button("组合为新索引").clicked() {
-                    self.clip_combine_index(&multi);
-                    w.multi.clear();
-                }
-                if ui.small_button("清空选择").clicked() {
-                    w.multi.clear();
-                }
-            }
-            if self.ppt_clip.is_some() {
-                if !multi.is_empty() {
-                    ui.separator();
-                }
-                ui.label(egui::RichText::new(format!("PPT 剪贴板 · {clip_pages} 页")).strong());
-                if ui.small_button("逐页成块粘贴").clicked() {
-                    self.clip_paste(true);
-                }
-                if ui.small_button("整组成块粘贴").clicked() {
-                    self.clip_paste(false);
-                }
-                if ui.small_button("清空剪贴板").clicked() {
-                    self.clip_clear();
-                }
-            }
-        });
-        ui.add_space(6.0);
-    }
+    // The content wall's own clipboard/combine strip
+    // (content_clip_bar) was removed by the 2026-11-25 deck-bar
+    // consolidation ruling: the selection count, copy / cut,
+    // combine, clear-selection and the two pastes now live only
+    // in the bottom bar's action group (shell.rs
+    // deckbar_actions), which calls the same clip_* methods.
+    // clip_clear keeps its implementation — its only entry went
+    // away with the strip, an accepted consequence of that
+    // ruling (a fresh copy/cut overwrites the clipboard anyway).
 }
 
 // ---------------- UI ----------------
@@ -7375,7 +7548,7 @@ impl App {
             let kind = match s(&r, "kind").as_str() {
                 "index" => tr("索引"),
                 "unit" => tr("内容块"),
-                "showroom" => tr("演示成品"),
+                "showroom" => tr("演示稿"),
                 _ => "",
             };
             let title = s(&r, "title");
@@ -7732,7 +7905,7 @@ impl App {
                 let (kind_label, tone) = match kind.as_str() {
                     "index" => (tr("索引"), BadgeTone::Info),
                     "unit" => (tr("内容块"), BadgeTone::Info),
-                    _ => (tr("演示成品"), BadgeTone::Neutral),
+                    _ => (tr("演示稿"), BadgeTone::Neutral),
                 };
                 let title = s(t, "title");
                 let origin = s(t, "origin");
@@ -7947,7 +8120,7 @@ impl App {
                 let kind_label = match kind.as_str() {
                     "index" => tr("索引"),
                     "unit" => tr("内容块"),
-                    _ => tr("演示成品"),
+                    _ => tr("演示稿"),
                 };
                 ui.label(
                     egui::RichText::new(format!(
@@ -9290,8 +9463,13 @@ impl App {
         }
     }
 
-    /// Open a showroom entry's whole-deck view (H): fetch the source
-    /// index so its resolved entries can be paged through.
+    /// Open a showroom entry's whole-deck view (H): page through
+    /// the item's resolved entries. The item's own payload is the
+    /// primary source — the showroom list resolves it with the
+    /// item's publish pins, so the deck view shows the formal
+    /// version the push confirmed; the source index detail (the
+    /// index layer's own face, following latest) is only a
+    /// fallback for item payloads that carry no resolved rows.
     fn open_showroom_deck(&mut self, item: &Value) {
         self.note_recent("showroom", &s(item, "id"), &s(item, "title"), "");
         self.showroom.stack.pop_to(0);
@@ -9303,11 +9481,18 @@ impl App {
             preview_open: false,
             closed: false,
         }));
-        let src = s(item, "source_index_id");
-        if !src.is_empty() {
-            if let Ok(v) = self.call("GET", &format!("/v1/indexes/{src}"), None) {
-                if let SrFrame::Deck(d) = self.showroom.stack.top_mut() {
-                    d.pages = showroom_pages(&v);
+        let item_pages = showroom_pages(item);
+        if !item_pages.is_empty() {
+            if let SrFrame::Deck(d) = self.showroom.stack.top_mut() {
+                d.pages = item_pages;
+            }
+        } else {
+            let src = s(item, "source_index_id");
+            if !src.is_empty() {
+                if let Ok(v) = self.call("GET", &format!("/v1/indexes/{src}"), None) {
+                    if let SrFrame::Deck(d) = self.showroom.stack.top_mut() {
+                        d.pages = showroom_pages(&v);
+                    }
                 }
             }
         }
@@ -9637,7 +9822,7 @@ impl App {
         };
         if let Some(p) = page {
             if (p as i64) >= page_count {
-                self.msg = "导出 PDF 失败：页码超出成品页数".into();
+                self.msg = "导出 PDF 失败：页码超出演示稿页数".into();
                 return true;
             }
         }
@@ -9773,20 +9958,27 @@ impl App {
             .find(|x| s(x, "id") == s(&item, "source_index_id"))
             .map(|x| s(x, "name"))
             .unwrap_or_default();
+        // Back-reference line (unified content model, user
+        // ruling 2026-11-25): this deck is a published index —
+        // name its source index and the published commit (or
+        // its follow state), never let it read as a standalone
+        // product. Source-less items are personal assemblies
+        // and carry no publish segment.
+        let mut head_line = if s(&item, "source_index_id").is_empty() {
+            "个人组装".to_string()
+        } else if src_name.is_empty() {
+            "来源索引".to_string()
+        } else {
+            format!("来源索引 {src_name}")
+        };
+        if !s(&item, "source_index_id").is_empty() {
+            head_line = format!("{head_line} · 发布版 {}", self.deck_commit_label(&item));
+        }
+        head_line = format!("{head_line} · {}", s(&item, "submitted_by"));
         ui.label(
-            egui::RichText::new(format!(
-                "{} · {}",
-                if s(&item, "source_index_id").is_empty() {
-                    "个人组装".to_string()
-                } else if src_name.is_empty() {
-                    "来源索引".to_string()
-                } else {
-                    format!("来源索引 {src_name}")
-                },
-                s(&item, "submitted_by")
-            ))
-            .size(11.5)
-            .color(palette_color(TEXT_FAINT)),
+            egui::RichText::new(head_line)
+                .size(11.5)
+                .color(palette_color(TEXT_FAINT)),
         );
         if text_action(ui, "用系统应用打开", palette_color(TEXT_WEAK), 11.5) {
             self.present_showroom(&s(&item, "id"), &s(&item, "title"));
@@ -10069,20 +10261,42 @@ impl App {
     }
 
     /// The index half of a showroom cache bundle: the source
-    /// index's detail JSON plus each distinct resolved block
+    /// index's detail JSON (its resolved rows replaced by the
+    /// item's pinned resolution) plus each distinct pinned block
     /// version's fragment bytes (version id, unit id, bytes, page
     /// count). None when any fetch fails — the caller then caches
     /// the assembled deck only, rather than failing the cache.
     fn fetch_cache_bundle(
         &mut self,
         source_index_id: &str,
+        item: &Value,
     ) -> Option<(Vec<u8>, Vec<(String, String, Vec<u8>, i64)>)> {
-        let detail = self
+        let mut detail = self
             .call("GET", &format!("/v1/indexes/{source_index_id}"), None)
             .ok()?;
+        // The bundle's blocks are the item's pinned resolution
+        // (the showroom list payload carries it as the item's
+        // resolved_entries), not the source index head's: the
+        // cached drill-down holds the formal version. The stored
+        // detail is stamped with the same rows, so offline page
+        // resolution reads the pinned set too. Items whose
+        // payload carries no resolved rows (older flows) fall
+        // back to the index detail's own rows, as before.
+        let pinned_rows = item
+            .get("resolved_entries")
+            .and_then(|r| r.as_array())
+            .filter(|rows| !rows.is_empty())
+            .cloned();
+        let rows = match &pinned_rows {
+            Some(rows) => rows.clone(),
+            None => detail["resolved_entries"].as_array()?.clone(),
+        };
+        if let Some(rows) = &pinned_rows {
+            detail["resolved_entries"] = Value::Array(rows.clone());
+        }
         let mut seen: Vec<String> = Vec::new();
         let mut blocks = Vec::new();
-        for entry in detail["resolved_entries"].as_array()?.iter() {
+        for entry in rows.iter() {
             let version = &entry["resolved"];
             let vid = s(version, "id");
             if vid.is_empty() || seen.contains(&vid) {
@@ -10116,10 +10330,14 @@ impl App {
             self.msg = "该条目暂不支持缓存到本地".into();
             return;
         }
+        // The cached deck is the showroom item's own export —
+        // its pinned commit with publish pins applied — not the
+        // source index's current main head: the cache holds the
+        // formal version, so it must not drift with the index.
         let data = match self.call(
             "POST",
-            &format!("/v1/indexes/{source}/export"),
-            Some(json!({ "branch": "main", "kind": "personal" })),
+            &format!("/v1/showroom/{}/export", s(item, "id")),
+            Some(json!({ "kind": "personal" })),
         ) {
             Ok(d) => d,
             Err(e) => {
@@ -10135,7 +10353,7 @@ impl App {
         // the assembled deck alone is not the cache — the bundle
         // also carries the source index and its blocks, so the
         // cached deck opens and drills down offline.
-        match self.fetch_cache_bundle(&source) {
+        match self.fetch_cache_bundle(&source, item) {
             Some((index_json, blocks)) => self.cache_deck_bundle(
                 &format!("sr_{}", s(item, "id")),
                 &s(item, "title"),
@@ -10971,7 +11189,7 @@ impl App {
                     .unwrap_or_else(|| s(item, "source_index_id"));
                 std_card(ui, false, |ui| {
                     ui.horizontal(|ui| {
-                        slide_cover(ui, tex, tr("演示成品"), &title, "", 84.0);
+                        slide_cover(ui, tex, tr("演示稿"), &title, "", 84.0);
                         ui.vertical(|ui| {
                             ui.label(
                                 egui::RichText::new(&title)
@@ -11810,7 +12028,6 @@ impl App {
                 .as_ref()
                 .map(|u| s(u, "display_name"))
                 .unwrap_or_default();
-            self.content_clip_bar(ui, w);
             egui::ScrollArea::vertical()
                 .id_salt("content-wall")
                 .show(ui, |ui| {
@@ -12194,6 +12411,9 @@ impl App {
                             palette_color(ACCENT_DEEP),
                             CHIP_BLUE_BG,
                         );
+                        if let Some(tag) = unit_kind_tag(i(&latest, "page_count")) {
+                            chip(ui, tag, palette_color(CHIP_GRAY_FG), CHIP_GRAY_BG);
+                        }
                         ui.label(
                             egui::RichText::new(format!("{} 页", i(&latest, "page_count")))
                                 .small()
@@ -12569,6 +12789,21 @@ impl App {
             self.refresh_all();
             return;
         }
+        // Type tag (unified content model, user ruling
+        // 2026-11-25): the head rendition's latest version
+        // decides — one page reads 单页, more read 内容块.
+        let head_latest = detail
+            .get("renditions")
+            .and_then(|r| r.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|r| r.get("latest"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let kind_tag = if head_latest.is_object() {
+            unit_kind_tag(i(&head_latest, "page_count"))
+        } else {
+            None
+        };
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             // Title (prototype data-dbl-edit): double-click turns
@@ -12587,6 +12822,9 @@ impl App {
                     st.meta_edit = Some((MetaField::Name, s(&unit, "name")));
                     st.meta_edit_focus = true;
                 }
+            }
+            if let Some(tag) = kind_tag {
+                chip(ui, tag, palette_color(CHIP_GRAY_FG), CHIP_GRAY_BG);
             }
             ui.label(format!(
                 "内容修订 r{} · 维护人 {}",
@@ -14059,7 +14297,7 @@ impl App {
     fn deck_info_ui(&mut self, ui: &mut egui::Ui, st: DeckInfoState) -> Option<Overlay> {
         let mut open = true;
         let mut close = false;
-        egui::Window::new(tr("成品信息"))
+        egui::Window::new(tr("演示稿信息"))
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -14078,7 +14316,8 @@ impl App {
                     .show(ui, |ui| {
                         for (label, value) in [
                             ("页数", &st.pages),
-                            ("版本", &st.version),
+                            ("来源索引", &st.source_index),
+                            ("发布版本", &st.version),
                             ("提交人", &st.submitter),
                             ("可见范围", &st.scope),
                         ] {
@@ -14108,45 +14347,65 @@ impl App {
         Some(Overlay::DeckInfo(st))
     }
 
+    /// Back-reference to the source index of a showroom item
+    /// (unified content model, user ruling 2026-11-25): the
+    /// showroom holds a published index, not a standalone
+    /// product, and its surfaces name the index it came from.
+    /// The index's name when the local index list knows it,
+    /// else the id's short form; "—" for source-less items
+    /// (hand-made assemblies).
+    fn deck_source_label(&self, item: &Value) -> String {
+        let sid = s(item, "source_index_id");
+        if sid.is_empty() {
+            return "—".to_string();
+        }
+        self.indexes
+            .iter()
+            .find(|x| s(x, "id") == sid)
+            .map(|x| s(x, "name"))
+            .unwrap_or_else(|| sid.chars().take(8).collect())
+    }
+
+    /// The published-commit label of a showroom item: the
+    /// pinned commit's message when the open index detail
+    /// holds the commit list (commits are labelled by message
+    /// in this client), else the commit's short id. An item
+    /// with no pinned commit follows its source index's
+    /// current head, and the label says so.
+    fn deck_commit_label(&self, item: &Value) -> String {
+        let cid = s(item, "commit_id");
+        if cid.is_empty() {
+            return "跟随索引最新".to_string();
+        }
+        if let IndexFrame::Detail(d) = self.index.stack.top() {
+            if d.index_id == s(item, "source_index_id") {
+                if let Some(list) = d.commits.as_ref().and_then(|c| c["commits"].as_array()) {
+                    if let Some(c) = list.iter().find(|c| s(c, "id") == cid) {
+                        let msg = s(c, "message");
+                        if !msg.is_empty() {
+                            return msg;
+                        }
+                    }
+                }
+            }
+        }
+        format!("提交 {}", cid.chars().take(8).collect::<String>())
+    }
+
     /// sdInfo click: snapshot the target item's metadata and
     /// open the panel. Page count is the open deck's loaded
     /// page list — a plaza-selected deck has not been loaded
     /// and the item record carries no page count, so the field
-    /// stays "—" rather than guessing. Version is the item's
-    /// pinned submission commit: its message when the source
-    /// index's detail frame holds the commit list (commits are
-    /// labelled by message in this client), else the commit's
-    /// short id.
+    /// stays "—" rather than guessing. The panel also carries
+    /// the back-reference to the published index (source index
+    /// name + published commit, via the helpers above).
     fn open_deck_info(&mut self, item: &Value, pages: Option<usize>) {
-        let version = {
-            let cid = s(item, "commit_id");
-            if cid.is_empty() {
-                "—".to_string()
-            } else {
-                let mut label = None;
-                if let IndexFrame::Detail(d) = self.index.stack.top() {
-                    if d.index_id == s(item, "source_index_id") {
-                        if let Some(list) =
-                            d.commits.as_ref().and_then(|c| c["commits"].as_array())
-                        {
-                            if let Some(c) = list.iter().find(|c| s(c, "id") == cid) {
-                                let msg = s(c, "message");
-                                if !msg.is_empty() {
-                                    label = Some(msg);
-                                }
-                            }
-                        }
-                    }
-                }
-                label.unwrap_or_else(|| {
-                    format!("提交 {}", cid.chars().take(8).collect::<String>())
-                })
-            }
-        };
+        let version = self.deck_commit_label(item);
         let submitter = s(item, "submitted_by");
         self.overlays.push(Overlay::DeckInfo(DeckInfoState {
             title: s(item, "title"),
             pages: pages.map(|n| n.to_string()).unwrap_or_else(|| "—".into()),
+            source_index: self.deck_source_label(item),
             version,
             submitter: if submitter.is_empty() {
                 "—".into()
@@ -16176,15 +16435,8 @@ impl App {
                                     .and_then(|x| x.as_array())
                                 {
                                     sel = vec![false; total];
-                                    for sl in slots {
-                                        if let Some(n) = sl
-                                            .as_str()
-                                            .and_then(|x| x.parse::<usize>().ok())
-                                        {
-                                            if n < total {
-                                                sel[n] = true;
-                                            }
-                                        }
+                                    for pos in excerpt_positions_json(&ver, slots) {
+                                        sel[pos] = true;
                                     }
                                 }
                                 *action = Some(IndexDetailAction::PickPages(pos, re.clone(), sel));

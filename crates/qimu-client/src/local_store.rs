@@ -306,14 +306,13 @@ impl LocalStore {
         units.iter().map(|u| unit_json(&store, u)).collect()
     }
 
-    /// The version's fragment PPTX bytes from the local CAS (the
-    /// same `file_get(fragment_hash)` read the server's thumb and
-    /// edit-preview handlers perform). None when the version is not
-    /// in this library.
+    /// The version's fragment PPTX bytes from the local store
+    /// (the same read the server's thumb and edit-preview handlers
+    /// perform). None when the version is not in this library.
     pub fn version_fragment(&self, version_id: &str) -> Option<Vec<u8>> {
         let store = self.store.lock().unwrap();
         let ver = store.get_version(version_id).ok()?;
-        store.file_get(&ver.fragment_hash).ok()
+        store.version_fragment_bytes(&ver).ok()
     }
 
     /// An attachment's bytes from the local CAS (the read the
@@ -331,8 +330,10 @@ impl LocalStore {
     /// mirroring the server's export funnel step for step (handler
     /// `export_showroom_pdf` + `build_export`): the item's commit
     /// (pinned `commit_id`, else the source index's main head)
-    /// supplies the entries; each entry resolves to a version whose
-    /// fragment is split and excerpted; speaker scripts are written
+    /// supplies the entries, with the item's publish pins applied;
+    /// each entry resolves to a version whose
+    /// pages are taken from its page-reference sequence and
+    /// excerpted; speaker scripts are written
     /// back into the notes pages when `include_notes`; personal
     /// placeholders resolve against the company profile + the
     /// library owner's profile (kind "personal", the only kind the
@@ -371,24 +372,24 @@ impl LocalStore {
                     store.get_commit(&head)?
                 }
             };
+            // Publish pins applied, mirroring the server's
+            // export funnel: the item assembles its confirmed
+            // formal version, not today's follow-latest drift.
+            let entries = store.pinned_commit_entries(&item, &commit)?;
             let mut pkgs: Vec<Package> = Vec::new();
             let mut bindings: Vec<Binding> = Vec::new();
             let mut binding_scripts: Vec<Vec<String>> = Vec::new();
-            for e in &commit.entries {
+            for e in &entries {
                 let version = store
                     .resolve_entry_version(e)?
                     .ok_or_else(|| {
                         "有条目无法解析到版本（内容块尚无已发布版本）".to_string()
                     })?;
-                let frag_bytes = store.file_get(&version.fragment_hash)?;
-                let frag_pkg = Package::load(&frag_bytes)?;
-                let singles = pptx::split(&frag_pkg)?;
+                let singles = store.version_page_packages(&version)?;
                 let chosen: Vec<usize> = match &e.excerpt_slots {
-                    Some(slots) => slots
-                        .iter()
-                        .filter_map(|sl| sl.parse::<usize>().ok())
-                        .filter(|i| *i < singles.len())
-                        .collect(),
+                    Some(slots) => {
+                        qimu_core::store::excerpt_positions(&version, slots)
+                    }
                     None => (0..singles.len()).collect(),
                 };
                 let mut fps = Vec::new();
@@ -547,7 +548,7 @@ impl LocalStore {
                     });
                 }
                 if !versions.iter().any(|v| v.id == version.id) {
-                    let bytes = store.file_get(&version.fragment_hash)?;
+                    let bytes = store.version_fragment_bytes(&version)?;
                     files.insert(
                         version.fragment_hash.clone(),
                         Value::String(crate::b64e(&bytes)),
@@ -889,7 +890,7 @@ impl LocalStore {
                 ("GET", ["v1", "versions", id, "fragment"]) => {
                     let store = self.store.lock().unwrap();
                     let ver = store.get_version(id).map_err(|_| NOT_FOUND.to_string())?;
-                    let bytes = store.file_get(&ver.fragment_hash)?;
+                    let bytes = store.version_fragment_bytes(&ver)?;
                     Ok(json!({
                         "version": serde_json::to_value(&ver).unwrap_or(Value::Null),
                         "data_base64": crate::b64e(&bytes),
@@ -915,7 +916,7 @@ impl LocalStore {
                         Ok(v) => v,
                         Err(_) => return Err(UNHANDLED.to_string()),
                     };
-                    let bytes = store.file_get(&ver.fragment_hash)?;
+                    let bytes = store.version_fragment_bytes(&ver)?;
                     let pkg = Package::load(&bytes)?;
                     let runs = qimu_core::pptx::slide_text_runs(&pkg, page)?;
                     let (slide_cx, slide_cy) = qimu_core::pptx::slide_size(&pkg);
@@ -974,7 +975,7 @@ impl LocalStore {
                     };
                     let rend = store.get_rendition(&ver.rendition_id)?;
                     let unit = store.get_unit(&rend.unit_id)?;
-                    let bytes = store.file_get(&ver.fragment_hash)?;
+                    let bytes = store.version_fragment_bytes(&ver)?;
                     let added_pages = body
                         .get("added_pages")
                         .and_then(|v| v.as_u64())
@@ -1585,15 +1586,9 @@ fn build_deck_local(
         let version = store
             .resolve_entry_version(e)?
             .ok_or_else(|| "有条目无法解析到版本（内容块尚无已发布版本）".to_string())?;
-        let frag_bytes = store.file_get(&version.fragment_hash)?;
-        let frag_pkg = Package::load(&frag_bytes)?;
-        let singles = pptx::split(&frag_pkg)?;
+        let singles = store.version_page_packages(&version)?;
         let chosen: Vec<usize> = match &e.excerpt_slots {
-            Some(slots) => slots
-                .iter()
-                .filter_map(|sl| sl.parse::<usize>().ok())
-                .filter(|i| *i < singles.len())
-                .collect(),
+            Some(slots) => qimu_core::store::excerpt_positions(&version, slots),
             None => (0..singles.len()).collect(),
         };
         let mut fps = Vec::new();

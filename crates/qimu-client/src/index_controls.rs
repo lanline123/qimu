@@ -275,16 +275,25 @@ impl App {
                 None => {}
             }
         }
-        self.msg = match self.call(
-            "POST",
-            "/v1/showroom",
-            Some(json!({
-                "title": title,
-                "intro": note,
-                "source_index_id": id,
-                "published_tag_id": published_tag_id,
-            })),
-        ) {
+        // The reference submission carries the push summary's
+        // confirmed resolution with it (publish pins): the item
+        // the approval lands publishes exactly the versions the
+        // summary displayed. Without pins (an empty summary —
+        // not expected from the dialog) the field is omitted and
+        // the server captures the submit-time resolution.
+        let mut body = json!({
+            "title": title,
+            "intro": note,
+            "source_index_id": id,
+            "published_tag_id": published_tag_id,
+        });
+        if !pinned_versions.is_empty() {
+            body["pinned_versions"] = json!(pinned_versions
+                .iter()
+                .map(|(_, v)| v.clone())
+                .collect::<Vec<_>>());
+        }
+        self.msg = match self.call("POST", "/v1/showroom", Some(body)) {
             Ok(_) => "已提交，等待审核".into(),
             Err(error) => error,
         };

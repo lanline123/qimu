@@ -126,7 +126,41 @@ pub struct RenditionRec {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PageInfo {
+    /// Page entity id: the page's stable identity, shared by every
+    /// version whose reference sequence includes this page. Derived
+    /// from the content fingerprint (see `page_id_for_fp`), so the
+    /// same page content is the same entity in every version, block
+    /// and store — inserting or deleting sibling pages never shifts
+    /// it. Empty in version rows written before page entity-ization;
+    /// Store::open's migration fills those in.
+    #[serde(default)]
+    pub id: String,
     pub fp: String,
+    pub title: String,
+}
+
+/// The page entity id for a content fingerprint. Pages are content,
+/// so identity derives from content: `pg_` + the fingerprint's
+/// first 32 hex chars (128 bits of the SHA-256 the fingerprint
+/// already is). The prefix keeps page ids unmistakably distinct
+/// from legacy numeric excerpt tokens and from other id families.
+pub fn page_id_for_fp(fp: &str) -> String {
+    let take = fp.len().min(32);
+    format!("pg_{}", &fp[..take])
+}
+
+/// One page entity: a single slide as an independently stored,
+/// independently referenceable unit of content. The entity's bytes
+/// are a single-page PPTX package in the file store (`hash`); the
+/// first package registered for a fingerprint is canonical — later
+/// packages with the same fingerprint are the same page by the
+/// system's own change-detection definition (page_fingerprint) and
+/// do not replace it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PageRec {
+    pub id: String,
+    pub fp: String,
+    pub hash: String,
     pub title: String,
 }
 
@@ -181,6 +215,36 @@ pub struct MergePreview {
     /// Auto-merged entries (conflicts excluded until adjudicated).
     pub merged: Vec<IndexEntry>,
     pub conflicts: Vec<MergeConflict>,
+}
+
+/// Resolve an index entry's excerpt selection to page positions
+/// in its resolved version. Excerpt tokens are page entity ids
+/// (current writes); pre-entity commits carry decimal slot indices,
+/// which keep resolving positionally — the compat read. A token
+/// carrying the `pg_` prefix only ever matches page ids; a numeric
+/// token only ever matches a position (page ids are never numeric),
+/// so the two generations can never be confused. Positions come
+/// back in token order, deduplicated; tokens that resolve to
+/// nothing (a followed version whose page was edited into a new
+/// entity, an out-of-range legacy index) select nothing — an
+/// excerpt pins exact pages, not positions, once it is written
+/// with ids.
+pub fn excerpt_positions(version: &VersionRec, tokens: &[String]) -> Vec<usize> {
+    let mut chosen: Vec<usize> = Vec::new();
+    for tok in tokens {
+        if tok.starts_with("pg_") {
+            for (i, p) in version.pages.iter().enumerate() {
+                if p.id == *tok && !chosen.contains(&i) {
+                    chosen.push(i);
+                }
+            }
+        } else if let Ok(n) = tok.parse::<usize>() {
+            if n < version.pages.len() && !chosen.contains(&n) {
+                chosen.push(n);
+            }
+        }
+    }
+    chosen
 }
 
 /// Occurrence-suffixed keys so the same block used twice in one index
@@ -378,6 +442,17 @@ pub struct PageBindingRec {
     pub kind: String,
     pub author: String,
     pub created_ms: i64,
+    /// Page entity ids the slots address: the binding's addressing
+    /// of record. Versions are immutable, so (version, slot) and
+    /// (version, page id) name the same page forever; the ids are
+    /// what survives as the addressing scheme (excerpt tokens made
+    /// the same move). Filled at write time and by Store::open's
+    /// migration for pre-entity rows; empty only when the bound
+    /// version's page could not be resolved at migration time.
+    #[serde(default)]
+    pub from_page_id: String,
+    #[serde(default)]
+    pub to_page_id: String,
 }
 
 /// One row of the trash (soft-delete overlay). `kind` is the client
@@ -596,10 +671,12 @@ CREATE TABLE IF NOT EXISTS exports(id TEXT PRIMARY KEY, index_id TEXT NOT NULL, 
 CREATE TABLE IF NOT EXISTS attachments(id TEXT PRIMARY KEY, parent_type TEXT NOT NULL, parent_id TEXT NOT NULL, filename TEXT NOT NULL, hash TEXT NOT NULL, size INTEGER NOT NULL, uploader TEXT NOT NULL, created_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS version_tags(id TEXT PRIMARY KEY, version_id TEXT NOT NULL, dim TEXT NOT NULL, value TEXT NOT NULL, strength TEXT NOT NULL DEFAULT 'fits', author TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS showroom(id TEXT PRIMARY KEY, title TEXT NOT NULL, intro TEXT NOT NULL DEFAULT '', source_index_id TEXT, commit_id TEXT, submitted_by TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending', created_ms INTEGER NOT NULL, scope TEXT NOT NULL DEFAULT 'org_public');
+CREATE TABLE IF NOT EXISTS showroom_pins(showroom_id TEXT NOT NULL, pos INTEGER NOT NULL, version_id TEXT NOT NULL, PRIMARY KEY(showroom_id, pos));
 CREATE TABLE IF NOT EXISTS submissions(id TEXT PRIMARY KEY, title TEXT NOT NULL, intro TEXT NOT NULL DEFAULT '', submitter_id TEXT NOT NULL, submitter_name TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending', note TEXT NOT NULL DEFAULT '', review_note TEXT NOT NULL DEFAULT '', reviewed_by TEXT NOT NULL DEFAULT '', reviewed_ms INTEGER NOT NULL DEFAULT 0, created_ms INTEGER NOT NULL, supersedes TEXT, source_index_id TEXT, landed_index_id TEXT, landed_showroom_id TEXT, entry_count INTEGER NOT NULL DEFAULT 0, page_count INTEGER NOT NULL DEFAULT 0, land_error TEXT NOT NULL DEFAULT '', manifest_json TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS trash_items(id TEXT PRIMARY KEY, kind TEXT NOT NULL, object_id TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', origin TEXT NOT NULL DEFAULT '', deleted_by TEXT NOT NULL DEFAULT '', deleted_ms INTEGER NOT NULL DEFAULT 0, UNIQUE(kind, object_id));
 CREATE TABLE IF NOT EXISTS assemblies(id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, entries_json TEXT NOT NULL, created_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS page_bindings(id TEXT PRIMARY KEY, unit_id TEXT NOT NULL, from_version_id TEXT NOT NULL, from_slot INTEGER NOT NULL, to_version_id TEXT NOT NULL, to_slot INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'manual', author TEXT NOT NULL, created_ms INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS pages(id TEXT PRIMARY KEY, fp TEXT NOT NULL, hash TEXT NOT NULL, title TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS custom_groups(id TEXT PRIMARY KEY, name TEXT NOT NULL, owner_id TEXT NOT NULL, created_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS custom_group_members(group_id TEXT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY(group_id, user_id));
 CREATE TABLE IF NOT EXISTS shares(id TEXT PRIMARY KEY, item_kind TEXT NOT NULL, item_id TEXT NOT NULL, title TEXT NOT NULL, from_user TEXT NOT NULL, target_kind TEXT NOT NULL, target_id TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', created_ms INTEGER NOT NULL);
@@ -670,6 +747,8 @@ impl Store {
             ("showroom", "reviewed_by", "TEXT NOT NULL DEFAULT ''"),
             ("showroom", "reviewed_ms", "INTEGER NOT NULL DEFAULT 0"),
             ("shares", "note", "TEXT NOT NULL DEFAULT ''"),
+            ("page_bindings", "from_page_id", "TEXT NOT NULL DEFAULT ''"),
+            ("page_bindings", "to_page_id", "TEXT NOT NULL DEFAULT ''"),
         ] {
             let has: bool = conn
                 .prepare(&format!("PRAGMA table_info({table})"))
@@ -691,6 +770,7 @@ impl Store {
             root: root.to_path_buf(),
         };
         store.backfill_folder_scopes()?;
+        store.migrate_page_entities()?;
         Ok(store)
     }
 
@@ -820,6 +900,236 @@ impl Store {
             .join("files")
             .join(sub)
             .join(format!("{hash}.bin"))
+    }
+
+    // ---------- page entities ----------
+
+    /// Register a page entity from its single-page package bytes.
+    /// Identity derives from the content fingerprint: if the page
+    /// already exists, the existing record is returned and the new
+    /// bytes are NOT stored (first registration is canonical — a
+    /// same-fingerprint package is the same page). Otherwise the
+    /// package goes into the file store and the row is created.
+    pub fn register_page(&self, fp: &str, title: &str, single: &[u8]) -> SResult<PageRec> {
+        let id = page_id_for_fp(fp);
+        if let Some(rec) = self.get_page(&id)? {
+            return Ok(rec);
+        }
+        let hash = self.file_put(single)?;
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO pages(id, fp, hash, title) VALUES(?1,?2,?3,?4)",
+                params![id, fp, hash, title],
+            )
+            .map_err(db_err)?;
+        self.get_page(&id)?.ok_or_else(|| "页实体登记失败".to_string())
+    }
+
+    pub fn get_page(&self, id: &str) -> SResult<Option<PageRec>> {
+        self.conn
+            .query_row(
+                "SELECT id, fp, hash, title FROM pages WHERE id=?1",
+                params![id],
+                |r| {
+                    Ok(PageRec {
+                        id: r.get(0)?,
+                        fp: r.get(1)?,
+                        hash: r.get(2)?,
+                        title: r.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db_err)
+    }
+
+    /// The single-page package bytes of one of a version's pages,
+    /// resolved through the page entity the version references.
+    pub fn version_page_package(&self, version: &VersionRec, pos: usize) -> SResult<Package> {
+        let info = version
+            .pages
+            .get(pos)
+            .ok_or_else(|| "页位越界".to_string())?;
+        if !info.id.is_empty() {
+            if let Some(rec) = self.get_page(&info.id)? {
+                let bytes = self.file_get(&rec.hash)?;
+                return Package::load(&bytes);
+            }
+        }
+        // Legacy fallback: a version whose pages carry no entity
+        // ids (migration could not split its fragment) still reads
+        // through its stored fragment.
+        let bytes = self.file_get(&version.fragment_hash)?;
+        let pkg = Package::load(&bytes)?;
+        let singles = crate::pptx::split(&pkg)?;
+        singles
+            .into_iter()
+            .nth(pos)
+            .ok_or_else(|| "页位越界".to_string())
+    }
+
+    /// All of a version's pages as single-page packages, in the
+    /// version's reference order — the page-level resolution every
+    /// export/assembly path consumes. Falls back to splitting the
+    /// stored fragment when any page lacks a resolvable entity.
+    pub fn version_page_packages(&self, version: &VersionRec) -> SResult<Vec<Package>> {
+        let entity_backed = !version.pages.is_empty()
+            && version
+                .pages
+                .iter()
+                .all(|p| !p.id.is_empty());
+        if entity_backed {
+            let mut out = Vec::with_capacity(version.pages.len());
+            for pos in 0..version.pages.len() {
+                match self.version_page_package(version, pos) {
+                    Ok(pkg) => out.push(pkg),
+                    Err(_) => return self.version_page_packages_legacy(version),
+                }
+            }
+            return Ok(out);
+        }
+        self.version_page_packages_legacy(version)
+    }
+
+    fn version_page_packages_legacy(&self, version: &VersionRec) -> SResult<Vec<Package>> {
+        let bytes = self.file_get(&version.fragment_hash)?;
+        let pkg = Package::load(&bytes)?;
+        crate::pptx::split(&pkg)
+    }
+
+    /// The version's fragment PPTX bytes. For entity-backed
+    /// versions this is the stored materialization of exactly the
+    /// fragment the version was inserted from (versions are
+    /// immutable, so the materialization cannot drift from the
+    /// reference sequence); consumers that need pages rather than
+    /// the whole fragment should prefer `version_page_packages`.
+    pub fn version_fragment_bytes(&self, version: &VersionRec) -> SResult<Vec<u8>> {
+        self.file_get(&version.fragment_hash)
+    }
+
+    /// Page entity-ization migration (Store::open): versions
+    /// written before page entities carry PageInfo rows without
+    /// ids. For each such version, split its stored fragment,
+    /// register every page as an entity and rewrite pages_json
+    /// with the reference sequence. Idempotent — versions whose
+    /// pages all carry ids are skipped, and a version whose
+    /// fragment cannot be read or split is left untouched (its
+    /// reads keep working through the legacy fragment fallback).
+    /// Page bindings gain their page-id addressing the same way:
+    /// (version, slot) resolves to the version's page reference.
+    fn migrate_page_entities(&self) -> SResult<()> {
+        let pending: Vec<(String, String, String)> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id, fragment_hash, pages_json FROM versions")
+                .map_err(db_err)?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(db_err)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(db_err)?;
+            rows
+        };
+        for (version_id, fragment_hash, pages_json) in &pending {
+            let mut pages: Vec<PageInfo> =
+                serde_json::from_str(pages_json).unwrap_or_default();
+            if pages.iter().all(|p| !p.id.is_empty()) {
+                continue;
+            }
+            let Ok(bytes) = self.file_get(fragment_hash) else {
+                continue;
+            };
+            let Ok(pkg) = Package::load(&bytes) else {
+                continue;
+            };
+            let Ok(singles) = crate::pptx::split(&pkg) else {
+                continue;
+            };
+            if singles.len() != pages.len() {
+                continue;
+            }
+            let mut filled = true;
+            for (i, page) in pages.iter_mut().enumerate() {
+                if !page.id.is_empty() {
+                    continue;
+                }
+                let Ok(single_bytes) = singles[i].to_bytes() else {
+                    filled = false;
+                    break;
+                };
+                match self.register_page(&page.fp, &page.title, &single_bytes) {
+                    Ok(rec) => page.id = rec.id,
+                    Err(_) => {
+                        filled = false;
+                        break;
+                    }
+                }
+            }
+            if !filled {
+                continue;
+            }
+            self.conn
+                .execute(
+                    "UPDATE versions SET pages_json=?2 WHERE id=?1",
+                    params![
+                        version_id,
+                        serde_json::to_string(&pages).unwrap_or_default()
+                    ],
+                )
+                .map_err(db_err)?;
+        }
+        // Page bindings: fill page-id addressing from (version, slot).
+        let bindings: Vec<(String, String, i64, String, i64)> = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT id, from_version_id, from_slot, to_version_id, to_slot FROM page_bindings WHERE from_page_id='' OR to_page_id=''",
+                )
+                .map_err(db_err)?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, i64>(4)?,
+                    ))
+                })
+                .map_err(db_err)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(db_err)?;
+            rows
+        };
+        for (binding_id, from_vid, from_slot, to_vid, to_slot) in &bindings {
+            let page_id_at = |vid: &str, slot: i64| -> String {
+                if slot < 0 {
+                    return String::new();
+                }
+                self.get_version(vid)
+                    .ok()
+                    .and_then(|v| v.pages.get(slot as usize).map(|p| p.id.clone()))
+                    .unwrap_or_default()
+            };
+            let from_pid = page_id_at(from_vid, *from_slot);
+            let to_pid = page_id_at(to_vid, *to_slot);
+            if from_pid.is_empty() && to_pid.is_empty() {
+                continue;
+            }
+            self.conn
+                .execute(
+                    "UPDATE page_bindings SET from_page_id=?2, to_page_id=?3 WHERE id=?1",
+                    params![binding_id, from_pid, to_pid],
+                )
+                .map_err(db_err)?;
+        }
+        Ok(())
     }
 
     // ---------- users / auth ----------
@@ -1743,6 +2053,47 @@ impl Store {
         })
     }
 
+    /// Home-scope gate for new entities (sidebar isolation as a
+    /// data constraint, not just client discipline — unified
+    /// content model, user ruling 2026-11-25): a content unit may
+    /// only be created under a content-scope folder, an index
+    /// only under an index-scope folder. No folder at all (None
+    /// or empty) is the virtual 未分类 home and always legal. A
+    /// folder id that does not exist, or whose scope belongs to
+    /// another surface's tree, is refused with a plain error
+    /// instead of landing as-is. Every creation path funnels
+    /// through here: the REST handlers, the client's local
+    /// dispatch, import, and internal derivations all call
+    /// create_unit / create_index.
+    fn check_home_folder(
+        &self,
+        folder_id: Option<&str>,
+        want_scope: &str,
+        what: &str,
+    ) -> SResult<()> {
+        let Some(fid) = folder_id.filter(|f| !f.is_empty()) else {
+            return Ok(());
+        };
+        let folder = self.list_folders()?.into_iter().find(|f| f.id == fid);
+        match folder {
+            None => Err("目标文件夹不存在".into()),
+            Some(f) if f.scope == want_scope => Ok(()),
+            Some(f) => {
+                let area = match f.scope.as_str() {
+                    "showroom" => "演示·公共",
+                    "library" => "演示·我的",
+                    "inbox" => "演示·分享",
+                    "content" => "页面",
+                    "index" => "索引",
+                    _ => "其他",
+                };
+                Err(format!(
+                    "{what}不能建在这个文件夹下：该文件夹属于「{area}」目录"
+                ))
+            }
+        }
+    }
+
     pub fn create_unit(
         &self,
         name: &str,
@@ -1752,6 +2103,7 @@ impl Store {
         lead_lang: &str,
         description: &str,
     ) -> SResult<UnitRec> {
+        self.check_home_folder(folder_id, "content", "内容块")?;
         let id = new_id("unt");
         self.conn
             .execute(
@@ -1979,6 +2331,7 @@ impl Store {
         for s in &slide_refs {
             let xml = pkg.get_text(&s.part)?;
             pages.push(PageInfo {
+                id: String::new(),
                 fp: s.fingerprint.clone(),
                 title: slide_title(&xml),
             });
@@ -1990,6 +2343,28 @@ impl Store {
                 return Err("讲稿数量与页面数量不匹配".into());
             }
             scripts = override_notes.to_vec();
+        }
+        // Page entity-ization: split the fragment and register
+        // every page as an independent entity; the version stores
+        // the ordered page-reference sequence (pages_json carries
+        // each page's entity id). Unchanged pages re-register to
+        // their existing entities, so editing one page of a version
+        // mints exactly one new page entity and leaves every other
+        // reference untouched. If the split disagrees with the
+        // slide listing (exotic package), the version degrades to
+        // id-less pages, which read through the fragment fallback.
+        if let Ok(singles) = crate::pptx::split(&pkg) {
+            if singles.len() == pages.len() {
+                for (i, page) in pages.iter_mut().enumerate() {
+                    if let Ok(single_bytes) = singles[i].to_bytes() {
+                        if let Ok(rec) =
+                            self.register_page(&page.fp, &page.title, &single_bytes)
+                        {
+                            page.id = rec.id;
+                        }
+                    }
+                }
+            }
         }
         let hash = self.file_put(fragment)?;
         let id = new_id("ver");
@@ -2185,6 +2560,17 @@ impl Store {
         if let Some(b) = existing {
             return Ok(b);
         }
+        // Page-id addressing: resolve both slots to the page
+        // entities they name in their (immutable) versions.
+        let page_id_at = |vid: &str, slot: i64| -> String {
+            if slot < 0 {
+                return String::new();
+            }
+            self.get_version(vid)
+                .ok()
+                .and_then(|v| v.pages.get(slot as usize).map(|p| p.id.clone()))
+                .unwrap_or_default()
+        };
         let rec = PageBindingRec {
             id: new_id("bnd"),
             unit_id: unit_id.into(),
@@ -2195,10 +2581,12 @@ impl Store {
             kind: kind.into(),
             author: author.into(),
             created_ms: now_ms(),
+            from_page_id: page_id_at(from_version_id, from_slot),
+            to_page_id: page_id_at(to_version_id, to_slot),
         };
         self.conn
             .execute(
-                "INSERT INTO page_bindings(id, unit_id, from_version_id, from_slot, to_version_id, to_slot, kind, author, created_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                "INSERT INTO page_bindings(id, unit_id, from_version_id, from_slot, to_version_id, to_slot, kind, author, created_ms, from_page_id, to_page_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
                 params![
                     rec.id,
                     rec.unit_id,
@@ -2208,7 +2596,9 @@ impl Store {
                     rec.to_slot,
                     rec.kind,
                     rec.author,
-                    rec.created_ms
+                    rec.created_ms,
+                    rec.from_page_id,
+                    rec.to_page_id
                 ],
             )
             .map_err(db_err)?;
@@ -2218,7 +2608,7 @@ impl Store {
     pub fn list_page_bindings(&self, unit_id: &str) -> SResult<Vec<PageBindingRec>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, unit_id, from_version_id, from_slot, to_version_id, to_slot, kind, author, created_ms FROM page_bindings WHERE unit_id=?1 ORDER BY created_ms")
+            .prepare("SELECT id, unit_id, from_version_id, from_slot, to_version_id, to_slot, kind, author, created_ms, from_page_id, to_page_id FROM page_bindings WHERE unit_id=?1 ORDER BY created_ms")
             .map_err(db_err)?;
         let rows = stmt
             .query_map(params![unit_id], |r| {
@@ -2232,6 +2622,8 @@ impl Store {
                     kind: r.get(6)?,
                     author: r.get(7)?,
                     created_ms: r.get(8)?,
+                    from_page_id: r.get(9)?,
+                    to_page_id: r.get(10)?,
                 })
             })
             .map_err(db_err)?
@@ -2323,6 +2715,7 @@ impl Store {
         scope: &str,
         entries: Vec<IndexEntry>,
     ) -> SResult<IndexRec> {
+        self.check_home_folder(folder_id, "index", "索引")?;
         let id = new_id("idx");
         self.conn
             .execute(
@@ -2792,6 +3185,112 @@ impl Store {
                 Ok(surviving.into_iter().next())
             }
         }
+    }
+
+    // ---------- showroom publish pins (unified content model F) ----------
+    //
+    // A showroom item is the formal, confirmed version of its
+    // source index: what the pusher saw in the push summary and
+    // confirmed is what the item publishes, permanently. The
+    // pinned commit (showroom.commit_id) already froze the entry
+    // list; the pins in `showroom_pins` freeze each entry's
+    // resolved version alongside it, one version id per entry
+    // position of that commit. Index-layer commits keep their
+    // own policies untouched (a follow-latest entry stays
+    // follow-latest in the index); the pin is consulted only at
+    // the showroom boundary — display, presentation, export and
+    // the guest funnel resolve through it, so the formal version
+    // never drifts when a block publishes a newer version.
+
+    /// Replace an item's whole pin set (one version id per entry
+    /// position of the item's pinned commit, in entry order).
+    /// Called at publish / landing time with exactly the versions
+    /// the confirmation summary displayed.
+    pub fn set_showroom_pins(&self, item_id: &str, version_ids: &[String]) -> SResult<()> {
+        self.conn
+            .execute(
+                "DELETE FROM showroom_pins WHERE showroom_id=?1",
+                params![item_id],
+            )
+            .map_err(db_err)?;
+        for (pos, vid) in version_ids.iter().enumerate() {
+            self.conn
+                .execute(
+                    "INSERT INTO showroom_pins(showroom_id, pos, version_id) VALUES(?1,?2,?3)",
+                    params![item_id, pos as i64, vid],
+                )
+                .map_err(db_err)?;
+        }
+        Ok(())
+    }
+
+    /// An item's pins, ordered by entry position. Empty when the
+    /// item predates publish pinning (legacy rows resolve exactly
+    /// as they always did).
+    pub fn showroom_pins(&self, item_id: &str) -> SResult<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT version_id FROM showroom_pins WHERE showroom_id=?1 ORDER BY pos",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![item_id], |r| r.get::<_, String>(0))
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(rows)
+    }
+
+    /// An entry with its policy materialized onto a pinned
+    /// version: the locked-entry resolution path (including
+    /// deletion substitution) then applies verbatim. The
+    /// substitution anchor is the entry's own locked_semver when
+    /// it carries one, else the pinned version's own number.
+    fn pinned_entry(&self, entry: &IndexEntry, version_id: &str) -> IndexEntry {
+        let mut eff = entry.clone();
+        if eff.locked_semver.is_none() {
+            eff.locked_semver = self.get_version(version_id).ok().map(|v| v.semver);
+        }
+        eff.policy = crate::model::EntryPolicy::Locked {
+            version_id: crate::model::Id(version_id.to_string()),
+        };
+        eff
+    }
+
+    /// Resolve one entry the way a showroom item publishes it:
+    /// with a pin for its position, the pinned version wins;
+    /// without one, the entry's own policy decides (the legacy
+    /// behavior for items that predate pinning).
+    pub fn resolve_showroom_entry(
+        &self,
+        entry: &IndexEntry,
+        pin: Option<&str>,
+    ) -> SResult<Option<VersionRec>> {
+        match pin {
+            Some(vid) => self.resolve_entry_version(&self.pinned_entry(entry, vid)),
+            None => self.resolve_entry_version(entry),
+        }
+    }
+
+    /// A commit's entries with the item's pins applied — the
+    /// entry list export / assembly consumers must resolve for
+    /// this item. Entries without a pin pass through unchanged.
+    pub fn pinned_commit_entries(
+        &self,
+        item: &ShowroomRec,
+        commit: &CommitRec,
+    ) -> SResult<Vec<IndexEntry>> {
+        let pins = self.showroom_pins(&item.id)?;
+        Ok(commit
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(pos, e)| match pins.get(pos) {
+                Some(vid) => self.pinned_entry(e, vid),
+                None => e.clone(),
+            })
+            .collect())
     }
 
     // ---------- exports / attachments / showroom / assemblies ----------
@@ -3533,6 +4032,14 @@ impl Store {
                 version_map.insert(v.id.clone(), nv.id);
             }
             let mut entries: Vec<IndexEntry> = Vec::new();
+            // The reviewed version of every entry, in entry
+            // order — these become the showroom item's publish
+            // pins below, so the formal version displays exactly
+            // the set review confirmed, follow-latest entries
+            // included (the landed index commit keeps its
+            // follow-latest policies; only the showroom face is
+            // pinned).
+            let mut landed_pins: Vec<String> = Vec::new();
             for e in &manifest.commit.entries {
                 let policy = match &e.entry.policy {
                     crate::model::EntryPolicy::FollowLatest => {
@@ -3555,6 +4062,7 @@ impl Store {
                     locked_semver: e.entry.locked_semver.clone(),
                     excerpt_slots: e.entry.excerpt_slots.clone(),
                 });
+                landed_pins.push(version_map[e.version_id.as_str()].clone());
             }
             // Follow-latest entries keep their policy — following
             // is a post-landing behavior — but the landing itself
@@ -3652,13 +4160,16 @@ impl Store {
             let commit =
                 self.create_commit(&index_id, "main", &sub.submitter_name, message, entries)?;
             // One showroom entry per landed source: a repeat
-            // landing refreshes the existing entry and unpins it
-            // (commit_id NULL), so entry resolution follows the
-            // source index's current main head — later commits and
-            // tags on the index show up without a re-push. A first
-            // landing (or an entry deleted since) inserts the
-            // entry pinned to the landed commit, exactly as
-            // before.
+            // landing refreshes the existing entry and re-pins it
+            // — explicitly, to this landing's newly confirmed
+            // commit and reviewed version set — instead of
+            // unpinning it into follow-the-head mode. The formal
+            // version an item publishes therefore only ever
+            // changes through a reviewed landing, never by drift:
+            // the item always points at a commit it confirmed,
+            // with the pins to match. A first landing (or an
+            // entry deleted since) inserts the entry the same
+            // way.
             let prior_entry = prior
                 .as_ref()
                 .and_then(|(_, entry)| entry.clone())
@@ -3667,22 +4178,24 @@ impl Store {
                 Some(entry_id) => {
                     self.conn
                         .execute(
-                            "UPDATE showroom SET title=?2, intro=?3, commit_id=NULL, state='live' WHERE id=?1",
-                            params![entry_id.as_str(), sub.title, sub.intro],
+                            "UPDATE showroom SET title=?2, intro=?3, commit_id=?4, state='live' WHERE id=?1",
+                            params![entry_id.as_str(), sub.title, sub.intro, commit.id],
                         )
                         .map_err(db_err)?;
+                    self.set_showroom_pins(entry_id, &landed_pins)?;
                     entry_id.clone()
                 }
                 None => {
-                    self.insert_showroom(
+                    let rec = self.insert_showroom(
                         &sub.title,
                         &sub.intro,
                         Some(&index_id),
                         Some(&commit.id),
                         &sub.submitter_id,
                         "live",
-                    )?
-                    .id
+                    )?;
+                    self.set_showroom_pins(&rec.id, &landed_pins)?;
+                    rec.id
                 }
             };
             let reviewed_ms = now_ms();
@@ -4293,8 +4806,13 @@ impl Store {
             let Some(commit) = self.guest_item_commit(&item)? else {
                 continue;
             };
-            for e in &commit.entries {
-                if let Some(v) = self.resolve_entry_version(e)? {
+            // The published version set of an item is its pinned
+            // resolution: a newer block version the item does not
+            // publish is not guest-reachable through it.
+            let pins = self.showroom_pins(&item.id)?;
+            for (pos, e) in commit.entries.iter().enumerate() {
+                let pin = pins.get(pos).map(|s| s.as_str());
+                if let Some(v) = self.resolve_showroom_entry(e, pin)? {
                     if v.id == version_id {
                         return Ok(true);
                     }

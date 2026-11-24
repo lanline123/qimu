@@ -544,14 +544,16 @@ impl App {
             Some(Overlay::PageEdit(pe)) => (true, pe.dirty()),
             _ => (false, false),
         };
-        // PPT clipboard snapshot (the five slots the clipboard
-        // package lit): the content wall's selection drives
-        // copy / cut / combine, the clipboard's own content
-        // drives the two pastes. The wall target set follows the
-        // wall bar's precedent (content_clip_bar): the ctrl-click
-        // multi set when non-empty, else the anchor selection as
-        // a one-block set. Copy targets, in order: the wall
-        // selection, the open deck, a plaza-selected deck
+        // PPT clipboard snapshot: the content wall's selection
+        // drives copy / cut / combine / ungroup and the
+        // clear-selection slot, the clipboard's own content
+        // drives the two pastes. (The wall once had its own
+        // selection strip; the 2026-11-25 consolidation ruling
+        // removed it — this group is the one entry point.) The
+        // wall target set: the ctrl-click multi set when
+        // non-empty, else the anchor selection as a one-block
+        // set. Copy targets, in order: the wall selection, the
+        // open deck, a plaza-selected deck
         // (prototype: 演示厅复制选中整套稿的全部页).
         let (wall_targets, wall_multi): (Vec<String>, Vec<String>) = if self.page == Page::Content {
             match self.content.stack.top() {
@@ -572,6 +574,21 @@ impl App {
         };
         let has_clip = self.ppt_clip.is_some();
         let can_combine = wall_multi.len() >= 2;
+        // 解除组合 target: exactly one effective wall target
+        // (the multi set, or the anchor selection as a one-block
+        // set — the same target set copy/cut act on) whose
+        // current version runs to more than one page. A
+        // multi-selection of two or more, a single-page block,
+        // or a block with no readable version all grey it.
+        let ungroup_target: Option<String> = if wall_targets.len() == 1 {
+            let uid = wall_targets[0].clone();
+            match self.unit_latest_page_count(&uid) {
+                Some(n) if n > 1 => Some(uid),
+                _ => None,
+            }
+        } else {
+            None
+        };
         let plaza_item: Option<Value> =
             if self.page == Page::Showroom && self.showroom.zone == "plaza" {
                 self.showroom.selected_card.as_ref().and_then(|id| {
@@ -776,84 +793,51 @@ impl App {
                 self.deckbar_save_block();
             }
         }
-        // sdDel — wired only where a clean delete target with an
-        // existing handler exists: the open content block (the
-        // unit detail's own 删除内容块 path). Everywhere else it
-        // greys with the group, as in the prototype.
-        let unit_open =
-            self.page == Page::Content && matches!(self.content.stack.top(), ContentFrame::Unit(_));
+        // The selection / PPT-clipboard group (2026-11-25
+        // consolidation ruling): the content wall's own
+        // selection strip is gone — this group is the only
+        // entry for the selection count, clear-selection,
+        // delete, the two combines, ungroup, cut / copy and
+        // the two pastes, all calling the same clip_* methods
+        // the strip called. Availability follows the
+        // prototype's syncBarState table, adapted to the
+        // client's clipboard: the pastes light while the
+        // clipboard holds pages, copy lights on any copy
+        // target (it does not follow a group grey-out), cut
+        // is wall-only (a showroom deck is not your source),
+        // the combines need a wall multi-selection of two or
+        // more, ungroup needs exactly one multi-page target.
+        // Cut and the combines clear the multi set afterwards.
+        // The bar lays out right-to-left, so the slots are
+        // added in reverse of their reading order — read
+        // visually (left to right) the group is: 已选计数 ·
+        // 清空选择 · 删除 · 组合为内容块 · 组合为索引 ·
+        // 解除组合 · 剪切 · 复制 · 整组成块 · 逐页成块.
         if ChromeIcons
             .tool(
                 ui,
-                ChromeIcon::Trash,
-                "删除选中的内容块",
-                unit_open,
+                ChromeIcon::PasteSplit,
+                "逐页成块：剪贴板每页各成一个内容块",
+                has_clip,
                 false,
                 true,
             )
             .clicked()
         {
-            self.deckbar_delete_unit();
-        }
-        // The PPT clipboard family and 组合 — lit (clipboard
-        // package): the methods are the wiring contract from
-        // that package's report, called with the snapshot
-        // contexts above. Availability follows the prototype's
-        // syncBarState table, adapted to the client's clipboard:
-        // the pastes light while the clipboard holds pages, copy
-        // lights on any copy target (it does not follow a group
-        // grey-out), cut is wall-only (a showroom deck is not
-        // your source), combine needs a wall multi-selection of
-        // two or more and opens the prototype's two-entry menu
-        // (new block / new index). Cut and combine clear the
-        // multi set afterwards, like the wall bar.
-        let combine_resp = ChromeIcons.tool(
-            ui,
-            ChromeIcon::Combine,
-            "组合：将选中的多个内容块组合",
-            can_combine,
-            false,
-            true,
-        );
-        let mut combine_pick: Option<bool> = None;
-        if can_combine {
-            egui::Popup::menu(&combine_resp).show(|ui| {
-                ui.set_min_width(156.0);
-                if ui.button(tr("组合为新内容块")).clicked() {
-                    combine_pick = Some(true);
-                    ui.close();
-                }
-                if ui.button(tr("组合为新索引")).clicked() {
-                    combine_pick = Some(false);
-                    ui.close();
-                }
-            });
-        }
-        if let Some(as_block) = combine_pick {
-            if as_block {
-                self.clip_combine_units(&wall_multi);
-            } else {
-                self.clip_combine_index(&wall_multi);
-            }
-            if let ContentFrame::Wall(w) = self.content.stack.top_mut() {
-                w.multi.clear();
-            }
+            self.clip_paste(true);
         }
         if ChromeIcons
             .tool(
                 ui,
-                ChromeIcon::Cut,
-                "剪切到 PPT 剪贴板",
-                !wall_targets.is_empty(),
+                ChromeIcon::PasteGroup,
+                "整组成块：剪贴板各页合为一个多页组块",
+                has_clip,
                 false,
                 true,
             )
             .clicked()
         {
-            self.clip_copy_units(&wall_targets, true);
-            if let ContentFrame::Wall(w) = self.content.stack.top_mut() {
-                w.multi.clear();
-            }
+            self.clip_paste(false);
         }
         if ChromeIcons
             .tool(
@@ -875,28 +859,125 @@ impl App {
         if ChromeIcons
             .tool(
                 ui,
-                ChromeIcon::PasteGroup,
-                "整组成块：剪贴板各页合为一个多页组块",
-                has_clip,
+                ChromeIcon::Cut,
+                "剪切到 PPT 剪贴板",
+                !wall_targets.is_empty(),
                 false,
                 true,
             )
             .clicked()
         {
-            self.clip_paste(false);
+            self.clip_copy_units(&wall_targets, true);
+            if let ContentFrame::Wall(w) = self.content.stack.top_mut() {
+                w.multi.clear();
+            }
+        }
+        // 解除组合 — the inverse of 组合为内容块, sitting
+        // right beside the two combine slots: the one
+        // selected multi-page block is split back into
+        // single-page blocks in its own folder and the
+        // original goes to the recycle bin (App::clip_ungroup_unit).
+        if ChromeIcons
+            .tool(
+                ui,
+                ChromeIcon::Split,
+                "解除组合：将多页内容块拆为单页块",
+                ungroup_target.is_some(),
+                false,
+                true,
+            )
+            .clicked()
+        {
+            if let Some(uid) = ungroup_target.clone() {
+                self.clip_ungroup_unit(&uid);
+                if let ContentFrame::Wall(w) = self.content.stack.top_mut() {
+                    w.multi.clear();
+                    if w.selected.as_deref() == Some(uid.as_str()) {
+                        w.selected = None;
+                    }
+                }
+            }
         }
         if ChromeIcons
             .tool(
                 ui,
-                ChromeIcon::PasteSplit,
-                "逐页成块：剪贴板每页各成一个内容块",
-                has_clip,
+                ChromeIcon::NewIndex,
+                "组合为索引：将选中的多个内容块组合为一个新索引",
+                can_combine,
                 false,
                 true,
             )
             .clicked()
         {
-            self.clip_paste(true);
+            self.clip_combine_index(&wall_multi);
+            if let ContentFrame::Wall(w) = self.content.stack.top_mut() {
+                w.multi.clear();
+            }
+        }
+        if ChromeIcons
+            .tool(
+                ui,
+                ChromeIcon::Combine,
+                "组合为内容块：将选中的多个内容块组合为一个新内容块",
+                can_combine,
+                false,
+                true,
+            )
+            .clicked()
+        {
+            self.clip_combine_units(&wall_multi);
+            if let ContentFrame::Wall(w) = self.content.stack.top_mut() {
+                w.multi.clear();
+            }
+        }
+        // sdDel — wired only where a clean delete target with an
+        // existing handler exists: the open content block (the
+        // unit detail's own 删除内容块 path). Everywhere else it
+        // greys with the group, as in the prototype.
+        let unit_open =
+            self.page == Page::Content && matches!(self.content.stack.top(), ContentFrame::Unit(_));
+        if ChromeIcons
+            .tool(
+                ui,
+                ChromeIcon::Trash,
+                "删除选中的内容块",
+                unit_open,
+                false,
+                true,
+            )
+            .clicked()
+        {
+            self.deckbar_delete_unit();
+        }
+        // 清空选择 — directly in front of 删除 (added after it
+        // in this right-to-left layout): drops the wall's
+        // multi-selection only; no data is touched. Grey
+        // while nothing is multi-selected.
+        if ChromeIcons
+            .tool(
+                ui,
+                ChromeIcon::Refresh,
+                "清空选择",
+                !wall_multi.is_empty(),
+                false,
+                true,
+            )
+            .clicked()
+        {
+            if let ContentFrame::Wall(w) = self.content.stack.top_mut() {
+                w.multi.clear();
+            }
+        }
+        // 已选计数 — a status label, not a button: the one
+        // member of the group allowed to appear and disappear
+        // (full-set ruling covers buttons). It follows the
+        // wall multi-selection exactly as the removed wall
+        // strip's count did.
+        if !wall_multi.is_empty() {
+            ui.label(
+                egui::RichText::new(format!("已选 {} 个内容块", wall_multi.len()))
+                    .color(palette_color(TEXT_WEAK)),
+            );
         }
         tool_vsep(ui);
         // sdInfo — the deck's metadata panel (T5 ruling
@@ -911,7 +992,7 @@ impl App {
             .tool(
                 ui,
                 ChromeIcon::Info,
-                "成品信息",
+                "演示稿信息",
                 info_target.is_some(),
                 false,
                 true,

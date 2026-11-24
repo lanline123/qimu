@@ -272,10 +272,15 @@ impl Store {
                             source_version.as_ref().is_some_and(|source| {
                                 source.basis_revision == version.basis_revision
                                     && source.page_count == version.page_count
-                                    && slots.iter().all(|slot| {
-                                        slot.parse::<usize>()
-                                            .is_ok_and(|slot| slot < version.pages.len())
-                                    })
+                                    // Every excerpt token must
+                                    // resolve in the source version
+                                    // (page-id tokens by entity,
+                                    // legacy tokens positionally —
+                                    // excerpt_positions is the one
+                                    // compat read).
+                                    && crate::store::excerpt_positions(source, slots)
+                                        .len()
+                                        >= slots.len()
                             })
                         })
                     };
@@ -289,12 +294,37 @@ impl Store {
                 }
             }
             if let Some(version) = selected {
+                // The derived entry points at another rendition
+                // whose pages are different entities (translated
+                // content): carry the excerpt across by position —
+                // resolve the tokens in the source version, then
+                // re-address them as the target version's page ids
+                // at the same positions.
+                let derived_excerpt = match (&entry.excerpt_slots, &source_version) {
+                    (Some(slots), Some(source)) => {
+                        let positions = crate::store::excerpt_positions(source, slots);
+                        let ids: Vec<String> = positions
+                            .iter()
+                            .filter_map(|pos| {
+                                version.pages.get(*pos).map(|p| p.id.clone())
+                            })
+                            .filter(|id| !id.is_empty())
+                            .collect();
+                        if ids.is_empty() {
+                            None
+                        } else {
+                            Some(ids)
+                        }
+                    }
+                    _ => entry.excerpt_slots.clone(),
+                };
                 entries.push(IndexEntry {
                     rendition_id: Id(version.rendition_id),
                     policy: EntryPolicy::Locked {
                         version_id: Id(version.id),
                     },
                     locked_semver: Some(version.semver),
+                    excerpt_slots: derived_excerpt,
                     ..entry
                 });
             } else {

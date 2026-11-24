@@ -874,7 +874,7 @@ fn prepare_translate(
         if r.unit_id != unit_id {
             return Err(bad("版本不属于该内容块"));
         }
-        let bytes = store.file_get(&v.fragment_hash).map_err(bad)?;
+        let bytes = store.version_fragment_bytes(&v).map_err(bad)?;
         let get = |k: &str| store.get_setting(k).ok().flatten().unwrap_or_default();
         (
             v,
@@ -1731,7 +1731,7 @@ async fn version_fragment(
         });
     }
     let store = st.store.lock().unwrap();
-    let bytes = store.file_get(&ver.fragment_hash).map_err(bad)?;
+    let bytes = store.version_fragment_bytes(&ver).map_err(bad)?;
     Ok(Json(json!({ "version": ver, "data_base64": b64e(&bytes) })))
 }
 
@@ -1835,7 +1835,7 @@ async fn version_thumb(
             });
         }
         let store = st.store.lock().unwrap();
-        let frag = store.file_get(&ver.fragment_hash).map_err(bad)?;
+        let frag = store.version_fragment_bytes(&ver).map_err(bad)?;
         (store.root().to_path_buf(), frag)
     };
     let cache_dir = root.join("thumbs").join("deckcraft-v2").join(&id);
@@ -2094,13 +2094,38 @@ fn resolved_entries(st: &St, commit: &CommitRec) -> Vec<Value> {
 }
 
 fn resolved_entries_for(st: &St, entries: &[IndexEntry]) -> Vec<Value> {
+    resolved_entries_impl(st, entries, None)
+}
+
+/// The showroom face of a commit's entries: the item's publish
+/// pins win over follow-latest, so what displays is the formal
+/// version the push confirmed — never a later drift of the
+/// source index's blocks. The index-layer faces keep using
+/// `resolved_entries` / `resolved_entries_for` and follow as
+/// before.
+fn resolved_entries_showroom(st: &St, item: &ShowroomRec, commit: &CommitRec) -> Vec<Value> {
+    let pins = {
+        let store = st.store.lock().unwrap();
+        store.showroom_pins(&item.id).unwrap_or_default()
+    };
+    resolved_entries_impl(st, &commit.entries, Some(&pins))
+}
+
+fn resolved_entries_impl(st: &St, entries: &[IndexEntry], pins: Option<&[String]>) -> Vec<Value> {
     let store = st.store.lock().unwrap();
     entries
         .iter()
-        .map(|e| {
+        .enumerate()
+        .map(|(pos, e)| {
             let unit = store.get_unit(&e.unit_id.0).ok();
             let rend = store.get_rendition(&e.rendition_id.0).ok();
-            let resolved = store.resolve_entry_version(e).ok().flatten();
+            let resolved = match pins {
+                Some(p) => store
+                    .resolve_showroom_entry(e, p.get(pos).map(|s| s.as_str()))
+                    .ok()
+                    .flatten(),
+                None => store.resolve_entry_version(e).ok().flatten(),
+            };
             let locked_id = match &e.policy {
                 EntryPolicy::Locked { version_id } => Some(version_id.0.clone()),
                 _ => None,
@@ -2158,7 +2183,7 @@ async fn get_index(
     Query(q): Query<BranchQuery>,
 ) -> Api<Value> {
     let branch = q.branch.unwrap_or_else(|| "main".to_string());
-    let (index, branches, tags, head) = match auth(&st, &headers) {
+    let (index, branches, tags, head, guest_item) = match auth(&st, &headers) {
         Ok(user) => {
             let store = st.store.lock().unwrap();
             let index = store.get_index(&id).map_err(|_| not_found())?;
@@ -2171,7 +2196,7 @@ async fn get_index(
                 Some(cid) => Some(store.get_commit(&cid).map_err(bad)?),
                 None => None,
             };
-            (index, branches, tags, head)
+            (index, branches, tags, head, None)
         }
         Err(e) => {
             // Guest entry funnel (org-model G2): a guest session
@@ -2190,10 +2215,17 @@ async fn get_index(
                 .ok_or_else(|| not_found())?;
             let index = store.get_index(&id).map_err(|_| not_found())?;
             let head = store.guest_item_commit(&item).map_err(bad)?;
-            (index, Vec::new(), Vec::new(), head)
+            (index, Vec::new(), Vec::new(), head, Some(item))
         }
     };
-    let entries = head.as_ref().map(|c| resolved_entries(&st, c));
+    // A guest resolves the index only as a showroom item's
+    // source chain, so the guest face resolves with the item's
+    // publish pins; named sessions keep the index-layer face.
+    let entries = match (&head, &guest_item) {
+        (Some(c), Some(item)) => Some(resolved_entries_showroom(&st, item, c)),
+        (Some(c), None) => Some(resolved_entries(&st, c)),
+        _ => None,
+    };
     Ok(Json(json!({
         "index": index,
         "branches": branches,
@@ -2235,8 +2267,9 @@ async fn index_push_preview(
         .unwrap_or_default();
     let previous_entries = previous
         .as_ref()
-        .and_then(|item| showroom_commit(&st, item))
-        .map(|commit| resolved_entries(&st, &commit))
+        .and_then(|item| {
+            showroom_commit(&st, item).map(|commit| resolved_entries_showroom(&st, item, &commit))
+        })
         .unwrap_or_default();
     Ok(Json(json!({
         "published_version": published.as_ref().map(|tag| tag.name.clone()),
@@ -2531,15 +2564,9 @@ fn build_export(
             .resolve_entry_version(e)
             .map_err(bad)?
             .ok_or_else(|| bad("有条目无法解析到版本（内容块尚无已发布版本）"))?;
-        let frag_bytes = store.file_get(&version.fragment_hash).map_err(bad)?;
-        let frag_pkg = Package::load(&frag_bytes).map_err(bad)?;
-        let singles = pptx::split(&frag_pkg).map_err(bad)?;
+        let singles = store.version_page_packages(&version).map_err(bad)?;
         let chosen: Vec<usize> = match &e.excerpt_slots {
-            Some(slots) => slots
-                .iter()
-                .filter_map(|s| s.parse::<usize>().ok())
-                .filter(|i| *i < singles.len())
-                .collect(),
+            Some(slots) => qimu_core::store::excerpt_positions(&version, slots),
             None => (0..singles.len()).collect(),
         };
         let mut fps = Vec::new();
@@ -2833,7 +2860,7 @@ fn diff_updates(st: &St, manifest: &Manifest) -> Result<Value, (StatusCode, Json
                     if v.id != b.version_id {
                         // per-page diff when the shape allows it
                         let slots: Vec<usize> = match &e.excerpt_slots {
-                            Some(s) => s.iter().filter_map(|x| x.parse::<usize>().ok()).collect(),
+                            Some(s) => qimu_core::store::excerpt_positions(&v, s),
                             None => (0..v.pages.len()).collect(),
                         };
                         let mut changed: Vec<usize> = Vec::new();
@@ -2920,7 +2947,7 @@ async fn update_package(
             }
             if let Some(vid) = u.get("to_version_id").and_then(|v| v.as_str()) {
                 if let Ok(v) = store.get_version(vid) {
-                    if let Ok(bytes) = store.file_get(&v.fragment_hash) {
+                    if let Ok(bytes) = store.version_fragment_bytes(&v) {
                         pages.push(json!({
                             "type": t,
                             "rendition_id": u.get("rendition_id"),
@@ -3045,6 +3072,14 @@ struct ShowroomReq {
     intro: Option<String>,
     source_index_id: Option<String>,
     published_tag_id: Option<String>,
+    /// The push summary's confirmed resolution: one version id
+    /// per entry of the published tag's commit, in entry order —
+    /// exactly the set the submitter saw and confirmed. The item
+    /// is pinned to these versions (publish pins), so the formal
+    /// version never drifts from the confirmed set. Absent from
+    /// older clients: the server then captures the resolution at
+    /// submit time instead.
+    pinned_versions: Option<Vec<String>>,
 }
 
 fn showroom_source_commit(
@@ -3090,6 +3125,46 @@ async fn submit_showroom(
         }
         None => String::new(),
     };
+    // Publish pins for the new item (unified content model F):
+    // the confirmed version set of the push summary. Supplied
+    // pins are validated against the tag commit exactly the way
+    // the submission-package builder validates them — count,
+    // rendition ownership, formally published status — and a
+    // mismatch rejects the push as a stale summary rather than
+    // pinning something the submitter never saw.
+    let pins: Vec<String> = if commit_id.is_empty() {
+        Vec::new()
+    } else {
+        let commit = store.get_commit(&commit_id).map_err(bad)?;
+        match &req.pinned_versions {
+            Some(supplied) => {
+                if supplied.len() != commit.entries.len() {
+                    return Err(bad("推送摘要已过期，请重新读取后再提交"));
+                }
+                for (e, vid) in commit.entries.iter().zip(supplied.iter()) {
+                    let v = store.get_version(vid).map_err(bad)?;
+                    if v.rendition_id != e.rendition_id.0 {
+                        return Err(bad("推送摘要与发布版本不匹配，请重新读取后再提交"));
+                    }
+                    if v.status != "normal" {
+                        return Err(bad("推送摘要中的内容块版本已失效，请重新发布后再提交"));
+                    }
+                }
+                supplied.clone()
+            }
+            None => commit
+                .entries
+                .iter()
+                .map(|e| {
+                    store
+                        .resolve_entry_version(e)
+                        .map_err(bad)?
+                        .map(|v| v.id)
+                        .ok_or_else(|| bad("内容块尚无已发布版本，请先发布后再推送"))
+                })
+                .collect::<Result<Vec<String>, _>>()?,
+        }
+    };
     let rec = store
         .insert_showroom(
             &req.title,
@@ -3100,6 +3175,9 @@ async fn submit_showroom(
             "pending",
         )
         .map_err(bad)?;
+    if !pins.is_empty() {
+        store.set_showroom_pins(&rec.id, &pins).map_err(bad)?;
+    }
     let mut value = serde_json::to_value(&rec).unwrap_or(Value::Null);
     value["submitted_by"] = json!(user.display_name);
     value["submitted_by_id"] = json!(user.id);
@@ -3139,7 +3217,7 @@ async fn list_showroom(
         .into_iter()
         .map(|item| {
             let entries = showroom_commit(&st, &item)
-                .map(|commit| resolved_entries(&st, &commit))
+                .map(|commit| resolved_entries_showroom(&st, &item, &commit))
                 .unwrap_or_default();
             let mut value = serde_json::to_value(&item).unwrap_or(Value::Null);
             value["submitted_by_id"] = json!(item.submitted_by.clone());
@@ -3655,7 +3733,7 @@ async fn version_page_text(
         if !store.can_see_group(&user, &unit.group_id).map_err(bad)? {
             return Err(not_found());
         }
-        let bytes = store.file_get(&ver.fragment_hash).map_err(bad)?;
+        let bytes = store.version_fragment_bytes(&ver).map_err(bad)?;
         (ver, bytes)
     };
     let _ = ver;
@@ -3760,7 +3838,7 @@ async fn edit_version_pages(
         let ver = store.get_version(&id).map_err(|_| not_found())?;
         let rend = store.get_rendition(&ver.rendition_id).map_err(bad)?;
         let unit = store.get_unit(&rend.unit_id).map_err(bad)?;
-        let bytes = store.file_get(&ver.fragment_hash).map_err(bad)?;
+        let bytes = store.version_fragment_bytes(&ver).map_err(bad)?;
         (ver, rend, unit, bytes)
     };
     need_cap(&st, &user, &unit.group_id, "publish")?;
@@ -4426,7 +4504,10 @@ async fn export_showroom(
                 store.get_commit(&head).map_err(bad)?
             }
         };
-        let entries = commit.entries;
+        // Publish pins applied: the export assembles the
+        // formal version the push confirmed, not whatever the
+        // entries would resolve to today.
+        let entries = store.pinned_commit_entries(&item, &commit).map_err(bad)?;
         let source = SourceRef {
             index_id: idx_id,
             branch: "main".to_string(),
@@ -4588,7 +4669,10 @@ async fn export_showroom_pdf(
                 store.get_commit(&head).map_err(bad)?
             }
         };
-        let entries = commit.entries;
+        // Publish pins applied: the export assembles the
+        // formal version the push confirmed, not whatever the
+        // entries would resolve to today.
+        let entries = store.pinned_commit_entries(&item, &commit).map_err(bad)?;
         let source = SourceRef {
             index_id: idx_id,
             branch: "main".to_string(),
@@ -4617,7 +4701,7 @@ async fn export_showroom_pdf(
     )?;
     if let Some(p) = req.page {
         if (p as i64) >= page_count {
-            return Err(bad("页码超出成品页数"));
+            return Err(bad("页码超出演示稿页数"));
         }
     }
     let pdf = deck_to_pdf(&st.data_dir, &id, &deck, &form, req.page).map_err(bad)?;
