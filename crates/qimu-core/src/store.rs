@@ -2871,6 +2871,41 @@ impl Store {
                 ));
             }
         }
+
+        // Only a formally published version may land. The
+        // version status set is normal | recalled | draft
+        // (model::VersionStatus): a recalled version can never
+        // be a resolution result, a draft is not yet published
+        // (and resolves like any surviving version once landed,
+        // so it must never enter as one), and an unrecognized
+        // status fails closed. The submitting client refuses
+        // all three when building the package; landing re-checks
+        // because the manifest is client-supplied. Every version
+        // in the package is an entry's resolution result, so
+        // gating the whole set gates exactly what review saw.
+        for v in &manifest.versions {
+            match v.status.as_str() {
+                "normal" => {}
+                "recalled" => {
+                    return Err(format!(
+                        "提交包清单不一致：版本 {} 已被召回，不能作为条目解析结果",
+                        v.id
+                    ));
+                }
+                "draft" => {
+                    return Err(format!(
+                        "提交包清单不一致：版本 {} 仍是草稿，未正式发布，不能落地",
+                        v.id
+                    ));
+                }
+                other => {
+                    return Err(format!(
+                        "提交包清单不一致：版本 {} 的状态无法识别（{other}）",
+                        v.id
+                    ));
+                }
+            }
+        }
         for e in &manifest.commit.entries {
             if !unit_ids.contains(e.entry.unit_id.0.as_str())
                 || !rendition_ids.contains(e.entry.rendition_id.0.as_str())
@@ -2879,8 +2914,38 @@ impl Store {
                     "提交包清单不一致：索引条目引用了未声明的内容块或 rendition".into(),
                 );
             }
-            if !manifest.versions.iter().any(|v| v.id == e.version_id) {
-                return Err("提交包清单不一致：索引条目引用了未声明的版本".into());
+            // Ownership, not just existence: the entry's
+            // rendition must belong to the entry's unit, and the
+            // version the entry resolved to (the exact version
+            // review saw) must belong to the entry's rendition.
+            // The submitting client checks both, but the
+            // manifest is client-supplied input — landing
+            // re-checks rather than trusting it, or a package
+            // could pair an entry with another rendition's
+            // version and land content review never saw for
+            // this entry.
+            let r = manifest
+                .renditions
+                .iter()
+                .find(|r| r.id == e.entry.rendition_id.0)
+                .ok_or_else(|| {
+                    "提交包清单不一致：索引条目引用了未声明的内容块或 rendition".to_string()
+                })?;
+            if r.unit_id != e.entry.unit_id.0 {
+                return Err(
+                    "提交包清单不一致：索引条目的 rendition 不属于其内容块".into(),
+                );
+            }
+            let v = manifest
+                .versions
+                .iter()
+                .find(|v| v.id == e.version_id)
+                .ok_or_else(|| "提交包清单不一致：索引条目引用了未声明的版本".to_string())?;
+            if v.rendition_id != e.entry.rendition_id.0 {
+                return Err(format!(
+                    "提交包清单不一致：条目解析的版本 {} 不属于其 rendition",
+                    v.id
+                ));
             }
         }
 
@@ -2938,15 +3003,9 @@ impl Store {
             for v in &manifest.versions {
                 let bytes = self.staged_file_get(id, &v.fragment_hash)?;
                 let semver = SemVer::parse(&v.semver)?;
-                // A recalled version can never be a resolution
-                // result, so a package carrying one is malformed;
-                // land anything else verbatim.
-                if v.status == "recalled" {
-                    return Err(format!(
-                        "提交包清单不一致：版本 {} 已被召回，不能作为条目解析结果",
-                        v.id
-                    ));
-                }
+                // Statuses were gated before the transaction
+                // (only formally published versions land), so
+                // every version reaching this loop is "normal".
                 let nv = self.insert_version_with_scripts(
                     &rendition_map[v.rendition_id.as_str()],
                     semver,
@@ -2990,6 +3049,33 @@ impl Store {
                     locked_semver: e.entry.locked_semver.clone(),
                     excerpt_slots: e.entry.excerpt_slots.clone(),
                 });
+            }
+            // Follow-latest entries keep their policy — following
+            // is a post-landing behavior — but the landing itself
+            // must display exactly what review approved: resolve
+            // each landed follow-latest entry through the same
+            // path the display faces use and require the reviewed
+            // version's landed counterpart. A package whose
+            // follow-latest resolution would drift at the landing
+            // instant (extra versions of the rendition riding
+            // along, a mis-paired pin) fails and stays pending.
+            // Locked entries need no such check: they re-lock
+            // onto the reviewed version by construction.
+            for (e, landed) in manifest.commit.entries.iter().zip(entries.iter()) {
+                if landed.policy != crate::model::EntryPolicy::FollowLatest {
+                    continue;
+                }
+                let want = &version_map[e.version_id.as_str()];
+                let resolved = self.resolve_entry_version(landed)?;
+                match resolved {
+                    Some(v) if v.id == *want => {}
+                    _ => {
+                        return Err(format!(
+                            "提交包清单不一致：跟随最新条目落地后将展示与审核不一致的版本（条目解析版本 {}）",
+                            e.version_id
+                        ));
+                    }
+                }
             }
             let scope = if ["company", "parent_org", "dept_sub", "dept", "private"]
                 .contains(&manifest.index_scope.as_str())
