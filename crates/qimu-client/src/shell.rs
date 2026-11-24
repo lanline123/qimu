@@ -280,15 +280,26 @@ impl App {
                 self.content.cache_open = !self.content.cache_open;
             }
         }
-        if page == Page::Trash
-            && btn_default_enabled(
-                ui,
-                !self.trash.items.is_empty(),
-                tr("清空回收站"),
+        if page == Page::Trash {
+            // Aligned with the 本地缓存 sidebar action above (user
+            // ruling 2026-11-24): same accent-filled form, white
+            // label, radius 6, full-width 32px — not the neutral
+            // btn_default form. The empty-trash gate keeps its old
+            // semantics, just carried by add_enabled_ui instead of
+            // btn_default_enabled.
+            let button = egui::Button::new(
+                egui::RichText::new(tr("清空回收站")).color(egui::Color32::WHITE),
             )
-            .clicked()
-        {
-            self.confirm_empty_trash();
+            .fill(ACCENT)
+            .corner_radius(6);
+            let resp = ui
+                .add_enabled_ui(!self.trash.items.is_empty(), |ui| {
+                    ui.add_sized([ui.available_width(), 32.0], button)
+                })
+                .inner;
+            if resp.clicked() {
+                self.confirm_empty_trash();
+            }
         }
     }
 
@@ -602,14 +613,6 @@ impl App {
             .clicked()
         {
             self.deckbar_back();
-        }
-        if self.page == Page::Content && matches!(self.overlays.last(), Some(Overlay::Light(_))) {
-            if ChromeIcons
-                .tool(ui, ChromeIcon::Doc, "编辑这一页", true, false, true)
-                .clicked()
-            {
-                self.open_light_editor();
-            }
         }
         tool_vsep(ui);
         // sdPresent — the accent main button (the tool button's
@@ -1162,14 +1165,6 @@ impl App {
         }
     }
 
-    fn content_light_open(&self) -> bool {
-        self.page == Page::Content
-            && self
-                .overlays
-                .iter()
-                .any(|overlay| matches!(overlay, Overlay::Light(_)))
-    }
-
     /// sdClose's label for the current state (prototype
     /// updateBarAvail): None on the home page, where the button
     /// greys out entirely.
@@ -1185,11 +1180,7 @@ impl App {
                 SrFrame::Wall => Some("回主页"),
             },
             Page::Content => match self.content.stack.top() {
-                ContentFrame::Unit(_) => Some(if self.content_light_open() {
-                    "返回内容块详情"
-                } else {
-                    "返回上一层"
-                }),
+                ContentFrame::Unit(_) => Some("返回上一层"),
                 ContentFrame::Wall(_) => Some("回主页"),
             },
             Page::Index => match self.index.stack.top() {
@@ -1229,9 +1220,7 @@ impl App {
                 }
             }
             Page::Content => {
-                if self.content_light_open() {
-                    self.overlays.pop();
-                } else if let ContentFrame::Unit(st) = self.content.stack.top_mut() {
+                if let ContentFrame::Unit(st) = self.content.stack.top_mut() {
                     st.closed = true;
                     self.refresh_all();
                 } else {
@@ -1321,16 +1310,7 @@ impl App {
                             "groups" => "#5",
                             _ => "#2",
                         },
-                        Page::Content => {
-                            if self.content_light_open() {
-                                "#406"
-                            } else {
-                                match self.content.stack.top() {
-                                    ContentFrame::Unit(_) => "#101",
-                                    ContentFrame::Wall(_) => "#6",
-                                }
-                            }
-                        }
+                        Page::Content => "#6",
                         Page::Index => "#7",
                         Page::Settings => "#8",
                         Page::Trash => "#9",
