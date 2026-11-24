@@ -106,3 +106,13 @@ craft-xml = { path = "vendor/craft-libs/crates/xml" }
 craft-cfb = { path = "vendor/craft-libs/crates/cfb" }
 craft-pptx = { path = "vendor/craft-libs/crates/pptx" }
 craft-pdf = { path = "vendor/craft-libs/crates/pdf" }
+
+# Informal trial packages (user ruling 2026-11-24): build speed
+# over squeeze — opt-level 2, many codegen units, no LTO. The
+# build-windows workflow compiles the client with this profile;
+# formal packages keep using --release.
+[profile.staging]
+inherits = "release"
+opt-level = 2
+codegen-units = 32
+lto = false
