@@ -1309,20 +1309,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "craft-font-catalog"
-version = "0.1.0"
-source = "git+https://github.com/lanline123/craft-libs?rev=b9c7b6970382acb1da090d83eb21e51f7006763a#b9c7b6970382acb1da090d83eb21e51f7006763a"
-dependencies = [
- "harfrust 0.13.3",
- "kurbo",
- "skrifa 0.47.0",
- "thiserror 2.0.21",
- "unicode-bidi",
- "unicode-segmentation",
- "windows-registry",
-]
-
-[[package]]
 name = "craft-fonts-build"
 version = "0.1.0"
 
@@ -1834,6 +1820,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "egui_system_font_provider"
+version = "0.37.0"
+source = "git+https://github.com/storytold/egui.git?rev=6d518fc799681571963842f95b55a6b68431b15a#6d518fc799681571963842f95b55a6b68431b15a"
+dependencies = [
+ "epaint",
+ "fontique",
+ "log",
+ "poll-promise",
+ "skrifa 0.44.0",
+ "sys-locale",
+ "unicode-script",
+]
+
+[[package]]
 name = "either"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1899,7 +1899,7 @@ dependencies = [
  "emath",
  "epaint_default_fonts",
  "font-types 0.12.7",
- "harfrust 0.12.0",
+ "harfrust",
  "log",
  "nohash-hasher",
  "parking_lot",
@@ -2117,6 +2117,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "835ae9d781464a79026cde387f9cbc650c9a4909d7cf7e658b127e3c35d2f35d"
 dependencies = [
  "bytemuck",
+]
+
+[[package]]
+name = "fontique"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6688bc1294fe7117d788937b6c53480169b29c566954af490830d4c09da9516a"
+dependencies = [
+ "hashbrown 0.17.1",
+ "linebender_resource_handle",
+ "memmap2",
+ "objc2 0.6.5",
+ "objc2-core-foundation",
+ "objc2-core-text",
+ "objc2-foundation 0.3.2",
+ "parlance",
+ "read-fonts 0.41.0",
+ "roxmltree",
+ "smallvec",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
+ "yeslogic-fontconfig-sys",
 ]
 
 [[package]]
@@ -2339,6 +2361,7 @@ dependencies = [
  "hashbrown 0.17.1",
  "log",
  "peniko",
+ "png",
  "skrifa 0.44.0",
  "smallvec",
  "vello_common 0.2.0",
@@ -2452,19 +2475,6 @@ dependencies = [
  "bitflags 2.13.2",
  "bytemuck",
  "read-fonts 0.41.0",
- "smallvec",
-]
-
-[[package]]
-name = "harfrust"
-version = "0.13.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "948d0741125ba89cd3e1c23e5642415b6ade7e1d29d67ba25fb925b533e989d6"
-dependencies = [
- "bitflags 2.13.2",
- "bytemuck",
- "once_cell",
- "read-fonts 0.43.3",
  "smallvec",
 ]
 
@@ -2726,7 +2736,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.58.0",
 ]
 
 [[package]]
@@ -3770,6 +3780,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "objc2-core-text"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0cde0dfb48d25d2b4862161a4d5fcc0e3c24367869ad306b0c9ec0073bfed92d"
+dependencies = [
+ "bitflags 2.13.2",
+ "objc2-core-foundation",
+]
+
+[[package]]
 name = "objc2-encode"
 version = "4.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3999,6 +4019,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "parlance"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73072a9470554c8e794778acece2312661218aaabb635600957d952cf01c716e"
+
+[[package]]
 name = "password-hash"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4044,7 +4070,7 @@ name = "pdfcraft-fonts"
 version = "0.21.1"
 source = "git+https://github.com/storytold/pdfcraft?rev=27287c297d25d505a8720ea6da2e7af38693bfa9#27287c297d25d505a8720ea6da2e7af38693bfa9"
 dependencies = [
- "harfrust 0.12.0",
+ "harfrust",
  "pdfcraft-cos",
  "skrifa 0.44.0",
  "unicode-bidi",
@@ -4278,6 +4304,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "poll-promise"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f6a58fecbf9da8965bcdb20ce4fd29788d1acee68ddbb64f0ba1b81bccdb7df"
+dependencies = [
+ "document-features",
+ "static_assertions",
+]
+
+[[package]]
 name = "polling"
 version = "3.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4441,12 +4477,13 @@ dependencies = [
  "aes-gcm",
  "base64 0.22.1",
  "craft-atomic",
- "craft-font-catalog",
  "craft-i18n",
  "craft-ui",
  "craft-update",
  "eframe",
  "egui",
+ "egui_system_font_provider",
+ "fontique",
  "image",
  "pdfcraft-render",
  "qimu-bridge",
@@ -4725,17 +4762,6 @@ dependencies = [
 
 [[package]]
 name = "read-fonts"
-version = "0.43.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "005c8acf251756c478b0bf402885bfd88a1476020c4c7e6060edc1aa68da38ea"
-dependencies = [
- "bytemuck",
- "font-types 0.12.7",
- "once_cell",
-]
-
-[[package]]
-name = "read-fonts"
 version = "0.44.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d5a0cf4bb6cbce4c29756270d189a5e400ac05e91192161d83a0bcb6e68492e8"
@@ -4820,6 +4846,15 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "roxmltree"
+version = "0.21.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9da7f59328b09405b181fee1018925fad50f157afb43c0c0f5c522c256dd5907"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
@@ -5784,6 +5819,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "993ad287eb20e8ba755312801cfe1413e0f25d604075863acaddca10b04c1833"
 
 [[package]]
+name = "unicode-script"
+version = "0.5.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa04c955db05429d464c74d495c1ee677e1866e783a4c3747f9c0cef7756cabf"
+
+[[package]]
 name = "unicode-segmentation"
 version = "1.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5986,6 +6027,7 @@ dependencies = [
  "guillotiere",
  "log",
  "peniko",
+ "png",
  "smallvec",
  "thiserror 2.0.21",
 ]
@@ -6011,6 +6053,7 @@ dependencies = [
  "bytemuck",
  "glifo 0.3.0",
  "hashbrown 0.17.1",
+ "png",
  "vello_common 0.2.0",
 ]
 
@@ -6909,6 +6952,17 @@ name = "y4m"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a5a4b21e1a62b67a2970e6831bc091d7b87e119e7f9791aef9702e3bef04448"
+
+[[package]]
+name = "yeslogic-fontconfig-sys"
+version = "6.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d8b8abf912b9a29ff112e1671c97c33636903d13a69712037190e6805af4f76"
+dependencies = [
+ "dlib",
+ "once_cell",
+ "pkg-config",
+]
 
 [[package]]
 name = "yoke"

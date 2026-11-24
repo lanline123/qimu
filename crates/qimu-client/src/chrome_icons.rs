@@ -69,7 +69,6 @@ impl ChromeIcons {
             normal,
             hovered: ButtonVisuals {
                 fill: palette_color(PRESSED_BG),
-                icon: ACCENT,
                 ..normal
             },
             pressed: None,
