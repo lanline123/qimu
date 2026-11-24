@@ -486,7 +486,7 @@ fn sniff_image_ext(bytes: &[u8]) -> Option<&'static str> {
 /// page — a line-for-line mirror of the conversion the server
 /// performs in its edit-pages handler, so the in-process preview
 /// applies exactly the operations the server would.
-fn slide_ops_from_json(
+pub(super) fn slide_ops_from_json(
     ops: &[Value],
 ) -> Result<std::collections::BTreeMap<usize, Vec<qimu_core::pptx::SlideOp>>, String> {
     use qimu_core::pptx::SlideOp;

@@ -1,24 +1,24 @@
-//! Local-first foundation (本地优先 P0, design §6.2/§7): the local
-//! library owned by the client process itself.
+//! The local library owned by the client process itself
+//! (local-first P0–P4, design §6.2/§7).
 //!
-//! Today the client's working data lives in a `qimu_core::store::Store`
-//! owned by a server process (the bundled standalone server on this
-//! machine, or an organization server), and the client only ever talks
-//! to it over REST. P0 moves the *ownership* back: when the gray switch
-//! `QIMU_LOCAL_FIRST=1` is set, the client opens the very same Store
-//! implementation in-process at the local library root — same on-disk
-//! format as the server's data root (`qimu.db` + `files/`), so an
-//! existing bundled-server `qimu-data` directory is taken over with
-//! zero migration. With the switch off nothing here runs and the
-//! client behaves exactly as before.
+//! The client's working data lives in a `qimu_core::store::Store`
+//! opened in-process at the local library root — the same Store
+//! implementation and the same on-disk format as a server's data
+//! root (`qimu.db` + `files/`), so a library previously served by
+//! the bundled standalone server is taken over with zero
+//! migration. Standalone use needs no server process at all
+//! (P4): the client never spawns one, and organization servers
+//! are an added layer reached over REST when the user connects
+//! one — never the foundation the local library stands on.
 //!
 //! Scope: the store handle, the library-root resolution, the
 //! seeded machine owner + default group, and the JSON adapter
 //! layer that feeds the UI the same `Value` shapes the REST list
-//! endpoints return. P1 adds the working-data write face: the
-//! `dispatch` router below serves the import / units / indexes /
-//! folders / trash / search REST paths from this library, so in
-//! local mode working data is written here, in-process.
+//! endpoints return. The `dispatch` router below serves the
+//! working-data REST paths (import / units / indexes / folders /
+//! trash / search / page editing / attachments / exports / index
+//! graphs) from this library, so working data is written here,
+//! in-process; organization surfaces fall through to REST.
 
 use qimu_core::manifest::{Binding, Manifest, SourceRef};
 use qimu_core::pptx::{self, Package};
@@ -27,15 +27,6 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
-
-/// The P0 gray switch (design §7): local-first behavior is opt-in via
-/// the environment until the migration phases flip the default.
-pub fn local_first_enabled() -> bool {
-    matches!(
-        std::env::var("QIMU_LOCAL_FIRST").as_deref(),
-        Ok("1") | Ok("true")
-    )
-}
 
 /// Library root resolution (design §6.2, same conventions as
 /// `cache_dir()`): the `library_dir` client setting wins; then an
@@ -152,22 +143,15 @@ fn pid_alive(pid: u32) -> bool {
 }
 
 impl LocalStore {
-    /// Open the local library when the gray switch is on; `None` when
-    /// it is off (legacy path untouched) or when opening fails (the
-    /// reason is printed to stderr; the client keeps running on the
-    /// legacy path instead of dying with the library).
-    pub fn open_if_enabled() -> Option<LocalStore> {
-        Self::open_if_enabled_detailed().0
-    }
-
-    /// Like `open_if_enabled`, but also returns the failure reason so
-    /// the settings diagnostic can show it instead of only logging
-    /// to stderr (P0 fix: a lock-held failure used to surface only
-    /// as "see the console log").
-    pub fn open_if_enabled_detailed() -> (Option<LocalStore>, Option<String>) {
-        if !local_first_enabled() {
-            return (None, None);
-        }
+    /// Open the local library (P4: unconditional — the local face
+    /// is the client's own capability, not a gray rollout). The
+    /// failure reason rides along so the settings page can show
+    /// it instead of only logging to stderr (P0 fix: a lock-held
+    /// failure used to surface only as "see the console log").
+    /// On failure the client keeps running — organization
+    /// connections still work — with the local face unavailable
+    /// and the reason on display.
+    pub fn open_library() -> (Option<LocalStore>, Option<String>) {
         let root = library_dir();
         match Self::open(&root) {
             Ok(s) => (Some(s), None),
@@ -181,16 +165,13 @@ impl LocalStore {
     pub fn open(root: &std::path::Path) -> Result<LocalStore, String> {
         std::fs::create_dir_all(root).map_err(|e| e.to_string())?;
         // Advisory lock (design §9 R5, client-side half): one client
-        // process owns a library root at a time. While the gray switch
-        // is on the client also skips spawning the bundled server
-        // against the same root (see restore_connections), so the two
-        // processes never hold the same library open together.
+        // process owns a library root at a time. The client never
+        // spawns a server against this root (P4), so the only
+        // possible second opener is another client process — or a
+        // bundled server left running from a pre-P4 install, which
+        // does not know this lock; the open error names the holder
+        // so that case stays visible instead of silent.
         let lock_path = root.join("qimu-local.lock");
-        // Advisory lock (design §9 R5, client-side half): one client
-        // process owns a library root at a time. While the gray switch
-        // is on the client also skips spawning the bundled server
-        // against the same root (see restore_connections), so the two
-        // processes never hold the same library open together.
         //
         // P0 fix: a lock left behind by a crashed process used to
         // block every later start until the user deleted it by hand.
@@ -333,6 +314,17 @@ impl LocalStore {
         let store = self.store.lock().unwrap();
         let ver = store.get_version(version_id).ok()?;
         store.file_get(&ver.fragment_hash).ok()
+    }
+
+    /// An attachment's bytes from the local CAS (the read the
+    /// server's download handler performs). None when the
+    /// attachment is not in this library — the PDF preview's
+    /// worker thread then falls back to the server download,
+    /// exactly like thumbnails do (T0 pattern).
+    pub fn attachment_bytes(&self, att_id: &str) -> Option<Vec<u8>> {
+        let store = self.store.lock().unwrap();
+        let rec = store.get_attachment(att_id).ok()?;
+        store.file_get(&rec.hash).ok()
     }
 
     /// Assemble one showroom item's deck from this library,
@@ -636,16 +628,21 @@ impl LocalStore {
         }))
     }
 
-    /// Working-data dispatcher (local-first P1): serves the REST
+    /// Working-data dispatcher (local-first P1/P4): serves the REST
     /// paths whose data is working data — import, units, indexes,
-    /// folders, trash, search — from this local library, with the
+    /// folders, trash, search, page editing (page-text / edit-pages
+    /// / scripts), attachments, the export registry and index
+    /// exports, index graphs — from this local library, with the
     /// exact response shapes and error strings the server handlers
     /// produce (they are thin shells over the same core calls; the
     /// capability checks they add are vacuous for the library's
     /// seeded super owner). Returns None for anything else —
     /// organization surfaces, and the few objects that live on the
     /// server even in local mode (showroom trash rows) — so the
-    /// caller falls through to REST unchanged.
+    /// caller falls through to REST unchanged. The arms added in
+    /// P4 additionally fall through when the target object is not
+    /// in this library at all, so a stray organization object can
+    /// never be answered from the wrong store.
     pub fn dispatch(
         &self,
         method: &str,
@@ -808,6 +805,171 @@ impl LocalStore {
                     store.get_version(id).map_err(|_| NOT_FOUND.to_string())?;
                     store.set_version_status(id, "recalled")?;
                     Ok(json!({ "ok": true }))
+                }
+                ("GET", ["v1", "versions", id, "page-text"]) => {
+                    // P4: the page editor's read side (server
+                    // `version_page_text`): the runs + element model
+                    // of one page, parsed from the local fragment
+                    // with the same core calls. A version this
+                    // library does not hold falls through to REST.
+                    let page: usize = query_param(q, "page")
+                        .and_then(|p| p.parse().ok())
+                        .unwrap_or(0);
+                    let store = self.store.lock().unwrap();
+                    let ver = match store.get_version(id) {
+                        Ok(v) => v,
+                        Err(_) => return Err(UNHANDLED.to_string()),
+                    };
+                    let bytes = store.file_get(&ver.fragment_hash)?;
+                    let pkg = Package::load(&bytes)?;
+                    let runs = qimu_core::pptx::slide_text_runs(&pkg, page)?;
+                    let (slide_cx, slide_cy) = qimu_core::pptx::slide_size(&pkg);
+                    let elements =
+                        qimu_core::pptx::slide_elements(&pkg, page).unwrap_or_default();
+                    Ok(json!({
+                        "page": page,
+                        "runs": runs,
+                        "slide_cx": slide_cx,
+                        "slide_cy": slide_cy,
+                        "elements": serde_json::to_value(&elements).unwrap_or(json!([])),
+                    }))
+                }
+                ("PUT", ["v1", "versions", id, "scripts"]) => {
+                    // P4: speaker-scripts save (server
+                    // `put_version_scripts`); never bumps a version.
+                    let store = self.store.lock().unwrap();
+                    if store.get_version(id).is_err() {
+                        return Err(UNHANDLED.to_string());
+                    }
+                    let scripts: Vec<String> = body
+                        .get("scripts")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .map(|x| x.as_str().unwrap_or("").to_string())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    store.set_version_scripts(id, &scripts)?;
+                    Ok(json!({ "ok": true }))
+                }
+                ("POST", ["v1", "versions", id, "edit-pages"]) => {
+                    // P4: the page editor's save (server
+                    // `edit_version_pages`, minus its preview_page
+                    // branch — previews never travel through the
+                    // dispatcher; page_editor's in-process preview
+                    // owns them). Applies the request to the local
+                    // fragment and inserts the bumped version, with
+                    // the server's exact verdicts. A version this
+                    // library does not hold falls through to REST.
+                    if body.get("preview_page").is_some() {
+                        return Err(UNHANDLED.to_string());
+                    }
+                    let edits_v = body.get("edits").and_then(|v| v.as_array());
+                    let ops_v = body.get("ops").and_then(|v| v.as_array());
+                    if edits_v.map(|a| a.len()).unwrap_or(0) > 20_000
+                        || ops_v.map(|a| a.len()).unwrap_or(0) > 20_000
+                    {
+                        return Err("编辑操作过多".to_string());
+                    }
+                    let store = self.store.lock().unwrap();
+                    let ver = match store.get_version(id) {
+                        Ok(v) => v,
+                        Err(_) => return Err(UNHANDLED.to_string()),
+                    };
+                    let rend = store.get_rendition(&ver.rendition_id)?;
+                    let unit = store.get_unit(&rend.unit_id)?;
+                    let bytes = store.file_get(&ver.fragment_hash)?;
+                    let added_pages = body
+                        .get("added_pages")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as usize;
+                    let mut pkg = Package::load(&bytes)?;
+                    qimu_core::pptx::append_blank_slides(&mut pkg, added_pages)?;
+                    let mut by_page: std::collections::BTreeMap<
+                        usize,
+                        Vec<(usize, String)>,
+                    > = std::collections::BTreeMap::new();
+                    if let Some(edits) = edits_v {
+                        for e in edits {
+                            let page =
+                                e.get("page").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                            let run =
+                                e.get("run").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                            let text = str_field(e, "text").unwrap_or_default();
+                            by_page.entry(page).or_default().push((run, text));
+                        }
+                    }
+                    let mut applied = added_pages;
+                    for (page, edits) in &by_page {
+                        applied +=
+                            qimu_core::pptx::replace_slide_text_runs(&mut pkg, *page, edits)?;
+                    }
+                    let empty_ops: Vec<Value> = Vec::new();
+                    let ops_by_page = crate::page_editor::slide_ops_from_json(
+                        ops_v.unwrap_or(&empty_ops),
+                    )?;
+                    for (page, ops) in &ops_by_page {
+                        applied += qimu_core::pptx::apply_slide_ops(&mut pkg, *page, ops)?;
+                    }
+                    if applied == 0 {
+                        return Err("没有可应用的修改".to_string());
+                    }
+                    let pages = qimu_core::pptx::slides(&pkg)?.len();
+                    let scripts: Vec<String> = match body.get("scripts") {
+                        Some(sv) => {
+                            let arr: Vec<String> = sv
+                                .as_array()
+                                .map(|a| {
+                                    a.iter()
+                                        .map(|x| x.as_str().unwrap_or("").to_string())
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            if arr.len() != pages {
+                                return Err("讲稿数量与页面数量不匹配".to_string());
+                            }
+                            arr
+                        }
+                        None => {
+                            let mut sc = ver.scripts.clone();
+                            sc.resize(pages, String::new());
+                            sc
+                        }
+                    };
+                    let frag = pkg.to_bytes()?;
+                    let basis = if body
+                        .get("new_revision")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                    {
+                        store.bump_unit_revision(&unit.id)?
+                    } else {
+                        unit.current_revision
+                    };
+                    let latest = store.latest_version(&rend.id)?;
+                    let inc = match str_field(&body, "bump").as_deref() {
+                        Some("major") => qimu_core::Increment::Major,
+                        Some("patch") => qimu_core::Increment::Patch,
+                        _ => qimu_core::Increment::Minor,
+                    };
+                    let next = match latest {
+                        Some(v) => qimu_core::SemVer::parse(&v.semver)?.bumped(inc),
+                        None => qimu_core::SemVer::new(1, 0, 0),
+                    };
+                    let new_ver = store.insert_version_with_scripts(
+                        &rend.id,
+                        next,
+                        basis,
+                        &self.owner.display_name,
+                        &str_field(&body, "note").unwrap_or_default(),
+                        &frag,
+                        "normal",
+                        Some(&scripts),
+                    )?;
+                    Ok(json!({
+                        "version": serde_json::to_value(&new_ver).unwrap_or(Value::Null)
+                    }))
                 }
                 // ---- folders ----
                 ("GET", ["v1", "folders"]) => {
@@ -1063,6 +1225,148 @@ impl LocalStore {
                         store.derive_english_index(&self.owner, &index, &branch, name)?;
                     Ok(serde_json::to_value(&derived).unwrap_or(Value::Null))
                 }
+                // ---- attachments (P4) ----
+                ("POST", ["v1", "attachments"]) => {
+                    // Attachments hang off units and indexes — this
+                    // library's working data. A parent this library
+                    // does not hold falls through to REST.
+                    let parent_id = str_field(&body, "parent_id").unwrap_or_default();
+                    let store = self.store.lock().unwrap();
+                    if store.get_unit(&parent_id).is_err()
+                        && store.get_index(&parent_id).is_err()
+                    {
+                        return Err(UNHANDLED.to_string());
+                    }
+                    let bytes = b64_field(&body, "data_base64")?;
+                    let rec = store.insert_attachment(
+                        &str_field(&body, "parent_type").unwrap_or_default(),
+                        &parent_id,
+                        &str_field(&body, "filename").unwrap_or_default(),
+                        &bytes,
+                        &self.owner.display_name,
+                    )?;
+                    Ok(serde_json::to_value(&rec).unwrap_or(Value::Null))
+                }
+                ("GET", ["v1", "attachments"]) => {
+                    let parent = query_param(q, "parent_id").unwrap_or_default();
+                    let store = self.store.lock().unwrap();
+                    if store.get_unit(&parent).is_err()
+                        && store.get_index(&parent).is_err()
+                    {
+                        return Err(UNHANDLED.to_string());
+                    }
+                    let rows = store.list_attachments(&parent)?;
+                    Ok(json!({ "attachments": values_of(rows) }))
+                }
+                ("GET", ["v1", "attachments", id, "download"]) => {
+                    let store = self.store.lock().unwrap();
+                    let rec = match store.get_attachment(id) {
+                        Ok(r) => r,
+                        Err(_) => return Err(UNHANDLED.to_string()),
+                    };
+                    let bytes = store.file_get(&rec.hash)?;
+                    Ok(json!({
+                        "filename": rec.filename,
+                        "data_base64": crate::b64e(&bytes),
+                    }))
+                }
+                // ---- export registry + index export (P4) ----
+                ("GET", ["v1", "exports"]) => {
+                    let store = self.store.lock().unwrap();
+                    let rows =
+                        store.list_exports(query_param(q, "index_id").as_deref())?;
+                    Ok(json!({ "exports": values_of(rows) }))
+                }
+                ("POST", ["v1", "indexes", id, "export"]) => {
+                    // The index export the detail page's 导出 runs
+                    // (server `export_index`): resolve the commit
+                    // (a tag on the branch, else the branch head),
+                    // assemble in-process, register the export and
+                    // return the deck inline — same response shape,
+                    // same personalization verdicts.
+                    let store = self.store.lock().unwrap();
+                    if store.get_index(id).is_err() {
+                        return Err(UNHANDLED.to_string());
+                    }
+                    let branch =
+                        str_field(&body, "branch").unwrap_or_else(|| "main".to_string());
+                    let commit = if let Some(tag_name) = str_field(&body, "tag") {
+                        let tags = store.list_tags(id)?;
+                        let tag = tags
+                            .iter()
+                            .find(|t| t.name == tag_name && t.branch == branch)
+                            .ok_or_else(|| "标签不存在".to_string())?;
+                        store.get_commit(&tag.commit_id)?
+                    } else {
+                        let head = store
+                            .branch_head(id, &branch)?
+                            .ok_or_else(|| "分支尚无提交".to_string())?;
+                        store.get_commit(&head)?
+                    };
+                    let kind =
+                        str_field(&body, "kind").unwrap_or_else(|| "personal".to_string());
+                    let include_notes = body
+                        .get("include_notes")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let source = SourceRef {
+                        index_id: id.to_string(),
+                        branch: branch.clone(),
+                        commit_id: commit.id.clone(),
+                        tag: str_field(&body, "tag"),
+                    };
+                    let (deck, manifest, page_count) = build_deck_local(
+                        &store,
+                        &self.owner,
+                        &commit.entries,
+                        Some(source),
+                        &kind,
+                        include_notes,
+                    )?;
+                    let export_id = qimu_core::auth::new_id("exp");
+                    let deck_hash = store.file_put(&deck)?;
+                    store.insert_export(&qimu_core::store::ExportRec {
+                        id: export_id.clone(),
+                        index_id: id.to_string(),
+                        branch: branch.clone(),
+                        commit_id: commit.id.clone(),
+                        tag: str_field(&body, "tag"),
+                        user_id: self.owner.id.clone(),
+                        created_ms: qimu_core::auth::now_ms(),
+                        deck_hash,
+                        page_count,
+                        kind: kind.clone(),
+                        deck_id: manifest.deck_id.clone(),
+                        manifest_json: serde_json::to_string(&manifest)
+                            .unwrap_or_default(),
+                    })?;
+                    Ok(json!({
+                        "export_id": export_id,
+                        "page_count": page_count,
+                        "manifest": serde_json::to_value(&manifest)
+                            .unwrap_or(Value::Null),
+                        "data_base64": crate::b64e(&deck),
+                    }))
+                }
+                // ---- index graphs (P4) ----
+                ("GET", ["v1", "index-graphs"]) => {
+                    let store = self.store.lock().unwrap();
+                    let mut graphs = std::collections::BTreeMap::new();
+                    if let Some(id) = query_param(q, "index_id") {
+                        if store.get_index(&id).is_err() {
+                            return Err(UNHANDLED.to_string());
+                        }
+                        graphs.insert(id.clone(), store.index_graph(&id)?);
+                    } else {
+                        for index in store.list_indexes(None)? {
+                            let graph = store.index_graph(&index.id)?;
+                            graphs.insert(index.id.clone(), graph);
+                        }
+                    }
+                    Ok(json!({
+                        "graphs": serde_json::to_value(&graphs).unwrap_or_default()
+                    }))
+                }
                 _ => Err(UNHANDLED.to_string()),
             }
         })();
@@ -1099,6 +1403,119 @@ fn opt_str_field<'a>(body: &'a Value, key: &str) -> Option<&'a str> {
 fn b64_field(body: &Value, key: &str) -> Result<Vec<u8>, String> {
     let s = str_field(body, key).unwrap_or_default();
     crate::b64d(&s).map_err(|e| format!("base64 解码失败: {e}"))
+}
+
+/// Assemble a deck from commit entries entirely in-process —
+/// the server's `build_export` with the library owner as the
+/// exporter (P4; the showroom face keeps its own copy in
+/// `assemble_showroom_deck`, T1). Personalization resolves exactly
+/// like the server's: company tokens always, the exporter's
+/// profile for a personal export, personal fields scrubbed for a
+/// company export, and a valueless placeholder blocks the export.
+fn build_deck_local(
+    store: &Store,
+    exporter: &UserRec,
+    entries: &[qimu_core::model::IndexEntry],
+    source: Option<SourceRef>,
+    kind: &str,
+    include_notes: bool,
+) -> Result<(Vec<u8>, Manifest, i64), String> {
+    let mut pkgs: Vec<Package> = Vec::new();
+    let mut bindings: Vec<Binding> = Vec::new();
+    let mut binding_scripts: Vec<Vec<String>> = Vec::new();
+    for e in entries {
+        let version = store
+            .resolve_entry_version(e)?
+            .ok_or_else(|| "有条目无法解析到版本（内容块尚无已发布版本）".to_string())?;
+        let frag_bytes = store.file_get(&version.fragment_hash)?;
+        let frag_pkg = Package::load(&frag_bytes)?;
+        let singles = pptx::split(&frag_pkg)?;
+        let chosen: Vec<usize> = match &e.excerpt_slots {
+            Some(slots) => slots
+                .iter()
+                .filter_map(|sl| sl.parse::<usize>().ok())
+                .filter(|i| *i < singles.len())
+                .collect(),
+            None => (0..singles.len()).collect(),
+        };
+        let mut fps = Vec::new();
+        let mut scripts = Vec::new();
+        for i in &chosen {
+            if let Some(p) = version.pages.get(*i) {
+                fps.push(p.fp.clone());
+            }
+            scripts.push(version.scripts.get(*i).cloned().unwrap_or_default());
+            pkgs.push(singles[*i].clone());
+        }
+        binding_scripts.push(scripts);
+        bindings.push(Binding {
+            unit_id: e.unit_id.0.clone(),
+            rendition_id: e.rendition_id.0.clone(),
+            version_id: version.id.clone(),
+            version_semver: version.semver.clone(),
+            page_fps: fps,
+        });
+    }
+    if pkgs.is_empty() {
+        return Err("没有可导出的页面".into());
+    }
+    let page_count = pkgs.len() as i64;
+    let mut assembled = qimu_core::assemble::assemble(&pkgs)?;
+    if include_notes {
+        let mut cursor = 0usize;
+        for scripts in &binding_scripts {
+            for script in scripts {
+                if !script.is_empty() {
+                    qimu_core::pptx::set_notes_text(&mut assembled, cursor, script);
+                }
+                cursor += 1;
+            }
+        }
+    }
+    {
+        use qimu_core::personalize;
+        let mut values: BTreeMap<String, String> = BTreeMap::new();
+        for (k, v) in store.company_profile()? {
+            let token = match k.as_str() {
+                "phone" => "company_phone",
+                "website" => "company_website",
+                "address" => "company_address",
+                "gongzhonghao" => "company_gongzhonghao",
+                _ => continue,
+            };
+            if !v.is_empty() {
+                values.insert(token.to_string(), v);
+            }
+        }
+        let scrub: &[&str] = if kind == "company" {
+            personalize::PERSONAL_FIELDS
+        } else {
+            values.insert("name".to_string(), exporter.display_name.clone());
+            for (k, v) in store.profile(&exporter.id)? {
+                if !v.is_empty() {
+                    values.insert(k, v);
+                }
+            }
+            &[]
+        };
+        let missing = personalize::substitute(&mut assembled, &values, scrub);
+        if !missing.is_empty() {
+            return Err(format!(
+                "导出已拦截：以下占位字段没有值（请先在设置里补全资料）：{}",
+                missing.join("、")
+            ));
+        }
+    }
+    let deck = assembled.to_bytes()?;
+    let manifest = Manifest {
+        deck_id: qimu_core::auth::new_id("deck"),
+        kind: kind.to_string(),
+        source,
+        exported_ms: qimu_core::auth::now_ms(),
+        bindings,
+    };
+    let deck = qimu_core::manifest::embed_manifest(&deck, &manifest)?;
+    Ok((deck, manifest, page_count))
 }
 
 /// The `unit_json` wrapper of the server, over an already-locked

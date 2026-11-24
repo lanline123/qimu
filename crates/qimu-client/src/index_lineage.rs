@@ -14,7 +14,7 @@ impl App {
             || "/v1/index-graphs".to_string(),
             |id| format!("/v1/index-graphs?index_id={}", query_component(id)),
         );
-        let mut response = self.call("GET", &path, None)?;
+        let mut response = self.call_work("GET", &path, None)?;
         serde_json::from_value(response["graphs"].take()).map_err(|error| error.to_string())
     }
 

@@ -1,7 +1,8 @@
 //! qimu-client — the Rust desktop client (spec §4): four top-level pages
-//! 演示厅 / 内容页 / 索引页 / 设置, talking to qimu-server over HTTP.
-//! All logic lives in qimu-core / the server; this crate is a frontend,
-//! exactly like the CLI (spec §4.4 parity).
+//! 演示厅 / 内容页 / 索引页 / 设置. Working data lives in the client's
+//! own in-process local library (qimu-core's Store, local-first
+//! P0–P4); organization servers are an added layer, talked to over
+//! HTTP only when the user connects one.
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod chrome_icons;
@@ -2666,15 +2667,15 @@ struct App {
     login_open: bool,
     /// About dialog visibility.
     about_open: bool,
-    /// Local-first foundation (P0): the in-process local library,
-    /// opened in App::new before any connection restore when the
-    /// QIMU_LOCAL_FIRST gray switch is on; None on the legacy path,
-    /// where behavior is unchanged.
+    /// The in-process local library (local-first P0–P4), opened in
+    /// App::new before any connection restore. None only when
+    /// opening failed — the reason is kept in `local_open_error`
+    /// and shown on the settings page.
     local: Option<std::sync::Arc<local_store::LocalStore>>,
-    /// P0 fix: why the local library failed to open, if it did —
-    /// shown in the settings diagnostic block (a lock-held failure
+    /// Why the local library failed to open, if it did — shown in
+    /// the settings page's local-library block (a lock-held failure
     /// used to surface only as "see the console log"). None when
-    /// the switch is off or the library opened fine.
+    /// the library opened fine.
     local_open_error: Option<String>,
 }
 
@@ -3083,74 +3084,6 @@ fn discover_servers() -> Vec<Value> {
     found
 }
 
-fn tcp_reachable(port: u16) -> bool {
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(300)).is_ok()
-}
-
-fn find_server_exe() -> Option<std::path::PathBuf> {
-    if let Ok(p) = std::env::var("QIMU_SERVER_EXE") {
-        let pb = std::path::PathBuf::from(p);
-        if pb.exists() {
-            return Some(pb);
-        }
-    }
-    let name = if cfg!(target_os = "windows") {
-        "qimu-server.exe"
-    } else {
-        "qimu-server"
-    };
-    let cand = exe_dir().join(name);
-    if cand.exists() {
-        Some(cand)
-    } else {
-        None
-    }
-}
-
-/// Best-effort: mark the bundled server's data directory as a
-/// standalone installation (a standalone.on marker the server
-/// honors when QIMU_STANDALONE is unset — the installer-autostarted
-/// instance never sees the env the client would have spawned it
-/// with). Only ever touches the data dir beside this executable;
-/// an organization server's directory sits on another machine and
-/// is unreachable from here.
-fn mark_local_standalone() {
-    if let Some(exe) = find_server_exe() {
-        if let Some(dir) = exe.parent() {
-            let data = dir.join("qimu-data");
-            if std::fs::create_dir_all(&data).is_ok() {
-                let _ = std::fs::write(data.join("standalone.on"), "standalone\n");
-            }
-        }
-    }
-}
-
-/// Start the bundled server next to this executable, detached, with its
-/// data in a `qimu-data` folder beside it (the server also resolves that
-/// itself; the env makes it explicit).
-fn spawn_local_server(exe: &std::path::Path) -> bool {
-    let dir = exe.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let data = dir.join("qimu-data");
-    let _ = std::fs::create_dir_all(&data);
-    let mut cmd = std::process::Command::new(exe);
-    // The bundled server is this machine's own data plane: it runs
-    // in standalone mode, where tokenless loopback requests act as
-    // the owner (org-model standalone gap). An organization server
-    // is started by hand and never sees this env.
-    cmd.env("QIMU_DATA_DIR", &data)
-        .env("QIMU_STANDALONE", "1")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
-    cmd.spawn().is_ok()
-}
-
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         egui_extras::install_image_loaders(&cc.egui_ctx);
@@ -3158,11 +3091,14 @@ impl App {
         init_i18n();
         apply_modern_style(&cc.egui_ctx);
         migrate_cache_dir_once();
-        // Local-first P0: open the in-process local library before
+        // Local-first: open the in-process local library before
         // any connection is restored — its availability must not
-        // depend on the connection state machine. No-op (None)
-        // unless the QIMU_LOCAL_FIRST gray switch is on.
-        let (local, local_open_error) = local_store::LocalStore::open_if_enabled_detailed();
+        // depend on the connection state machine. The library is
+        // the client's own foundation (P4), opened unconditionally;
+        // a failure leaves `local` None with the reason kept for
+        // the settings page, and organization connections still
+        // work.
+        let (local, local_open_error) = local_store::LocalStore::open_library();
         let local = local.map(std::sync::Arc::new);
         let (thumb_tx, thumb_rx) = std::sync::mpsc::channel();
         let (pdf_tx, pdf_rx) = std::sync::mpsc::channel();
@@ -3290,9 +3226,9 @@ impl App {
                 _ => {}
             }
         } else {
-            // Normal start: restore saved connections (validating each
-            // token); with none saved, make sure a local server exists
-            // so the user never has to start one by hand.
+            // Normal start: restore saved connections (validating
+            // each token); with none saved, the client simply runs
+            // on its local library — no server is started for it.
             app.restore_connections();
             if std::env::var("QIMU_DISCOVER").is_ok() {
                 // Screenshot/test hook: run one LAN scan up front.
@@ -3422,12 +3358,12 @@ impl App {
         raw_call(&self.server, self.token.as_deref(), method, path, body, false)
     }
 
-    /// Working-data call (local-first P1): with the gray switch on,
-    /// the import / units / indexes / folders / trash / search
+    /// Working-data call (local-first P1/P4): the working-data
     /// paths are served by the in-process local library; anything
     /// the local dispatcher does not claim — organization surfaces,
     /// objects that live on the server — falls through to REST
-    /// unchanged. With the switch off this is exactly `call`.
+    /// unchanged. With no local library (its open failed) this is
+    /// exactly `call`.
     fn call_work(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
         if let Some(local) = &self.local {
             if let Some(r) = local.dispatch(method, path, body.as_ref()) {
@@ -3624,27 +3560,6 @@ impl App {
         }
     }
 
-    /// Standalone local form (org-model standalone gap): when the
-    /// bundled server runs in standalone mode it answers a
-    /// tokenless /v1/me as the machine's owner — adopt that
-    /// identity so the local library loads in full, with no
-    /// account anywhere in sight. Any other answer (an organization
-    /// server, or standalone mode off) leaves the client on the
-    /// guest surface, exactly as before.
-    fn try_adopt_local_owner(&mut self) -> bool {
-        match raw_call(&self.server, None, "GET", "/v1/me", None, true) {
-            Ok(v) => match v.get("user").cloned() {
-                Some(u) => {
-                    self.user = Some(u);
-                    self.refresh_all();
-                    true
-                }
-                None => false,
-            },
-            Err(_) => false,
-        }
-    }
-
     /// Startup path when no env-driven login was requested: load saved
     /// connections, validate them, enter through the remembered active
     /// one (or the first that still answers). With nothing saved, make
@@ -3652,19 +3567,12 @@ impl App {
     fn restore_connections(&mut self) {
         self.conns = load_conns();
         if self.conns.is_empty() {
-            if self.local.is_some() {
-                // Local-first gray mode: the working library lives in
-                // this process. Do not spawn the bundled server
-                // against the same data root (design §8.1 dual-open
-                // guard); organization surfaces stay empty until the
-                // user adds a server.
-                self.refresh_all();
-                return;
-            }
-            self.autostart_local_server();
-            if !self.try_adopt_local_owner() {
-                self.refresh_guest();
-            }
+            // No organization server saved: the client runs purely
+            // on its in-process local library (P4 — standalone is a
+            // real mode, not a bundled server in disguise; nothing
+            // is spawned, nothing is adopted). Organization surfaces
+            // stay empty until the user adds a server.
+            self.refresh_all();
             return;
         }
         for i in 0..self.conns.len() {
@@ -3709,31 +3617,6 @@ impl App {
         }
         if self.token.is_none() || self.anon_active() {
             self.refresh_guest();
-        }
-    }
-
-    /// "The server is not something the user starts": when nothing is
-    /// listening on 127.0.0.1:8730, launch the server bundled beside
-    /// this executable and wait for its port.
-    fn autostart_local_server(&mut self) {
-        mark_local_standalone();
-        if tcp_reachable(8730) {
-            self.server = "http://127.0.0.1:8730".into();
-            return;
-        }
-        if let Some(exe) = find_server_exe() {
-            if spawn_local_server(&exe) {
-                for _ in 0..80 {
-                    if tcp_reachable(8730) {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-                if tcp_reachable(8730) {
-                    self.server = "http://127.0.0.1:8730".into();
-                    self.msg = "已自动启动本机服务器".into();
-                }
-            }
         }
     }
 
@@ -4027,11 +3910,12 @@ impl App {
         self.my_id.clear();
     }
 
-    /// Refresh dispatcher (local-first P0): with the gray switch on,
-    /// working data (folders/groups/units/indexes) is fed by the
-    /// in-process local library and only the organization surfaces go
-    /// over REST; with it off, the legacy all-REST refresh runs
-    /// verbatim (refresh_all_rest below).
+    /// Refresh dispatcher (local-first P0/P4): working data
+    /// (folders/groups/units/indexes) is fed by the in-process
+    /// local library and only the organization surfaces go over
+    /// REST. The all-REST refresh (refresh_all_rest below) remains
+    /// verbatim as the fallback for a local library that failed
+    /// to open.
     fn refresh_all(&mut self) {
         if self.local.is_some() {
             self.refresh_local();
@@ -4439,7 +4323,7 @@ impl App {
     }
 
     fn load_attachments(&mut self, parent_id: &str) {
-        if let Ok(v) = self.call(
+        if let Ok(v) = self.call_work(
             "GET",
             &format!("/v1/attachments?parent_id={parent_id}"),
             None,
@@ -4468,24 +4352,37 @@ impl App {
             note: "正在加载…".into(),
         });
         let (server, token, tx) = (self.server.clone(), self.token.clone(), self.pdf_tx.clone());
+        // Local-first P4: an attachment held by the local library
+        // is read from its CAS first (the T0 thumbnail pattern);
+        // anything else keeps the server download below, unchanged.
+        let local = self.local.clone();
         std::thread::spawn(move || {
-            let out = raw_call(
-                &server,
-                token.as_deref(),
-                "GET",
-                &format!("/v1/attachments/{att_id}/download"),
-                None,
-                false,
-            )
-            .and_then(|v| {
-                v.get("data_base64")
-                    .and_then(|x| x.as_str())
-                    .map(str::to_string)
-                    .ok_or_else(|| "附件下载响应异常".to_string())
-            })
-            .and_then(|b| b64d(&b))
-            .map(std::sync::Arc::new)
-            .and_then(|bytes| render_pdf_page(&bytes, 0).map(|img| (bytes, img)));
+            let out = match local
+                .as_deref()
+                .and_then(|store| store.attachment_bytes(&att_id))
+            {
+                Some(bytes) => {
+                    let bytes = std::sync::Arc::new(bytes);
+                    render_pdf_page(&bytes, 0).map(|img| (bytes, img))
+                }
+                None => raw_call(
+                    &server,
+                    token.as_deref(),
+                    "GET",
+                    &format!("/v1/attachments/{att_id}/download"),
+                    None,
+                    false,
+                )
+                .and_then(|v| {
+                    v.get("data_base64")
+                        .and_then(|x| x.as_str())
+                        .map(str::to_string)
+                        .ok_or_else(|| "附件下载响应异常".to_string())
+                })
+                .and_then(|b| b64d(&b))
+                .map(std::sync::Arc::new)
+                .and_then(|bytes| render_pdf_page(&bytes, 0).map(|img| (bytes, img))),
+            };
             match out {
                 Ok((bytes, img)) => {
                     let _ = tx.send((att_id, 0, Some(bytes), Ok(img)));
@@ -4577,7 +4474,7 @@ impl App {
                                 "filename": filename,
                                 "data_base64": b64e(&bytes),
                             });
-                            match self.call("POST", "/v1/attachments", Some(body)) {
+                            match self.call_work("POST", "/v1/attachments", Some(body)) {
                                 Ok(_) => {
                                     self.msg = "附件已添加".into();
                                     self.load_attachments(parent_id);
@@ -4614,7 +4511,7 @@ impl App {
                 }
                 if ui.small_button("下载").clicked() {
                     let att_id = s(att, "id");
-                    match self.call(
+                    match self.call_work(
                         "GET",
                         &format!("/v1/attachments/{att_id}/download"),
                         None,
@@ -4815,7 +4712,7 @@ impl App {
             )
             .ok();
         let exports = self
-            .call("GET", &format!("/v1/exports?index_id={id}"), None)
+            .call_work("GET", &format!("/v1/exports?index_id={id}"), None)
             .ok();
         if let IndexFrame::Detail(d) = self.index.stack.top_mut() {
             d.commits = commits;
@@ -6315,12 +6212,14 @@ impl App {
         }
         let current = sections[self.settings.section];
         // Sidebar morphology (prototype settings sidebar): a
-        // 「设置分区」 heading over the sections grouped by the
-        // prototype's categories, every row carrying its icon, and
-        // the approval row showing the live pending count. The
-        // prototype renders a second 「设置目录」 TOC with the same
-        // anchors; in this section-switch layout the nav itself is
-        // the directory, so the two lists are rendered as one.
+        // 「设置分区」 heading over the sections grouped by
+        // ownership — 本机 vs 服务器与组织 (local-first P4; the
+        // prototype's categories predate the local-first split) —
+        // every row carrying its icon, and the approval row showing
+        // the live pending count. The prototype renders a second
+        // 「设置目录」 TOC with the same anchors; in this
+        // section-switch layout the nav itself is the directory,
+        // so the two lists are rendered as one.
         ui.label(
             egui::RichText::new(tr("设置分区"))
                 .size(13.0)
@@ -6329,26 +6228,22 @@ impl App {
         );
         ui.add_space(4.0);
         let groups: &[(&str, &[(&str, ChromeIcon)])] = &[
-            ("", &[("服务器", ChromeIcon::Power)]),
             (
-                "个人设置",
+                "本机",
                 &[
-                    ("个人资料", ChromeIcon::Clipboard),
                     ("离线缓存", ChromeIcon::Download),
                     ("演示偏好", ChromeIcon::Presenter),
                 ],
             ),
             (
-                "组织管理",
+                "服务器与组织",
                 &[
+                    ("服务器", ChromeIcon::Power),
+                    ("个人资料", ChromeIcon::Clipboard),
+                    ("我的提交", ChromeIcon::Clipboard),
                     ("组织管理", ChromeIcon::Lineage),
                     ("内容组与授权", ChromeIcon::Directory),
                     ("审批队列", ChromeIcon::Active),
-                ],
-            ),
-            (
-                "公司设置",
-                &[
                     ("公司公共资料", ChromeIcon::Home),
                     ("内容语言", ChromeIcon::All),
                     ("AI 翻译", ChromeIcon::Split),
@@ -7272,11 +7167,10 @@ impl App {
     fn settings_sections(&self) -> Vec<&'static str> {
         if self.user.is_none() {
             // No named identity (logged out, anonymous guest, or
-            // standalone before the owner is adopted): only the
-            // local sections — connecting a
-            // server (and logging in there) plus the on-device
-            // offline cache. Identity-bound sections appear after
-            // login, per role, as before.
+            // standalone — the local library needs no identity):
+            // only the local sections plus the server connection
+            // entry. Identity-bound sections appear after login,
+            // per role, as before.
             return vec!["服务器", "离线缓存", "演示偏好"];
         }
         let role = self.role();
@@ -7734,7 +7628,7 @@ impl App {
         else {
             return;
         };
-        let r = self.call(
+        let r = self.call_work(
             "POST",
             &format!("/v1/indexes/{id}/export"),
             Some(json!({
@@ -8707,13 +8601,39 @@ impl App {
         resp.on_hover_text(label).clicked()
     }
 
-    /// PPTX export for the showroom deck on screen: the server
-    /// assembles the deck and it lands through a save dialog.
-    /// This is also the current phase's export-style share path —
-    /// the exported file is the share artifact (standalone ruling:
-    /// sharing is export-only for now) — so the deck header's 导出
-    /// and the bottom bar's 分享 call this same handler.
+    /// PPTX export for the showroom deck on screen: assembled
+    /// in-process when the deck lives in the local library,
+    /// otherwise the server assembles it; lands through a save
+    /// dialog either way. This is also the current phase's
+    /// export-style share path — the exported file is the share
+    /// artifact (standalone ruling: sharing is export-only for
+    /// now) — so the deck header's 导出 and the bottom bar's 分享
+    /// call this same handler.
     fn export_showroom_pptx(&mut self, item: &Value) {
+        // Local-first P4: a deck that lives in the local library
+        // is assembled in-process (the same LocalStore assembly
+        // the PDF path uses since T1) — standalone sharing depends
+        // on it, there being no server to assemble for us. A local
+        // assembly failure falls back to the server path below,
+        // unchanged (T1 discipline).
+        if let Some(local) = &self.local {
+            match local.assemble_showroom_deck(&s(&item, "id"), false) {
+                Some(Ok((bytes, _page_count))) => {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .set_file_name(format!("{}.pptx", s(&item, "title")))
+                        .save_file()
+                    {
+                        let _ = std::fs::write(path, bytes);
+                        self.msg = "已保存".into();
+                    }
+                    return;
+                }
+                Some(Err(e)) => {
+                    eprintln!("[qimu] 本地组装稿件失败，回退服务端导出：{e}");
+                }
+                None => {}
+            }
+        }
         match self.call(
             "POST",
             &format!("/v1/showroom/{}/export", s(&item, "id")),
@@ -11673,7 +11593,7 @@ impl App {
                     ui.label(egui::RichText::new("逐页讲稿（保存不升版本）").strong());
                     if ui.button("保存讲稿").clicked() {
                         let scripts = st.scripts_edit.clone();
-                        match self.call(
+                        match self.call_work(
                             "PUT",
                             &format!("/v1/versions/{vid}/scripts"),
                             Some(json!({ "scripts": scripts })),
@@ -12954,7 +12874,7 @@ impl App {
                 "bump": bump,
                 "note": pe.note,
             });
-            match self.call(
+            match self.call_work(
                 "POST",
                 &format!("/v1/versions/{}/edit-pages", pe.version_id),
                 Some(payload),
@@ -12969,7 +12889,7 @@ impl App {
                 }
             }
         } else if pe.scripts != pe.scripts_base {
-            if let Err(e) = self.call(
+            if let Err(e) = self.call_work(
                 "PUT",
                 &format!("/v1/versions/{}/scripts", pe.version_id),
                 Some(json!({ "scripts": pe.scripts })),
@@ -13010,7 +12930,7 @@ impl App {
         if !pe.work.contains_key(&pe.page) {
             let vid = pe.version_id.clone();
             let page = pe.page;
-            match self.call(
+            match self.call_work(
                 "GET",
                 &format!("/v1/versions/{vid}/page-text?page={page}"),
                 None,
@@ -14975,7 +14895,7 @@ impl App {
         });
         ui.add_space(12.0);
         ui.label(
-            egui::RichText::new("本地库（本地优先 · 灰度诊断）")
+            egui::RichText::new("本地库")
                 .strong()
                 .size(14.0)
                 .color(palette_color(TEXT_MAIN)),
@@ -14985,7 +14905,7 @@ impl App {
             Some(local) => {
                 let (units, folders, indexes) = local.counts();
                 format!(
-                    "已启用：{} · 所有者 {} · 内容块 {} · 目录 {} · 索引 {}",
+                    "已打开：{} · 所有者 {} · 内容块 {} · 目录 {} · 索引 {}",
                     local.root.display(),
                     local.owner.display_name,
                     units,
@@ -14993,20 +14913,16 @@ impl App {
                     indexes
                 )
             }
-            None if local_store::local_first_enabled() => match &self.local_open_error {
+            None => match &self.local_open_error {
                 Some(e) => format!(
-                    "开关已开，但本地库打开失败：{e}（库根 {}）",
+                    "本地库打开失败：{e}（库根 {}）",
                     local_store::library_dir().display()
                 ),
                 None => format!(
-                    "开关已开，但本地库打开失败（原因见控制台日志）；库根解析为 {}",
+                    "本地库打开失败（原因见控制台日志）；库根解析为 {}",
                     local_store::library_dir().display()
                 ),
             },
-            None => format!(
-                "未启用（环境变量 QIMU_LOCAL_FIRST 未开）；库根将解析为 {}",
-                local_store::library_dir().display()
-            ),
         };
         ui.label(
             egui::RichText::new(local_diag)

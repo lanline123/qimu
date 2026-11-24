@@ -415,8 +415,8 @@ impl App {
             }
         }
         self.workspace_controls.search_error = None;
-        if self.user.is_some() {
-            match self.call(
+        if self.user.is_some() || self.local.is_some() {
+            match self.call_work(
                 "GET",
                 &format!("/v1/search?q={}", query_component(query)),
                 None,
