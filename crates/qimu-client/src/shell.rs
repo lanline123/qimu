@@ -18,7 +18,7 @@ impl Page {
         match self {
             Self::Home => "主页",
             Self::Showroom => "演示厅",
-            Self::Content => "内容页",
+            Self::Content => "页面",
             Self::Index => "索引页",
             Self::Trash => "回收站",
             Self::Settings => "设置",
@@ -260,7 +260,7 @@ impl App {
         if page == Page::Trash
             && btn_default_enabled(
                 ui,
-                self.token.is_some() && !self.trash.items.is_empty(),
+                !self.trash.items.is_empty(),
                 tr("清空回收站"),
             )
             .clicked()
@@ -386,6 +386,14 @@ impl App {
                 ui.horizontal_centered(|ui| {
                     ui.spacing_mut().item_spacing.x = 3.0;
                     for page in Page::ALL {
+                        // No Settings tab in the tool row (user
+                        // ruling 2026-11-24). Settings stays
+                        // reachable through the View menu and the
+                        // menu-row entries, which iterate Page::ALL
+                        // unfiltered.
+                        if page == Page::Settings {
+                            continue;
+                        }
                         let tab = ChromeIcons.tool(
                             ui,
                             page.icon(),

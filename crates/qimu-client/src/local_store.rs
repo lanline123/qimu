@@ -1085,7 +1085,7 @@ impl LocalStore {
                                 .map_err(|_| NOT_FOUND.to_string())?;
                             (
                                 unit.name.clone(),
-                                trash_origin(&store, unit.folder_id.as_deref(), "内容页"),
+                                trash_origin(&store, unit.folder_id.as_deref(), "页面"),
                             )
                         }
                         _ => return Err("unknown trash kind".to_string()),

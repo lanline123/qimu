@@ -1,5 +1,5 @@
 //! qimu-client — the Rust desktop client (spec §4): four top-level pages
-//! 演示厅 / 内容页 / 索引页 / 设置. Working data lives in the client's
+//! 演示厅 / 页面 / 索引页 / 设置. Working data lives in the client's
 //! own in-process local library (qimu-core's Store, local-first
 //! P0–P4); organization servers are an added layer, talked to over
 //! HTTP only when the user connects one.
@@ -6682,29 +6682,9 @@ impl App {
     }
 
     fn ct_nav_body(&mut self, ui: &mut egui::Ui) {
-        // Sidebar heading (prototype wall sidebar: 目录 + tree-add).
-        // The add button opens the same inline folder editor the
-        // tree itself uses, parented to the current selection —
-        // a root folder when nothing is selected.
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(tr("目录"))
-                    .size(13.0)
-                    .strong()
-                    .color(palette_color(TEXT_MAIN)),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if self.small_icon_button(ui, ChromeIcon::FolderPlus, tr("新建目录")) {
-                    self.folder_edit = Some(FolderEdit {
-                        target: None,
-                        parent: self.content.folder_filter.clone(),
-                        text: "新文件夹".into(),
-                    });
-                    self.folder_edit_focus = true;
-                }
-            });
-        });
-        ui.add_space(2.0);
+        // No 目录 header row and no header add button (user ruling
+        // 2026-11-24): the sidebar starts directly with the folder
+        // tree, whose 全部 row carries the new-folder button.
         let mut selected = self.content.folder_filter.clone();
         self.folder_tree(ui, &mut selected, false);
         if self.content.folder_filter != selected
@@ -6922,22 +6902,22 @@ impl App {
     }
 
     fn trash_nav_body(&mut self, ui: &mut egui::Ui) {
-        if self.token.is_none() {
-            return;
-        }
+        // Sidebar sections per the prototype's trash tree
+        // (演示 / 索引 / 页面, each with its count). The trash is
+        // local-first — locally deleted items are this page's main
+        // content — so the sidebar renders with or without a
+        // server connection (user ruling 2026-11-24). The filter
+        // values are trash_list_ui's positional filters.
         let active = match self.trash.stack.top() {
             TrashFrame::List(state) => state.filter,
             TrashFrame::Preview(_) => usize::MAX,
         };
         for (filter, (kind, label, icon)) in [
-            ("", "全部", ChromeIcon::Settings),
-            ("index", "索引", ChromeIcon::Index),
-            ("unit", "内容块", ChromeIcon::Content),
-            ("showroom", "演示成品", ChromeIcon::Showroom),
-        ]
-        .into_iter()
-        .enumerate()
-        {
+            (0, "", "全部", ChromeIcon::Settings),
+            (3, "showroom", "演示", ChromeIcon::Showroom),
+            (1, "index", "索引", ChromeIcon::Index),
+            (2, "unit", "页面", ChromeIcon::Content),
+        ] {
             let count = self
                 .trash
                 .items
@@ -7227,32 +7207,12 @@ impl App {
     /// through the Confirm overlay.
     fn page_trash(&mut self, ui: &mut egui::Ui) {
         body_frame().show(ui, |ui| {
-        if self.token.is_none() {
-            // Explicit not-connected state (not an error): the trash
-            // lives on the server. Local work is unaffected, and the
-            // page says exactly what connecting unlocks.
-            ui.label(egui::RichText::new(tr("回收站")).size(18.0).color(palette_color(TEXT_MAIN)));
-            ui.add_space(16.0);
-            card_frame().show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new(tr("回收站保存的是服务器上的已删条目"))
-                        .size(13.0)
-                        .color(palette_color(TEXT_MAIN)),
-                );
-                ui.label(
-                    egui::RichText::new(tr(
-                        "连接并登录服务器后可查看、恢复或彻底删除；未连接不影响本地的索引、内容与演示功能。",
-                    ))
-                    .size(11.5)
-                    .color(palette_color(TEXT_WEAK)),
-                );
-                ui.add_space(8.0);
-                if btn_primary(ui, tr("登录")).clicked() {
-                    self.login_open = true;
-                }
-            });
-            return;
-        }
+        // The trash is the local library's first (user ruling
+        // 2026-11-24): locally deleted units and indexes land in
+        // the in-process store's trash and are managed here with
+        // no server connection at all; organization showroom rows
+        // join through the same call_work path when connected.
+        // This page has no not-connected state.
         if !self.trash.loaded {
             self.trash_load();
         }
