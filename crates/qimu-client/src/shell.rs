@@ -528,7 +528,7 @@ impl App {
     /// (2026-11-24: the bottom-bar buttons are the user's picked
     /// set, none may be dropped) keeps every prototype slot:
     /// slots whose feature is not built yet render as
-    /// DECKBAR-PLACEHOLDER entries (see deckbar_placeholder) and
+    /// placeholder entries (see deckbar_placeholder) and
     /// light up one by one as their features land. Called inside
     /// the footer's right-to-left
     /// layout, so buttons are added right-to-left: sdClose first,
@@ -564,6 +564,47 @@ impl App {
             Some(Overlay::PageEdit(pe)) => (true, pe.dirty()),
             _ => (false, false),
         };
+        // PPT clipboard snapshot (the five slots the clipboard
+        // package lit): the content wall's selection drives
+        // copy / cut / combine, the clipboard's own content
+        // drives the two pastes. The wall target set follows the
+        // wall bar's precedent (content_clip_bar): the ctrl-click
+        // multi set when non-empty, else the anchor selection as
+        // a one-block set. Copy targets, in order: the wall
+        // selection, the open deck, a plaza-selected deck
+        // (prototype: 演示厅复制选中整套稿的全部页).
+        let (wall_targets, wall_multi): (Vec<String>, Vec<String>) =
+            if self.page == Page::Content {
+                match self.content.stack.top() {
+                    ContentFrame::Wall(w) => {
+                        let targets = if !w.multi.is_empty() {
+                            w.multi.clone()
+                        } else if let Some(sel) = &w.selected {
+                            vec![sel.clone()]
+                        } else {
+                            Vec::new()
+                        };
+                        (targets, w.multi.clone())
+                    }
+                    _ => (Vec::new(), Vec::new()),
+                }
+            } else {
+                (Vec::new(), Vec::new())
+            };
+        let has_clip = self.ppt_clip.is_some();
+        let can_combine = wall_multi.len() >= 2;
+        let plaza_item: Option<Value> =
+            if self.page == Page::Showroom && self.showroom.zone == "plaza" {
+                self.showroom.selected_card.as_ref().and_then(|id| {
+                    self.showroom_live
+                        .iter()
+                        .find(|it| s(it, "id") == *id)
+                        .cloned()
+                })
+            } else {
+                None
+            };
+        let copy_deck: Option<Value> = item.clone().or(plaza_item);
         // sdClose — the global back button. It keeps its own
         // availability and never follows the group's grey state.
         let back_label = self.deckbar_back_label();
@@ -736,37 +777,109 @@ impl App {
         {
             self.deckbar_delete_unit();
         }
-        // DECKBAR-PLACEHOLDER — the PPT clipboard family and
-        // 组合 (user ruling 2026-11-24: placeholders now, lit up
-        // one by one as the features land; the clipboard feature
-        // itself — capture / store / paste-as-blocks — is not
-        // built yet). Registered here and in deckbar_placeholder;
-        // grep DECKBAR-PLACEHOLDER for the full registry.
-        self.deckbar_placeholder(
+        // The PPT clipboard family and 组合 — lit (clipboard
+        // package): the methods are the wiring contract from
+        // that package's report, called with the snapshot
+        // contexts above. Availability follows the prototype's
+        // syncBarState table, adapted to the client's clipboard:
+        // the pastes light while the clipboard holds pages, copy
+        // lights on any copy target (it does not follow a group
+        // grey-out), cut is wall-only (a showroom deck is not
+        // your source), combine needs a wall multi-selection of
+        // two or more and opens the prototype's two-entry menu
+        // (new block / new index). Cut and combine clear the
+        // multi set afterwards, like the wall bar.
+        let combine_resp = ChromeIcons.tool(
             ui,
             ChromeIcon::Combine,
-            "组合：将选中的多个内容块组合（建设中）",
+            "组合：将选中的多个内容块组合",
+            can_combine,
+            false,
+            true,
         );
-        self.deckbar_placeholder(
-            ui,
-            ChromeIcon::Cut,
-            "剪切：将选中的页剪切到剪贴板（建设中）",
-        );
-        self.deckbar_placeholder(
-            ui,
-            ChromeIcon::CopyPpt,
-            "复制：将选中的页复制到剪贴板（建设中）",
-        );
-        self.deckbar_placeholder(
-            ui,
-            ChromeIcon::PasteGroup,
-            "整组成块：剪贴板内容整组粘贴为一个内容块（建设中）",
-        );
-        self.deckbar_placeholder(
-            ui,
-            ChromeIcon::PasteSplit,
-            "逐页成块：剪贴板每页各成一个内容块（建设中）",
-        );
+        let mut combine_pick: Option<bool> = None;
+        if can_combine {
+            egui::Popup::menu(&combine_resp).show(|ui| {
+                ui.set_min_width(156.0);
+                if ui.button(tr("组合为新内容块")).clicked() {
+                    combine_pick = Some(true);
+                    ui.close();
+                }
+                if ui.button(tr("组合为新索引")).clicked() {
+                    combine_pick = Some(false);
+                    ui.close();
+                }
+            });
+        }
+        if let Some(as_block) = combine_pick {
+            if as_block {
+                self.clip_combine_units(&wall_multi);
+            } else {
+                self.clip_combine_index(&wall_multi);
+            }
+            if let ContentFrame::Wall(w) = self.content.stack.top_mut() {
+                w.multi.clear();
+            }
+        }
+        if ChromeIcons
+            .tool(
+                ui,
+                ChromeIcon::Cut,
+                "剪切到 PPT 剪贴板",
+                !wall_targets.is_empty(),
+                false,
+                true,
+            )
+            .clicked()
+        {
+            self.clip_copy_units(&wall_targets, true);
+            if let ContentFrame::Wall(w) = self.content.stack.top_mut() {
+                w.multi.clear();
+            }
+        }
+        if ChromeIcons
+            .tool(
+                ui,
+                ChromeIcon::CopyPpt,
+                "复制到 PPT 剪贴板",
+                !wall_targets.is_empty() || copy_deck.is_some(),
+                false,
+                true,
+            )
+            .clicked()
+        {
+            if !wall_targets.is_empty() {
+                self.clip_copy_units(&wall_targets, false);
+            } else if let Some(deck) = &copy_deck {
+                self.clip_copy_deck(deck);
+            }
+        }
+        if ChromeIcons
+            .tool(
+                ui,
+                ChromeIcon::PasteGroup,
+                "整组成块：剪贴板各页合为一个多页组块",
+                has_clip,
+                false,
+                true,
+            )
+            .clicked()
+        {
+            self.clip_paste(false);
+        }
+        if ChromeIcons
+            .tool(
+                ui,
+                ChromeIcon::PasteSplit,
+                "逐页成块：剪贴板每页各成一个内容块",
+                has_clip,
+                false,
+                true,
+            )
+            .clicked()
+        {
+            self.clip_paste(true);
+        }
         tool_vsep(ui);
         // sdCache — the prototype's sdPull slot (T6 ruling
         // 2026-11-24: the slot is 缓存, not 收进我的 — the
@@ -794,7 +907,7 @@ impl App {
         }
     }
 
-    /// DECKBAR-PLACEHOLDER — a bottom-bar slot whose feature is
+    /// Placeholder slot — a bottom-bar slot whose feature is
     /// not built yet. The full-set ruling (2026-11-24) keeps
     /// every slot of the user's picked set: a placeholder renders
     /// in the group's disabled form (muted glyph, no fill) with a
@@ -803,8 +916,10 @@ impl App {
     /// handler when the feature lands. It is painted by hand
     /// rather than through the disabled tool button because a
     /// disabled scope swallows hover — the tooltip must still
-    /// work. Registry: sdPasteSplit, sdPasteGroup, sdCopyPpt,
-    /// sdCutPpt, sdCombine, sdBlockPublish (in deckbar_actions).
+    /// work. Registry: sdBlockPublish (in deckbar_actions) is
+    /// the one remaining entry; sdPasteSplit, sdPasteGroup,
+    /// sdCopyPpt, sdCutPpt and sdCombine lit up with the
+    /// clipboard package.
     fn deckbar_placeholder(&mut self, ui: &mut egui::Ui, icon: ChromeIcon, label: &str) {
         let (rect, resp) =
             ui.allocate_exact_size(egui::vec2(30.0, 28.0), egui::Sense::hover());
@@ -1014,6 +1129,37 @@ impl App {
                         egui::FontId::proportional(11.5),
                         palette_color(TEXT_WEAK),
                     );
+                    // PPT clipboard chip (prototype #deckBar's
+                    // left-side tray chip): shown only while the
+                    // clipboard holds pages; the text is the
+                    // clipboard package's clip_badge().
+                    if let Some(clip) = self.clip_badge() {
+                        ui.add_space(8.0);
+                        let font = egui::FontId::proportional(11.5);
+                        let galley = ui.painter().layout_no_wrap(
+                            clip.clone(),
+                            font.clone(),
+                            palette_color(TEXT_WEAK),
+                        );
+                        let (chip, _) = ui.allocate_exact_size(
+                            egui::vec2(galley.size().x + 16.0, 26.0),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().rect(
+                            chip,
+                            6.0,
+                            palette_color(HOVER_BG),
+                            egui::Stroke::new(1.0, palette_color(FIELD_BORDER)),
+                            egui::StrokeKind::Inside,
+                        );
+                        ui.painter().text(
+                            chip.center(),
+                            egui::Align2::CENTER_CENTER,
+                            clip,
+                            font,
+                            palette_color(TEXT_WEAK),
+                        );
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(22.0);
                         self.deckbar_actions(ui);
