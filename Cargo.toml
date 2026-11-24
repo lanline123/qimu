@@ -42,6 +42,17 @@ hayro-jbig2 = { git = "https://github.com/storytold/pdfcraft", rev = "27287c297d
 lopdf = { git = "https://github.com/storytold/pdfcraft", rev = "27287c297d25d505a8720ea6da2e7af38693bfa9" }
 vello_common = { git = "https://github.com/storytold/pdfcraft", rev = "27287c297d25d505a8720ea6da2e7af38693bfa9" }
 vello_cpu = { git = "https://github.com/storytold/pdfcraft", rev = "27287c297d25d505a8720ea6da2e7af38693bfa9" }
+# krilla: mirrored from craft-libs' own root patch. Its crates/pdf is
+# written against the vendored, patched krilla carried inside the
+# craft-libs repo and refuses to compile against the crates.io
+# original (compile-time tripwires in craft-pdf's write.rs: the
+# CRAFT_UNWIND_POISONING / CRAFT_PRINT_COLOR / CRAFT_OPTIONAL_CONTENT
+# constants; the vendored copy also carries SerializeSettings'
+# group_color_space / output_intent / trapped and Metadata::
+# modification_date). DeckCraft's root patch selects the same
+# vendored copy via git. Without this line the unified graph
+# resolves krilla v0.8.2 from crates.io and craft-pdf fails.
+krilla = { path = "vendor/craft-libs/vendor/krilla" }
 ecolor = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
 emath = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
 epaint = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
