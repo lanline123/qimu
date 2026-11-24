@@ -25,11 +25,18 @@ pub enum Increment {
 
 impl SemVer {
     pub fn new(major: u64, minor: u64, patch: u64) -> Self {
-        Self { major, minor, patch }
+        Self {
+            major,
+            minor,
+            patch,
+        }
     }
 
     pub fn parse(s: &str) -> Result<Self, String> {
-        let s = s.strip_prefix('V').or_else(|| s.strip_prefix('v')).unwrap_or(s);
+        let s = s
+            .strip_prefix('V')
+            .or_else(|| s.strip_prefix('v'))
+            .unwrap_or(s);
         let mut it = s.split('.');
         let mut next = |what: &str| -> Result<u64, String> {
             it.next()

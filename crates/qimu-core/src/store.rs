@@ -172,10 +172,8 @@ fn compute_merge(
 ) -> (Vec<IndexEntry>, Vec<MergeConflict>) {
     use std::collections::HashMap;
     let (bk, ok, tk) = (entry_keys(base), entry_keys(ours), entry_keys(theirs));
-    let bmap: HashMap<&str, &IndexEntry> =
-        bk.iter().map(|k| k.as_str()).zip(base.iter()).collect();
-    let omap: HashMap<&str, &IndexEntry> =
-        ok.iter().map(|k| k.as_str()).zip(ours.iter()).collect();
+    let bmap: HashMap<&str, &IndexEntry> = bk.iter().map(|k| k.as_str()).zip(base.iter()).collect();
+    let omap: HashMap<&str, &IndexEntry> = ok.iter().map(|k| k.as_str()).zip(ours.iter()).collect();
     let tmap: HashMap<&str, &IndexEntry> =
         tk.iter().map(|k| k.as_str()).zip(theirs.iter()).collect();
 
@@ -200,14 +198,20 @@ fn compute_merge(
         } else if b == t {
             o.cloned()
         } else {
-            match resolutions.and_then(|r| r.get(key.as_str())).map(|s| s.as_str()) {
+            match resolutions
+                .and_then(|r| r.get(key.as_str()))
+                .map(|s| s.as_str())
+            {
                 Some("ours") => o.cloned(),
                 Some("theirs") => t.cloned(),
                 _ => {
                     let (unit_id, rendition_id) = key
                         .split_once(':')
                         .map(|(u, rest)| {
-                            (u.to_string(), rest.split('#').next().unwrap_or("").to_string())
+                            (
+                                u.to_string(),
+                                rest.split('#').next().unwrap_or("").to_string(),
+                            )
                         })
                         .unwrap_or_default();
                     conflicts.push(MergeConflict {
@@ -561,7 +565,7 @@ CREATE TABLE IF NOT EXISTS assemblies(id TEXT PRIMARY KEY, user_id TEXT NOT NULL
 CREATE TABLE IF NOT EXISTS page_bindings(id TEXT PRIMARY KEY, unit_id TEXT NOT NULL, from_version_id TEXT NOT NULL, from_slot INTEGER NOT NULL, to_version_id TEXT NOT NULL, to_slot INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'manual', author TEXT NOT NULL, created_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS custom_groups(id TEXT PRIMARY KEY, name TEXT NOT NULL, owner_id TEXT NOT NULL, created_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS custom_group_members(group_id TEXT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY(group_id, user_id));
-CREATE TABLE IF NOT EXISTS shares(id TEXT PRIMARY KEY, item_kind TEXT NOT NULL, item_id TEXT NOT NULL, title TEXT NOT NULL, from_user TEXT NOT NULL, target_kind TEXT NOT NULL, target_id TEXT NOT NULL, created_ms INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS shares(id TEXT PRIMARY KEY, item_kind TEXT NOT NULL, item_id TEXT NOT NULL, title TEXT NOT NULL, from_user TEXT NOT NULL, target_kind TEXT NOT NULL, target_id TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', created_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS library_entries(id TEXT PRIMARY KEY, user_id TEXT NOT NULL, item_kind TEXT NOT NULL, item_id TEXT NOT NULL, title TEXT NOT NULL, folder TEXT NOT NULL DEFAULT '', added_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS profile_fields(user_id TEXT NOT NULL, field TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(user_id, field));
 CREATE TABLE IF NOT EXISTS company_profile(field TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -625,12 +629,16 @@ impl Store {
             ("showroom", "review_note", "TEXT NOT NULL DEFAULT ''"),
             ("showroom", "reviewed_by", "TEXT NOT NULL DEFAULT ''"),
             ("showroom", "reviewed_ms", "INTEGER NOT NULL DEFAULT 0"),
+            ("shares", "note", "TEXT NOT NULL DEFAULT ''"),
         ] {
             let has: bool = conn
                 .prepare(&format!("PRAGMA table_info({table})"))
                 .and_then(|mut s| {
                     let rows = s.query_map([], |r| r.get::<_, String>(1))?;
-                    Ok(rows.collect::<Result<Vec<_>, _>>()?.iter().any(|n| n == col))
+                    Ok(rows
+                        .collect::<Result<Vec<_>, _>>()?
+                        .iter()
+                        .any(|n| n == col))
                 })
                 .unwrap_or(false);
             if !has {
@@ -673,7 +681,10 @@ impl Store {
 
     pub fn file_path(&self, hash: &str) -> PathBuf {
         let sub = if hash.len() >= 2 { &hash[..2] } else { "00" };
-        self.root.join("files").join(sub).join(format!("{hash}.bin"))
+        self.root
+            .join("files")
+            .join(sub)
+            .join(format!("{hash}.bin"))
     }
 
     // ---------- users / auth ----------
@@ -1019,7 +1030,11 @@ impl Store {
         let mut chain = vec![dept_id.to_string()];
         let mut cur = dept_id.to_string();
         loop {
-            match depts.iter().find(|d| d.id == cur).and_then(|d| d.parent_id.clone()) {
+            match depts
+                .iter()
+                .find(|d| d.id == cur)
+                .and_then(|d| d.parent_id.clone())
+            {
                 Some(p) => {
                     chain.push(p.clone());
                     cur = p;
@@ -1034,7 +1049,9 @@ impl Store {
         let id = new_id("fld");
         let sort: i64 = self
             .conn
-            .query_row("SELECT COALESCE(MAX(sort),0)+1 FROM folders", [], |r| r.get(0))
+            .query_row("SELECT COALESCE(MAX(sort),0)+1 FROM folders", [], |r| {
+                r.get(0)
+            })
             .map_err(db_err)?;
         self.conn
             .execute(
@@ -1054,7 +1071,9 @@ impl Store {
     pub fn list_folders(&self) -> SResult<Vec<FolderRec>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, name, parent_id, sort, main_index_id FROM folders ORDER BY sort, name")
+            .prepare(
+                "SELECT id, name, parent_id, sort, main_index_id FROM folders ORDER BY sort, name",
+            )
             .map_err(db_err)?;
         let rows = stmt
             .query_map([], |r| {
@@ -1467,7 +1486,14 @@ impl Store {
         status: &str,
     ) -> SResult<VersionRec> {
         self.insert_version_with_scripts(
-            rendition_id, semver, basis_revision, author, note, fragment, status, None,
+            rendition_id,
+            semver,
+            basis_revision,
+            author,
+            note,
+            fragment,
+            status,
+            None,
         )
     }
 
@@ -1536,7 +1562,10 @@ impl Store {
         self.conn
             .execute(
                 "UPDATE versions SET scripts_json=?2 WHERE id=?1",
-                params![version_id, serde_json::to_string(scripts).unwrap_or_default()],
+                params![
+                    version_id,
+                    serde_json::to_string(scripts).unwrap_or_default()
+                ],
             )
             .map_err(db_err)?;
         Ok(())
@@ -1684,15 +1713,12 @@ impl Store {
                 return Err("页位不能为负".into());
             }
         }
-        let existing = self
-            .list_page_bindings(unit_id)?
-            .into_iter()
-            .find(|b| {
-                b.from_version_id == from_version_id
-                    && b.from_slot == from_slot
-                    && b.to_version_id == to_version_id
-                    && b.to_slot == to_slot
-            });
+        let existing = self.list_page_bindings(unit_id)?.into_iter().find(|b| {
+            b.from_version_id == from_version_id
+                && b.from_slot == from_slot
+                && b.to_version_id == to_version_id
+                && b.to_slot == to_slot
+        });
         if let Some(b) = existing {
             return Ok(b);
         }
@@ -2127,8 +2153,7 @@ impl Store {
 
     /// Nearest common ancestor of two commits (the fork point), if any.
     pub fn merge_base(&self, a: &str, b: &str) -> SResult<Option<String>> {
-        let b_set: std::collections::HashSet<String> =
-            self.ancestors(b)?.into_iter().collect();
+        let b_set: std::collections::HashSet<String> = self.ancestors(b)?.into_iter().collect();
         for cand in self.ancestors(a)? {
             if b_set.contains(&cand) {
                 return Ok(Some(cand));
@@ -2227,15 +2252,8 @@ impl Store {
         Ok(out)
     }
 
-    pub fn create_tag(
-        &self,
-        index_id: &str,
-        branch: &str,
-        name: &str,
-    ) -> SResult<IndexTagRec> {
-        let head = self
-            .branch_head(index_id, branch)?
-            .ok_or("分支尚无提交")?;
+    pub fn create_tag(&self, index_id: &str, branch: &str, name: &str) -> SResult<IndexTagRec> {
+        let head = self.branch_head(index_id, branch)?.ok_or("分支尚无提交")?;
         let id = new_id("tag");
         self.conn
             .execute(
@@ -2255,7 +2273,7 @@ impl Store {
     pub fn list_tags(&self, index_id: &str) -> SResult<Vec<IndexTagRec>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, index_id, branch, name, commit_id FROM index_tags WHERE index_id=?1 ORDER BY name DESC")
+            .prepare("SELECT id, index_id, branch, name, commit_id FROM index_tags WHERE index_id=?1 ORDER BY rowid DESC")
             .map_err(db_err)?;
         let rows = stmt
             .query_map(params![index_id], |r| {
@@ -2374,7 +2392,9 @@ impl Store {
     /// recovery). Latest export wins.
     pub fn export_by_deck_id(&self, deck_id: &str) -> SResult<Option<ExportRec>> {
         let all = self.list_exports(None)?;
-        Ok(all.into_iter().find(|e| e.deck_id == deck_id && !e.manifest_json.is_empty()))
+        Ok(all
+            .into_iter()
+            .find(|e| e.deck_id == deck_id && !e.manifest_json.is_empty()))
     }
 
     pub fn insert_attachment(
@@ -3167,10 +3187,16 @@ impl Store {
             }
             "index" => {
                 self.conn
-                    .execute("DELETE FROM index_branches WHERE index_id = ?1", params![oid])
+                    .execute(
+                        "DELETE FROM index_branches WHERE index_id = ?1",
+                        params![oid],
+                    )
                     .map_err(db_err)?;
                 self.conn
-                    .execute("DELETE FROM index_commits WHERE index_id = ?1", params![oid])
+                    .execute(
+                        "DELETE FROM index_commits WHERE index_id = ?1",
+                        params![oid],
+                    )
                     .map_err(db_err)?;
                 self.conn
                     .execute("DELETE FROM index_tags WHERE index_id = ?1", params![oid])
@@ -3407,12 +3433,13 @@ impl Store {
         from_user: &str,
         target_kind: &str,
         target_id: &str,
+        note: &str,
     ) -> SResult<String> {
         let id = new_id("shr2");
         self.conn
             .execute(
-                "INSERT INTO shares(id, item_kind, item_id, title, from_user, target_kind, target_id, created_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-                params![id, item_kind, item_id, title, from_user, target_kind, target_id, now_ms()],
+                "INSERT INTO shares(id, item_kind, item_id, title, from_user, target_kind, target_id, note, created_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![id, item_kind, item_id, title, from_user, target_kind, target_id, note, now_ms()],
             )
             .map_err(db_err)?;
         Ok(id)
@@ -3429,7 +3456,7 @@ impl Store {
         };
         let mut stmt = self
             .conn
-            .prepare("SELECT id, item_kind, item_id, title, from_user, target_kind, target_id, created_ms FROM shares ORDER BY created_ms DESC")
+            .prepare("SELECT id, item_kind, item_id, title, from_user, target_kind, target_id, note, created_ms FROM shares ORDER BY created_ms DESC")
             .map_err(db_err)?;
         let rows = stmt
             .query_map([], |r| {
@@ -3442,7 +3469,8 @@ impl Store {
                     "from_name": name_of(&r.get::<_, String>(4)?),
                     "target_kind": r.get::<_, String>(5)?,
                     "target_id": r.get::<_, String>(6)?,
-                    "created_ms": r.get::<_, i64>(7)?,
+                    "note": r.get::<_, String>(7)?,
+                    "created_ms": r.get::<_, i64>(8)?,
                 }))
             })
             .map_err(db_err)?
@@ -3514,30 +3542,26 @@ impl Store {
 
     /// Can this user access a showroom item at item level: it is live and
     /// (its source group is visible, or it was shared to them / their
-    /// department / one of their custom groups, or it sits in their
-    /// library, or they submitted it)?
+    /// department / one of their custom groups), or they submitted it and
+    /// still have source access. A library reference never grants access.
     pub fn showroom_item_access(&self, user: &UserRec, item: &ShowroomRec) -> SResult<bool> {
-        if item.submitted_by == user.id
-            || item.submitted_by == user.display_name
-            || user.role == "super"
-        {
+        if user.role == "super" {
             return Ok(true);
+        }
+        let source_visible = match &item.source_index_id {
+            Some(id) => match self.get_index(id) {
+                Ok(index) => self.can_see_group(user, &index.group_id)?,
+                Err(_) => false,
+            },
+            None => false,
+        };
+        if item.submitted_by == user.id || item.submitted_by == user.display_name {
+            return Ok(item.source_index_id.is_none() || source_visible);
         }
         if item.state != "live" {
             return Ok(false);
         }
-        if let Some(idx_id) = &item.source_index_id {
-            if let Ok(idx) = self.get_index(idx_id) {
-                if self.can_see_group(user, &idx.group_id)? {
-                    return Ok(true);
-                }
-            }
-        }
-        if self
-            .list_library(&user.id)?
-            .iter()
-            .any(|e| e["item_id"] == item.id)
-        {
+        if source_visible {
             return Ok(true);
         }
         let my_depts = self.user_dept_ids(&user.id)?;
@@ -3552,7 +3576,11 @@ impl Store {
             }
             match s["target_kind"].as_str() {
                 Some("user") if s["target_id"] == user.id => return Ok(true),
-                Some("group") if my_groups.iter().any(|g| Some(g.as_str()) == s["target_id"].as_str()) => {
+                Some("group")
+                    if my_groups
+                        .iter()
+                        .any(|g| Some(g.as_str()) == s["target_id"].as_str()) =>
+                {
                     return Ok(true)
                 }
                 Some("dept") => {
@@ -3596,12 +3624,9 @@ impl Store {
     /// The newest live org_public item sourced from an index — the
     /// entry point of the guest source chain for that index.
     pub fn guest_source_item(&self, index_id: &str) -> SResult<Option<ShowroomRec>> {
-        Ok(self
-            .list_showroom(Some("live"))?
-            .into_iter()
-            .find(|i| {
-                i.source_index_id.as_deref() == Some(index_id) && scope_allows_guest(&i.scope)
-            }))
+        Ok(self.list_showroom(Some("live"))?.into_iter().find(|i| {
+            i.source_index_id.as_deref() == Some(index_id) && scope_allows_guest(&i.scope)
+        }))
     }
 
     /// Whether a version is among the published versions of some
@@ -3670,9 +3695,7 @@ impl Store {
             .prepare("SELECT field, value FROM company_profile ORDER BY field")
             .map_err(db_err)?;
         let rows = stmt
-            .query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
             .map_err(db_err)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(db_err)?;
@@ -3682,9 +3705,11 @@ impl Store {
     pub fn get_setting(&self, key: &str) -> SResult<Option<String>> {
         let v: Option<String> = self
             .conn
-            .query_row("SELECT value FROM settings WHERE key=?1", params![key], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT value FROM settings WHERE key=?1",
+                params![key],
+                |r| r.get(0),
+            )
             .ok();
         Ok(v)
     }

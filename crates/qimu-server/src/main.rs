@@ -6,7 +6,7 @@
 use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, StatusCode},
-    routing::{delete, get, patch, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use base64::Engine;
@@ -85,7 +85,10 @@ fn peer_is_loopback(headers: &HeaderMap) -> bool {
 /// (org-model G1); Err(401) when a header is present but the
 /// session is unknown or expired — a stale token surfaces as 401
 /// instead of silently downgrading (entry-fix ruling, kept).
-fn session_user(st: &St, headers: &HeaderMap) -> Result<Option<UserRec>, (StatusCode, Json<Value>)> {
+fn session_user(
+    st: &St,
+    headers: &HeaderMap,
+) -> Result<Option<UserRec>, (StatusCode, Json<Value>)> {
     let Some(token) = bearer_token(headers) else {
         return Ok(None);
     };
@@ -98,7 +101,10 @@ fn session_user(st: &St, headers: &HeaderMap) -> Result<Option<UserRec>, (Status
                 .map_err(|e| err(StatusCode::UNAUTHORIZED, e)),
             None => Ok(None),
         },
-        _ => Err(err(StatusCode::UNAUTHORIZED, "会话无效或已过期，请重新登录")),
+        _ => Err(err(
+            StatusCode::UNAUTHORIZED,
+            "会话无效或已过期，请重新登录",
+        )),
     }
 }
 
@@ -210,7 +216,10 @@ fn b64d(s: &str) -> Result<Vec<u8>, (StatusCode, Json<Value>)> {
         .map_err(|e| bad(format!("base64 解码失败: {e}")))
 }
 
-fn visible_set(st: &St, user: &UserRec) -> Result<Option<std::collections::HashSet<String>>, (StatusCode, Json<Value>)> {
+fn visible_set(
+    st: &St,
+    user: &UserRec,
+) -> Result<Option<std::collections::HashSet<String>>, (StatusCode, Json<Value>)> {
     let store = st.store.lock().unwrap();
     store.visible_groups(user).map_err(bad)
 }
@@ -226,7 +235,11 @@ struct LoginReq {
 async fn login(State(st): State<St>, headers: HeaderMap, Json(req): Json<LoginReq>) -> Api<Value> {
     let store = st.store.lock().unwrap();
     let (token, user) = store
-        .login_with_ip(&req.username, &req.password, peer_ip_str(&headers).as_deref())
+        .login_with_ip(
+            &req.username,
+            &req.password,
+            peer_ip_str(&headers).as_deref(),
+        )
         .map_err(bad)?;
     Ok(Json(json!({ "token": token, "user": user })))
 }
@@ -254,8 +267,7 @@ async fn logout(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
     // Any live session may end itself — named or guest (dropping
     // its guest session is how an anonymous client disconnects
     // cleanly).
-    let token = bearer_token(&headers)
-        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "未登录"))?;
+    let token = bearer_token(&headers).ok_or_else(|| err(StatusCode::UNAUTHORIZED, "未登录"))?;
     let store = st.store.lock().unwrap();
     match store.session_by_token(&token) {
         Ok(Some(_)) => {}
@@ -268,7 +280,8 @@ async fn logout(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
 async fn me(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
     let user = auth(&st, &headers)?;
     let store = st.store.lock().unwrap();
-    let profile: HashMap<String, String> = store.profile(&user.id).map_err(bad)?.into_iter().collect();
+    let profile: HashMap<String, String> =
+        store.profile(&user.id).map_err(bad)?.into_iter().collect();
     Ok(Json(json!({ "user": user, "profile": profile })))
 }
 
@@ -302,6 +315,47 @@ async fn org(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
         json!(store.list_users().map_err(bad)?)
     };
     Ok(Json(json!({ "departments": departments, "users": users })))
+}
+
+async fn org_contacts(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Api<Value> {
+    let _ = auth(&st, &headers)?;
+    let store = st.store.lock().unwrap();
+    let departments = store.list_departments().map_err(bad)?;
+    let query = q
+        .get("q")
+        .map(|q| q.trim().to_lowercase())
+        .unwrap_or_default();
+    let mut users = store.list_users().map_err(bad)?;
+    users.retain(|user| {
+        !user.disabled
+            && (query.is_empty()
+                || user.display_name.to_lowercase().contains(&query)
+                || user.username.to_lowercase().contains(&query))
+    });
+    users.truncate(50);
+    let users = users
+        .into_iter()
+        .map(|user| {
+            let dept_name = user
+                .dept_id
+                .as_deref()
+                .and_then(|id| departments.iter().find(|dept| dept.id == id))
+                .map(|dept| dept.name.clone())
+                .unwrap_or_default();
+            json!({
+                "id": user.id,
+                "display_name": user.display_name,
+                "username": user.username,
+                "dept_id": user.dept_id,
+                "dept_name": dept_name,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({ "users": users })))
 }
 
 #[derive(Deserialize)]
@@ -435,7 +489,12 @@ async fn add_grant(
     }
     let store = st.store.lock().unwrap();
     let g = store
-        .add_grant(&req.group_id, &req.subject_type, &req.subject_id, &req.capability)
+        .add_grant(
+            &req.group_id,
+            &req.subject_type,
+            &req.subject_id,
+            &req.capability,
+        )
         .map_err(bad)?;
     Ok(Json(json!(g)))
 }
@@ -533,7 +592,10 @@ async fn put_glossary(
     }
     let store = st.store.lock().unwrap();
     store
-        .set_setting("glossary", &serde_json::to_string(&req.pairs).unwrap_or_default())
+        .set_setting(
+            "glossary",
+            &serde_json::to_string(&req.pairs).unwrap_or_default(),
+        )
         .map_err(bad)?;
     Ok(Json(json!({ "ok": true })))
 }
@@ -572,7 +634,9 @@ async fn put_ai_settings(
         return Err(forbidden());
     }
     let store = st.store.lock().unwrap();
-    store.set_setting("ai_provider", &req.provider).map_err(bad)?;
+    store
+        .set_setting("ai_provider", &req.provider)
+        .map_err(bad)?;
     if let Some(e) = &req.endpoint {
         store.set_setting("ai_endpoint", e).map_err(bad)?;
     }
@@ -622,7 +686,8 @@ impl OpenAiCompat {
                 tools: true,
                 structured_output: true,
             });
-        let model_id = ModelId::new(self.model.clone()).map_err(|e| format!("模型名不合法：{e}"))?;
+        let model_id =
+            ModelId::new(self.model.clone()).map_err(|e| format!("模型名不合法：{e}"))?;
         let mut info = ModelInfo::new(model_id.clone(), self.model.clone());
         info.capabilities = vec![spec];
         // The settings field holds the service base (e.g.
@@ -631,8 +696,8 @@ impl OpenAiCompat {
         let base = self.endpoint.trim().trim_end_matches('/');
         let base = base.strip_suffix("/v1").unwrap_or(base);
         let config = craft_ai_openai::OpenAiConfig::new(format!("{base}/v1"))
-        .with_key(SecretString::new(self.api_key.clone()))
-        .with_models(vec![info]);
+            .with_key(SecretString::new(self.api_key.clone()))
+            .with_models(vec![info]);
         let provider = craft_ai_openai::OpenAiProvider::new(config)
             .map_err(|e| format!("翻译服务配置不合法：{e}"))?;
         let request = Request::new(cap)
@@ -708,9 +773,14 @@ impl Translator for OpenAiCompat {
         );
         let user = serde_json::to_string(texts).unwrap_or_default();
         let content = self.complete(&system, &user)?;
-        let content = content.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
-        let out: Vec<String> = serde_json::from_str(content)
-            .map_err(|e| format!("翻译服务未返回 JSON 数组：{e}"))?;
+        let content = content
+            .trim()
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim();
+        let out: Vec<String> =
+            serde_json::from_str(content).map_err(|e| format!("翻译服务未返回 JSON 数组：{e}"))?;
         Ok(out)
     }
 }
@@ -781,7 +851,9 @@ fn prepare_translate(
     need_cap(st, user, &unit.group_id, "publish")?;
     let (src_version, src_rendition, frag_bytes, glossary, provider_cfg, codes) = {
         let store = st.store.lock().unwrap();
-        let v = store.get_version(&req.version_id).map_err(|_| not_found())?;
+        let v = store
+            .get_version(&req.version_id)
+            .map_err(|_| not_found())?;
         let r = store.get_rendition(&v.rendition_id).map_err(bad)?;
         if r.unit_id != unit_id {
             return Err(bad("版本不属于该内容块"));
@@ -1127,7 +1199,9 @@ async fn put_cache_policy(
 async fn folders(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
     let _ = auth(&st, &headers)?;
     let store = st.store.lock().unwrap();
-    Ok(Json(json!({ "folders": store.list_folders().map_err(bad)? })))
+    Ok(Json(
+        json!({ "folders": store.list_folders().map_err(bad)? }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -1143,9 +1217,9 @@ async fn create_folder(
 ) -> Api<Value> {
     let _ = auth(&st, &headers)?;
     let store = st.store.lock().unwrap();
-    Ok(Json(json!(
-        store.create_folder(&req.name, req.parent_id.as_deref()).map_err(bad)?
-    )))
+    Ok(Json(json!(store
+        .create_folder(&req.name, req.parent_id.as_deref())
+        .map_err(bad)?)))
 }
 
 #[derive(Deserialize)]
@@ -1244,11 +1318,7 @@ async fn list_units(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
     Ok(Json(json!({ "units": out })))
 }
 
-async fn get_unit(
-    State(st): State<St>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Api<Value> {
+async fn get_unit(State(st): State<St>, headers: HeaderMap, Path(id): Path<String>) -> Api<Value> {
     let user = auth(&st, &headers)?;
     let unit = {
         let store = st.store.lock().unwrap();
@@ -1578,8 +1648,8 @@ fn render_thumbs_deckcraft(cache_dir: &std::path::Path, frag: &[u8]) -> Result<(
     }
 
     let mut pages = Vec::new();
-    for entry in std::fs::read_dir(&outdir)
-        .map_err(|e| format!("读取 DeckCraft 渲染结果失败: {e}"))?
+    for entry in
+        std::fs::read_dir(&outdir).map_err(|e| format!("读取 DeckCraft 渲染结果失败: {e}"))?
     {
         let entry = entry.map_err(|e| e.to_string())?;
         let name = entry.file_name();
@@ -1800,7 +1870,9 @@ async fn list_version_tags(
 ) -> Api<Value> {
     let _ = auth(&st, &headers)?;
     let store = st.store.lock().unwrap();
-    Ok(Json(json!({ "tags": store.list_version_tags(&id).map_err(bad)? })))
+    Ok(Json(
+        json!({ "tags": store.list_version_tags(&id).map_err(bad)? }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -1808,7 +1880,11 @@ struct SearchQuery {
     q: String,
 }
 
-async fn search(State(st): State<St>, headers: HeaderMap, Query(qp): Query<SearchQuery>) -> Api<Value> {
+async fn search(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Query(qp): Query<SearchQuery>,
+) -> Api<Value> {
     let user = auth(&st, &headers)?;
     let visible = visible_set(&st, &user)?;
     let store = st.store.lock().unwrap();
@@ -1884,9 +1960,12 @@ struct BranchQuery {
 }
 
 fn resolved_entries(st: &St, commit: &CommitRec) -> Vec<Value> {
+    resolved_entries_for(st, &commit.entries)
+}
+
+fn resolved_entries_for(st: &St, entries: &[IndexEntry]) -> Vec<Value> {
     let store = st.store.lock().unwrap();
-    commit
-        .entries
+    entries
         .iter()
         .map(|e| {
             let unit = store.get_unit(&e.unit_id.0).ok();
@@ -1910,6 +1989,36 @@ fn resolved_entries(st: &St, commit: &CommitRec) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+fn showroom_commit(st: &St, item: &ShowroomRec) -> Option<CommitRec> {
+    let store = st.store.lock().unwrap();
+    let commit_id = match &item.commit_id {
+        Some(id) => Some(id.clone()),
+        None => item
+            .source_index_id
+            .as_ref()
+            .and_then(|id| store.branch_head(id, "main").ok().flatten()),
+    }?;
+    store.get_commit(&commit_id).ok()
+}
+
+fn latest_published_tag(
+    store: &Store,
+    index_id: &str,
+    branch: &str,
+) -> SResult<Option<IndexTagRec>> {
+    let mut tags = store
+        .list_tags(index_id)?
+        .into_iter()
+        .filter(|tag| tag.branch == branch)
+        .collect::<Vec<_>>();
+    tags.sort_by(|a, b| {
+        SemVer::parse(&b.name)
+            .ok()
+            .cmp(&SemVer::parse(&a.name).ok())
+    });
+    Ok(tags.into_iter().next())
 }
 
 async fn get_index(
@@ -1961,6 +2070,46 @@ async fn get_index(
         "tags": tags,
         "head": head,
         "resolved_entries": entries,
+    })))
+}
+
+async fn index_push_preview(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(q): Query<BranchQuery>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let branch = q.branch.unwrap_or_else(|| "main".to_string());
+    let store = st.store.lock().unwrap();
+    let index = store.get_index(&id).map_err(|_| not_found())?;
+    if !store.can_see_group(&user, &index.group_id).map_err(bad)? {
+        return Err(not_found());
+    }
+    let published = latest_published_tag(&store, &id, &branch).map_err(bad)?;
+    let current = published
+        .as_ref()
+        .and_then(|tag| store.get_commit(&tag.commit_id).ok());
+    let previous = store
+        .list_showroom(Some("live"))
+        .map_err(bad)?
+        .into_iter()
+        .find(|item| item.source_index_id.as_deref() == Some(id.as_str()));
+    drop(store);
+    let current_entries = current
+        .as_ref()
+        .map(|commit| resolved_entries(&st, commit))
+        .unwrap_or_default();
+    let previous_entries = previous
+        .as_ref()
+        .and_then(|item| showroom_commit(&st, item))
+        .map(|commit| resolved_entries(&st, &commit))
+        .unwrap_or_default();
+    Ok(Json(json!({
+        "published_version": published.as_ref().map(|tag| tag.name.clone()),
+        "published_tag_id": published.as_ref().map(|tag| tag.id.clone()),
+        "current_entries": current_entries,
+        "previous_entries": previous_entries,
     })))
 }
 
@@ -2130,7 +2279,9 @@ async fn set_lifecycle(
     };
     need_cap(&st, &user, &index.group_id, "manage")?;
     let store = st.store.lock().unwrap();
-    store.set_index_lifecycle(&id, &req.lifecycle).map_err(bad)?;
+    store
+        .set_index_lifecycle(&id, &req.lifecycle)
+        .map_err(bad)?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -2549,10 +2700,7 @@ fn diff_updates(st: &St, manifest: &Manifest) -> Result<Value, (StatusCode, Json
                     if v.id != b.version_id {
                         // per-page diff when the shape allows it
                         let slots: Vec<usize> = match &e.excerpt_slots {
-                            Some(s) => s
-                                .iter()
-                                .filter_map(|x| x.parse::<usize>().ok())
-                                .collect(),
+                            Some(s) => s.iter().filter_map(|x| x.parse::<usize>().ok()).collect(),
                             None => (0..v.pages.len()).collect(),
                         };
                         let mut changed: Vec<usize> = Vec::new();
@@ -2581,8 +2729,11 @@ fn diff_updates(st: &St, manifest: &Manifest) -> Result<Value, (StatusCode, Json
             }
         }
     }
-    let head_rends: std::collections::HashSet<&str> =
-        head.entries.iter().map(|e| e.rendition_id.0.as_str()).collect();
+    let head_rends: std::collections::HashSet<&str> = head
+        .entries
+        .iter()
+        .map(|e| e.rendition_id.0.as_str())
+        .collect();
     for b in &manifest.bindings {
         if !head_rends.contains(b.rendition_id.as_str()) {
             updates.push(json!({
@@ -2661,9 +2812,7 @@ async fn update_package(
 // static file host; the JSON is inert metadata and assets are installers
 // the user still runs manually.
 
-async fn update_releases(
-    State(st): State<St>,
-) -> axum::response::Response {
+async fn update_releases(State(st): State<St>) -> axum::response::Response {
     use axum::response::IntoResponse;
     let path = st.data_dir.join("update-mirror").join("releases.json");
     let bytes = std::fs::read(&path).unwrap_or_else(|_| b"[]".to_vec());
@@ -2762,6 +2911,7 @@ struct ShowroomReq {
     title: String,
     intro: Option<String>,
     source_index_id: Option<String>,
+    published_tag_id: Option<String>,
 }
 
 async fn submit_showroom(
@@ -2770,17 +2920,40 @@ async fn submit_showroom(
     Json(req): Json<ShowroomReq>,
 ) -> Api<Value> {
     let user = auth(&st, &headers)?;
-    let store = st.store.lock().unwrap();
-    let commit = match &req.source_index_id {
-        Some(iid) => store.branch_head(iid, "main").map_err(bad)?,
+    let source_group = match &req.source_index_id {
+        Some(id) => {
+            let store = st.store.lock().unwrap();
+            Some(store.get_index(id).map_err(|_| not_found())?.group_id)
+        }
         None => None,
+    };
+    if let Some(group_id) = &source_group {
+        need_cap(&st, &user, group_id, "publish")?;
+    }
+    let store = st.store.lock().unwrap();
+    let commit_id = match &req.source_index_id {
+        Some(iid) => {
+            let tag = match &req.published_tag_id {
+                Some(tag_id) => store
+                    .list_tags(iid)
+                    .map_err(bad)?
+                    .into_iter()
+                    .find(|tag| tag.id == *tag_id)
+                    .ok_or_else(|| bad("发布版本不存在或不属于该索引"))?,
+                None => latest_published_tag(&store, iid, "main")
+                    .map_err(bad)?
+                    .ok_or_else(|| bad("请先发布索引版本，再推送到演示厅"))?,
+            };
+            store.get_commit(&tag.commit_id).map_err(bad)?.id
+        }
+        None => String::new(),
     };
     let rec = store
         .insert_showroom(
             &req.title,
             req.intro.as_deref().unwrap_or(""),
             req.source_index_id.as_deref(),
-            commit.as_deref(),
+            (!commit_id.is_empty()).then_some(commit_id.as_str()),
             &user.display_name,
             "pending",
         )
@@ -2801,12 +2974,24 @@ async fn list_showroom(
     let state = q.get("state").map(|s| s.as_str());
     let mut items = store.list_showroom(state).map_err(bad)?;
     match &user {
-        None => items.retain(|i| i.state == "live"),
+        None => items.retain(|item| store.guest_item_visible(item)),
         Some(u) if u.role != "super" => {
-            items.retain(|i| i.state == "live" || i.submitted_by == u.display_name)
+            items.retain(|item| store.showroom_item_access(u, item).unwrap_or(false));
         }
         _ => {}
     }
+    drop(store);
+    let items = items
+        .into_iter()
+        .map(|item| {
+            let entries = showroom_commit(&st, &item)
+                .map(|commit| resolved_entries(&st, &commit))
+                .unwrap_or_default();
+            let mut value = serde_json::to_value(&item).unwrap_or(Value::Null);
+            value["resolved_entries"] = json!(entries);
+            value
+        })
+        .collect::<Vec<_>>();
     Ok(Json(json!({ "items": items })))
 }
 
@@ -2839,8 +3024,6 @@ async fn review_showroom(
         .map_err(bad)?;
     Ok(Json(json!({ "ok": true })))
 }
-
-
 
 // ---------------- submissions (local-first P3, design §6.3) ----------------
 // The real-byte submission chain, replacing reference-style
@@ -3131,11 +3314,7 @@ fn trash_check_cap(
 
 /// Restore / purge gate on an existing trash row: super, the person
 /// who deleted it, or a `manage` holder on the object's group.
-fn trash_row_cap(
-    st: &St,
-    user: &UserRec,
-    row: &TrashRec,
-) -> Result<(), (StatusCode, Json<Value>)> {
+fn trash_row_cap(st: &St, user: &UserRec, row: &TrashRec) -> Result<(), (StatusCode, Json<Value>)> {
     if user.role == "super" || row.deleted_by == user.display_name {
         return Ok(());
     }
@@ -3231,7 +3410,13 @@ async fn add_trash(
     let (title, origin) = trash_check_cap(&st, &user, &req.kind, &req.object_id)?;
     let store = st.store.lock().unwrap();
     let rec = store
-        .trash_add(&req.kind, &req.object_id, &title, &origin, &user.display_name)
+        .trash_add(
+            &req.kind,
+            &req.object_id,
+            &title,
+            &origin,
+            &user.display_name,
+        )
         .map_err(bad)?;
     Ok(Json(json!(rec)))
 }
@@ -3309,10 +3494,7 @@ async fn version_page_text(
         (ver, bytes)
     };
     let _ = ver;
-    let page: usize = q
-        .get("page")
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(0);
+    let page: usize = q.get("page").and_then(|p| p.parse().ok()).unwrap_or(0);
     let pkg = Package::load(&bytes).map_err(bad)?;
     let runs = pptx::slide_text_runs(&pkg, page).map_err(bad)?;
     // v2 editor read side: the slide's element model. A parse failure
@@ -3433,12 +3615,10 @@ async fn edit_version_pages(
             .as_deref()
             .ok_or_else(|| bad("替换图片缺少图片数据"))?;
         let bytes = b64d(b64)?;
-        let sniffed = sniff_image_ext(&bytes)
-            .ok_or_else(|| bad("只支持 PNG / JPEG / GIF / BMP 图片"))?;
+        let sniffed =
+            sniff_image_ext(&bytes).ok_or_else(|| bad("只支持 PNG / JPEG / GIF / BMP 图片"))?;
         let ext = match op.ext.as_deref().map(|e| e.to_ascii_lowercase()) {
-            Some(e) if e == sniffed || (e == "jpeg" && sniffed == "jpg") => {
-                sniffed.to_string()
-            }
+            Some(e) if e == sniffed || (e == "jpeg" && sniffed == "jpg") => sniffed.to_string(),
             Some(_) => return Err(bad("图片扩展名与实际格式不一致")),
             None => sniffed.to_string(),
         };
@@ -3509,13 +3689,19 @@ async fn edit_version_pages(
                 cy: op.cy.unwrap_or(0),
             },
             "reset_style" => pptx::SlideOp::ResetStyle {
-                el: op.el, para: op.para.unwrap_or(0), run: op.run.unwrap_or(0),
+                el: op.el,
+                para: op.para.unwrap_or(0),
+                run: op.run.unwrap_or(0),
             },
             "line_color" => pptx::SlideOp::LineColor {
-                el: op.el, color: op.color.clone().ok_or_else(|| bad("缺少线条颜色"))?,
+                el: op.el,
+                color: op.color.clone().ok_or_else(|| bad("缺少线条颜色"))?,
             },
             "preset" => {
-                let preset = op.preset.clone().filter(|preset| pptx::editor_preset_allowed(preset))
+                let preset = op
+                    .preset
+                    .clone()
+                    .filter(|preset| pptx::editor_preset_allowed(preset))
                     .ok_or_else(|| bad("未知的形状预设"))?;
                 pptx::SlideOp::Preset { el: op.el, preset }
             }
@@ -3534,7 +3720,11 @@ async fn edit_version_pages(
                     .get(&i)
                     .ok_or_else(|| bad("替换图片数据丢失"))?
                     .clone();
-                pptx::SlideOp::ReplacePic { el: op.el, bytes, ext }
+                pptx::SlideOp::ReplacePic {
+                    el: op.el,
+                    bytes,
+                    ext,
+                }
             }
             other => return Err(bad(format!("未知编辑操作 {other}"))),
         };
@@ -3544,7 +3734,10 @@ async fn edit_version_pages(
         let sop = if op.parents.is_empty() {
             sop
         } else {
-            pptx::SlideOp::InGroup { parents: op.parents.clone(), op: Box::new(sop) }
+            pptx::SlideOp::InGroup {
+                parents: op.parents.clone(),
+                op: Box::new(sop),
+            }
         };
         ops_by_page.entry(op.page).or_default().push(sop);
     }
@@ -3556,7 +3749,9 @@ async fn edit_version_pages(
             return Err(bad("预览页超出范围"));
         }
         let rendered = tokio::task::spawn_blocking(move || render_page_edit_preview(&pkg, page))
-            .await.map_err(|error| bad(error.to_string()))?.map_err(bad)?;
+            .await
+            .map_err(|error| bad(error.to_string()))?
+            .map_err(bad)?;
         return Ok(Json(json!({ "data_base64": b64e(&rendered) })));
     }
     if applied == 0 {
@@ -3617,7 +3812,10 @@ fn render_page_edit_preview(pkg: &Package, page: usize) -> Result<Vec<u8>, Strin
         .output()
         .map_err(|error| format!("启动 DeckCraft 预览失败：{error}"))?;
     if !output.status.success() {
-        return Err(format!("DeckCraft 预览失败：{}", String::from_utf8_lossy(&output.stderr)));
+        return Err(format!(
+            "DeckCraft 预览失败：{}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
     std::fs::read(image).map_err(|error| error.to_string())
 }
@@ -3636,7 +3834,9 @@ async fn create_custom_group(
 ) -> Api<Value> {
     let user = auth(&st, &headers)?;
     let store = st.store.lock().unwrap();
-    let id = store.create_custom_group(&user.id, &req.name).map_err(bad)?;
+    let id = store
+        .create_custom_group(&user.id, &req.name)
+        .map_err(bad)?;
     Ok(Json(json!({ "id": id })))
 }
 
@@ -3660,7 +3860,10 @@ async fn add_custom_group_member(
 ) -> Api<Value> {
     let user = auth(&st, &headers)?;
     let store = st.store.lock().unwrap();
-    let (_, owner) = store.custom_group(&id).map_err(bad)?.ok_or_else(|| not_found())?;
+    let (_, owner) = store
+        .custom_group(&id)
+        .map_err(bad)?
+        .ok_or_else(|| not_found())?;
     if owner != user.id && user.role != "super" {
         return Err(forbidden());
     }
@@ -3678,7 +3881,10 @@ async fn remove_custom_group_member(
 ) -> Api<Value> {
     let user = auth(&st, &headers)?;
     let store = st.store.lock().unwrap();
-    let (_, owner) = store.custom_group(&id).map_err(bad)?.ok_or_else(|| not_found())?;
+    let (_, owner) = store
+        .custom_group(&id)
+        .map_err(bad)?
+        .ok_or_else(|| not_found())?;
     if owner != user.id && user.id != req.user_id && user.role != "super" {
         return Err(forbidden());
     }
@@ -3694,6 +3900,7 @@ struct ShareReq {
     item_id: String,
     target_kind: String, // user | dept | group
     target_id: String,
+    note: Option<String>,
 }
 
 async fn create_share(
@@ -3728,12 +3935,22 @@ async fn create_share(
     // validate target
     match req.target_kind.as_str() {
         "user" => {
-            if !store.list_users().map_err(bad)?.iter().any(|u| u.id == req.target_id) {
+            if !store
+                .list_users()
+                .map_err(bad)?
+                .iter()
+                .any(|u| u.id == req.target_id)
+            {
                 return Err(bad("目标用户不存在"));
             }
         }
         "dept" => {
-            if !store.list_departments().map_err(bad)?.iter().any(|d| d.id == req.target_id) {
+            if !store
+                .list_departments()
+                .map_err(bad)?
+                .iter()
+                .any(|d| d.id == req.target_id)
+            {
                 return Err(bad("目标部门不存在"));
             }
         }
@@ -3746,7 +3963,15 @@ async fn create_share(
         _ => return Err(bad("target_kind 只能是 user、dept 或 group")),
     }
     let id = store
-        .create_share(&req.item_kind, &req.item_id, &title, &user.id, &req.target_kind, &req.target_id)
+        .create_share(
+            &req.item_kind,
+            &req.item_id,
+            &title,
+            &user.id,
+            &req.target_kind,
+            &req.target_id,
+            req.note.as_deref().unwrap_or("").trim(),
+        )
         .map_err(bad)?;
     Ok(Json(json!({ "share_id": id })))
 }
@@ -3798,9 +4023,7 @@ async fn group_space(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
     for g in &groups {
         let items: Vec<Value> = shares
             .iter()
-            .filter(|s| {
-                s["target_kind"] == "group" && s["target_id"] == g["id"]
-            })
+            .filter(|s| s["target_kind"] == "group" && s["target_id"] == g["id"])
             .cloned()
             .collect();
         out.push(json!({ "group": g, "items": items }));
@@ -3922,6 +4145,52 @@ async fn list_library(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
     Ok(Json(json!({ "entries": entries })))
 }
 
+#[derive(Deserialize)]
+struct LibraryReq {
+    item_kind: String,
+    item_id: String,
+    folder: Option<String>,
+}
+
+async fn add_library_entry(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Json(req): Json<LibraryReq>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let store = st.store.lock().unwrap();
+    let title = match req.item_kind.as_str() {
+        "showroom" => {
+            let item = store
+                .get_showroom(&req.item_id)
+                .map_err(bad)?
+                .ok_or_else(|| not_found())?;
+            if !store.showroom_item_access(&user, &item).map_err(bad)? {
+                return Err(forbidden());
+            }
+            item.title
+        }
+        "assembly" => store
+            .list_assemblies(&user.id)
+            .map_err(bad)?
+            .into_iter()
+            .find(|item| item["id"] == req.item_id)
+            .and_then(|item| item["name"].as_str().map(str::to_owned))
+            .ok_or_else(|| not_found())?,
+        _ => return Err(bad("item_kind 只能是 showroom 或 assembly")),
+    };
+    let library_id = store
+        .add_library_entry(
+            &user.id,
+            &req.item_kind,
+            &req.item_id,
+            &title,
+            req.folder.as_deref().unwrap_or("").trim(),
+        )
+        .map_err(bad)?;
+    Ok(Json(json!({ "library_id": library_id })))
+}
+
 async fn remove_library_entry(
     State(st): State<St>,
     headers: HeaderMap,
@@ -3965,7 +4234,10 @@ async fn export_showroom(
                 None
             }
         };
-        let idx_id = item.source_index_id.clone().ok_or_else(|| bad("该条目没有来源索引"))?;
+        let idx_id = item
+            .source_index_id
+            .clone()
+            .ok_or_else(|| bad("该条目没有来源索引"))?;
         let commit = match &item.commit_id {
             Some(cid) => store.get_commit(cid).map_err(bad)?,
             None => {
@@ -3976,6 +4248,7 @@ async fn export_showroom(
                 store.get_commit(&head).map_err(bad)?
             }
         };
+        let entries = commit.entries;
         let source = SourceRef {
             index_id: idx_id,
             branch: "main".to_string(),
@@ -3989,7 +4262,7 @@ async fn export_showroom(
         } else {
             "company"
         };
-        (commit.entries.clone(), source, exporter, kind)
+        (entries, source, exporter, kind)
     };
     let (deck, manifest, page_count) = build_export(
         &st,
@@ -4025,7 +4298,9 @@ fn deck_to_pdf(
     page: Option<usize>,
 ) -> Result<Vec<u8>, String> {
     let bin = deckcraft_cli_bin();
-    let work = root.join("pdf").join(format!(".work-{tag}-{}", std::process::id()));
+    let work = root
+        .join("pdf")
+        .join(format!(".work-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
     let cleanup = |work: &std::path::Path| {
@@ -4121,7 +4396,10 @@ async fn export_showroom_pdf(
                 None
             }
         };
-        let idx_id = item.source_index_id.clone().ok_or_else(|| bad("该条目没有来源索引"))?;
+        let idx_id = item
+            .source_index_id
+            .clone()
+            .ok_or_else(|| bad("该条目没有来源索引"))?;
         let commit = match &item.commit_id {
             Some(cid) => store.get_commit(cid).map_err(bad)?,
             None => {
@@ -4132,6 +4410,7 @@ async fn export_showroom_pdf(
                 store.get_commit(&head).map_err(bad)?
             }
         };
+        let entries = commit.entries;
         let source = SourceRef {
             index_id: idx_id,
             branch: "main".to_string(),
@@ -4145,7 +4424,7 @@ async fn export_showroom_pdf(
         } else {
             "company"
         };
-        (commit.entries.clone(), source, exporter, kind)
+        (entries, source, exporter, kind)
     };
     // The notes form is pointless without the speaker scripts written
     // back into the deck's notes pages, so it implies include_notes.
@@ -4251,10 +4530,16 @@ const DISCOVERY_PORT: u16 = 8731;
 const DISCOVERY_MAGIC: &[u8] = b"QIMU_DISCOVER_V1";
 
 fn machine_name() -> String {
-    std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
+    std::env::var("QIMU_SERVER_NAME")
         .ok()
         .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_string())
+        .or_else(|| {
+            std::env::var("HOSTNAME")
+                .or_else(|_| std::env::var("COMPUTERNAME"))
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
         .unwrap_or_else(|| "启幕服务器".to_string())
 }
 
@@ -4372,7 +4657,9 @@ fn resolve_data_dir() -> std::path::PathBuf {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| ".".to_string());
-    std::path::PathBuf::from(home).join(".qimu").join("server-data")
+    std::path::PathBuf::from(home)
+        .join(".qimu")
+        .join("server-data")
 }
 
 /// Startup failures of a double-clicked console app vanish together
@@ -4419,7 +4706,17 @@ async fn main() {
         standalone,
     });
     let app = Router::new()
-        .route("/health", get(|| async { Json(json!({ "status": "ok", "service": "qimu-server" })) }))
+        .route(
+            "/health",
+            get(|| async {
+                Json(json!({
+                    "status": "ok",
+                    "service": "qimu-server",
+                    "name": machine_name(),
+                    "version": env!("CARGO_PKG_VERSION"),
+                }))
+            }),
+        )
         .route("/update/releases.json", get(update_releases))
         .route("/update/:tag/:name", get(update_asset))
         .route("/v1/auth/login", post(login))
@@ -4428,15 +4725,22 @@ async fn main() {
         .route("/v1/me", get(me))
         .route("/v1/me/profile", axum::routing::put(put_profile))
         .route("/v1/org", get(org))
+        .route("/v1/org/contacts", get(org_contacts))
         .route("/v1/org/departments", post(create_dept))
         .route("/v1/org/users", post(create_user))
         .route("/v1/org/users/:id/disable", post(disable_user))
         .route("/v1/groups", get(groups).post(create_group))
         .route("/v1/grants", get(grants).post(add_grant))
-        .route("/v1/company-profile", get(company_profile).put(put_company_profile))
+        .route(
+            "/v1/company-profile",
+            get(company_profile).put(put_company_profile),
+        )
         .route("/v1/settings/languages", get(languages).put(put_languages))
         .route("/v1/settings/glossary", get(get_glossary).put(put_glossary))
-        .route("/v1/settings/cache-policy", get(get_cache_policy).put(put_cache_policy))
+        .route(
+            "/v1/settings/cache-policy",
+            get(get_cache_policy).put(put_cache_policy),
+        )
         .route("/v1/settings/ai", get(get_ai_settings).put(put_ai_settings))
         .route("/v1/units/:id/translate", post(translate_unit))
         .route("/v1/units/:id/translate-jobs", post(start_translate_job))
@@ -4448,16 +4752,21 @@ async fn main() {
         .route("/v1/folders/:id/main-index", post(set_folder_main_index))
         .route("/v1/units", get(list_units).post(create_unit))
         .route("/v1/units/:id", get(get_unit).patch(patch_unit))
-        .route("/v1/units/:id/bump-revision", post(|State(st): State<St>, headers: HeaderMap, Path(id): Path<String>| async move {
-            let user = auth(&st, &headers)?;
-            let store = st.store.lock().unwrap();
-            let unit = store.get_unit(&id).map_err(|_| not_found())?;
-            drop(store);
-            need_cap(&st, &user, &unit.group_id, "publish")?;
-            let store = st.store.lock().unwrap();
-            let r = store.bump_unit_revision(&id).map_err(bad)?;
-            Ok::<_, (StatusCode, Json<Value>)>(Json(json!({ "current_revision": r })))
-        }))
+        .route(
+            "/v1/units/:id/bump-revision",
+            post(
+                |State(st): State<St>, headers: HeaderMap, Path(id): Path<String>| async move {
+                    let user = auth(&st, &headers)?;
+                    let store = st.store.lock().unwrap();
+                    let unit = store.get_unit(&id).map_err(|_| not_found())?;
+                    drop(store);
+                    need_cap(&st, &user, &unit.group_id, "publish")?;
+                    let store = st.store.lock().unwrap();
+                    let r = store.bump_unit_revision(&id).map_err(bad)?;
+                    Ok::<_, (StatusCode, Json<Value>)>(Json(json!({ "current_revision": r })))
+                },
+            ),
+        )
         .route("/v1/import", post(import_deck))
         .route("/v1/import/propose", post(import_propose))
         .route("/v1/units/:id/publish", post(publish))
@@ -4465,21 +4774,34 @@ async fn main() {
         .route("/v1/versions/:id/delete", post(delete_version))
         .route("/v1/versions/:id/fragment", get(version_fragment))
         .route("/v1/versions/:id/thumb/:page", get(version_thumb))
-        .route("/v1/versions/:id/tags", get(list_version_tags).post(add_version_tag))
+        .route(
+            "/v1/versions/:id/tags",
+            get(list_version_tags).post(add_version_tag),
+        )
         .route("/v1/versions/:id", get(get_version))
-        .route("/v1/versions/:id/scripts", axum::routing::put(put_version_scripts))
+        .route(
+            "/v1/versions/:id/scripts",
+            axum::routing::put(put_version_scripts),
+        )
         .route(
             "/v1/units/:id/page-bindings",
             get(list_page_bindings).post(add_page_binding),
         )
-        .route("/v1/units/:id/page-bindings/:bid/delete", post(delete_page_binding))
+        .route(
+            "/v1/units/:id/page-bindings/:bid/delete",
+            post(delete_page_binding),
+        )
         .route("/v1/search", get(search))
         .route("/v1/indexes", get(list_indexes).post(create_index))
         .route("/v1/index-graphs", get(index_graphs))
         .route("/v1/indexes/:id/folder", post(move_index_to_folder))
         .route("/v1/indexes/:id/english", post(create_english_index))
         .route("/v1/indexes/:id", get(get_index))
-        .route("/v1/indexes/:id/commits", get(list_commits).post(post_commit))
+        .route("/v1/indexes/:id/push-preview", get(index_push_preview))
+        .route(
+            "/v1/indexes/:id/commits",
+            get(list_commits).post(post_commit),
+        )
         .route("/v1/indexes/:id/branches", post(create_branch))
         .route("/v1/indexes/:id/merge/preview", post(merge_preview))
         .route("/v1/indexes/:id/merge", post(merge_execute))
@@ -4490,7 +4812,10 @@ async fn main() {
         .route("/v1/exports", get(list_exports))
         .route("/v1/check-updates", post(check_updates))
         .route("/v1/deck/update-package", post(update_package))
-        .route("/v1/attachments", get(list_attachments).post(add_attachment))
+        .route(
+            "/v1/attachments",
+            get(list_attachments).post(add_attachment),
+        )
         .route("/v1/attachments/:id/download", get(download_attachment))
         .route("/v1/showroom", get(list_showroom).post(submit_showroom))
         .route("/v1/showroom/:id/review", post(review_showroom))
@@ -4505,9 +4830,18 @@ async fn main() {
         .route("/v1/versions/:id/edit-pages", post(edit_version_pages))
         .route("/v1/showroom/:id/export", post(export_showroom))
         .route("/v1/showroom/:id/export-pdf", post(export_showroom_pdf))
-        .route("/v1/custom-groups", get(list_custom_groups).post(create_custom_group))
-        .route("/v1/custom-groups/:id/members", post(add_custom_group_member))
-        .route("/v1/custom-groups/:id/members/remove", post(remove_custom_group_member))
+        .route(
+            "/v1/custom-groups",
+            get(list_custom_groups).post(create_custom_group),
+        )
+        .route(
+            "/v1/custom-groups/:id/members",
+            post(add_custom_group_member),
+        )
+        .route(
+            "/v1/custom-groups/:id/members/remove",
+            post(remove_custom_group_member),
+        )
         .route("/v1/shares", post(create_share))
         .route("/v1/shares/inbox", get(list_inbox))
         .route("/v1/shares/:id/accept", post(accept_share))

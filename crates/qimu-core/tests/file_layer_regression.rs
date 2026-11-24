@@ -52,7 +52,12 @@ struct Entry {
 
 impl Entry {
     fn new(name: &str, data: impl Into<Vec<u8>>) -> Entry {
-        Entry { name: name.to_string(), data: data.into(), crc_override: None, declared_size_override: None }
+        Entry {
+            name: name.to_string(),
+            data: data.into(),
+            crc_override: None,
+            declared_size_override: None,
+        }
     }
 }
 
@@ -165,7 +170,10 @@ fn deck_parts() -> Vec<(String, String)> {
         .to_string();
     vec![
         ("[Content_Types].xml".into(), ct),
-        ("_rels/.rels".into(), rels_xml(&[("rId1", "officeDocument", "ppt/presentation.xml")])),
+        (
+            "_rels/.rels".into(),
+            rels_xml(&[("rId1", "officeDocument", "ppt/presentation.xml")]),
+        ),
         ("ppt/presentation.xml".into(), pres),
         (
             "ppt/_rels/presentation.xml.rels".into(),
@@ -176,7 +184,10 @@ fn deck_parts() -> Vec<(String, String)> {
             ]),
         ),
         ("ppt/slides/slide1.xml".into(), slide_xml("Hello One")),
-        ("ppt/slides/slide2.xml".into(), slide_xml("Fish &amp; Chips &#169;")),
+        (
+            "ppt/slides/slide2.xml".into(),
+            slide_xml("Fish &amp; Chips &#169;"),
+        ),
         (
             "ppt/slides/_rels/slide1.xml.rels".into(),
             rels_xml(&[("rId1", "slideLayout", "../slideLayouts/slideLayout1.xml")]),
@@ -187,7 +198,8 @@ fn deck_parts() -> Vec<(String, String)> {
         ),
         (
             "ppt/slideLayouts/slideLayout1.xml".into(),
-            "<p:sldLayout xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\"/>".into(),
+            "<p:sldLayout xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\"/>"
+                .into(),
         ),
         (
             "ppt/slideLayouts/_rels/slideLayout1.xml.rels".into(),
@@ -195,7 +207,8 @@ fn deck_parts() -> Vec<(String, String)> {
         ),
         (
             "ppt/slideMasters/slideMaster1.xml".into(),
-            "<p:sldMaster xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\"/>".into(),
+            "<p:sldMaster xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\"/>"
+                .into(),
         ),
         (
             "ppt/slideMasters/_rels/slideMaster1.xml.rels".into(),
@@ -217,7 +230,10 @@ fn deck_bytes() -> Vec<u8> {
 }
 
 fn deck_map() -> BTreeMap<String, Vec<u8>> {
-    deck_parts().into_iter().map(|(n, c)| (n, c.into_bytes())).collect()
+    deck_parts()
+        .into_iter()
+        .map(|(n, c)| (n, c.into_bytes()))
+        .collect()
 }
 
 // ---------------------------------------------------------------------
@@ -293,7 +309,10 @@ mod parity {
     #[test]
     fn notes_absent_is_empty_and_set_fails_soft() {
         let pkg = Package::load(&deck_bytes()).unwrap();
-        assert_eq!(qimu_core::text::notes_text(&pkg, "ppt/slides/slide1.xml"), "");
+        assert_eq!(
+            qimu_core::text::notes_text(&pkg, "ppt/slides/slide1.xml"),
+            ""
+        );
         let mut pkg = pkg;
         assert!(!pptx::set_notes_text(&mut pkg, 0, "讲稿"));
     }
@@ -303,10 +322,17 @@ mod parity {
         // The page editor's index-coupled read/write pair (landed with
         // the five-features package): indices must agree.
         let mut pkg = Package::load(&deck_bytes()).unwrap();
-        assert_eq!(pptx::slide_text_runs(&pkg, 0).unwrap(), vec!["Hello One".to_string()]);
-        let applied = pptx::replace_slide_text_runs(&mut pkg, 0, &[(0, "A & B".to_string())]).unwrap();
+        assert_eq!(
+            pptx::slide_text_runs(&pkg, 0).unwrap(),
+            vec!["Hello One".to_string()]
+        );
+        let applied =
+            pptx::replace_slide_text_runs(&mut pkg, 0, &[(0, "A & B".to_string())]).unwrap();
         assert_eq!(applied, 1);
-        assert_eq!(pptx::slide_text_runs(&pkg, 0).unwrap(), vec!["A & B".to_string()]);
+        assert_eq!(
+            pptx::slide_text_runs(&pkg, 0).unwrap(),
+            vec!["A & B".to_string()]
+        );
         let xml = pkg.get_text("ppt/slides/slide1.xml").unwrap();
         assert!(xml.contains("A &amp; B"), "written run not escaped: {xml}");
     }
@@ -326,7 +352,10 @@ mod changed {
         // New: craft-xml decodes numeric references.
         let pkg = Package::load(&deck_bytes()).unwrap();
         let xml = pkg.get_text("ppt/slides/slide2.xml").unwrap();
-        assert_eq!(qimu_core::text::extract_texts(&xml), vec!["Fish & Chips ©".to_string()]);
+        assert_eq!(
+            qimu_core::text::extract_texts(&xml),
+            vec!["Fish & Chips ©".to_string()]
+        );
         // KNOWN DIVERGENCE (pre-existing, not from this migration): the
         // page editor's slide_text_runs still uses its own five-entity
         // unescape, so it returns the reference undecoded. Pinned here
@@ -374,7 +403,10 @@ mod changed {
         let pkg = Package::load(&build_zip(&entries)).unwrap();
         assert_eq!(pkg.parts.len(), 1);
         let kept = &pkg.parts["dup.xml"];
-        assert!(kept == b"first" || kept == b"second", "kept unexpected bytes: {kept:?}");
+        assert!(
+            kept == b"first" || kept == b"second",
+            "kept unexpected bytes: {kept:?}"
+        );
     }
 
     #[test]
@@ -431,7 +463,10 @@ mod hostile {
             .iter()
             .map(|(n, c)| Entry::new(n, c.clone().into_bytes()))
             .collect();
-        let slide = entries.iter_mut().find(|e| e.name == "ppt/slides/slide1.xml").unwrap();
+        let slide = entries
+            .iter_mut()
+            .find(|e| e.name == "ppt/slides/slide1.xml")
+            .unwrap();
         slide.crc_override = Some(crc32(&slide.data) ^ 0xFFFF);
         assert!(Package::load(&build_zip(&entries)).is_err());
     }
@@ -473,7 +508,10 @@ mod hostile {
             1,
         );
         parts.insert("ppt/presentation.xml".into(), pres.into_bytes());
-        let entries: Vec<Entry> = parts.iter().map(|(n, c)| Entry::new(n, c.clone())).collect();
+        let entries: Vec<Entry> = parts
+            .iter()
+            .map(|(n, c)| Entry::new(n, c.clone()))
+            .collect();
         let pkg = Package::load(&build_zip(&entries)).unwrap();
         assert!(pptx::slides(&pkg).is_err());
     }
@@ -510,8 +548,10 @@ mod hostile {
     fn text_in_comments_is_not_extracted() {
         // Old: the scanner matched `<a:t>` inside comments. New: a
         // real parser never sees comment text as elements.
-        let xml = slide_xml("real")
-            .replace("</p:spTree>", "<!-- <a:t>ghost</a:t> --></p:spTree>");
-        assert_eq!(qimu_core::text::extract_texts(&xml), vec!["real".to_string()]);
+        let xml = slide_xml("real").replace("</p:spTree>", "<!-- <a:t>ghost</a:t> --></p:spTree>");
+        assert_eq!(
+            qimu_core::text::extract_texts(&xml),
+            vec!["real".to_string()]
+        );
     }
 }

@@ -82,7 +82,8 @@ pub fn embed_manifest(deck: &[u8], manifest: &Manifest) -> Result<Vec<u8>, Strin
     if let Some(pos) = custom.rfind("</Properties>") {
         custom.insert_str(pos, &prop);
     }
-    pkg.parts.insert(CUSTOM_PART.to_string(), custom.into_bytes());
+    pkg.parts
+        .insert(CUSTOM_PART.to_string(), custom.into_bytes());
 
     // 2) mirror part
     pkg.parts
@@ -157,12 +158,19 @@ fn upsert_keywords_token(pkg: &mut Package, token: &str) {
     let joined = tokens.join(" ");
     let new_core = if let Some(s) = core.find("<cp:keywords>") {
         let vs = s + "<cp:keywords>".len();
-        let e = core[vs..].find("</cp:keywords>").map(|x| vs + x).unwrap_or(vs);
+        let e = core[vs..]
+            .find("</cp:keywords>")
+            .map(|x| vs + x)
+            .unwrap_or(vs);
         let mut out = core.clone();
         out.replace_range(vs..e, &joined);
         out
     } else if core.contains("<cp:keywords/>") {
-        core.replacen("<cp:keywords/>", &format!("<cp:keywords>{joined}</cp:keywords>"), 1)
+        core.replacen(
+            "<cp:keywords/>",
+            &format!("<cp:keywords>{joined}</cp:keywords>"),
+            1,
+        )
     } else if let Some(pos) = core.rfind("</cp:coreProperties>") {
         let mut out = core.clone();
         out.insert_str(pos, &format!("<cp:keywords>{joined}</cp:keywords>"));
@@ -170,7 +178,8 @@ fn upsert_keywords_token(pkg: &mut Package, token: &str) {
     } else {
         core
     };
-    pkg.parts.insert(CORE_PART.to_string(), new_core.into_bytes());
+    pkg.parts
+        .insert(CORE_PART.to_string(), new_core.into_bytes());
 }
 
 /// The deck ID from any surviving carrier: full manifest first, then the
@@ -276,7 +285,10 @@ mod tests {
             .unwrap()
             .get_text("docProps/core.xml")
             .unwrap();
-        assert!(core.contains("qimu:deck_test"), "keywords token missing: {core}");
+        assert!(
+            core.contains("qimu:deck_test"),
+            "keywords token missing: {core}"
+        );
         assert_eq!(back.bindings.len(), 1);
         assert_eq!(back.bindings[0].version_semver, "1.0.0");
         // re-embed replaces rather than duplicates

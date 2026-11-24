@@ -13,10 +13,18 @@
 	服务器：{name}	Server: {name}
 	PPT 内容管理与更新系统	PPT content management & update system
 	服务器	Server
+	暂无服务器	No server
 	账号	Account
 	密码	Password
 	登录	Log in
 	个人资料	Profile
+	账户信息	Account information
+	用户名	Username
+	邮箱	Email
+	手机	Phone
+	编辑个人资料	Edit profile
+	退出登录	Log out
+	匿名账户	Anonymous account
 	组织管理	Organization
 	内容组与授权	Groups & permissions
 	公司公共资料	Company profile
@@ -68,6 +76,10 @@
 	切换主题	Switch theme
 	收到的分享	Received shares
 	本次会话暂无消息	No messages this session
+	会话消息	Session message
+	刚刚	Just now
+	分钟前	minutes ago
+	小时前	hours ago
 	推送到演示厅	Push to showroom
 	发布版本	Publish version
 	发起合并	Start merge

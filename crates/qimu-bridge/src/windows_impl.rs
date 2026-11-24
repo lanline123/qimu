@@ -14,7 +14,7 @@
 //! The presentation is NOT saved by the bridge — the file on disk changes
 //! only when the user saves in PowerPoint, exactly like a manual edit.
 
-use windows::core::{BSTR, GUID, Interface, PCWSTR, VARIANT};
+use windows::core::{Interface, BSTR, GUID, PCWSTR, VARIANT};
 use windows::Win32::System::Com::{
     CLSIDFromProgID, CoCreateInstance, CoInitializeEx, CoUninitialize, IDispatch,
     CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, DISPATCH_METHOD, DISPATCH_PROPERTYGET,
@@ -138,8 +138,7 @@ fn active_powerpoint() -> Result<IDispatch, String> {
 }
 
 fn active_presentation(app: &IDispatch) -> Result<IDispatch, String> {
-    get_obj(app, "ActivePresentation")
-        .map_err(|_| "PowerPoint 中没有打开的演示文稿".to_string())
+    get_obj(app, "ActivePresentation").map_err(|_| "PowerPoint 中没有打开的演示文稿".to_string())
 }
 
 impl PowerPointBridge for WindowsBridge {
@@ -192,13 +191,9 @@ impl PowerPointBridge for WindowsBridge {
         ordered.sort_by_key(|r| std::cmp::Reverse(r.start));
         for rep in &ordered {
             for _ in 0..rep.remove_count {
-                let item = call(
-                    &slides,
-                    "Item",
-                    &mut [VARIANT::from(rep.start as i32)],
-                )?;
-                let slide = IDispatch::try_from(&item)
-                    .map_err(|e| format!("Slides.Item 不是对象: {e}"))?;
+                let item = call(&slides, "Item", &mut [VARIANT::from(rep.start as i32)])?;
+                let slide =
+                    IDispatch::try_from(&item).map_err(|e| format!("Slides.Item 不是对象: {e}"))?;
                 call(&slide, "Delete", &mut [])?;
             }
             if let Some(fragment) = &rep.fragment_path {
@@ -250,12 +245,9 @@ impl PowerPointBridge for WindowsBridge {
         let presentations = get_obj(&app, "Presentations")?;
         // Add(WithWindow = msoFalse = 0): no window for the temp deck.
         let added = call(&presentations, "Add", &mut [VARIANT::from(0i32)])?;
-        let pres = IDispatch::try_from(&added)
-            .map_err(|e| format!("新建临时演示失败: {e}"))?;
+        let pres = IDispatch::try_from(&added).map_err(|e| format!("新建临时演示失败: {e}"))?;
         let slides = get_obj(&pres, "Slides")?;
-        if call(&slides, "Paste", &mut []).is_err()
-            || get_i32(&slides, "Count").unwrap_or(0) == 0
-        {
+        if call(&slides, "Paste", &mut []).is_err() || get_i32(&slides, "Count").unwrap_or(0) == 0 {
             let _ = call(&pres, "Close", &mut []);
             return Ok(None);
         }

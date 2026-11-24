@@ -41,7 +41,10 @@ pub fn notes_text(pkg: &crate::pptx::Package, slide_part: &str) -> String {
         Err(_) => return String::new(),
     };
     let rels = crate::pptx::parse_rels(&rels_xml);
-    let notes_rel = match rels.iter().find(|r| craft_opc::type_is(&r.ty, "notesSlide")) {
+    let notes_rel = match rels
+        .iter()
+        .find(|r| craft_opc::type_is(&r.ty, "notesSlide"))
+    {
         Some(r) => r,
         None => return String::new(),
     };
