@@ -5960,31 +5960,34 @@ impl App {
                 let resp = tree_row(ui, current == name, 0.0, Some(icon), tr(name), 12.5);
                 if name == "审批队列" {
                     let pending = self.showroom_pending.len();
-                    if pending > 0 {
-                        // Pending-count pill (prototype .cnt on the
-                        // queue nav item), painted on the row's right
-                        // edge; the count is the loaded review queue.
-                        let font = egui::FontId::new(10.5, egui::FontFamily::Proportional);
-                        let galley = ui.painter().layout_no_wrap(
-                            pending.to_string(),
-                            font,
-                            egui::Color32::WHITE,
-                        );
-                        let w = galley.size().x + 10.0;
-                        let rect = egui::Rect::from_min_size(
-                            egui::pos2(resp.rect.max.x - w - 8.0, resp.rect.center().y - 8.0),
-                            egui::vec2(w, 16.0),
-                        );
-                        ui.painter().rect_filled(rect, 8.0, ROSE);
-                        ui.painter().galley(
-                            egui::pos2(
-                                rect.center().x - galley.size().x / 2.0,
-                                rect.center().y - galley.size().y / 2.0,
-                            ),
-                            galley,
-                            egui::Color32::WHITE,
-                        );
-                    }
+                    // Pending count (prototype .set-toc .cnt, L969):
+                    // plain text, muted at rest, amber only when warn
+                    // (prototype renderSetToc, L5537: warn = qn > 0;
+                    // .cnt.warn{color:var(--amber)}, L970). No filled
+                    // pill. Always rendered (muted "0" at rest, the
+                    // merged nav follows the TOC form).
+                    let warn = pending > 0;
+                    let fg = if warn {
+                        palette_color(CHIP_ORANGE_FG)
+                    } else {
+                        palette_color(TEXT_WEAK)
+                    };
+                    let font = egui::FontId::new(10.5, egui::FontFamily::Proportional);
+                    let galley =
+                        ui.painter().layout_no_wrap(pending.to_string(), font, fg);
+                    let w = galley.size().x + 10.0;
+                    let rect = egui::Rect::from_min_size(
+                        egui::pos2(resp.rect.max.x - w - 8.0, resp.rect.center().y - 8.0),
+                        egui::vec2(w, 16.0),
+                    );
+                    ui.painter().galley(
+                        egui::pos2(
+                            rect.center().x - galley.size().x / 2.0,
+                            rect.center().y - galley.size().y / 2.0,
+                        ),
+                        galley,
+                        fg,
+                    );
                 }
                 if resp.clicked() {
                     if let Some(pos) = sections.iter().position(|x| *x == name) {
@@ -9807,7 +9810,7 @@ impl App {
                 ui.label(
                     egui::RichText::new(format!(
                         "总占用 {:.1} MB / 上限 {} MB",
-                        used_bytes as f64 / 1_000_000.0,
+                        used_bytes as f64 / 1_048_576.0,
                         cap_mb
                     ))
                     .size(12.5)
@@ -9840,7 +9843,7 @@ impl App {
             ui.label(
                 egui::RichText::new(format!(
                     "本地已用 {:.1} MB / 上限 {} MB",
-                    used_bytes as f64 / 1_000_000.0,
+                    used_bytes as f64 / 1_048_576.0,
                     cap_mb
                 ))
                 .size(11.5)
@@ -9883,7 +9886,7 @@ impl App {
                                             egui::RichText::new(format!(
                                                 "{} 页 · {:.1} MB · 缓存于 {}",
                                                 i(e, "page_count"),
-                                                i(e, "bytes") as f64 / 1_000_000.0,
+                                                i(e, "bytes") as f64 / 1_048_576.0,
                                                 fmt_time(i(e, "cached_ms"))
                                             ))
                                             .size(11.5)
@@ -13465,7 +13468,7 @@ impl App {
                 "当前生效：{} · {} 条缓存 · {:.1} MB",
                 effective.display(),
                 self.cache_entries.len(),
-                total_bytes as f64 / 1_000_000.0
+                total_bytes as f64 / 1_048_576.0
             ))
             .size(11.5)
             .color(palette_color(TEXT_WEAK)),
