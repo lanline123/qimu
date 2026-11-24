@@ -401,16 +401,34 @@ impl App {
         let path = format!("/v1/versions/{}/edit-pages", pe.version_id);
         let (tx, receiver) = mpsc::channel();
         let ctx = ctx.clone();
+        // Transplant T0: with the local library open, the stage
+        // preview is produced in-process (preview_png_in_process:
+        // the same core ops application the server performs, then
+        // local_render at scale 1 / edit mode). Any case it does not
+        // cover — no local library, version not local, a local
+        // pipeline failure — falls back to the server request below.
+        let local = self.local.clone();
+        let version_id = pe.version_id.clone();
         std::thread::spawn(move || {
-            let result = raw_call(
-                &server,
-                token.as_deref(),
-                "POST",
-                &path,
-                Some(request),
-                false,
-            )
-            .and_then(|response| b64d(&s(&response, "data_base64")))
+            let result = local
+                .as_deref()
+                .and_then(|store| {
+                    preview_png_in_process(store, &version_id, page, added, &request["ops"])
+                })
+                .map_or_else(
+                    || {
+                        raw_call(
+                            &server,
+                            token.as_deref(),
+                            "POST",
+                            &path,
+                            Some(request),
+                            false,
+                        )
+                        .and_then(|response| b64d(&s(&response, "data_base64")))
+                    },
+                    Ok,
+                )
             .and_then(|bytes| {
                 let image = image::load_from_memory(&bytes)
                     .map_err(|error| error.to_string())?
@@ -445,4 +463,201 @@ impl EditStagePreview {
             ui.label(egui::RichText::new(tr("正在更新舞台…")).weak());
         }
     }
+}
+
+/// Sniff an image format from magic bytes (None = unrecognized).
+/// Mirrors the server's helper of the same name (edit-pages).
+fn sniff_image_ext(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
+        Some("png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("jpg")
+    } else if bytes.starts_with(b"GIF8") {
+        Some("gif")
+    } else if bytes.starts_with(b"BM") {
+        Some("bmp")
+    } else {
+        None
+    }
+}
+
+/// Convert the wire ops of one edit-pages request (the JSON shape
+/// `PageEditState::page_ops` emits) into core `SlideOp`s grouped by
+/// page — a line-for-line mirror of the conversion the server
+/// performs in its edit-pages handler, so the in-process preview
+/// applies exactly the operations the server would.
+fn slide_ops_from_json(
+    ops: &[Value],
+) -> Result<std::collections::BTreeMap<usize, Vec<qimu_core::pptx::SlideOp>>, String> {
+    use qimu_core::pptx::SlideOp;
+    if ops.len() > 20_000 {
+        return Err("编辑操作过多".into());
+    }
+    let str_of = |op: &Value, key: &str| -> Option<String> {
+        op.get(key).and_then(|v| v.as_str()).map(str::to_string)
+    };
+    let usize_of = |op: &Value, key: &str| -> Option<usize> {
+        op.get(key).and_then(|v| v.as_u64()).map(|n| n as usize)
+    };
+    let i64_of = |op: &Value, key: &str| -> Option<i64> { op.get(key).and_then(|v| v.as_i64()) };
+    // Picture payloads are decoded and sniffed up front, exactly
+    // like the server: op index -> (bytes, ext).
+    let mut pic_bytes: std::collections::HashMap<usize, (Vec<u8>, String)> =
+        std::collections::HashMap::new();
+    for (i, op) in ops.iter().enumerate() {
+        let kind = str_of(op, "kind").unwrap_or_default();
+        let needs_picture = kind == "replace_pic"
+            || (kind == "add_element" && str_of(op, "element_kind").as_deref() == Some("picture"));
+        if !needs_picture {
+            continue;
+        }
+        let b64 = str_of(op, "data_base64").ok_or("替换图片缺少图片数据")?;
+        let bytes = b64d(&b64)?;
+        let sniffed = sniff_image_ext(&bytes).ok_or("只支持 PNG / JPEG / GIF / BMP 图片")?;
+        let ext = match str_of(op, "ext").map(|e| e.to_ascii_lowercase()) {
+            Some(e) if e == sniffed || (e == "jpeg" && sniffed == "jpg") => {
+                sniffed.to_string()
+            }
+            Some(_) => return Err("图片扩展名与实际格式不一致".into()),
+            None => sniffed.to_string(),
+        };
+        pic_bytes.insert(i, (bytes, ext));
+    }
+    let mut ops_by_page: std::collections::BTreeMap<usize, Vec<SlideOp>> =
+        std::collections::BTreeMap::new();
+    for (i, op) in ops.iter().enumerate() {
+        let kind = str_of(op, "kind").unwrap_or_default();
+        let el = usize_of(op, "el").unwrap_or(0);
+        let para = usize_of(op, "para");
+        let sop = match kind.as_str() {
+            "set_text" => SlideOp::SetText {
+                el,
+                para: para.unwrap_or(0),
+                run: usize_of(op, "run").unwrap_or(0),
+                text: str_of(op, "text").unwrap_or_default(),
+            },
+            "set_style" => SlideOp::SetStyle {
+                el,
+                para: para.unwrap_or(0),
+                run: usize_of(op, "run").unwrap_or(0),
+                sz: op.get("sz").and_then(|v| v.as_f64()).map(|f| f as f32),
+                b: op.get("b").and_then(|v| v.as_bool()),
+                color: str_of(op, "color"),
+            },
+            "add_para" => SlideOp::AddPara {
+                el,
+                after: para,
+                text: str_of(op, "text").unwrap_or_default(),
+            },
+            "del_para" => SlideOp::DeletePara {
+                el,
+                para: para.unwrap_or(0),
+            },
+            "add_run" => SlideOp::AddRun {
+                el,
+                para: para.unwrap_or(0),
+                text: str_of(op, "text").unwrap_or_default(),
+            },
+            "del_run" => SlideOp::DeleteRun {
+                el,
+                para: para.unwrap_or(0),
+                run: usize_of(op, "run").unwrap_or(0),
+            },
+            "move" => SlideOp::Move {
+                el,
+                x: i64_of(op, "x").unwrap_or(0),
+                y: i64_of(op, "y").unwrap_or(0),
+            },
+            "resize" => SlideOp::Resize {
+                el,
+                cx: i64_of(op, "cx").unwrap_or(0),
+                cy: i64_of(op, "cy").unwrap_or(0),
+            },
+            "reset_style" => SlideOp::ResetStyle {
+                el,
+                para: para.unwrap_or(0),
+                run: usize_of(op, "run").unwrap_or(0),
+            },
+            "line_color" => SlideOp::LineColor {
+                el,
+                color: str_of(op, "color").ok_or("缺少线条颜色")?,
+            },
+            "preset" => {
+                let preset = str_of(op, "preset")
+                    .filter(|p| qimu_core::pptx::editor_preset_allowed(p))
+                    .ok_or("未知的形状预设")?;
+                SlideOp::Preset { el, preset }
+            }
+            "add_element" => SlideOp::AddElement(qimu_core::pptx::NewSlideElement {
+                kind: str_of(op, "element_kind").ok_or("缺少元素类型")?,
+                preset: str_of(op, "preset"),
+                text: str_of(op, "text").unwrap_or_default(),
+                x: i64_of(op, "x").unwrap_or(0),
+                y: i64_of(op, "y").unwrap_or(0),
+                cx: i64_of(op, "cx").unwrap_or(0),
+                cy: i64_of(op, "cy").unwrap_or(0),
+                picture: pic_bytes.remove(&i),
+            }),
+            "replace_pic" => {
+                let (bytes, ext) = pic_bytes
+                    .get(&i)
+                    .ok_or("替换图片数据丢失")?
+                    .clone();
+                SlideOp::ReplacePic { el, bytes, ext }
+            }
+            other => return Err(format!("未知编辑操作 {other}")),
+        };
+        let parents: Vec<usize> = op
+            .get("parents")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_u64().map(|n| n as usize))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if parents.len() > 32 {
+            return Err("组合层级过深".into());
+        }
+        let sop = if parents.is_empty() {
+            sop
+        } else {
+            SlideOp::InGroup {
+                parents,
+                op: Box::new(sop),
+            }
+        };
+        ops_by_page
+            .entry(usize_of(op, "page").unwrap_or(0))
+            .or_default()
+            .push(sop);
+    }
+    Ok(ops_by_page)
+}
+
+/// In-process stage preview (transplant T0): replay the server
+/// edit-pages preview pipeline against the local library — load the
+/// version's fragment, append the added pages, apply the request's
+/// v2 ops with qimu-core, then render the page via local_render.
+/// Returns None when the version is not in the local library or any
+/// step fails; the caller then falls back to the server request.
+fn preview_png_in_process(
+    local: &crate::local_store::LocalStore,
+    version_id: &str,
+    page: usize,
+    added_pages: usize,
+    ops: &Value,
+) -> Option<Vec<u8>> {
+    let frag = local.version_fragment(version_id)?;
+    let mut pkg = qimu_core::pptx::Package::load(&frag).ok()?;
+    qimu_core::pptx::append_blank_slides(&mut pkg, added_pages).ok()?;
+    let ops_by_page = slide_ops_from_json(ops.as_array()?).ok()?;
+    for (p, list) in &ops_by_page {
+        qimu_core::pptx::apply_slide_ops(&mut pkg, *p, list).ok()?;
+    }
+    if page >= qimu_core::pptx::slides(&pkg).ok()?.len() {
+        return None;
+    }
+    let bytes = pkg.to_bytes().ok()?;
+    crate::local_render::render_edit_preview(&bytes, page).ok()
 }

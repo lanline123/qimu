@@ -219,6 +219,28 @@ impl LocalStore {
         out
     }
 
+    /// The version's fragment PPTX bytes from the local CAS (the
+    /// same `file_get(fragment_hash)` read the server's thumb and
+    /// edit-preview handlers perform). None when the version is not
+    /// in this library.
+    pub fn version_fragment(&self, version_id: &str) -> Option<Vec<u8>> {
+        let store = self.store.lock().unwrap();
+        let ver = store.get_version(version_id).ok()?;
+        store.file_get(&ver.fragment_hash).ok()
+    }
+
+    /// Thumbnail cache directory for one version, in the server's
+    /// exact layout (`<root>/thumbs/deckcraft-v2/<version id>`), so
+    /// a library previously served by the bundled server hands its
+    /// cache over verbatim — and the server fallback path keeps
+    /// finding the pages this process rendered.
+    pub fn thumb_cache_dir(&self, version_id: &str) -> PathBuf {
+        self.root
+            .join("thumbs")
+            .join("deckcraft-v2")
+            .join(version_id)
+    }
+
     /// (units, folders, indexes) counts for the settings diagnostic.
     pub fn counts(&self) -> (usize, usize, usize) {
         let store = self.store.lock().unwrap();

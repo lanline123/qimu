@@ -14,6 +14,7 @@ mod page_editor;
 use page_editor::*;
 mod workspace_controls;
 mod local_store;
+mod local_render;
 
 use chrome_icons::{ChromeIcon, ChromeIcons};
 use index_controls::{IndexMoreAction, IndexOverviewControls, IndexScope};
@@ -2518,7 +2519,7 @@ struct App {
     /// opened in App::new before any connection restore when the
     /// QIMU_LOCAL_FIRST gray switch is on; None on the legacy path,
     /// where behavior is unchanged.
-    local: Option<local_store::LocalStore>,
+    local: Option<std::sync::Arc<local_store::LocalStore>>,
 }
 
 enum ThumbState {
@@ -3005,7 +3006,7 @@ impl App {
         // any connection is restored — its availability must not
         // depend on the connection state machine. No-op (None)
         // unless the QIMU_LOCAL_FIRST gray switch is on.
-        let local = local_store::LocalStore::open_if_enabled();
+        let local = local_store::LocalStore::open_if_enabled().map(std::sync::Arc::new);
         let (thumb_tx, thumb_rx) = std::sync::mpsc::channel();
         let (pdf_tx, pdf_rx) = std::sync::mpsc::channel();
         let (upd_tx, upd_rx) = std::sync::mpsc::channel();
@@ -7252,8 +7253,12 @@ impl eframe::App for App {
 }
 
 impl App {
-    /// Real slide thumbnail, fetched on a background thread (the server
-    /// renders it once via LibreOffice and caches it on disk).
+    /// Real slide thumbnail, resolved on a background thread: a
+    /// version that lives in the local library is rendered
+    /// in-process (transplant T0, local_render) and served from the
+    /// shared deckcraft-v2 cache; anything else is fetched from the
+    /// server, which renders it once via DeckCraft and caches it on
+    /// disk under the same layout.
     fn thumb(&mut self, version_id: &str, page: usize) -> Option<egui::TextureHandle> {
         if version_id.is_empty() {
             return None;
@@ -7270,7 +7275,21 @@ impl App {
                     self.thumb_tx.clone(),
                 );
                 let url = format!("{server}/v1/versions/{version_id}/thumb/{page}");
+                // Transplant T0: with the local library open, try the
+                // in-process render first; a version that is not
+                // local (org content) or a local failure falls back
+                // to the server fetch below, unchanged.
+                let local = self.local.clone();
+                let version_id = version_id.to_string();
                 std::thread::spawn(move || {
+                    if let Some(local) = &local {
+                        if let Some(bytes) =
+                            local_render::local_thumb(local, &version_id, page)
+                        {
+                            let _ = tx.send((key, Some(bytes)));
+                            return;
+                        }
+                    }
                     let mut req = ureq::get(&url);
                     if let Some(t) = &token {
                         req = req.set("Authorization", &format!("Bearer {t}"));

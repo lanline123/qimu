@@ -59,15 +59,24 @@ craft-update = { git = "https://github.com/lanline123/craft-libs", rev = "b9c7b6
 # the submodule pointer and these pins together, gated by CI
 # (route plan §6 item 2 retires the P0 alignment notes).
 #
-# P1 reserved wiring (PLAN §4 consumption surface / §6 P1) — enable
-# by uncommenting when the read-only capabilities land (thumbnails,
-# deck viewing, show + presenter embedding):
-# deckcraft-model  = { path = "../../vendor/deckcraft/crates/model" }
-# deckcraft-render = { path = "../../vendor/deckcraft/crates/render" }
-# deckcraft-engine = { path = "../../vendor/deckcraft/crates/engine" }
-# deckcraft-ui-egui = { path = "../../vendor/deckcraft/crates/ui-egui" }
+# P1 reserved wiring (PLAN §4 consumption surface / §6 P1),
+# progressively enabled as the capabilities land in-process
+# (DeckCraft transplant, DESIGN §6):
+# - T0 (thumbnails + page-edit stage preview in-process): model,
+#   render, engine, pptx, fonts, text. The fonts crate's build
+#   script embeds the craft-fonts set when CRAFT_FONTS_DIR is set —
+#   the build-windows client step sets it together with
+#   CRAFT_FONTS_REQUIRED=1, so CJK coverage ships inside the
+#   binary instead of degrading to .notdef on fontless machines.
+deckcraft-model  = { path = "../../vendor/deckcraft/crates/model" }
+deckcraft-render = { path = "../../vendor/deckcraft/crates/render" }
+deckcraft-engine = { path = "../../vendor/deckcraft/crates/engine" }
+deckcraft-pptx   = { path = "../../vendor/deckcraft/crates/pptx" }
+deckcraft-fonts  = { path = "../../vendor/deckcraft/crates/fonts" }
+deckcraft-text   = { path = "../../vendor/deckcraft/crates/text" }
+# - Still reserved: pdf (T1 export), ui-egui (T2 show hosting).
 # deckcraft-pdf    = { path = "../../vendor/deckcraft/crates/pdf" }
-# deckcraft-pptx   = { path = "../../vendor/deckcraft/crates/pptx" }
+# deckcraft-ui-egui = { path = "../../vendor/deckcraft/crates/ui-egui" }
 # ---------------------------------------------------------------------------
 
 # build.rs embeds the brand logo as the Windows executable icon.
