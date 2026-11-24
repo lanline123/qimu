@@ -7155,6 +7155,35 @@ impl App {
         resp.on_hover_text(label).clicked()
     }
 
+    /// PPTX export for the showroom deck on screen: the server
+    /// assembles the deck and it lands through a save dialog.
+    /// This is also the current phase's export-style share path —
+    /// the exported file is the share artifact (standalone ruling:
+    /// sharing is export-only for now) — so the deck header's 导出
+    /// and the bottom bar's 分享 call this same handler.
+    fn export_showroom_pptx(&mut self, item: &Value) {
+        match self.call(
+            "POST",
+            &format!("/v1/showroom/{}/export", s(&item, "id")),
+            Some(json!({ "kind": "personal" })),
+        ) {
+            Ok(v) => {
+                if let Some(data) = v.get("data_base64").and_then(|x| x.as_str()) {
+                    if let (Ok(bytes), Some(path)) = (
+                        b64d(data),
+                        rfd::FileDialog::new()
+                            .set_file_name(format!("{}.pptx", s(&item, "title")))
+                            .save_file(),
+                    ) {
+                        let _ = std::fs::write(path, bytes);
+                        self.msg = "已保存".into();
+                    }
+                }
+            }
+            Err(e) => self.msg = format!("导出失败：{e}"),
+        }
+    }
+
     /// PDF export for the showroom deck on screen (Q21): asks the
     /// server for the DeckCraft PDF (the whole deck in the chosen
     /// form, or one deck-global page) and saves it through the same
@@ -7337,28 +7366,7 @@ impl App {
                     self.start_presentation(ui, &item, &st.pages);
                 }
             }
-            Some("export") => {
-                match self.call(
-                    "POST",
-                    &format!("/v1/showroom/{}/export", s(&item, "id")),
-                    Some(json!({ "kind": "personal" })),
-                ) {
-                    Ok(v) => {
-                        if let Some(data) = v.get("data_base64").and_then(|x| x.as_str()) {
-                            if let (Ok(bytes), Some(path)) = (
-                                b64d(data),
-                                rfd::FileDialog::new()
-                                    .set_file_name(format!("{}.pptx", s(&item, "title")))
-                                    .save_file(),
-                            ) {
-                                let _ = std::fs::write(path, bytes);
-                                self.msg = "已保存".into();
-                            }
-                        }
-                    }
-                    Err(e) => self.msg = format!("导出失败：{e}"),
-                }
-            }
+            Some("export") => self.export_showroom_pptx(&item),
             Some("cache") => self.cache_showroom_deck(&item),
             _ => {}
         }
@@ -10483,6 +10491,69 @@ impl App {
         Some(Overlay::Present(p))
     }
 
+    /// The page editor's save — ONE implementation shared by
+    /// the editor footer's 保存并发布新版本 and the bottom bar's
+    /// 保存到索引 (sdBlockSave): the §8 bump-rule payload, the
+    /// edit-pages call, the result message, the unit-detail
+    /// reopen and the refresh. Returns true when the editor
+    /// should close (saved, or nothing to save); false keeps it
+    /// open after a failed call, with the failure in self.msg.
+    fn save_page_edit(&mut self, pe: &PageEditState) -> bool {
+        let edits = pe.legacy_edits();
+        let ops = pe.page_ops(None);
+        let mut new_semver = String::new();
+        if !edits.is_empty() || !ops.is_empty() || pe.added_pages() > 0 {
+            let bump = ["major", "minor", "patch"][pe.bump];
+            let payload = json!({
+                "edits": edits.iter().map(|(p, r, t)| json!({
+                    "page": p, "run": r, "text": t,
+                })).collect::<Vec<_>>(),
+                "ops": ops,
+                "added_pages": pe.added_pages(),
+                "scripts": pe.scripts,
+                "bump": bump,
+                "note": pe.note,
+            });
+            match self.call(
+                "POST",
+                &format!("/v1/versions/{}/edit-pages", pe.version_id),
+                Some(payload),
+            ) {
+                Ok(v) => {
+                    let ver = v.get("version").cloned().unwrap_or(json!({}));
+                    new_semver = s(&ver, "semver");
+                }
+                Err(e) => {
+                    self.msg = format!("保存失败：{e}");
+                    return false;
+                }
+            }
+        } else if pe.scripts != pe.scripts_base {
+            if let Err(e) = self.call(
+                "PUT",
+                &format!("/v1/versions/{}/scripts", pe.version_id),
+                Some(json!({ "scripts": pe.scripts })),
+            ) {
+                self.msg = format!("讲稿保存失败：{e}");
+                return false;
+            }
+        }
+        self.msg = if new_semver.is_empty() {
+            "已保存".into()
+        } else {
+            format!("已保存为新版本 v{new_semver}")
+        };
+        let open_uid = match self.content.stack.top() {
+            ContentFrame::Unit(st) => Some(st.unit_id.clone()),
+            _ => None,
+        };
+        if let Some(uid) = open_uid {
+            self.open_unit_detail(&uid);
+        }
+        self.refresh_all();
+        true
+    }
+
     /// Page-level visual editor (prototype A29 shell): page rail,
     /// large preview, per-run text editing and the speaker notes
     /// of the page. Saving publishes a NEW version under the §8
@@ -10894,59 +10965,10 @@ impl App {
             return None;
         }
         if save {
-            let edits = pe.legacy_edits();
-            let ops = pe.page_ops(None);
-            let mut new_semver = String::new();
-            if !edits.is_empty() || !ops.is_empty() || pe.added_pages() > 0 {
-                let bump = ["major", "minor", "patch"][pe.bump];
-                let payload = json!({
-                    "edits": edits.iter().map(|(p, r, t)| json!({
-                        "page": p, "run": r, "text": t,
-                    })).collect::<Vec<_>>(),
-                    "ops": ops,
-                    "added_pages": pe.added_pages(),
-                    "scripts": pe.scripts,
-                    "bump": bump,
-                    "note": pe.note,
-                });
-                match self.call(
-                    "POST",
-                    &format!("/v1/versions/{}/edit-pages", pe.version_id),
-                    Some(payload),
-                ) {
-                    Ok(v) => {
-                        let ver = v.get("version").cloned().unwrap_or(json!({}));
-                        new_semver = s(&ver, "semver");
-                    }
-                    Err(e) => {
-                        self.msg = format!("保存失败：{e}");
-                        return Some(Overlay::PageEdit(pe));
-                    }
-                }
-            } else if pe.scripts != pe.scripts_base {
-                if let Err(e) = self.call(
-                    "PUT",
-                    &format!("/v1/versions/{}/scripts", pe.version_id),
-                    Some(json!({ "scripts": pe.scripts })),
-                ) {
-                    self.msg = format!("讲稿保存失败：{e}");
-                    return Some(Overlay::PageEdit(pe));
-                }
+            if self.save_page_edit(&pe) {
+                return None;
             }
-            self.msg = if new_semver.is_empty() {
-                "已保存".into()
-            } else {
-                format!("已保存为新版本 v{new_semver}")
-            };
-            let open_uid = match self.content.stack.top() {
-                ContentFrame::Unit(st) => Some(st.unit_id.clone()),
-                _ => None,
-            };
-            if let Some(uid) = open_uid {
-                self.open_unit_detail(&uid);
-            }
-            self.refresh_all();
-            return None;
+            return Some(Overlay::PageEdit(pe));
         }
         Some(Overlay::PageEdit(pe))
     }

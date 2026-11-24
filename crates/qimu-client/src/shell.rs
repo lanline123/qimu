@@ -71,6 +71,31 @@ impl App {
             .resizable(false)
             .frame(egui::Frame::NONE.fill(palette_color(PANEL_BG)))
             .show(ui, |ui| {
+                // Community foot (prototype .sp-foot): created
+                // before the action panel so it hugs the sidebar's
+                // bottom edge; the per-page actions stack above it.
+                egui::Panel::bottom("sidebar_community")
+                    .frame(egui::Frame::NONE.fill(palette_color(PANEL_BG)))
+                    .show_separator_line(false)
+                    .show(ui, |ui| {
+                        let r = ui.max_rect();
+                        ui.painter().hline(
+                            r.x_range(),
+                            r.min.y + 0.5,
+                            egui::Stroke::new(1.0, palette_color(SEPARATOR)),
+                        );
+                        egui::Frame::NONE
+                            .inner_margin(egui::Margin {
+                                left: 14,
+                                right: 14,
+                                top: 10,
+                                bottom: 12,
+                            })
+                            .show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                self.sidebar_community(ui);
+                            });
+                    });
                 let action_height = match page {
                     Page::Home => 166.0,
                     Page::Index => 90.0,
@@ -107,6 +132,79 @@ impl App {
                         });
                 });
             });
+    }
+
+    /// Sidebar community foot (prototype .sp-foot): a small
+    /// section title over three full-width icon links, pinned to
+    /// the sidebar's bottom edge on every page. The links open the
+    /// project's public pages in the browser (the prototype's
+    /// click was a placeholder toast; the client opens the real
+    /// addresses the old bottom-bar cluster used).
+    fn sidebar_community(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            egui::RichText::new(tr("社区"))
+                .size(10.5)
+                .strong()
+                .color(palette_color(TEXT_WEAK)),
+        );
+        ui.add_space(2.0);
+        for (icon, label, url) in [
+            (
+                ChromeIcon::Doc,
+                "帮助文档",
+                "https://github.com/lanline123/qimu#readme",
+            ),
+            (
+                ChromeIcon::Globe,
+                "启幕 · 官网",
+                "https://github.com/lanline123/qimu",
+            ),
+            (
+                ChromeIcon::Link,
+                "内容索引规范",
+                "https://github.com/lanline123/qimu/blob/main/docs/产品规格.md",
+            ),
+        ] {
+            self.community_link(ui, icon, label, url);
+        }
+    }
+
+    /// One .sp-link row: 15px glyph + 12.5px label, muted at rest,
+    /// accent on hover, the whole 28px row clickable.
+    fn community_link(&mut self, ui: &mut egui::Ui, icon: ChromeIcon, label: &str, url: &str) {
+        let (rect, resp) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), 28.0),
+            egui::Sense::click(),
+        );
+        let hovered = resp.hovered();
+        let text_color = if hovered {
+            ACCENT
+        } else {
+            palette_color(TEXT_WEAK)
+        };
+        let glyph_color = if hovered {
+            ACCENT
+        } else {
+            palette_color(ICON_TINT)
+        };
+        ChromeIcons.paint(
+            ui,
+            icon,
+            egui::pos2(rect.min.x + 2.0 + 7.5, rect.center().y),
+            15.0,
+            glyph_color,
+        );
+        ui.painter().text(
+            egui::pos2(rect.min.x + 2.0 + 15.0 + 9.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            tr(label),
+            egui::FontId::proportional(12.5),
+            text_color,
+        );
+        if resp.clicked() {
+            ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+        }
+        let _ = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     }
 
     fn sidebar_actions(&mut self, ui: &mut egui::Ui, page: Page) {
@@ -185,6 +283,13 @@ impl App {
             )
             .show_separator_line(false)
             .show(ui, |ui| {
+                // horizontal_centered allocates the panel's
+                // full 32px and centers its child vertically:
+                // MenuBar's own strip is only as tall as its
+                // tallest control and would otherwise sit at
+                // the top of the row, leaving every menu label
+                // and right-cluster control riding high.
+                ui.horizontal_centered(|ui| {
                 egui::MenuBar::new().ui(ui, |ui| {
                     ui.menu_button(egui::RichText::new(tr("文件")).size(12.0), |ui| {
                         ui.set_min_width(160.0);
@@ -308,6 +413,7 @@ impl App {
                         }
                     });
                 });
+                });
                 let r = ui.max_rect();
                 ui.painter().hline(
                     r.x_range(),
@@ -396,6 +502,457 @@ impl App {
             });
     }
 
+    /// Bottom-bar action group (prototype #deckBar .deckbar-acts):
+    /// resident icon buttons, separator-grouped, present on every
+    /// page; a button whose target does not exist in the current
+    /// context is greyed and inert — the same availability model
+    /// as the toolbar's two resident groups. The full-set ruling
+    /// (2026-11-24: the bottom-bar buttons are the user's picked
+    /// set, none may be dropped) keeps every prototype slot:
+    /// slots whose feature is not built yet render as
+    /// DECKBAR-PLACEHOLDER entries (see deckbar_placeholder) and
+    /// light up one by one as their features land. Called inside
+    /// the footer's right-to-left
+    /// layout, so buttons are added right-to-left: sdClose first,
+    /// sdShare last.
+    fn deckbar_actions(&mut self, ui: &mut egui::Ui) {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        // Snapshot of the open deck, cloned out of the frame: the
+        // handlers below need &mut self.
+        let (item, pages, from, view, cached) = match self.showroom.stack.top() {
+            SrFrame::Deck(st) => {
+                let cache_key = format!("sr_{}", s(&st.item, "id"));
+                let cached = self
+                    .cache_entries
+                    .iter()
+                    .any(|e| s(e, "key") == cache_key);
+                (
+                    Some(st.item.clone()),
+                    Some(st.pages.clone()),
+                    st.selected_page.unwrap_or(0),
+                    st.view,
+                    cached,
+                )
+            }
+            _ => (None, None, 0, DeckView::Thumbnails, false),
+        };
+        let deck_open = item.is_some();
+        // Editor snapshot for sdBlockSave / sdBlockPublish: the
+        // two buttons exist only while the page editor is the
+        // topmost overlay (prototype: hidden outside the editing
+        // state), lit by the editor's own dirty flag — they do
+        // not follow the group's grey state.
+        let (editing, edit_dirty) = match self.overlays.last() {
+            Some(Overlay::PageEdit(pe)) => (true, pe.dirty()),
+            _ => (false, false),
+        };
+        // sdClose — the global back button. It keeps its own
+        // availability and never follows the group's grey state.
+        let back_label = self.deckbar_back_label();
+        if ChromeIcons
+            .tool(
+                ui,
+                ChromeIcon::Back,
+                back_label.unwrap_or("返回上一层"),
+                back_label.is_some(),
+                false,
+                true,
+            )
+            .clicked()
+        {
+            self.deckbar_back();
+        }
+        tool_vsep(ui);
+        // sdPresent — the accent main button (the tool button's
+        // selected form is its accent-filled state).
+        if ChromeIcons
+            .tool(ui, ChromeIcon::Play, "开始演示", deck_open, true, true)
+            .clicked()
+        {
+            let (item, pages) = (item.clone().unwrap(), pages.clone().unwrap());
+            if !self.present_via_deckcraft(
+                &s(&item, "id"),
+                &s(&item, "title"),
+                DcMode::Play,
+                from,
+            ) {
+                self.start_presentation(ui, &item, &pages);
+            }
+        }
+        if ChromeIcons
+            .tool(ui, ChromeIcon::Presenter, "演示者视图", deck_open, false, true)
+            .clicked()
+        {
+            let (item, pages) = (item.clone().unwrap(), pages.clone().unwrap());
+            if !self.present_via_deckcraft(
+                &s(&item, "id"),
+                &s(&item, "title"),
+                DcMode::Presenter,
+                from,
+            ) {
+                self.start_presentation(ui, &item, &pages);
+            }
+        }
+        if ChromeIcons
+            .tool(
+                ui,
+                ChromeIcon::Notes,
+                "备注视图",
+                deck_open,
+                view == DeckView::Notes,
+                true,
+            )
+            .clicked()
+        {
+            if let SrFrame::Deck(st) = self.showroom.stack.top_mut() {
+                st.view = DeckView::Notes;
+            }
+        }
+        if ChromeIcons
+            .tool(
+                ui,
+                ChromeIcon::Thumbs,
+                "缩略视图",
+                deck_open,
+                view == DeckView::Thumbnails,
+                true,
+            )
+            .clicked()
+        {
+            if let SrFrame::Deck(st) = self.showroom.stack.top_mut() {
+                st.view = DeckView::Thumbnails;
+            }
+        }
+        if ChromeIcons
+            .tool(ui, ChromeIcon::Reading, "普通视图", deck_open, false, true)
+            .clicked()
+        {
+            let item = item.clone().unwrap();
+            if !self.present_via_deckcraft(
+                &s(&item, "id"),
+                &s(&item, "title"),
+                DcMode::Reading,
+                from,
+            ) {
+                self.present_showroom(&s(&item, "id"), &s(&item, "title"));
+            }
+        }
+        tool_vsep(ui);
+        if ChromeIcons
+            .tool(ui, ChromeIcon::Pdf, "导出 PDF", deck_open, false, true)
+            .clicked()
+        {
+            let item = item.clone().unwrap();
+            self.export_showroom_pdf(&item, "slides", None);
+        }
+        if ChromeIcons
+            .tool(ui, ChromeIcon::Export, "导出 PPTX", deck_open, false, true)
+            .clicked()
+        {
+            let item = item.clone().unwrap();
+            self.export_showroom_pptx(&item);
+        }
+        // sdPreview — the #212 script screen. In the client that
+        // screen is the deck's own 讲稿 (Notes) view — the deck
+        // page's segmented 讲稿 tab — so the button lands there;
+        // it carries no mode-selected state of its own.
+        if ChromeIcons
+            .tool(ui, ChromeIcon::Eye, "预览 / 讲稿视图", deck_open, false, true)
+            .clicked()
+        {
+            if let SrFrame::Deck(st) = self.showroom.stack.top_mut() {
+                st.view = DeckView::Notes;
+            }
+        }
+        tool_vsep(ui);
+        if editing {
+            // DECKBAR-PLACEHOLDER sdBlockPublish — the save half
+            // is real (sdBlockSave, below) but the publish half
+            // has no truthful target from the editor: the
+            // client's only publish-to-showroom path is
+            // index-granular (push_index_to_showroom — POST
+            // /v1/showroom with a source_index_id taken from the
+            // index detail), the editor context carries no index
+            // id (PageEditState holds a version id only), and the
+            // server offers no unit/version-granular submission.
+            // Placeholder until that link exists; the package
+            // report declares the gap in full.
+            self.deckbar_placeholder(
+                ui,
+                ChromeIcon::BlockPublish,
+                "保存并发布到演示厅（建设中）",
+            );
+            // sdBlockSave — the page editor's own save driven
+            // from the bar; one save implementation, not two
+            // (see deckbar_save_block / App::save_page_edit).
+            if ChromeIcons
+                .tool(
+                    ui,
+                    ChromeIcon::BlockSave,
+                    "保存到索引",
+                    edit_dirty,
+                    false,
+                    true,
+                )
+                .clicked()
+            {
+                self.deckbar_save_block();
+            }
+        }
+        // sdDel — wired only where a clean delete target with an
+        // existing handler exists: the open content block (the
+        // unit detail's own 删除内容块 path). Everywhere else it
+        // greys with the group, as in the prototype.
+        let unit_open = self.page == Page::Content
+            && matches!(self.content.stack.top(), ContentFrame::Unit(_));
+        if ChromeIcons
+            .tool(
+                ui,
+                ChromeIcon::Trash,
+                "删除选中的内容块",
+                unit_open,
+                false,
+                true,
+            )
+            .clicked()
+        {
+            self.deckbar_delete_unit();
+        }
+        // DECKBAR-PLACEHOLDER — the PPT clipboard family and
+        // 组合 (user ruling 2026-11-24: placeholders now, lit up
+        // one by one as the features land; the clipboard feature
+        // itself — capture / store / paste-as-blocks — is not
+        // built yet). Registered here and in deckbar_placeholder;
+        // grep DECKBAR-PLACEHOLDER for the full registry.
+        self.deckbar_placeholder(
+            ui,
+            ChromeIcon::Combine,
+            "组合：将选中的多个内容块组合（建设中）",
+        );
+        self.deckbar_placeholder(
+            ui,
+            ChromeIcon::Cut,
+            "剪切：将选中的页剪切到剪贴板（建设中）",
+        );
+        self.deckbar_placeholder(
+            ui,
+            ChromeIcon::CopyPpt,
+            "复制：将选中的页复制到剪贴板（建设中）",
+        );
+        self.deckbar_placeholder(
+            ui,
+            ChromeIcon::PasteGroup,
+            "整组成块：剪贴板内容整组粘贴为一个内容块（建设中）",
+        );
+        self.deckbar_placeholder(
+            ui,
+            ChromeIcon::PasteSplit,
+            "逐页成块：剪贴板每页各成一个内容块（建设中）",
+        );
+        tool_vsep(ui);
+        // sdCache — the prototype's sdPull slot (T6 ruling
+        // 2026-11-24: the slot is 缓存, not 收进我的 — the
+        // prototype itself was wrong). Accent-filled while the
+        // open deck sits in the local cache (the same cache-entry
+        // probe the deck header uses); clicking (re)caches through
+        // the deck header's own cache handler.
+        if ChromeIcons
+            .tool(ui, ChromeIcon::Cache, "缓存到本地", deck_open, cached, true)
+            .clicked()
+        {
+            let item = item.clone().unwrap();
+            self.cache_showroom_deck(&item);
+        }
+        // sdShare — group head (T7 ruling 2026-11-24: kept).
+        // Sharing in the current phase is export-style only, so
+        // the button produces the deck's share file through the
+        // same export handler as the deck header's 导出.
+        if ChromeIcons
+            .tool(ui, ChromeIcon::Share, "分享给…", deck_open, false, true)
+            .clicked()
+        {
+            let item = item.clone().unwrap();
+            self.export_showroom_pptx(&item);
+        }
+    }
+
+    /// DECKBAR-PLACEHOLDER — a bottom-bar slot whose feature is
+    /// not built yet. The full-set ruling (2026-11-24) keeps
+    /// every slot of the user's picked set: a placeholder renders
+    /// in the group's disabled form (muted glyph, no fill) with a
+    /// tooltip that states the slot's purpose, and lights up by
+    /// replacing its deckbar_placeholder call with the real
+    /// handler when the feature lands. It is painted by hand
+    /// rather than through the disabled tool button because a
+    /// disabled scope swallows hover — the tooltip must still
+    /// work. Registry: sdPasteSplit, sdPasteGroup, sdCopyPpt,
+    /// sdCutPpt, sdCombine, sdBlockPublish (in deckbar_actions).
+    fn deckbar_placeholder(&mut self, ui: &mut egui::Ui, icon: ChromeIcon, label: &str) {
+        let (rect, resp) =
+            ui.allocate_exact_size(egui::vec2(30.0, 28.0), egui::Sense::hover());
+        let glyph = palette_color(TEXT_WEAK).gamma_multiply(0.5);
+        ChromeIcons.paint(ui, icon, rect.center(), 16.0, glyph);
+        resp.on_hover_text(tr(label));
+    }
+
+    /// sdBlockSave: run the page editor's own save from the
+    /// bottom bar. The editor overlay owns the edit state; the
+    /// save itself is App::save_page_edit — the identical code
+    /// path as the editor footer's 保存并发布新版本 — so the bump
+    /// rule, payload and follow-up refresh exist exactly once.
+    /// The overlay is taken out of the stack for the call (the
+    /// save needs &mut App while the state borrows it) and put
+    /// back when the editor must stay open.
+    fn deckbar_save_block(&mut self) {
+        let Some(pos) = self
+            .overlays
+            .iter()
+            .rposition(|o| matches!(o, Overlay::PageEdit(_)))
+        else {
+            return;
+        };
+        if !matches!(self.overlays.last(), Some(Overlay::PageEdit(_))) {
+            return; // a confirm dialog sits over the editor
+        }
+        let overlay = self.overlays.remove(pos);
+        let Overlay::PageEdit(pe) = &overlay else {
+            self.overlays.insert(pos, overlay);
+            return;
+        };
+        if !pe.dirty() || !self.save_page_edit(pe) {
+            self.overlays.insert(pos, overlay);
+        }
+    }
+
+    /// sdClose's label for the current state (prototype
+    /// updateBarAvail): None on the home page, where the button
+    /// greys out entirely.
+    fn deckbar_back_label(&self) -> Option<&'static str> {
+        match self.page {
+            Page::Home => None,
+            Page::Showroom => match self.showroom.stack.top() {
+                SrFrame::Deck(st) => Some(if st.preview_open {
+                    "返回稿件详情"
+                } else {
+                    "关闭条目详情"
+                }),
+                SrFrame::Wall => Some("回主页"),
+            },
+            Page::Content => match self.content.stack.top() {
+                ContentFrame::Unit(_) => Some("返回上一层"),
+                ContentFrame::Wall(_) => Some("回主页"),
+            },
+            Page::Index => match self.index.stack.top() {
+                IndexFrame::Overview(_) => Some("回主页"),
+                _ => Some("返回上一层"),
+            },
+            Page::Trash => match self.trash.stack.top() {
+                TrashFrame::Preview(_) => Some("返回上一层"),
+                TrashFrame::List(_) => Some("回主页"),
+            },
+            Page::Settings => {
+                if self
+                    .settings_sections()
+                    .get(self.settings.section)
+                    .copied()
+                    == Some("审批队列")
+                    && matches!(self.review.stack.top(), ReviewFrame::Detail(_))
+                {
+                    Some("返回上一层")
+                } else {
+                    Some("回主页")
+                }
+            }
+        }
+    }
+
+    /// sdClose's action: each page's own existing back path —
+    /// never a second mechanism. Drill frames close through the
+    /// same flags/pops their in-page back controls use; at a
+    /// page's root frame the button returns home (the prototype's
+    /// 回主页 state).
+    fn deckbar_back(&mut self) {
+        match self.page {
+            Page::Home => {}
+            Page::Showroom => {
+                if matches!(self.showroom.stack.top(), SrFrame::Deck(_)) {
+                    self.back_from_showroom_detail();
+                } else {
+                    self.navigate_to(Page::Home);
+                }
+            }
+            Page::Content => {
+                if let ContentFrame::Unit(st) = self.content.stack.top_mut() {
+                    st.closed = true;
+                    self.refresh_all();
+                } else {
+                    self.navigate_to(Page::Home);
+                }
+            }
+            Page::Index => {
+                // Tag first: acting on the frame must not happen
+                // while a stack borrow is alive.
+                let top = match self.index.stack.top() {
+                    IndexFrame::Detail(_) => 1,
+                    IndexFrame::Create(_) => 2,
+                    IndexFrame::Overview(_) => 0,
+                };
+                match top {
+                    1 => {
+                        if let IndexFrame::Detail(st) = self.index.stack.top_mut() {
+                            st.closed = true;
+                        }
+                    }
+                    2 => {
+                        if let IndexFrame::Create(st) = self.index.stack.top_mut() {
+                            st.closed = true;
+                        }
+                    }
+                    _ => self.navigate_to(Page::Home),
+                }
+            }
+            Page::Trash => {
+                if matches!(self.trash.stack.top(), TrashFrame::Preview(_)) {
+                    self.trash.stack.pop();
+                } else {
+                    self.navigate_to(Page::Home);
+                }
+            }
+            Page::Settings => {
+                if self
+                    .settings_sections()
+                    .get(self.settings.section)
+                    .copied()
+                    == Some("审批队列")
+                    && matches!(self.review.stack.top(), ReviewFrame::Detail(_))
+                {
+                    self.review.stack.pop();
+                } else {
+                    self.navigate_to(Page::Home);
+                }
+            }
+        }
+    }
+
+    /// sdDel's one wired context: delete the open content block
+    /// through the unit detail's own path (trash_add + close).
+    fn deckbar_delete_unit(&mut self) {
+        let uid = match self.content.stack.top() {
+            ContentFrame::Unit(st) => {
+                let unit = st.detail.get("unit").cloned().unwrap_or(json!({}));
+                s(&unit, "id")
+            }
+            _ => return,
+        };
+        if uid.is_empty() {
+            return;
+        }
+        if let ContentFrame::Unit(st) = self.content.stack.top_mut() {
+            st.closed = true;
+        }
+        self.trash_add("unit", &uid);
+    }
+
     fn page_footer(&mut self, ui: &mut egui::Ui) {
         egui::Panel::bottom("deck_bar")
             .exact_size(46.0)
@@ -439,29 +996,9 @@ impl App {
                         egui::FontId::proportional(11.5),
                         palette_color(TEXT_WEAK),
                     );
-                    if self.page == Page::Showroom
-                        && matches!(self.showroom.stack.top(), SrFrame::Deck(_))
-                    {
-                        if self.tool_slot(ui, false, "返回上一层", ChromeIcon::Back) {
-                            self.back_from_showroom_detail();
-                        }
-                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(22.0);
-                        for (label, url) in [
-                            (
-                                "内容索引规范",
-                                "https://github.com/lanline123/qimu/blob/main/docs/产品规格.md",
-                            ),
-                            ("帮助文档", "https://github.com/lanline123/qimu#readme"),
-                            ("项目主页", "https://github.com/lanline123/qimu"),
-                        ] {
-                            ui.hyperlink_to(
-                                egui::RichText::new(tr(label)).size(11.5).color(palette_color(TEXT_WEAK)),
-                                url,
-                            );
-                        }
-                        ui.label(egui::RichText::new(tr("社区")).size(11.5).strong());
+                        self.deckbar_actions(ui);
                     });
                 });
             });

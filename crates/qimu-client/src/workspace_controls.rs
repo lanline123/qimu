@@ -220,7 +220,36 @@ impl App {
             corner_radius: egui::CornerRadius::same(6),
             focus_stroke: egui::Stroke::new(1.0, ACCENT),
         };
-        if IconButton::new(tr("切换主题"), egui::vec2(29.0, 24.0), &style)
+        // The theme glyph is the one chrome icon with a large
+        // filled area (theme.svg's half-disc). Icon textures
+        // rasterize pure white (SvgStyle current_color #ffffff,
+        // painted on transparency by the egui_extras/resvg
+        // loader) and the draw tint multiplies through, so the
+        // shared style's ICON_TINT — which is TEXT_MAIN, pure
+        // white — renders the half-disc as a solid white block
+        // on the dark menu bar (the reported white background).
+        // The prototype's menu icons sit at a muted tone, so the
+        // theme button gets its own glyph colors: TEXT_WEAK at
+        // rest, brightening to TEXT_MAIN on hover. The glyph
+        // file and all other icons are unchanged.
+        let theme_hovered = ButtonVisuals {
+            fill: palette_color(PRESSED_BG),
+            stroke: egui::Stroke::NONE,
+            icon: palette_color(TEXT_MAIN),
+        };
+        let theme_style = IconButtonStyle {
+            normal: ButtonVisuals {
+                fill: egui::Color32::TRANSPARENT,
+                stroke: egui::Stroke::NONE,
+                icon: palette_color(TEXT_WEAK),
+            },
+            hovered: theme_hovered,
+            pressed: Some(theme_hovered),
+            selected: theme_hovered,
+            corner_radius: egui::CornerRadius::same(6),
+            focus_stroke: egui::Stroke::new(1.0, ACCENT),
+        };
+        if IconButton::new(tr("切换主题"), egui::vec2(29.0, 24.0), &theme_style)
             .show(ui, |ui, rect, tint| {
                 icons.paint(ui, ChromeIcon::Theme, rect.center(), 15.0, tint)
             })

@@ -36,6 +36,22 @@ pub(super) enum ChromeIcon {
     FolderPlus,
     Split,
     Clipboard,
+    Doc,
+    Globe,
+    Link,
+    Share,
+    Cache,
+    Thumbs,
+    Notes,
+    Eye,
+    Pdf,
+    PasteSplit,
+    PasteGroup,
+    CopyPpt,
+    Cut,
+    Combine,
+    BlockSave,
+    BlockPublish,
 }
 
 static SVG_ICONS: &[(&str, &[u8])] = &[
@@ -107,6 +123,40 @@ static SVG_ICONS: &[(&str, &[u8])] = &[
     ),
     ("split", include_bytes!("../assets/icons/split.svg")),
     ("clipboard", include_bytes!("../assets/icons/clipboard.svg")),
+    ("doc", include_bytes!("../assets/icons/doc.svg")),
+    ("globe", include_bytes!("../assets/icons/globe.svg")),
+    ("link", include_bytes!("../assets/icons/link.svg")),
+    ("share", include_bytes!("../assets/icons/share.svg")),
+    ("cache", include_bytes!("../assets/icons/cache.svg")),
+    (
+        "deck-thumbs",
+        include_bytes!("../assets/icons/deck-thumbs.svg"),
+    ),
+    (
+        "deck-notes",
+        include_bytes!("../assets/icons/deck-notes.svg"),
+    ),
+    ("eye", include_bytes!("../assets/icons/eye.svg")),
+    ("pdf", include_bytes!("../assets/icons/pdf.svg")),
+    (
+        "paste-split",
+        include_bytes!("../assets/icons/paste-split.svg"),
+    ),
+    (
+        "paste-group",
+        include_bytes!("../assets/icons/paste-group.svg"),
+    ),
+    ("copy-ppt", include_bytes!("../assets/icons/copy-ppt.svg")),
+    ("cut", include_bytes!("../assets/icons/cut.svg")),
+    ("combine", include_bytes!("../assets/icons/combine.svg")),
+    (
+        "block-save",
+        include_bytes!("../assets/icons/block-save.svg"),
+    ),
+    (
+        "block-publish",
+        include_bytes!("../assets/icons/block-publish.svg"),
+    ),
 ];
 static ICONS: std::sync::LazyLock<SvgIconSet> = std::sync::LazyLock::new(|| {
     SvgIconSet::new(
@@ -155,6 +205,22 @@ impl ChromeIcon {
             Self::FolderPlus => "folder-plus",
             Self::Split => "split",
             Self::Clipboard => "clipboard",
+            Self::Doc => "doc",
+            Self::Globe => "globe",
+            Self::Link => "link",
+            Self::Share => "share",
+            Self::Cache => "cache",
+            Self::Thumbs => "deck-thumbs",
+            Self::Notes => "deck-notes",
+            Self::Eye => "eye",
+            Self::Pdf => "pdf",
+            Self::PasteSplit => "paste-split",
+            Self::PasteGroup => "paste-group",
+            Self::CopyPpt => "copy-ppt",
+            Self::Cut => "cut",
+            Self::Combine => "combine",
+            Self::BlockSave => "block-save",
+            Self::BlockPublish => "block-publish",
         };
         egui::Image::new(ICONS.source(name))
             .fit_to_exact_size(egui::Vec2::splat(size))
@@ -207,7 +273,7 @@ impl ChromeIcons {
                 stroke: egui::Stroke::NONE,
                 icon: egui::Color32::WHITE,
             },
-            corner_radius: egui::CornerRadius::same(7),
+            corner_radius: egui::CornerRadius::same(6),
             focus_stroke: egui::Stroke::new(1.0, ACCENT),
         };
         let label = tr(label);
