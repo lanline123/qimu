@@ -84,7 +84,15 @@ impl App {
                 {
                     painter.line_segment([center, egui::pos2(center.x, rect.bottom())], stroke);
                 }
-                painter.circle_filled(center, 3.5, if is_selected { ACCENT } else { palette_color(TEXT_WEAK) });
+                painter.circle_filled(
+                    center,
+                    3.5,
+                    if is_selected {
+                        ACCENT
+                    } else {
+                        palette_color(TEXT_WEAK)
+                    },
+                );
                 if ui
                     .selectable_label(is_selected, s(commit, "message"))
                     .clicked()
@@ -105,7 +113,10 @@ impl App {
         }
         ui.add_space(8.0);
         let Some(commit) = selected.and_then(|index| commits.get(index)) else {
-            ui.label(egui::RichText::new("所选提交不在当前返回的记录中。").color(palette_color(TEXT_WEAK)));
+            ui.label(
+                egui::RichText::new("所选提交不在当前返回的记录中。")
+                    .color(palette_color(TEXT_WEAK)),
+            );
             return;
         };
         card_frame().show(ui, |ui| {
@@ -197,7 +208,8 @@ impl App {
                     ui.label(coordinate);
                     ui.label(format!("{} 页", i(record, "page_count")));
                     ui.label(
-                        egui::RichText::new(fmt_time(i(record, "created_ms"))).color(palette_color(TEXT_WEAK)),
+                        egui::RichText::new(fmt_time(i(record, "created_ms")))
+                            .color(palette_color(TEXT_WEAK)),
                     );
                     if ui.small_button("查看提交").clicked() {
                         *action = Some(IndexDetailAction::FocusCommit {

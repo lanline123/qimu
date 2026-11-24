@@ -30,7 +30,6 @@ pub(super) enum ChromeIcon {
     Download,
     Back,
     Refresh,
-    Power,
     Folder,
     FolderOpen,
     FolderPlus,
@@ -109,7 +108,6 @@ static SVG_ICONS: &[(&str, &[u8])] = &[
     ("download", include_bytes!("../assets/icons/download.svg")),
     ("back", include_bytes!("../assets/icons/back.svg")),
     ("refresh", include_bytes!("../assets/icons/refresh.svg")),
-    ("power", include_bytes!("../assets/icons/power.svg")),
     (
         "folder-close",
         include_bytes!("../assets/icons/folder-close.svg"),
@@ -201,7 +199,6 @@ impl ChromeIcon {
             Self::Download => "download",
             Self::Back => "back",
             Self::Refresh => "refresh",
-            Self::Power => "power",
             Self::Folder => "folder-close",
             Self::FolderOpen => "folder-open",
             Self::FolderPlus => "folder-plus",

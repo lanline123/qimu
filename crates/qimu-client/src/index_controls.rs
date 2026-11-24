@@ -1,4 +1,5 @@
 use super::*;
+use qimu_core::model::IndexEntry;
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum IndexStatus {
@@ -216,7 +217,7 @@ impl App {
                 if push {
                     let id = st.index_id.clone();
                     let title = s(&st.detail["index"], "name");
-                    self.submit_index_to_showroom(&id, &title);
+                    self.open_push_dialog(&id, &title);
                 }
             }
             tool_vsep(ui);
@@ -235,15 +236,26 @@ impl App {
     /// library (organization-side indexes) keeps the legacy
     /// reference submission for this cycle (design §8.3), as does
     /// the whole action while the local library is closed.
-    fn submit_index_to_showroom(&mut self, id: &str, title: &str) {
-        if !self.need_identity("提交到演示厅") {
+    pub(super) fn push_index_to_showroom(
+        &mut self,
+        id: &str,
+        title: &str,
+        published_tag_id: &str,
+        pinned_versions: &[(IndexEntry, String)],
+        note: &str,
+    ) {
+        if !self.require_org_online("推送到演示厅") {
+            return;
+        }
+        if !self.need_identity("推送到演示厅") {
             return;
         }
         if let Some(local) = &self.local {
-            match local.build_submission_package(id, "main") {
+            match local.build_submission_package(id, published_tag_id, pinned_versions) {
                 Some(Ok(mut body)) => {
                     body["title"] = json!(title);
-                    body["intro"] = json!("");
+                    body["intro"] = json!(note);
+                    body["note"] = json!(note);
                     body["source_index_id"] = json!(id);
                     if let Some(prev) = self.my_submissions.iter().find(|x| {
                         s(x, "source_index_id") == id && s(x, "state") == "rejected"
@@ -266,7 +278,12 @@ impl App {
         self.msg = match self.call(
             "POST",
             "/v1/showroom",
-            Some(json!({ "title": title, "intro": "", "source_index_id": id })),
+            Some(json!({
+                "title": title,
+                "intro": note,
+                "source_index_id": id,
+                "published_tag_id": published_tag_id,
+            })),
         ) {
             Ok(_) => "已提交，等待审核".into(),
             Err(error) => error,

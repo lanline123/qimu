@@ -5,26 +5,32 @@
 //! HTTP only when the user connects one.
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+mod account_menu;
 mod chrome_icons;
 mod index_controls;
-mod index_lineage;
 mod index_history;
-mod shell;
+mod index_lineage;
 mod page_editor;
+mod prototype_dialogs;
+mod server_menu;
+mod shell;
+mod workspace_controls;
 
 use page_editor::*;
-mod workspace_controls;
-mod local_store;
-mod local_render;
 #[allow(dead_code)] // T2 spike: hosted-show shell, no call sites yet
 mod hosted_show;
 mod hosted_audio;
+mod local_render;
+mod local_store;
+use prototype_dialogs::{PullDialogState, PushDialogState, ShareDialogState};
 
 use chrome_icons::{ChromeIcon, ChromeIcons};
 use index_controls::{IndexMoreAction, IndexOverviewControls, IndexScope};
 use index_lineage::IndexGraphs;
 use qimu_core::store::IndexGraph;
-use workspace_controls::{palette_color, query_component, WorkspaceControls, ENGLISH_UI, LIGHT_THEME};
+use workspace_controls::{
+    palette_color, query_component, WorkspaceControls, ENGLISH_UI, LIGHT_THEME,
+};
 
 use base64::Engine;
 use eframe::egui;
@@ -106,8 +112,8 @@ pub const ACCENT_DEEP: egui::Color32 = egui::Color32::from_rgb(0x5B, 0x8C, 0xFF)
 /// transparent over --bg).
 pub const CHROME: egui::Color32 = egui::Color32::from_rgb(0x0B, 0x0B, 0x0D);
 pub const APP_BG: egui::Color32 = egui::Color32::from_rgb(0x0B, 0x0B, 0x0D);
-pub const CARD_BG: egui::Color32 = egui::Color32::from_rgb(0x15, 0x15, 0x19);
-pub const CARD_BORDER: egui::Color32 = egui::Color32::from_rgb(0x28, 0x28, 0x30);
+pub const CARD_BG: egui::Color32 = egui::Color32::from_rgb(0x1B, 0x1B, 0x21);
+pub const CARD_BORDER: egui::Color32 = egui::Color32::from_rgb(0x38, 0x38, 0x42);
 /// 「我维护」 card fill (prototype --mine-bg): the panel bg mixed
 /// 10% toward the accent — #181E2F on the dark theme, mapped to
 /// #EAF0FE on the light theme by palette_color.
@@ -163,7 +169,11 @@ pub const PAGE_PAD_L: f32 = 22.0;
 
 fn apply_modern_style(ctx: &egui::Context) {
     let light = LIGHT_THEME.get();
-    ctx.set_theme(if light { egui::Theme::Light } else { egui::Theme::Dark });
+    ctx.set_theme(if light {
+        egui::Theme::Light
+    } else {
+        egui::Theme::Dark
+    });
     let mut style = (*ctx.global_style()).clone();
     let mut v = if light {
         egui::Visuals::light()
@@ -272,9 +282,10 @@ fn apply_modern_style(ctx: &egui::Context) {
         TextStyle::Small,
         FontId::new(11.0, FontFamily::Proportional),
     );
-    style
-        .text_styles
-        .insert(TextStyle::Monospace, FontId::new(12.0, FontFamily::Monospace));
+    style.text_styles.insert(
+        TextStyle::Monospace,
+        FontId::new(12.0, FontFamily::Monospace),
+    );
     style.spacing.item_spacing = egui::vec2(8.0, 5.0);
     style.spacing.button_padding = egui::vec2(10.0, 4.0);
     // Product floor (§8): desktop hit targets stay ≈28–30 high.
@@ -305,8 +316,8 @@ fn apply_modern_style(ctx: &egui::Context) {
     ctx.set_global_style(style);
 }
 
-/// The one standard card: the prototype's --panel surface over the
-/// --bg canvas, 1px --line hairline as the only finish, 6px radius
+/// The one standard card: a raised dark surface over the --bg
+/// canvas, 1px --line hairline as the only finish, 6px radius
 /// (the final tightening layer puts .std-card and every panel-class
 /// surface at 6px), NO shadow (the final .std-card rule sets
 /// box-shadow:none) — cover-first layout. Inner margin follows the
@@ -359,22 +370,28 @@ fn chip(ui: &mut egui::Ui, text: &str, fg: egui::Color32, bg: egui::Color32) {
 /// Status chips: the prototype's semantic pairs (fg over its *-soft
 /// bg; gray = --muted on --panel2).
 pub const CHIP_GREEN_FG: egui::Color32 = egui::Color32::from_rgb(0x3F, 0xAE, 0x74);
-pub const CHIP_GREEN_BG: egui::Color32 = egui::Color32::from_rgba_unmultiplied_const(0x3F, 0xAE, 0x74, 38);
+pub const CHIP_GREEN_BG: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(0x3F, 0xAE, 0x74, 38);
 pub const CHIP_ORANGE_FG: egui::Color32 = egui::Color32::from_rgb(0xE0, 0x91, 0x3A);
-pub const CHIP_ORANGE_BG: egui::Color32 = egui::Color32::from_rgba_unmultiplied_const(0xE0, 0x91, 0x3A, 36);
-pub const CHIP_BLUE_BG: egui::Color32 = egui::Color32::from_rgba_unmultiplied_const(0x5B, 0x8C, 0xFF, 41);
+pub const CHIP_ORANGE_BG: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(0xE0, 0x91, 0x3A, 36);
+pub const CHIP_BLUE_BG: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(0x5B, 0x8C, 0xFF, 41);
 pub const CHIP_GRAY_FG: egui::Color32 = TEXT_WEAK;
 pub const CHIP_GRAY_BG: egui::Color32 = egui::Color32::from_rgb(0x1D, 0x1D, 0x23);
 /// Danger pair — the prototype's --rose / --rose-soft.
 pub const ROSE: egui::Color32 = egui::Color32::from_rgb(0xFF, 0x72, 0x76);
-pub const ROSE_SOFT_BG: egui::Color32 = egui::Color32::from_rgba_unmultiplied_const(0xF2, 0x55, 0x5A, 36);
+pub const ROSE_SOFT_BG: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(0xF2, 0x55, 0x5A, 36);
 /// Accent-soft fill (prototype --accent-soft — the same value as
 /// SEL_BG): the .show-seg selected state and accent-tinted fills.
-pub const ACCENT_SOFT: egui::Color32 = egui::Color32::from_rgba_unmultiplied_const(0x2F, 0x6B, 0xF5, 41);
+pub const ACCENT_SOFT: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(0x2F, 0x6B, 0xF5, 41);
 /// Badge Bad tone: the prototype's --rose over its soft pair
 /// (identical values to ROSE / ROSE_SOFT_BG above).
 pub const BADGE_BAD_FG: egui::Color32 = ROSE;
-pub const BADGE_BAD_BG: egui::Color32 = egui::Color32::from_rgba_unmultiplied_const(0xF2, 0x55, 0x5A, 36);
+pub const BADGE_BAD_BG: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(0xF2, 0x55, 0x5A, 36);
 /// Solid danger button fill with white text.
 pub const DANGER_BG: egui::Color32 = egui::Color32::from_rgb(0xB9, 0x1C, 0x1C);
 
@@ -423,8 +440,7 @@ fn tree_row(
     size: f32,
 ) -> egui::Response {
     let width = ui.available_width();
-    let (rect, resp) =
-        ui.allocate_exact_size(egui::vec2(width, 28.0), egui::Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 28.0), egui::Sense::click());
     let painter = ui.painter();
     if selected {
         painter.rect_filled(rect, 6.0, palette_color(SEL_BG));
@@ -457,12 +473,14 @@ fn tree_row(
 /// --bottombar-h the prototype's content column reserves. The fill
 /// is the canvas fill used by the prototype's content column.
 fn body_frame() -> egui::Frame {
-    egui::Frame::NONE.fill(palette_color(APP_BG)).inner_margin(egui::Margin {
-        left: PAGE_PAD_L as i8,
-        right: 22,
-        top: 20,
-        bottom: 14,
-    })
+    egui::Frame::NONE
+        .fill(palette_color(APP_BG))
+        .inner_margin(egui::Margin {
+            left: PAGE_PAD_L as i8,
+            right: 22,
+            top: 20,
+            bottom: 14,
+        })
 }
 
 /// Local per-machine state lives under ~/.qimu: the saved server
@@ -505,7 +523,9 @@ fn save_client_settings(patch: Value) {
     let _ = std::fs::create_dir_all(&dir);
     let _ = craft_atomic::atomic_write(
         &dir.join("client-settings.json"),
-        serde_json::to_string_pretty(&cur).unwrap_or_default().as_bytes(),
+        serde_json::to_string_pretty(&cur)
+            .unwrap_or_default()
+            .as_bytes(),
     );
 }
 
@@ -647,7 +667,11 @@ fn dir_manifest(root: &std::path::Path) -> Vec<(String, u64)> {
                 if p.is_dir() {
                     walk(base, &p, out);
                 } else if let Ok(m) = e.metadata() {
-                    let rel = p.strip_prefix(base).unwrap_or(&p).to_string_lossy().into_owned();
+                    let rel = p
+                        .strip_prefix(base)
+                        .unwrap_or(&p)
+                        .to_string_lossy()
+                        .into_owned();
                     out.push((rel, m.len()));
                 }
             }
@@ -664,7 +688,11 @@ fn dir_manifest(root: &std::path::Path) -> Vec<(String, u64)> {
 /// configured a path themselves. If the copy cannot be verified, the old
 /// directory is kept and pinned as the configured path — nothing is lost.
 fn migrate_cache_dir_once() {
-    if client_settings().get("cache_dir").and_then(|v| v.as_str()).is_some() {
+    if client_settings()
+        .get("cache_dir")
+        .and_then(|v| v.as_str())
+        .is_some()
+    {
         return;
     }
     let legacy = legacy_cache_dir();
@@ -672,7 +700,9 @@ fn migrate_cache_dir_once() {
     if legacy == target || !legacy.is_dir() {
         return;
     }
-    let has_content = std::fs::read_dir(&legacy).map(|mut d| d.next().is_some()).unwrap_or(false);
+    let has_content = std::fs::read_dir(&legacy)
+        .map(|mut d| d.next().is_some())
+        .unwrap_or(false);
     if !has_content || target.join("index.json").exists() {
         return;
     }
@@ -759,8 +789,8 @@ fn key_hex(key: &[u8; 32]) -> String {
 }
 
 fn cache_key() -> Option<[u8; 32]> {
-    use aes_gcm::aead::OsRng;
     use aes_gcm::aead::rand_core::RngCore;
+    use aes_gcm::aead::OsRng;
     let dir = cache_dir();
     let path = dir.join("cache.key");
     if let Some(key) = read_key_file(&path) {
@@ -787,8 +817,8 @@ fn cache_key() -> Option<[u8; 32]> {
 }
 
 fn encrypt_bytes(key: &[u8; 32], plain: &[u8]) -> Option<Vec<u8>> {
-    use aes_gcm::aead::{Aead, OsRng};
     use aes_gcm::aead::rand_core::RngCore;
+    use aes_gcm::aead::{Aead, OsRng};
     use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
     let mut nonce = [0u8; 12];
@@ -915,10 +945,13 @@ fn dc_content_stamp(bytes: &[u8]) -> String {
 
 /// Device-local preference. Preserve explicit choices from the old settings file.
 fn load_dc_auto_quit() -> bool {
-    client_settings()["deckcraft_auto_quit"].as_bool().or_else(|| {
-        let text = std::fs::read_to_string(qimu_home().join("present.json")).ok()?;
-        serde_json::from_str::<Value>(&text).ok()?["auto_quit"].as_bool()
-    }).unwrap_or(false)
+    client_settings()["deckcraft_auto_quit"]
+        .as_bool()
+        .or_else(|| {
+            let text = std::fs::read_to_string(qimu_home().join("present.json")).ok()?;
+            serde_json::from_str::<Value>(&text).ok()?["auto_quit"].as_bool()
+        })
+        .unwrap_or(false)
 }
 
 /// One JSON-lines control connection to a DeckCraft instance.
@@ -931,10 +964,8 @@ struct DcControl {
 impl DcControl {
     fn connect(port: u16) -> std::io::Result<DcControl> {
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-        let stream = std::net::TcpStream::connect_timeout(
-            &addr,
-            std::time::Duration::from_millis(600),
-        )?;
+        let stream =
+            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(600))?;
         stream.set_read_timeout(Some(std::time::Duration::from_secs(3)))?;
         stream.set_write_timeout(Some(std::time::Duration::from_secs(3)))?;
         let _ = stream.set_nodelay(true);
@@ -1058,7 +1089,9 @@ fn save_cache_index(entries: &[Value]) {
     let _ = std::fs::create_dir_all(&dir);
     let _ = craft_atomic::atomic_write(
         &dir.join("index.json"),
-        serde_json::to_string_pretty(&json!(entries)).unwrap_or_default().as_bytes(),
+        serde_json::to_string_pretty(&json!(entries))
+            .unwrap_or_default()
+            .as_bytes(),
     );
 }
 
@@ -1080,7 +1113,9 @@ fn entry_label(e: &Value) -> String {
     let mut base = if pol.get("locked").is_some() {
         format!(
             "锁定 v{}",
-            e.get("locked_semver").and_then(|x| x.as_str()).unwrap_or("?")
+            e.get("locked_semver")
+                .and_then(|x| x.as_str())
+                .unwrap_or("?")
         )
     } else {
         "跟随最新".to_string()
@@ -1151,6 +1186,7 @@ enum Page {
     Index,
     Trash,
     Settings,
+    Messages,
 }
 
 /// Content page state. Only page-level fields live here: the
@@ -1273,8 +1309,15 @@ enum IndexFrame {
 enum IndexDetailAction {
     Reload,
     ChangeBranch(String),
-    FocusCommit { branch: String, id: String },
-    OpenGraphTarget { index: String, branch: String, commit: Option<String> },
+    FocusCommit {
+        branch: String,
+        id: String,
+    },
+    OpenGraphTarget {
+        index: String,
+        branch: String,
+        commit: Option<String>,
+    },
     Export(&'static str),
     Commit(Vec<Value>, &'static str),
     Insert(usize),
@@ -1516,7 +1559,7 @@ enum TrashFrame {
 
 #[derive(Default)]
 struct TrashListState {
-    filter: usize, // 0 all | 1 index | 2 unit | 3 showroom
+    filter: usize,                               // 0 all | 1 index | 2 unit | 3 showroom
     selected: std::collections::HashSet<String>, // trash row ids
 }
 
@@ -1701,10 +1744,7 @@ fn elwork_from_json(v: &Value) -> ElWork {
                                     RunWork {
                                         reset_style: false,
                                         text: s(r, "text"),
-                                        sz: st
-                                            .get("sz")
-                                            .and_then(|x| x.as_f64())
-                                            .map(|f| f as f32),
+                                        sz: st.get("sz").and_then(|x| x.as_f64()).map(|f| f as f32),
                                         b: st.get("b").and_then(|x| x.as_bool()),
                                         color: st
                                             .get("color")
@@ -1737,10 +1777,7 @@ fn elwork_from_json(v: &Value) -> ElWork {
         y: i(v, "y") as i64,
         cx: i(v, "cx") as i64,
         cy: i(v, "cy") as i64,
-        has_xfrm: v
-            .get("has_xfrm")
-            .and_then(|x| x.as_bool())
-            .unwrap_or(false),
+        has_xfrm: v.get("has_xfrm").and_then(|x| x.as_bool()).unwrap_or(false),
         media: v.get("media").and_then(|x| x.as_str()).map(str::to_string),
         paras,
         new_image: None,
@@ -1873,15 +1910,16 @@ impl PageEditState {
         if self.added_pages() > 0 || self.scripts != self.scripts_base {
             return true;
         }
-        if self.elems.iter().any(|(page, list)| self.elems_base.get(page) != Some(list)) {
+        if self
+            .elems
+            .iter()
+            .any(|(page, list)| self.elems_base.get(page) != Some(list))
+        {
             return true;
         }
-        self.work.iter().any(|(p, runs)| {
-            self.base
-                .get(p)
-                .map(|b| b != runs)
-                .unwrap_or(false)
-        })
+        self.work
+            .iter()
+            .any(|(p, runs)| self.base.get(p).map(|b| b != runs).unwrap_or(false))
     }
     /// The flat edit list for the save call: (page, run, new text)
     /// for every run whose working copy differs from the baseline.
@@ -1966,8 +2004,12 @@ impl PageEditState {
     /// descending, paragraph insertions ascending).
     fn page_ops(&self, only_page: Option<usize>) -> Vec<Value> {
         let mut out: Vec<Value> = Vec::new();
-        let mut pages: Vec<usize> = self.elems.keys().copied()
-            .filter(|&page| only_page.is_none_or(|only| only == page)).collect();
+        let mut pages: Vec<usize> = self
+            .elems
+            .keys()
+            .copied()
+            .filter(|&page| only_page.is_none_or(|only| only == page))
+            .collect();
         pages.sort_unstable();
         for p in pages {
             let w = &self.elems[&p];
@@ -2004,7 +2046,9 @@ impl PageEditState {
                     out.push(json!({"kind":"preset", "page":p, "el":ei, "preset":we.preset}));
                 }
                 if we.line_color != be.line_color {
-                    out.push(json!({"kind":"line_color", "page":p, "el":ei, "color":we.line_color}));
+                    out.push(
+                        json!({"kind":"line_color", "page":p, "el":ei, "color":we.line_color}),
+                    );
                 }
                 let common = we.paras.len().min(be.paras.len());
                 for pi in 0..common {
@@ -2071,20 +2115,18 @@ impl PageEditState {
     }
 }
 
-
 /// A millimetre field for an EMU value; returns the new EMU value on
 /// change. Focus gain raises `want_snapshot` (see the inspector's
 /// undo discipline).
-fn mm_field(
-    ui: &mut egui::Ui,
-    label: &str,
-    emu: i64,
-    want_snapshot: &mut bool,
-) -> Option<i64> {
+fn mm_field(ui: &mut egui::Ui, label: &str, emu: i64, want_snapshot: &mut bool) -> Option<i64> {
     let mut v = emu_mm(emu);
     let mut out = None;
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(label).size(11.5).color(palette_color(TEXT_FAINT)));
+        ui.label(
+            egui::RichText::new(label)
+                .size(11.5)
+                .color(palette_color(TEXT_FAINT)),
+        );
         let resp = ui.add(
             egui::DragValue::new(&mut v)
                 .speed(0.1)
@@ -2142,7 +2184,10 @@ fn page_edit_inspector(
             }
         );
         let indent = "　".repeat(el.parents().len());
-        if ui.selectable_label(pe.selection.contains(&idx), format!("{indent}{label}")).clicked() {
+        if ui
+            .selectable_label(pe.selection.contains(&idx), format!("{indent}{label}"))
+            .clicked()
+        {
             *sel_req = Some(Some(idx));
         }
     }
@@ -2233,12 +2278,19 @@ fn page_edit_inspector(
         }
         "text" | "shape" => {
             if let Some(preset) = &mut elw.preset {
-                let label = SHAPE_PRESETS.iter().find(|(key, _)| key == preset).map(|(_, label)| tr(label)).unwrap_or(preset);
+                let label = SHAPE_PRESETS
+                    .iter()
+                    .find(|(key, _)| key == preset)
+                    .map(|(_, label)| tr(label))
+                    .unwrap_or(preset);
                 egui::ComboBox::from_id_salt(("shape-preset", sel))
                     .selected_text(label.to_owned())
                     .show_ui(ui, |ui| {
                         for (key, label) in SHAPE_PRESETS {
-                            if ui.selectable_value(preset, (*key).into(), tr(label)).changed() {
+                            if ui
+                                .selectable_value(preset, (*key).into(), tr(label))
+                                .changed()
+                            {
                                 *want_snapshot = true;
                             }
                         }
@@ -2362,7 +2414,11 @@ fn page_edit_inspector(
         "line" => {
             ui.horizontal(|ui| {
                 ui.label(tr("线条颜色"));
-                let mut color = elw.line_color.as_deref().map(hex_color32).unwrap_or(egui::Color32::DARK_GRAY);
+                let mut color = elw
+                    .line_color
+                    .as_deref()
+                    .map(hex_color32)
+                    .unwrap_or(egui::Color32::DARK_GRAY);
                 if ui.color_edit_button_srgba(&mut color).changed() {
                     elw.line_color = Some(color32_hex(color));
                     *want_snapshot = true;
@@ -2541,6 +2597,7 @@ enum TranslateEvent {
 
 struct App {
     server: String,
+    current_server_name: String,
     username: String,
     password: String,
     token: Option<String>,
@@ -2548,6 +2605,7 @@ struct App {
     conns: Vec<Conn>,
     active: Option<usize>,
     add_url: String,
+    add_name: String,
     add_user: String,
     add_pass: String,
     discovered: Vec<Value>,
@@ -2684,6 +2742,9 @@ struct App {
     /// used to surface only as "see the console log"). None when
     /// the library opened fine.
     local_open_error: Option<String>,
+    share_dialog: Option<ShareDialogState>,
+    pull_dialog: Option<PullDialogState>,
+    push_dialog: Option<PushDialogState>,
 }
 
 enum ThumbState {
@@ -2829,7 +2890,8 @@ fn tr(source: &str) -> &str {
         return source;
     };
     let code = if ENGLISH_UI.get() { "en-us" } else { "zh-hans" };
-    i18n.from_code(code).map_or(source, |lang| i18n.t(lang, source))
+    i18n.from_code(code)
+        .map_or(source, |lang| i18n.t(lang, source))
 }
 
 fn icon_png(b64: &str) -> &'static [u8] {
@@ -2925,6 +2987,20 @@ fn conn_display_name(url: &str) -> String {
     }
 }
 
+fn fetch_server_name(url: &str) -> Result<String, String> {
+    let response = raw_call(url, None, "GET", "/health", None, true)?;
+    if response.get("status").and_then(Value::as_str) != Some("ok") {
+        return Err("服务器健康检查未通过".into());
+    }
+    response
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "服务器未返回名称，请尝试旧版本或手动填写".into())
+}
+
 fn load_conns() -> Vec<Conn> {
     let arr = std::fs::read_to_string(qimu_home().join("servers.json"))
         .ok()
@@ -2951,7 +3027,11 @@ fn load_conns() -> Vec<Conn> {
                     .map(|n| n.to_string())
                     .unwrap_or_else(|| conn_display_name(&url)),
                 url,
-                username: v.get("username").and_then(|u| u.as_str()).unwrap_or("").to_string(),
+                username: v
+                    .get("username")
+                    .and_then(|u| u.as_str())
+                    .unwrap_or("")
+                    .to_string(),
                 status: if anon {
                     ConnStatus::Anonymous // probed at startup like the rest
                 } else if token.is_some() {
@@ -3046,7 +3126,11 @@ fn raw_call(
             let text = r.into_string().unwrap_or_default();
             Err(serde_json::from_str::<Value>(&text)
                 .ok()
-                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(|s| s.to_string()))
+                .and_then(|v| {
+                    v.get("error")
+                        .and_then(|e| e.as_str())
+                        .map(|s| s.to_string())
+                })
                 .unwrap_or(text))
         }
         Err(e) => Err(format!("请求失败: {e}")),
@@ -3114,6 +3198,7 @@ impl App {
         let (dc_tx, dc_rx) = std::sync::mpsc::channel();
         let mut app = App {
             server: std::env::var("QIMU_SERVER").unwrap_or_else(|_| "http://127.0.0.1:8730".into()),
+            current_server_name: String::new(),
             username: std::env::var("QIMU_USERNAME").unwrap_or_else(|_| "admin".into()),
             password: std::env::var("QIMU_PASSWORD").unwrap_or_default(),
             token: None,
@@ -3121,6 +3206,7 @@ impl App {
             conns: vec![],
             active: None,
             add_url: String::new(),
+            add_name: String::new(),
             add_user: String::new(),
             add_pass: String::new(),
             discovered: vec![],
@@ -3211,6 +3297,9 @@ impl App {
             about_open: false,
             local,
             local_open_error,
+            share_dialog: None,
+            pull_dialog: None,
+            push_dialog: None,
         };
         if std::env::var("QIMU_AUTOLOGIN").is_ok() && !app.password.is_empty() {
             app.do_login();
@@ -3241,6 +3330,10 @@ impl App {
                 // Screenshot/test hook: run one LAN scan up front.
                 app.discovered = discover_servers();
             }
+        }
+        if app.active.is_none() {
+            app.current_server_name =
+                fetch_server_name(&app.server).unwrap_or_else(|_| conn_display_name(&app.server));
         }
         // Screenshot/test hooks that need a logged-in app, on either
         // start path: QIMU_OPEN=showroom:<item-id> opens the deck view;
@@ -3281,12 +3374,7 @@ impl App {
                         if let Some(data) = v.get("data_base64").and_then(|x| x.as_str()) {
                             if let Ok(bytes) = b64d(data) {
                                 let pages = i(&v, "page_count");
-                                app.cache_deck(
-                                    &format!("sr_{item_id}"),
-                                    &title,
-                                    &bytes,
-                                    pages,
-                                );
+                                app.cache_deck(&format!("sr_{item_id}"), &title, &bytes, pages);
                             }
                         }
                     }
@@ -3306,6 +3394,26 @@ impl App {
                     {
                         app.open_showroom_deck(&item);
                     }
+                }
+            }
+            if let Ok(dialog) = std::env::var("QIMU_DIALOG") {
+                match dialog.as_str() {
+                    "share" => {
+                        if let Some(item) = app.showroom_live.first().cloned() {
+                            app.open_share_dialog(&item);
+                        }
+                    }
+                    "pull" => {
+                        if let Some(item) = app.showroom_live.first().cloned() {
+                            app.open_pull_dialog(&item, None);
+                        }
+                    }
+                    "push" => {
+                        if let Some(index) = app.indexes.first() {
+                            app.open_push_dialog(&s(index, "id"), &s(index, "name"));
+                        }
+                    }
+                    _ => {}
                 }
             }
             if let Ok(att_id) = std::env::var("QIMU_PDF_PREVIEW") {
@@ -3362,7 +3470,14 @@ impl App {
     }
 
     fn call(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
-        raw_call(&self.server, self.token.as_deref(), method, path, body, false)
+        raw_call(
+            &self.server,
+            self.token.as_deref(),
+            method,
+            path,
+            body,
+            false,
+        )
     }
 
     /// Working-data call (local-first P1/P4): the working-data
@@ -3402,26 +3517,31 @@ impl App {
         );
         match r {
             Ok(v) => {
-                self.token = v.get("token").and_then(|t| t.as_str()).map(|s| s.to_string());
+                self.token = v
+                    .get("token")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.to_string());
                 self.user = v.get("user").cloned();
                 self.msg = "登录成功".into();
                 self.login_open = false;
                 // Persist this server as a saved connection so the next
                 // start goes straight in.
                 let url = self.server.clone();
+                let name = fetch_server_name(&url).unwrap_or_else(|_| conn_display_name(&url));
                 let idx = match self
                     .conns
                     .iter()
                     .position(|c| c.url == url && c.username == self.username)
                 {
                     Some(i) => {
+                        self.conns[i].name = name;
                         self.conns[i].token = self.token.clone();
                         self.conns[i].status = ConnStatus::Connected;
                         i
                     }
                     None => {
                         self.conns.push(Conn {
-                            name: conn_display_name(&url),
+                            name,
                             url,
                             username: self.username.clone(),
                             token: self.token.clone(),
@@ -3474,13 +3594,12 @@ impl App {
                 // (org-model G1), so guest reads carry the
                 // session. Identity decisions never key on this
                 // field — the connection's anon flag is the key.
-                self.token = if c.status == ConnStatus::Connected
-                    || c.status == ConnStatus::Anonymous
-                {
-                    c.token.clone()
-                } else {
-                    None
-                };
+                self.token =
+                    if c.status == ConnStatus::Connected || c.status == ConnStatus::Anonymous {
+                        c.token.clone()
+                    } else {
+                        None
+                    };
                 return;
             }
         }
@@ -3595,13 +3714,10 @@ impl App {
         let pick = saved
             .as_deref()
             .and_then(|u| {
-                self.conns
-                    .iter()
-                    .position(|c| {
-                        c.url == u
-                            && (c.status == ConnStatus::Connected
-                                || c.status == ConnStatus::Anonymous)
-                    })
+                self.conns.iter().position(|c| {
+                    c.url == u
+                        && (c.status == ConnStatus::Connected || c.status == ConnStatus::Anonymous)
+                })
             })
             .or_else(|| {
                 self.conns
@@ -3627,6 +3743,32 @@ impl App {
         }
     }
 
+    fn fetch_add_server_name(&mut self) {
+        let url = normalize_url(&self.add_url);
+        if url.is_empty() {
+            self.msg = "请先填写服务器地址".into();
+            return;
+        }
+        match fetch_server_name(&url) {
+            Ok(name) => {
+                self.add_name = name.clone();
+                self.msg = format!("已获取服务器名称：{name}");
+            }
+            Err(error) => self.msg = format!("获取服务器名称失败：{error}"),
+        }
+    }
+
+    fn server_name_for_add(&mut self, url: &str) -> String {
+        let custom = self.add_name.trim();
+        if !custom.is_empty() {
+            return custom.to_string();
+        }
+        match fetch_server_name(url) {
+            Ok(name) => name,
+            Err(_) => conn_display_name(url),
+        }
+    }
+
     /// Settings → 添加服务器： log in against the typed address and, on
     /// success, save + activate the new connection.
     fn add_server_login(&mut self) {
@@ -3645,20 +3787,25 @@ impl App {
             false,
         ) {
             Ok(v) => {
-                let token = v.get("token").and_then(|t| t.as_str()).map(|s| s.to_string());
+                let token = v
+                    .get("token")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.to_string());
+                let name = self.server_name_for_add(&url);
                 let idx = match self
                     .conns
                     .iter()
                     .position(|c| c.url == url && c.username == username)
                 {
                     Some(i) => {
+                        self.conns[i].name = name;
                         self.conns[i].token = token;
                         self.conns[i].status = ConnStatus::Connected;
                         i
                     }
                     None => {
                         self.conns.push(Conn {
-                            name: conn_display_name(&url),
+                            name,
                             url,
                             username,
                             token,
@@ -3686,11 +3833,17 @@ impl App {
     /// pre-guest-surface) server is reported, not silently
     /// "connected".
     fn activate_anonymous(&mut self, url: &str) -> bool {
+        self.activate_anonymous_named(url, None)
+    }
+
+    fn activate_anonymous_named(&mut self, url: &str, name: Option<String>) -> bool {
         let url = normalize_url(url);
         if url.is_empty() {
             self.msg = "请先填写服务器地址".into();
             return false;
         }
+        let name = name
+            .unwrap_or_else(|| fetch_server_name(&url).unwrap_or_else(|_| conn_display_name(&url)));
         // Org-model G1: entering anonymously takes a real guest
         // session from the server (POST /v1/auth/guest) — the
         // token is what the reads ride on, and what makes the
@@ -3706,6 +3859,7 @@ impl App {
         }
         let idx = match self.conns.iter().position(|c| c.url == url && c.anon) {
             Some(i) => {
+                self.conns[i].name = name;
                 self.conns[i].status = ConnStatus::Anonymous;
                 if issued.is_some() {
                     self.conns[i].token = issued.clone();
@@ -3714,7 +3868,7 @@ impl App {
             }
             None => {
                 self.conns.push(Conn {
-                    name: conn_display_name(&url),
+                    name,
                     url: url.clone(),
                     username: String::new(),
                     token: issued.clone(),
@@ -3760,7 +3914,8 @@ impl App {
             self.msg = "请填写服务器地址".into();
             return;
         }
-        self.activate_anonymous(&url);
+        let name = self.server_name_for_add(&url);
+        self.activate_anonymous_named(&url, Some(name));
     }
 
     fn start_discovery(&mut self) {
@@ -3775,11 +3930,42 @@ impl App {
         });
     }
 
+    fn disconnect_conn(&mut self, i: usize) {
+        let Some(conn) = self.conns.get(i) else {
+            return;
+        };
+        if let Some(token) = conn.token.as_deref() {
+            let _ = raw_call(
+                &conn.url,
+                Some(token),
+                "POST",
+                "/v1/auth/logout",
+                None,
+                true,
+            );
+        }
+        let name = conn.name.clone();
+        if let Some(conn) = self.conns.get_mut(i) {
+            conn.token = None;
+            conn.status = ConnStatus::LoggedOut;
+        }
+        if self.active == Some(i) {
+            self.token = None;
+            self.user = None;
+            self.clear_account_state();
+        }
+        self.persist_conns();
+        self.msg = format!("已断开服务器 {name}（保存的地址保留）");
+    }
+
     fn active_server_label(&self) -> String {
         if let Some(i) = self.active {
             if let Some(c) = self.conns.get(i) {
                 return c.name.clone();
             }
+        }
+        if !self.current_server_name.is_empty() {
+            return self.current_server_name.clone();
         }
         conn_display_name(&self.server)
     }
@@ -3892,6 +4078,7 @@ impl App {
 
     /// Drop every server-scoped list tied to the previous identity.
     fn clear_account_state(&mut self) {
+        self.settings.profile.clear();
         self.folders.clear();
         self.groups.clear();
         self.units.clear();
@@ -3988,12 +4175,20 @@ impl App {
             self.org = v;
         }
         if let Ok(v) = self.call("GET", "/v1/showroom?state=live", None) {
-            self.showroom_live = v.get("items").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+            self.showroom_live = v
+                .get("items")
+                .and_then(|f| f.as_array())
+                .cloned()
+                .unwrap_or_default();
             self.index_covers.retain(|_, v| !v.is_empty());
             self.resolve_showroom_covers();
         }
         if let Ok(v) = self.call("GET", "/v1/showroom?state=pending", None) {
-            self.showroom_pending = v.get("items").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+            self.showroom_pending = v
+                .get("items")
+                .and_then(|f| f.as_array())
+                .cloned()
+                .unwrap_or_default();
         }
         // P3 submission chain (design §6.3): the approval queue
         // also counts real-byte submissions, and the signed-in
@@ -4019,16 +4214,32 @@ impl App {
             self.cache_policy = v;
         }
         if let Ok(v) = self.call("GET", "/v1/shares/inbox", None) {
-            self.inbox = v.get("shares").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+            self.inbox = v
+                .get("shares")
+                .and_then(|f| f.as_array())
+                .cloned()
+                .unwrap_or_default();
         }
         if let Ok(v) = self.call("GET", "/v1/group-space", None) {
-            self.group_spaces = v.get("spaces").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+            self.group_spaces = v
+                .get("spaces")
+                .and_then(|f| f.as_array())
+                .cloned()
+                .unwrap_or_default();
         }
         if let Ok(v) = self.call("GET", "/v1/custom-groups", None) {
-            self.my_teams = v.get("groups").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+            self.my_teams = v
+                .get("groups")
+                .and_then(|f| f.as_array())
+                .cloned()
+                .unwrap_or_default();
         }
         if let Ok(v) = self.call("GET", "/v1/library", None) {
-            self.library_refs = v.get("entries").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+            self.library_refs = v
+                .get("entries")
+                .and_then(|f| f.as_array())
+                .cloned()
+                .unwrap_or_default();
         }
         self.cache_entries = load_cache_index();
         if let Ok(v) = self.call("GET", "/v1/me", None) {
@@ -4087,33 +4298,56 @@ impl App {
         }
         if self.content.import_group.is_empty() {
             if let Some(g) = self.groups.first() {
-                self.content.import_group =
-                    g.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                self.content.import_group = g
+                    .get("id")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
             }
         }
     }
 
     fn refresh_all_rest(&mut self) {
         if let Ok(v) = self.call("GET", "/v1/folders", None) {
-            self.folders = v.get("folders").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+            self.folders = v
+                .get("folders")
+                .and_then(|f| f.as_array())
+                .cloned()
+                .unwrap_or_default();
         }
         if let Ok(v) = self.call("GET", "/v1/groups", None) {
-            self.groups = v.get("groups").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+            self.groups = v
+                .get("groups")
+                .and_then(|f| f.as_array())
+                .cloned()
+                .unwrap_or_default();
         }
         if let Ok(v) = self.call("GET", "/v1/units", None) {
-            self.units = v.get("units").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+            self.units = v
+                .get("units")
+                .and_then(|f| f.as_array())
+                .cloned()
+                .unwrap_or_default();
         }
         if let Ok(v) = self.call("GET", "/v1/indexes", None) {
             if let IndexFrame::Overview(overview) = self.index.stack.root_mut() {
                 overview.graphs = None;
             }
-            self.indexes = v.get("indexes").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+            self.indexes = v
+                .get("indexes")
+                .and_then(|f| f.as_array())
+                .cloned()
+                .unwrap_or_default();
         }
         if let Ok(v) = self.call("GET", "/v1/org", None) {
             self.org = v;
         }
         if let Ok(v) = self.call("GET", "/v1/showroom?state=live", None) {
-            self.showroom_live = v.get("items").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+            self.showroom_live = v
+                .get("items")
+                .and_then(|f| f.as_array())
+                .cloned()
+                .unwrap_or_default();
             // A guest pass earlier in this session may have parked
             // empty placeholders for covers it could not resolve;
             // a named session re-resolves instead of inheriting
@@ -4148,7 +4382,11 @@ impl App {
             }
         }
         if let Ok(v) = self.call("GET", "/v1/showroom?state=pending", None) {
-            self.showroom_pending = v.get("items").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+            self.showroom_pending = v
+                .get("items")
+                .and_then(|f| f.as_array())
+                .cloned()
+                .unwrap_or_default();
         }
         // P3 submission chain (design §6.3): the approval queue
         // also counts real-byte submissions, and the signed-in
@@ -4174,16 +4412,32 @@ impl App {
             self.cache_policy = v;
         }
         if let Ok(v) = self.call("GET", "/v1/shares/inbox", None) {
-            self.inbox = v.get("shares").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+            self.inbox = v
+                .get("shares")
+                .and_then(|f| f.as_array())
+                .cloned()
+                .unwrap_or_default();
         }
         if let Ok(v) = self.call("GET", "/v1/group-space", None) {
-            self.group_spaces = v.get("spaces").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+            self.group_spaces = v
+                .get("spaces")
+                .and_then(|f| f.as_array())
+                .cloned()
+                .unwrap_or_default();
         }
         if let Ok(v) = self.call("GET", "/v1/custom-groups", None) {
-            self.my_teams = v.get("groups").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+            self.my_teams = v
+                .get("groups")
+                .and_then(|f| f.as_array())
+                .cloned()
+                .unwrap_or_default();
         }
         if let Ok(v) = self.call("GET", "/v1/library", None) {
-            self.library_refs = v.get("entries").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+            self.library_refs = v
+                .get("entries")
+                .and_then(|f| f.as_array())
+                .cloned()
+                .unwrap_or_default();
         }
         self.cache_entries = load_cache_index();
         if let Ok(v) = self.call("GET", "/v1/me", None) {
@@ -4242,8 +4496,11 @@ impl App {
         }
         if self.content.import_group.is_empty() {
             if let Some(g) = self.groups.first() {
-                self.content.import_group =
-                    g.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                self.content.import_group = g
+                    .get("id")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
             }
         }
     }
@@ -4306,9 +4563,7 @@ impl App {
                 st.bindings = self
                     .call_work("GET", &format!("/v1/units/{unit_id}/page-bindings"), None)
                     .ok()
-                    .and_then(|b| {
-                        b.get("bindings").and_then(|x| x.as_array()).cloned()
-                    })
+                    .and_then(|b| b.get("bindings").and_then(|x| x.as_array()).cloned())
                     .unwrap_or_default();
                 // Opening replaces the drill-down, as the single
                 // detail slot did: reset to the wall, then push.
@@ -4424,7 +4679,11 @@ impl App {
         if let Some(tex) = &tex {
             let size = tex.size_vec2();
             let w = 620.0f32.min(size.x);
-            let h = if size.x > 0.0 { size.y * (w / size.x) } else { 0.0 };
+            let h = if size.x > 0.0 {
+                size.y * (w / size.x)
+            } else {
+                0.0
+            };
             ui.image((tex.id(), egui::vec2(w, h)));
         }
         let mut delta: Option<isize> = None;
@@ -4466,7 +4725,11 @@ impl App {
     fn attachments_ui(&mut self, ui: &mut egui::Ui, parent_type: &str, parent_id: &str) {
         ui.add_space(10.0);
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("附件").strong().color(palette_color(TEXT_MAIN)));
+            ui.label(
+                egui::RichText::new("附件")
+                    .strong()
+                    .color(palette_color(TEXT_MAIN)),
+            );
             if ui.small_button("＋ 添加附件").clicked() {
                 if let Some(path) = rfd::FileDialog::new().pick_file() {
                     let filename = path
@@ -4531,15 +4794,12 @@ impl App {
                                 .to_string();
                             match b64d(&b64) {
                                 Ok(bytes) => {
-                                    if let Some(path) = rfd::FileDialog::new()
-                                        .set_file_name(&filename)
-                                        .save_file()
+                                    if let Some(path) =
+                                        rfd::FileDialog::new().set_file_name(&filename).save_file()
                                     {
                                         match craft_atomic::atomic_write(&path, &bytes) {
                                             Ok(()) => self.msg = "附件已保存".into(),
-                                            Err(e) => {
-                                                self.msg = format!("保存失败：{e}")
-                                            }
+                                            Err(e) => self.msg = format!("保存失败：{e}"),
                                         }
                                     }
                                 }
@@ -4550,8 +4810,7 @@ impl App {
                     }
                 }
             });
-            if self.pdf_view.as_ref().map(|v| v.att_id.as_str()) == Some(s(att, "id").as_str())
-            {
+            if self.pdf_view.as_ref().map(|v| v.att_id.as_str()) == Some(s(att, "id").as_str()) {
                 self.pdf_preview_ui(ui);
             }
         }
@@ -4579,7 +4838,11 @@ impl App {
         } else {
             st.branch.clone()
         };
-        match self.call_work("GET", &format!("/v1/indexes/{index_id}?branch={}", query_component(&b)), None) {
+        match self.call_work(
+            "GET",
+            &format!("/v1/indexes/{index_id}?branch={}", query_component(&b)),
+            None,
+        ) {
             Ok(v) => st.detail = v,
             Err(e) => {
                 self.msg = format!("打开索引失败：{e}");
@@ -4622,7 +4885,11 @@ impl App {
             ),
             _ => return,
         };
-        match self.call_work("GET", &format!("/v1/indexes/{id}?branch={}", query_component(&branch)), None) {
+        match self.call_work(
+            "GET",
+            &format!("/v1/indexes/{id}?branch={}", query_component(&branch)),
+            None,
+        ) {
             Ok(v) => {
                 if let IndexFrame::Overview(overview) = self.index.stack.root_mut() {
                     overview.graphs = None;
@@ -4642,7 +4909,11 @@ impl App {
             return;
         };
         let id = st.index_id.clone();
-        match self.call_work("GET", &format!("/v1/indexes/{id}?branch={}", query_component(&branch)), None) {
+        match self.call_work(
+            "GET",
+            &format!("/v1/indexes/{id}?branch={}", query_component(&branch)),
+            None,
+        ) {
             Ok(detail) => {
                 if let IndexFrame::Detail(st) = self.index.stack.top_mut() {
                     st.branch = branch;
@@ -4714,7 +4985,10 @@ impl App {
         let commits = self
             .call_work(
                 "GET",
-                &format!("/v1/indexes/{id}/commits?branch={}", query_component(&branch)),
+                &format!(
+                    "/v1/indexes/{id}/commits?branch={}",
+                    query_component(&branch)
+                ),
                 None,
             )
             .ok();
@@ -4962,10 +5236,7 @@ impl App {
     /// Grid-end add card on the content page: blank block, or a block
     /// whose first version is pasted in from PowerPoint.
     fn content_add_card(&mut self, ui: &mut egui::Ui, card_w: f32, card_h: f32) {
-        let (rect, resp) = ui.allocate_exact_size(
-            egui::vec2(card_w, card_h),
-            egui::Sense::click(),
-        );
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(card_w, card_h), egui::Sense::click());
         ui.painter().rect_stroke(
             rect,
             6.0,
@@ -4977,8 +5248,16 @@ impl App {
         ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(64.0);
-                ui.label(egui::RichText::new("+").size(34.0).color(palette_color(TEXT_FAINT)));
-                ui.label(egui::RichText::new("新建内容块").size(13.0).color(palette_color(TEXT_WEAK)));
+                ui.label(
+                    egui::RichText::new("+")
+                        .size(34.0)
+                        .color(palette_color(TEXT_FAINT)),
+                );
+                ui.label(
+                    egui::RichText::new("新建内容块")
+                        .size(13.0)
+                        .color(palette_color(TEXT_WEAK)),
+                );
                 ui.add_space(14.0);
                 ui.horizontal(|ui| {
                     let w = ui.available_width();
@@ -5056,13 +5335,15 @@ impl App {
             .ok()
             .map(std::path::PathBuf::from)
             .filter(|p| p.exists())
-            .or_else(|| match qimu_bridge::platform_bridge().capture_copied_slides() {
-                Ok(p) => p,
-                Err(e) => {
-                    self.msg = format!("无法读取 PowerPoint 剪贴板：{e}");
-                    None
-                }
-            });
+            .or_else(
+                || match qimu_bridge::platform_bridge().capture_copied_slides() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        self.msg = format!("无法读取 PowerPoint 剪贴板：{e}");
+                        None
+                    }
+                },
+            );
         let Some(path) = frag else {
             self.msg = "先在 PowerPoint 里复制页面，再点「粘贴 PPT 页新建」".into();
             return;
@@ -5071,8 +5352,7 @@ impl App {
             self.msg = "读取粘贴片段失败".into();
             return;
         };
-        if let Some(uid) =
-            self.publish_bytes_as_unit(&bytes, "未命名内容块", "剪贴板粘贴新建")
+        if let Some(uid) = self.publish_bytes_as_unit(&bytes, "未命名内容块", "剪贴板粘贴新建")
         {
             self.msg = "已粘贴新建内容块".into();
             self.refresh_all();
@@ -5084,12 +5364,7 @@ impl App {
     /// as its first version. Shared by 粘贴新建 and every clipboard
     /// paste path. Returns the new unit id; failures land in
     /// `self.msg`.
-    fn publish_bytes_as_unit(
-        &mut self,
-        bytes: &[u8],
-        name: &str,
-        note: &str,
-    ) -> Option<String> {
+    fn publish_bytes_as_unit(&mut self, bytes: &[u8], name: &str, note: &str) -> Option<String> {
         let created = self.call_work(
             "POST",
             "/v1/units",
@@ -5192,8 +5467,9 @@ impl App {
                 self.msg = format!("已复制 {pages} 页到 PPT 剪贴板（可直接粘贴到 PowerPoint）")
             }
             Ok(false) => {
-                self.msg =
-                    format!("已复制 {pages} 页到 PPT 剪贴板（PowerPoint 未运行，未同步到系统剪贴板）")
+                self.msg = format!(
+                    "已复制 {pages} 页到 PPT 剪贴板（PowerPoint 未运行，未同步到系统剪贴板）"
+                )
             }
             Err(e) => {
                 self.msg = format!("已复制 {pages} 页到 PPT 剪贴板（同步到 PowerPoint 失败：{e}）")
@@ -5311,7 +5587,9 @@ impl App {
 
     fn unit_latest_version_id(&self, uid: &str) -> Option<String> {
         for item in &self.units {
-            let Some(unit) = item.get("unit") else { continue };
+            let Some(unit) = item.get("unit") else {
+                continue;
+            };
             if s(unit, "id") != uid {
                 continue;
             }
@@ -5327,7 +5605,9 @@ impl App {
 
     fn unit_lead_rendition(&self, uid: &str) -> Option<String> {
         for item in &self.units {
-            let Some(unit) = item.get("unit") else { continue };
+            let Some(unit) = item.get("unit") else {
+                continue;
+            };
             if s(unit, "id") != uid {
                 continue;
             }
@@ -5392,7 +5672,11 @@ impl App {
     /// Cut sends each source block to the recycle bin (回收站) —
     /// only after the clipboard holds its pages.
     fn clip_copy_units(&mut self, unit_ids: &[String], cut: bool) {
-        let what = if cut { "剪切内容块" } else { "复制内容块" };
+        let what = if cut {
+            "剪切内容块"
+        } else {
+            "复制内容块"
+        };
         if !self.need_identity_local(what) {
             return;
         }
@@ -5508,9 +5792,7 @@ impl App {
                     self.msg = format!("已剪切 {} 页（原内容块已发布新版本）", pages.len());
                     self.refresh_all();
                 }
-                Err(e) => {
-                    self.msg = format!("页面已复制到剪贴板，但源块发布新版本失败：{e}")
-                }
+                Err(e) => self.msg = format!("页面已复制到剪贴板，但源块发布新版本失败：{e}"),
             },
             Err(e) => self.msg = format!("剪切失败：{e}"),
         }
@@ -5567,11 +5849,7 @@ impl App {
                 }
             }
         }
-        let group_id = self
-            .groups
-            .first()
-            .map(|g| s(g, "id"))
-            .unwrap_or_default();
+        let group_id = self.groups.first().map(|g| s(g, "id")).unwrap_or_default();
         let name = format!(
             "{} 等 {} 个内容块索引",
             self.unit_name(&unit_ids[0]),
@@ -5605,9 +5883,7 @@ impl App {
         }
         ui.horizontal_wrapped(|ui| {
             if !multi.is_empty() {
-                ui.label(
-                    egui::RichText::new(format!("已选 {} 个内容块", multi.len())).strong(),
-                );
+                ui.label(egui::RichText::new(format!("已选 {} 个内容块", multi.len())).strong());
                 if ui.small_button("复制").clicked() {
                     self.clip_copy_units(&multi, false);
                 }
@@ -5631,9 +5907,7 @@ impl App {
                 if !multi.is_empty() {
                     ui.separator();
                 }
-                ui.label(
-                    egui::RichText::new(format!("PPT 剪贴板 · {clip_pages} 页")).strong(),
-                );
+                ui.label(egui::RichText::new(format!("PPT 剪贴板 · {clip_pages} 页")).strong());
                 if ui.small_button("逐页成块粘贴").clicked() {
                     self.clip_paste(true);
                 }
@@ -5647,13 +5921,15 @@ impl App {
         });
         ui.add_space(6.0);
     }
-
 }
 
 // ---------------- UI ----------------
 
 fn s(v: &Value, key: &str) -> String {
-    v.get(key).and_then(|x| x.as_str()).unwrap_or("").to_string()
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 fn i(v: &Value, key: &str) -> i64 {
@@ -5667,7 +5943,11 @@ fn i(v: &Value, key: &str) -> i64 {
 fn tool_vsep(ui: &mut egui::Ui) {
     ui.add_space(5.0);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(1.0, 18.0), egui::Sense::hover());
-    ui.painter().vline(rect.center().x, rect.y_range(), egui::Stroke::new(1.0, palette_color(LINE_34)));
+    ui.painter().vline(
+        rect.center().x,
+        rect.y_range(),
+        egui::Stroke::new(1.0, palette_color(LINE_34)),
+    );
     ui.add_space(5.0);
 }
 
@@ -5717,7 +5997,9 @@ fn home_recent_row(ui: &mut egui::Ui, columns: [&str; 4], interactive: bool) -> 
 
 fn showroom_columns(ui: &egui::Ui, minimum_width: f32) -> (usize, f32) {
     let available = ui.available_width();
-    let columns = ((available + 12.0) / (minimum_width + 12.0)).floor().max(1.0) as usize;
+    let columns = ((available + 12.0) / (minimum_width + 12.0))
+        .floor()
+        .max(1.0) as usize;
     let width = ((available + 12.0) / columns as f32 - 12.0).floor();
     (columns, width.max(1.0))
 }
@@ -5751,19 +6033,27 @@ fn btn_default(ui: &mut egui::Ui, label: &str) -> egui::Response {
 fn btn_default_enabled(ui: &mut egui::Ui, enabled: bool, label: &str) -> egui::Response {
     ui.add_enabled(
         enabled,
-        egui::Button::new(egui::RichText::new(label).size(12.5).color(palette_color(TEXT_MAIN)))
-            .fill(palette_color(BTN_BG))
-            .corner_radius(6)
-            .min_size(egui::vec2(0.0, 28.0)),
+        egui::Button::new(
+            egui::RichText::new(label)
+                .size(12.5)
+                .color(palette_color(TEXT_MAIN)),
+        )
+        .fill(palette_color(BTN_BG))
+        .corner_radius(6)
+        .min_size(egui::vec2(0.0, 28.0)),
     )
 }
 
 fn btn_danger(ui: &mut egui::Ui, label: &str) -> egui::Response {
     ui.add(
-        egui::Button::new(egui::RichText::new(label).size(12.5).color(egui::Color32::WHITE))
-            .fill(DANGER_BG)
-            .corner_radius(6)
-            .min_size(egui::vec2(0.0, 28.0)),
+        egui::Button::new(
+            egui::RichText::new(label)
+                .size(12.5)
+                .color(egui::Color32::WHITE),
+        )
+        .fill(DANGER_BG)
+        .corner_radius(6)
+        .min_size(egui::vec2(0.0, 28.0)),
     )
 }
 
@@ -5805,9 +6095,11 @@ fn segmented(
                         for (i, label) in labels.iter().enumerate() {
                             let active = i == selected;
                             let btn = egui::Button::new(
-                                egui::RichText::new(tr(*label))
-                                    .size(12.5)
-                                    .color(if active { palette_color(TEXT_MAIN) } else { palette_color(TEXT_WEAK) }),
+                                egui::RichText::new(tr(*label)).size(12.5).color(if active {
+                                    palette_color(TEXT_MAIN)
+                                } else {
+                                    palette_color(TEXT_WEAK)
+                                }),
                             )
                             .fill(if active {
                                 palette_color(PRESSED_BG)
@@ -5915,7 +6207,8 @@ fn standard_card_v<R>(
         frame = frame.stroke(egui::Stroke::new(1.0, color));
     }
     frame.show(ui, |ui| {
-        ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), add).inner
+        ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), add)
+            .inner
     })
 }
 
@@ -5966,7 +6259,11 @@ fn slide_cover(
     let inner = rect.shrink(8.0);
     let eyebrow_font = egui::FontId::new(9.0, egui::FontFamily::Proportional);
     let g = painter.layout_no_wrap(eyebrow.to_string(), eyebrow_font, palette_color(TEXT_FAINT));
-    painter.galley(egui::pos2(inner.min.x, inner.min.y), g, palette_color(TEXT_FAINT));
+    painter.galley(
+        egui::pos2(inner.min.x, inner.min.y),
+        g,
+        palette_color(TEXT_FAINT),
+    );
     let title_font = egui::FontId::new(12.0, egui::FontFamily::Proportional);
     let g = painter.layout(
         title.to_string(),
@@ -5974,7 +6271,11 @@ fn slide_cover(
         palette_color(TEXT_MAIN),
         inner.width(),
     );
-    painter.galley(egui::pos2(inner.min.x, inner.min.y + 14.0), g, palette_color(TEXT_MAIN));
+    painter.galley(
+        egui::pos2(inner.min.x, inner.min.y + 14.0),
+        g,
+        palette_color(TEXT_MAIN),
+    );
     if !foot.is_empty() {
         let foot_font = egui::FontId::new(9.0, egui::FontFamily::Proportional);
         let g = painter.layout_no_wrap(foot.to_string(), foot_font, palette_color(TEXT_FAINT));
@@ -5994,10 +6295,14 @@ fn slide_cover(
 /// legacy pages migrate onto them page by page (see phase-1 report).
 fn q_primary_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     ui.add(
-        egui::Button::new(egui::RichText::new(label).size(12.5).color(egui::Color32::WHITE))
-            .fill(ACCENT)
-            .corner_radius(6)
-            .min_size(egui::vec2(0.0, 28.0)),
+        egui::Button::new(
+            egui::RichText::new(label)
+                .size(12.5)
+                .color(egui::Color32::WHITE),
+        )
+        .fill(ACCENT)
+        .corner_radius(6)
+        .min_size(egui::vec2(0.0, 28.0)),
     )
 }
 
@@ -6007,14 +6312,19 @@ fn q_seg_pills(ui: &mut egui::Ui, labels: &[&str], selected: usize) -> Option<us
     ui.horizontal(|ui| {
         for (i, label) in labels.iter().enumerate() {
             let active = i == selected;
-            let btn = egui::Button::new(
-                egui::RichText::new(tr(*label))
-                    .size(12.0)
-                    .color(if active { egui::Color32::WHITE } else { palette_color(TEXT_WEAK) }),
-            )
-            .fill(if active { ACCENT } else { palette_color(BTN_BG) })
-            .corner_radius(255)
-            .min_size(egui::vec2(0.0, 26.0));
+            let btn =
+                egui::Button::new(egui::RichText::new(tr(*label)).size(12.0).color(if active {
+                    egui::Color32::WHITE
+                } else {
+                    palette_color(TEXT_WEAK)
+                }))
+                .fill(if active {
+                    ACCENT
+                } else {
+                    palette_color(BTN_BG)
+                })
+                .corner_radius(255)
+                .min_size(egui::vec2(0.0, 26.0));
             if ui.add(btn).clicked() && !active {
                 changed = Some(i);
             }
@@ -6053,7 +6363,11 @@ impl App {
         ui.add_space(8.0);
         match self.showroom.zone.as_str() {
             "library" => {
-                ui.label(egui::RichText::new("我的目录").size(12.0).color(palette_color(TEXT_WEAK)));
+                ui.label(
+                    egui::RichText::new("我的目录")
+                        .size(12.0)
+                        .color(palette_color(TEXT_WEAK)),
+                );
                 // Sidebar tree rows lead with an icon (prototype
                 // .tree blanket rule); the 全部 row reuses the
                 // all-applications glyph folder_tree uses for it.
@@ -6082,7 +6396,11 @@ impl App {
                 }
             }
             "inbox" => {
-                ui.label(egui::RichText::new("分享来源").size(12.0).color(palette_color(TEXT_WEAK)));
+                ui.label(
+                    egui::RichText::new("分享来源")
+                        .size(12.0)
+                        .color(palette_color(TEXT_WEAK)),
+                );
                 for (idx, (label, icon)) in [
                     ("全部", ChromeIcon::Settings),
                     ("个人分享", ChromeIcon::Share),
@@ -6112,7 +6430,11 @@ impl App {
                 }
             }
             "groups" => {
-                ui.label(egui::RichText::new("群组").size(12.0).color(palette_color(TEXT_WEAK)));
+                ui.label(
+                    egui::RichText::new("群组")
+                        .size(12.0)
+                        .color(palette_color(TEXT_WEAK)),
+                );
                 let active = self
                     .active_showroom_group()
                     .map(|space| s(&space["group"], "id"));
@@ -6124,7 +6446,15 @@ impl App {
                         s(group, "name"),
                         group["members"].as_array().map_or(0, Vec::len),
                     );
-                    if tree_row(ui, active.as_ref() == Some(&id), 0.0, Some(ChromeIcon::Folder), &label, 12.5).clicked()
+                    if tree_row(
+                        ui,
+                        active.as_ref() == Some(&id),
+                        0.0,
+                        Some(ChromeIcon::Folder),
+                        &label,
+                        12.5,
+                    )
+                    .clicked()
                     {
                         self.showroom.group_id = Some(id);
                         self.showroom.stack.pop_to(0);
@@ -6132,7 +6462,11 @@ impl App {
                 }
             }
             _ => {
-                ui.label(egui::RichText::new("公共目录").size(12.0).color(palette_color(TEXT_WEAK)));
+                ui.label(
+                    egui::RichText::new("公共目录")
+                        .size(12.0)
+                        .color(palette_color(TEXT_WEAK)),
+                );
                 let mut selected = self.showroom.folder.clone();
                 self.folder_tree(ui, &mut selected, false);
                 if selected != self.showroom.folder {
@@ -6248,7 +6582,7 @@ impl App {
             (
                 "服务器与组织",
                 &[
-                    ("服务器", ChromeIcon::Power),
+                    ("服务器", ChromeIcon::Globe),
                     ("个人资料", ChromeIcon::Clipboard),
                     ("我的提交", ChromeIcon::Clipboard),
                     ("组织管理", ChromeIcon::Lineage),
@@ -6295,8 +6629,7 @@ impl App {
                         palette_color(TEXT_WEAK)
                     };
                     let font = egui::FontId::new(10.5, egui::FontFamily::Proportional);
-                    let galley =
-                        ui.painter().layout_no_wrap(pending.to_string(), font, fg);
+                    let galley = ui.painter().layout_no_wrap(pending.to_string(), font, fg);
                     let w = galley.size().x + 10.0;
                     let rect = egui::Rect::from_min_size(
                         egui::pos2(resp.rect.max.x - w - 8.0, resp.rect.center().y - 8.0),
@@ -6372,7 +6705,10 @@ impl App {
                 )
                 .fill(ACCENT)
                 .corner_radius(6);
-                if ui.add_sized([ui.available_width(), 30.0], add_sub).clicked() {
+                if ui
+                    .add_sized([ui.available_width(), 30.0], add_sub)
+                    .clicked()
+                {
                     jump_org = true;
                 }
                 let add_root = egui::Button::new(
@@ -6382,7 +6718,10 @@ impl App {
                 )
                 .fill(palette_color(HOVER_BG))
                 .corner_radius(6);
-                if ui.add_sized([ui.available_width(), 30.0], add_root).clicked() {
+                if ui
+                    .add_sized([ui.available_width(), 30.0], add_root)
+                    .clicked()
+                {
                     jump_org = true;
                 }
             });
@@ -6607,10 +6946,13 @@ impl App {
         icon: ChromeIcon,
         label: &str,
     ) -> bool {
-        let (rect, resp) =
-            ui.allocate_exact_size(egui::vec2(width, 66.0), egui::Sense::click());
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 66.0), egui::Sense::click());
         let painter = ui.painter();
-        let fill = if resp.hovered() { palette_color(HOVER_BG) } else { palette_color(CARD_BG) };
+        let fill = if resp.hovered() {
+            palette_color(HOVER_BG)
+        } else {
+            palette_color(CARD_BG)
+        };
         painter.rect_filled(rect, 6.0, fill);
         painter.rect_stroke(
             rect,
@@ -6777,7 +7119,11 @@ impl App {
     }
 
     fn trash_restore(&mut self, trash_id: &str) {
-        match self.call_work("POST", &format!("/v1/trash/{trash_id}/restore"), Some(json!({}))) {
+        match self.call_work(
+            "POST",
+            &format!("/v1/trash/{trash_id}/restore"),
+            Some(json!({})),
+        ) {
             Ok(_) => {
                 self.msg = "已恢复".into();
                 self.trash.loaded = false;
@@ -6788,7 +7134,11 @@ impl App {
     }
 
     fn trash_purge(&mut self, trash_id: &str) {
-        match self.call_work("POST", &format!("/v1/trash/{trash_id}/purge"), Some(json!({}))) {
+        match self.call_work(
+            "POST",
+            &format!("/v1/trash/{trash_id}/purge"),
+            Some(json!({})),
+        ) {
             Ok(_) => {
                 self.msg = "已彻底删除".into();
                 self.trash.loaded = false;
@@ -6834,7 +7184,11 @@ impl App {
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(tr("回收站")).size(18.0).color(palette_color(TEXT_MAIN)));
+                ui.label(
+                    egui::RichText::new(tr("回收站"))
+                        .size(18.0)
+                        .color(palette_color(TEXT_MAIN)),
+                );
                 ui.add_space(12.0);
                 ui.label(
                     egui::RichText::new(format!(
@@ -6856,9 +7210,14 @@ impl App {
             if !selected.is_empty() {
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new(format!("{} {} {}", tr("已选"), selected.len(), tr("项")))
-                            .size(12.0)
-                            .color(palette_color(TEXT_MAIN)),
+                        egui::RichText::new(format!(
+                            "{} {} {}",
+                            tr("已选"),
+                            selected.len(),
+                            tr("项")
+                        ))
+                        .size(12.0)
+                        .color(palette_color(TEXT_MAIN)),
                     );
                     if btn_default(ui, tr("批量恢复")).clicked() {
                         batch = Some("restore");
@@ -6875,9 +7234,13 @@ impl App {
             if !self.trash.load_error.is_empty() {
                 card_frame().show(ui, |ui| {
                     ui.label(
-                        egui::RichText::new(format!("{}：{}", tr("回收站加载失败"), self.trash.load_error))
-                            .size(12.5)
-                            .color(palette_color(TEXT_MAIN)),
+                        egui::RichText::new(format!(
+                            "{}：{}",
+                            tr("回收站加载失败"),
+                            self.trash.load_error
+                        ))
+                        .size(12.5)
+                        .color(palette_color(TEXT_MAIN)),
                     );
                     if btn_primary(ui, tr("重试")).clicked() {
                         retry = true;
@@ -6927,7 +7290,9 @@ impl App {
                         slide_cover(ui, tex, kind_label, &title, "", 84.0);
                         ui.vertical(|ui| {
                             ui.label(
-                                egui::RichText::new(&title).size(13.0).color(palette_color(TEXT_MAIN)),
+                                egui::RichText::new(&title)
+                                    .size(13.0)
+                                    .color(palette_color(TEXT_MAIN)),
                             );
                             ui.horizontal(|ui| {
                                 badge(ui, kind_label, tone);
@@ -6941,8 +7306,7 @@ impl App {
                                 if btn_default(ui, tr("恢复")).clicked() {
                                     restore = Some(tid.clone());
                                 }
-                                if !cover_vid.is_empty()
-                                    && btn_default(ui, tr("预览")).clicked()
+                                if !cover_vid.is_empty() && btn_default(ui, tr("预览")).clicked()
                                 {
                                     preview = Some(t.clone());
                                 }
@@ -7000,14 +7364,16 @@ impl App {
             }));
         }
         if let Some(t) = preview {
-            self.trash.stack.push(TrashFrame::Preview(TrashPreviewState {
-                trash_id: s(&t, "id"),
-                kind: s(&t, "kind"),
-                title: s(&t, "title"),
-                version_id: s(&t, "cover_version_id"),
-                page_count: i(&t, "page_count").max(0) as usize,
-                page: 0,
-            }));
+            self.trash
+                .stack
+                .push(TrashFrame::Preview(TrashPreviewState {
+                    trash_id: s(&t, "id"),
+                    kind: s(&t, "kind"),
+                    title: s(&t, "title"),
+                    version_id: s(&t, "cover_version_id"),
+                    page_count: i(&t, "page_count").max(0) as usize,
+                    page: 0,
+                }));
         }
         match batch {
             Some("clear") => {
@@ -7053,18 +7419,17 @@ impl App {
     }
 
     fn trash_preview_ui(&mut self, ui: &mut egui::Ui) {
-        let (trash_id, kind, title, version_id, page_count, page) =
-            match self.trash.stack.top() {
-                TrashFrame::Preview(p) => (
-                    p.trash_id.clone(),
-                    p.kind.clone(),
-                    p.title.clone(),
-                    p.version_id.clone(),
-                    p.page_count,
-                    p.page,
-                ),
-                _ => return,
-            };
+        let (trash_id, kind, title, version_id, page_count, page) = match self.trash.stack.top() {
+            TrashFrame::Preview(p) => (
+                p.trash_id.clone(),
+                p.kind.clone(),
+                p.title.clone(),
+                p.version_id.clone(),
+                p.page_count,
+                p.page,
+            ),
+            _ => return,
+        };
         let row = self
             .trash
             .items
@@ -7168,7 +7533,6 @@ impl App {
             self.trash.stack.pop();
         }
     }
-
 }
 
 impl App {
@@ -7217,7 +7581,8 @@ impl App {
         if self.msg != self.toast_msg {
             self.toast_msg = self.msg.clone();
             self.toast_since = now;
-            self.workspace_controls.record_message(&self.msg);
+            self.workspace_controls
+                .record_message(&self.msg, now, self.page != Page::Messages);
         }
         if self.toast_msg.is_empty() || now - self.toast_since > 3.4 {
             return;
@@ -7254,7 +7619,6 @@ impl App {
             .request_repaint_after(std::time::Duration::from_millis(500));
     }
 }
-
 
 impl eframe::App for App {
     /// T2 frame forwarding, part 1: while a hosted show runs, the
@@ -7323,10 +7687,8 @@ impl eframe::App for App {
                         Ok(img) => {
                             v.pages = img.pages;
                             v.page = page.min(img.pages.saturating_sub(1));
-                            let ci = egui::ColorImage::from_rgba_unmultiplied(
-                                [img.w, img.h],
-                                &img.rgba,
-                            );
+                            let ci =
+                                egui::ColorImage::from_rgba_unmultiplied([img.w, img.h], &img.rgba);
                             v.tex = Some(ctx.load_texture(
                                 format!("pdf:{att_id}:{page}"),
                                 ci,
@@ -7444,7 +7806,6 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
 
-
         let screen = ui.max_rect();
         self.workspace_ui(ui);
         self.toast(ui, screen);
@@ -7486,9 +7847,7 @@ impl App {
                 let version_id = version_id.to_string();
                 std::thread::spawn(move || {
                     if let Some(local) = &local {
-                        if let Some(bytes) =
-                            local_render::local_thumb(local, &version_id, page)
-                        {
+                        if let Some(bytes) = local_render::local_thumb(local, &version_id, page) {
                             let _ = tx.send((key, Some(bytes)));
                             return;
                         }
@@ -7610,7 +7969,13 @@ impl App {
 
     /// Switch one index entry to a specific version: picking the latest
     /// restores follow-latest; a historical pick locks the entry.
-    fn switch_entry_version(&mut self, pos: usize, version_id: &str, semver: &str, is_latest: bool) {
+    fn switch_entry_version(
+        &mut self,
+        pos: usize,
+        version_id: &str,
+        semver: &str,
+        is_latest: bool,
+    ) {
         let mut es = self.current_entries();
         if pos >= es.len() {
             return;
@@ -7655,7 +8020,11 @@ impl App {
                         self.msg = format!(
                             "已导出 {} 页（{}）",
                             v.get("page_count").and_then(|x| x.as_i64()).unwrap_or(0),
-                            if kind == "company" { "公用版" } else { "个人版" }
+                            if kind == "company" {
+                                "公用版"
+                            } else {
+                                "个人版"
+                            }
                         );
                         self.load_index_detail();
                     }
@@ -7852,6 +8221,17 @@ impl App {
             })
     }
 
+    fn require_org_online(&mut self, action: &str) -> bool {
+        if self.org_online() {
+            return true;
+        }
+        self.msg = format!(
+            "{action}：{}",
+            tr("需要连接服务器；离线内容仍可打开。")
+        );
+        false
+    }
+
     /// True when the item's offline cache is the complete bundle
     /// (T1 cache payload: index + blocks): the entry carries its
     /// source index file, the same marker `cached_index_detail`
@@ -7953,7 +8333,10 @@ impl App {
                 self.msg = "缺少本地缓存密钥，无法打开".into();
                 return;
             };
-            let data = match std::fs::read(&stored).ok().and_then(|d| decrypt_bytes(&ck, &d)) {
+            let data = match std::fs::read(&stored)
+                .ok()
+                .and_then(|d| decrypt_bytes(&ck, &d))
+            {
                 Some(d) => d,
                 None => {
                     self.msg = "缓存解密失败".into();
@@ -8172,8 +8555,7 @@ impl App {
                             // the wire key is presenterView; keep the
                             // snake_case spelling as a fallback.
                             .and_then(|u| {
-                                u.get("presenterView")
-                                    .or_else(|| u.get("presenter_view"))
+                                u.get("presenterView").or_else(|| u.get("presenter_view"))
                             })
                             .and_then(|x| x.as_bool());
                     }
@@ -8209,10 +8591,7 @@ impl App {
                         // UiState is #[serde(rename_all = "camelCase")]:
                         // the wire key is presenterView; keep the
                         // snake_case spelling as a fallback.
-                        .and_then(|u| {
-                            u.get("presenterView")
-                                .or_else(|| u.get("presenter_view"))
-                        })
+                        .and_then(|u| u.get("presenterView").or_else(|| u.get("presenter_view")))
                         .and_then(|x| x.as_bool());
                     self.dc = Some(DcSession {
                         child,
@@ -8237,8 +8616,7 @@ impl App {
                         .spawn()
                     {
                         Ok(_) => {
-                            self.msg =
-                                "已以降级模式在 DeckCraft 打开演示（控制通道不可用）".into()
+                            self.msg = "已以降级模式在 DeckCraft 打开演示（控制通道不可用）".into()
                         }
                         Err(e) => self.msg = format!("无法启动 DeckCraft：{e}"),
                     }
@@ -8249,7 +8627,10 @@ impl App {
         let (mut ctl, _inspect) = live.unwrap();
         let port = self.dc.as_ref().map(|s| s.port).unwrap_or(0);
         let run = (|| -> Result<(), String> {
-            ctl.call("app.open", json!({ "path": path.to_string_lossy().into_owned() }))?;
+            ctl.call(
+                "app.open",
+                json!({ "path": path.to_string_lossy().into_owned() }),
+            )?;
             match mode {
                 DcMode::Play => {
                     ctl.call(
@@ -8285,7 +8666,10 @@ impl App {
                 // only); bumping the generation retires any watcher
                 // from an earlier session.
                 if self.dc_auto_quit {
-                    let gen = self.dc_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    let gen = self
+                        .dc_gen
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        + 1;
                     let gen_arc = self.dc_gen.clone();
                     let tx = self.dc_tx.clone();
                     std::thread::spawn(move || dc_watch(port, gen_arc, gen, tx));
@@ -8469,12 +8853,7 @@ impl App {
     /// Icon-only action button: an IconPark glyph (20px) inside a 30px
     /// hot zone, with a hover tooltip and an accessibility label — an
     /// icon button is never shipped without its name (hard floor).
-    fn icon_button(
-        &mut self,
-        ui: &mut egui::Ui,
-        icon: ChromeIcon,
-        label: &str,
-    ) -> bool {
+    fn icon_button(&mut self, ui: &mut egui::Ui, icon: ChromeIcon, label: &str) -> bool {
         self.icon_button_tinted(ui, icon, label, palette_color(ICON_TINT))
     }
 
@@ -8501,11 +8880,11 @@ impl App {
                 }
             }
             let (w, h) = rgba.dimensions();
-            let ci = egui::ColorImage::from_rgba_unmultiplied(
-                [w as usize, h as usize],
-                rgba.as_raw(),
-            );
-            let tex = ui.ctx().load_texture(name, ci, egui::TextureOptions::LINEAR);
+            let ci =
+                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
+            let tex = ui
+                .ctx()
+                .load_texture(name, ci, egui::TextureOptions::LINEAR);
             self.icon_tex.insert(name, tex);
         }
         self.icon_tex.get(name).expect("icon texture").id()
@@ -8540,10 +8919,12 @@ impl App {
             corner_radius: egui::CornerRadius::same(6),
             focus_stroke: egui::Stroke::new(1.0, ACCENT),
         };
-        let resp = craft_ui::buttons::IconButton::new(label, egui::vec2(30.0, 30.0), &style)
-            .show(ui, |ui, rect, icon_tint| {
+        let resp = craft_ui::buttons::IconButton::new(label, egui::vec2(30.0, 30.0), &style).show(
+            ui,
+            |ui, rect, icon_tint| {
                 ChromeIcons.paint(ui, icon, rect.center(), 20.0, icon_tint);
-            });
+            },
+        );
         resp.on_hover_text(label).clicked()
     }
 
@@ -8560,7 +8941,8 @@ impl App {
         label: &str,
         icon: ChromeIcon,
     ) -> bool {
-        self.tool_slot_sized(ui, active, label, icon, 26.0).clicked()
+        self.tool_slot_sized(ui, active, label, icon, 26.0)
+            .clicked()
     }
 
     fn tool_slot_sized(
@@ -8571,12 +8953,10 @@ impl App {
         icon: ChromeIcon,
         height: f32,
     ) -> egui::Response {
-        let visuals = |fill: egui::Color32, icon: egui::Color32| {
-            craft_ui::buttons::ButtonVisuals {
-                fill,
-                stroke: egui::Stroke::NONE,
-                icon,
-            }
+        let visuals = |fill: egui::Color32, icon: egui::Color32| craft_ui::buttons::ButtonVisuals {
+            fill,
+            stroke: egui::Stroke::NONE,
+            icon,
         };
         let style = craft_ui::buttons::IconButtonStyle {
             normal: visuals(egui::Color32::TRANSPARENT, palette_color(ICON_TINT)),
@@ -8597,12 +8977,7 @@ impl App {
     /// Panel-footer icon button: 28×28 craft-ui IconButton with a
     /// 15px glyph — the prototype's .sp-foot action scale (28px
     /// rows, 15px glyphs, 6px radius).
-    fn small_icon_button(
-        &mut self,
-        ui: &mut egui::Ui,
-        icon: ChromeIcon,
-        label: &str,
-    ) -> bool {
+    fn small_icon_button(&mut self, ui: &mut egui::Ui, icon: ChromeIcon, label: &str) -> bool {
         let visuals = |fill: egui::Color32| craft_ui::buttons::ButtonVisuals {
             fill,
             stroke: egui::Stroke::NONE,
@@ -8616,10 +8991,12 @@ impl App {
             corner_radius: egui::CornerRadius::same(6),
             focus_stroke: egui::Stroke::new(1.0, ACCENT),
         };
-        let resp = craft_ui::buttons::IconButton::new(label, egui::vec2(28.0, 28.0), &style)
-            .show(ui, |ui, rect, icon_tint| {
+        let resp = craft_ui::buttons::IconButton::new(label, egui::vec2(28.0, 28.0), &style).show(
+            ui,
+            |ui, rect, icon_tint| {
                 ChromeIcons.paint(ui, icon, rect.center(), 15.0, icon_tint);
-            });
+            },
+        );
         resp.on_hover_text(label).clicked()
     }
 
@@ -8876,10 +9253,16 @@ impl App {
                 if self.icon_button(ui, ChromeIcon::Play, "开始演示") {
                     act = Some("play");
                 }
-                if ChromeIcons.tool(ui, ChromeIcon::Presenter, "演示者视图", true, false, true).clicked() {
+                if ChromeIcons
+                    .tool(ui, ChromeIcon::Presenter, "演示者视图", true, false, true)
+                    .clicked()
+                {
                     act = Some("presenter");
                 }
-                if ChromeIcons.tool(ui, ChromeIcon::Reading, "普通视图", true, false, true).clicked() {
+                if ChromeIcons
+                    .tool(ui, ChromeIcon::Reading, "普通视图", true, false, true)
+                    .clicked()
+                {
                     act = Some("reading");
                 }
             });
@@ -8997,7 +9380,10 @@ impl App {
                     DeckView::Thumbnails
                 };
             }
-            ui.label(egui::RichText::new(format!("{} 页", st.pages.len())).color(palette_color(TEXT_WEAK)));
+            ui.label(
+                egui::RichText::new(format!("{} 页", st.pages.len()))
+                    .color(palette_color(TEXT_WEAK)),
+            );
             if ui
                 .add_enabled(st.selected_page.is_some(), egui::Button::new("预览所选页"))
                 .clicked()
@@ -9149,6 +9535,9 @@ impl App {
     /// the showroom access gate. Either way the result is the
     /// library entry the header's saved state reads.
     fn save_showroom_to_library(&mut self, item: &Value) {
+        if !self.require_org_online("保存到我的库") {
+            return;
+        }
         let item_id = s(item, "id");
         if let Some(share) = self
             .inbox
@@ -9219,6 +9608,9 @@ impl App {
     }
 
     fn cache_showroom_deck(&mut self, item: &Value) {
+        if !self.require_org_online("缓存到本地") {
+            return;
+        }
         let source = s(item, "source_index_id");
         if source.is_empty() {
             self.msg = "该条目暂不支持缓存到本地".into();
@@ -9462,14 +9854,18 @@ impl App {
                 .small()
                 .weak(),
             );
+            let note = s(item, "note");
+            if !note.is_empty() {
+                ui.label(
+                    egui::RichText::new(format!("{}：{note}", tr("分享说明")))
+                        .size(11.5)
+                        .color(palette_color(TEXT_WEAK)),
+                );
+            }
             if item["item_kind"] == "showroom"
                 && !app.org_online()
                 && !app.sr_bundle_cached(&id)
             {
-                // Offline with no complete local bundle (T3
-                // ruling): a status label instead of the action
-                // row. Non-showroom shares keep their save action —
-                // the bundle test only speaks for showroom decks.
                 ui.label(egui::RichText::new("离线不可用").small().weak());
             } else {
                 ui.horizontal_wrapped(|ui| {
@@ -9478,15 +9874,9 @@ impl App {
                     }
                     if saved {
                         ui.label(egui::RichText::new("已在我的库").small().weak());
-                    } else if ui.small_button("保存到我的库").clicked() {
+                    } else if app.org_online() && ui.small_button("保存到我的库").clicked() {
                         let sid = s(item, "id");
-                        match app.call("POST", &format!("/v1/shares/{sid}/accept"), Some(json!({}))) {
-                            Ok(_) => {
-                                app.msg = "已保存到我的库".into();
-                                app.refresh_all();
-                            }
-                            Err(e) => app.msg = format!("保存失败：{e}"),
-                        }
+                        app.open_pull_dialog(item, Some(sid));
                     }
                 });
             }
@@ -9686,7 +10076,8 @@ impl App {
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new(s(&item, "title")).strong());
                             ui.label(format!("提交人 {}", s(&item, "submitted_by")));
-                            if ui.button("通过").clicked() && self.need_identity("审批演示厅投稿") {
+                            if ui.button("通过").clicked() && self.need_identity("审批演示厅投稿")
+                            {
                                 let _ = self.call(
                                     "POST",
                                     &format!("/v1/showroom/{}/review", s(&item, "id")),
@@ -9702,20 +10093,19 @@ impl App {
                                 self.page = Page::Settings;
                                 self.review.jump_source = Some(Page::Showroom);
                                 let sections = self.settings_sections();
-                                if let Some(pos) =
-                                    sections.iter().position(|x| *x == "审批队列")
+                                if let Some(pos) = sections.iter().position(|x| *x == "审批队列")
                                 {
                                     self.settings.section = pos;
                                 }
-                                self.review.stack.push(ReviewFrame::Detail(
-                                    ReviewDetailState {
+                                self.review
+                                    .stack
+                                    .push(ReviewFrame::Detail(ReviewDetailState {
                                         item_id: s(&item, "id"),
                                         reject_open: true,
                                         reject_text: String::new(),
                                         deck: None,
                                         deck_loaded: false,
-                                    },
-                                ));
+                                    }));
                             }
                         });
                     }
@@ -9735,6 +10125,9 @@ impl App {
     /// One review decision against the server's manual approval
     /// flow. Rejection requires a reason (server-enforced).
     fn review_act(&mut self, item_id: &str, state: &str, note: &str) -> bool {
+        if !self.require_org_online("审批演示厅投稿") {
+            return false;
+        }
         if !self.need_identity("审批演示厅投稿") {
             return false;
         }
@@ -9771,6 +10164,9 @@ impl App {
     /// Rejection requires a reason (server-enforced, returned to
     /// the submitter verbatim).
     fn review_submission_act(&mut self, sub_id: &str, state: &str, note: &str) -> bool {
+        if !self.require_org_online("审批演示厅投稿") {
+            return false;
+        }
         if !self.need_identity("审批演示厅投稿") {
             return false;
         }
@@ -9860,6 +10256,7 @@ impl App {
         }
         let mut withdraw: Option<String> = None;
         let mut goto_showroom = false;
+        let online = self.org_online();
         for sub in &subs {
             let state = s(sub, "state");
             standard_card_v(
@@ -9928,6 +10325,7 @@ impl App {
                     }
                     ui.horizontal(|ui| {
                         if state == "pending"
+                            && online
                             && btn_danger(ui, tr("撤回")).clicked()
                         {
                             withdraw = Some(s(sub, "id"));
@@ -9988,12 +10386,8 @@ impl App {
             self.review_records_load();
         }
         let mut new_tab: Option<usize> = None;
-        if let Some(t) = segmented(
-            ui,
-            &[tr("待审批"), tr("已处理记录")],
-            tab,
-            SegStyle::Soft,
-        ) {
+        if let Some(t) = segmented(ui, &[tr("待审批"), tr("已处理记录")], tab, SegStyle::Soft)
+        {
             new_tab = Some(t);
         }
         ui.add_space(10.0);
@@ -10004,9 +10398,11 @@ impl App {
             let subs = self.submissions_pending.clone();
             if pending.is_empty() && subs.is_empty() {
                 ui.label(
-                    egui::RichText::new(tr("暂无待审批的演示成品。新提交会先进入这里，人工通过后才公开展示。"))
-                        .size(12.5)
-                        .color(palette_color(TEXT_WEAK)),
+                    egui::RichText::new(tr(
+                        "暂无待审批的演示成品。新提交会先进入这里，人工通过后才公开展示。",
+                    ))
+                    .size(12.5)
+                    .color(palette_color(TEXT_WEAK)),
                 );
             }
             let mut approve_sub: Option<String> = None;
@@ -10114,7 +10510,9 @@ impl App {
                         slide_cover(ui, tex, tr("演示成品"), &title, "", 84.0);
                         ui.vertical(|ui| {
                             ui.label(
-                                egui::RichText::new(&title).size(13.0).color(palette_color(TEXT_MAIN)),
+                                egui::RichText::new(&title)
+                                    .size(13.0)
+                                    .color(palette_color(TEXT_MAIN)),
                             );
                             ui.horizontal(|ui| {
                                 badge(ui, tr("待审"), BadgeTone::Warn);
@@ -10179,39 +10577,52 @@ impl App {
                     false,
                     None,
                     false,
-                    if rejected { CardVariant::Rejected } else { CardVariant::Normal },
+                    if rejected {
+                        CardVariant::Rejected
+                    } else {
+                        CardVariant::Normal
+                    },
                     |ui| {
-                    ui.horizontal(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(s(item, "title"))
+                                    .size(13.0)
+                                    .color(palette_color(TEXT_MAIN)),
+                            );
+                            badge(
+                                ui,
+                                if rejected {
+                                    tr("已驳回")
+                                } else {
+                                    tr("已通过")
+                                },
+                                if rejected {
+                                    BadgeTone::Bad
+                                } else {
+                                    BadgeTone::Ok
+                                },
+                            );
+                        });
                         ui.label(
-                            egui::RichText::new(s(item, "title"))
-                                .size(13.0)
-                                .color(palette_color(TEXT_MAIN)),
+                            egui::RichText::new(format!(
+                                "{} {} · {}",
+                                tr("审批人"),
+                                s(item, "reviewed_by"),
+                                fmt_time(i(item, "reviewed_ms"))
+                            ))
+                            .size(11.0)
+                            .color(palette_color(TEXT_FAINT)),
                         );
-                        badge(
-                            ui,
-                            if rejected { tr("已驳回") } else { tr("已通过") },
-                            if rejected { BadgeTone::Bad } else { BadgeTone::Ok },
-                        );
-                    });
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{} {} · {}",
-                            tr("审批人"),
-                            s(item, "reviewed_by"),
-                            fmt_time(i(item, "reviewed_ms"))
-                        ))
-                        .size(11.0)
-                        .color(palette_color(TEXT_FAINT)),
-                    );
-                    let note = s(item, "review_note");
-                    if !note.is_empty() {
-                        ui.label(
-                            egui::RichText::new(format!("{}：{}", tr("理由"), note))
-                                .size(11.5)
-                                .color(palette_color(TEXT_WEAK)),
-                        );
-                    }
-                });
+                        let note = s(item, "review_note");
+                        if !note.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!("{}：{}", tr("理由"), note))
+                                    .size(11.5)
+                                    .color(palette_color(TEXT_WEAK)),
+                            );
+                        }
+                    },
+                );
                 ui.add_space(8.0);
             }
         }
@@ -10224,13 +10635,15 @@ impl App {
             self.review_act(&iid, "live", "");
         }
         if let Some((iid, reject)) = open_detail {
-            self.review.stack.push(ReviewFrame::Detail(ReviewDetailState {
-                item_id: iid,
-                reject_open: reject,
-                reject_text: String::new(),
-                deck: None,
-                deck_loaded: false,
-            }));
+            self.review
+                .stack
+                .push(ReviewFrame::Detail(ReviewDetailState {
+                    item_id: iid,
+                    reject_open: reject,
+                    reject_text: String::new(),
+                    deck: None,
+                    deck_loaded: false,
+                }));
         }
     }
 
@@ -10295,7 +10708,9 @@ impl App {
             card_frame().show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new(s(it, "title")).size(14.0).color(palette_color(TEXT_MAIN)),
+                        egui::RichText::new(s(it, "title"))
+                            .size(14.0)
+                            .color(palette_color(TEXT_MAIN)),
                     );
                     match state.as_str() {
                         "pending" => badge(ui, tr("待审"), BadgeTone::Warn),
@@ -10306,7 +10721,11 @@ impl App {
                 });
                 let intro = s(it, "intro");
                 if !intro.is_empty() {
-                    ui.label(egui::RichText::new(intro).size(12.0).color(palette_color(TEXT_WEAK)));
+                    ui.label(
+                        egui::RichText::new(intro)
+                            .size(12.0)
+                            .color(palette_color(TEXT_WEAK)),
+                    );
                 }
                 ui.label(
                     egui::RichText::new(format!(
@@ -10562,7 +10981,16 @@ impl App {
                         app.start_present_from_deck(ui);
                     }
                 }
-                if !s(item, "source_index_id").is_empty() {
+                if app.org_online()
+                    && !app
+                        .library_refs
+                        .iter()
+                        .any(|entry| entry["item_id"] == item["id"])
+                    && ui.small_button("保存到我的库").clicked()
+                {
+                    app.open_pull_dialog(item, None);
+                }
+                if app.org_online() && !s(item, "source_index_id").is_empty() {
                     let key = format!("sr_{id}");
                     let cached = app.cache_entries.iter().any(|entry| entry["key"] == key);
                     let label = if cached {
@@ -10574,11 +11002,12 @@ impl App {
                         app.cache_showroom_deck(item);
                     }
                 }
-                if app.role() == "super"
-                    || app
-                        .user
-                        .as_ref()
-                        .is_some_and(|u| s(u, "display_name") == s(item, "submitted_by"))
+                if app.org_online()
+                    && (app.role() == "super"
+                        || app
+                            .user
+                            .as_ref()
+                            .is_some_and(|u| s(u, "display_name") == s(item, "submitted_by")))
                 {
                     if text_action(ui, "删除", palette_color(BADGE_BAD_FG), 12.0) {
                         app.trash_add("showroom", &id);
@@ -10648,7 +11077,20 @@ impl App {
         selected: bool,
         body: impl FnOnce(&mut Self, &mut egui::Ui),
     ) -> egui::Rect {
-        self.wall_card(ui, WallCard { width, min_height: 0.0, title, cover, selected, scope: None, variant: CardVariant::Normal }, body).inner
+        self.wall_card(
+            ui,
+            WallCard {
+                width,
+                min_height: 0.0,
+                title,
+                cover,
+                selected,
+                scope: None,
+                variant: CardVariant::Normal,
+            },
+            body,
+        )
+        .inner
     }
 
     fn wall_card(
@@ -10661,20 +11103,31 @@ impl App {
             ui.set_width(card.width);
             ui.set_min_height(card.min_height);
             ui.spacing_mut().item_spacing.y = 0.0;
-            let cover_rect = ui.allocate_ui(egui::vec2(card.width, card.width * 9.0 / 16.0), |ui| {
-                if card.cover.is_empty() {
-                    slide_cover(ui, None, "", "", "", card.width);
-                } else {
-                    self.thumb_ui(ui, card.cover, 0, card.width);
-                }
-            }).response.rect;
+            let cover_rect = ui
+                .allocate_ui(egui::vec2(card.width, card.width * 9.0 / 16.0), |ui| {
+                    if card.cover.is_empty() {
+                        slide_cover(ui, None, "", "", "", card.width);
+                    } else {
+                        self.thumb_ui(ui, card.cover, 0, card.width);
+                    }
+                })
+                .response
+                .rect;
             egui::Frame::NONE
-                .inner_margin(egui::Margin { left: 12, right: 12, top: 11, bottom: 12 })
+                .inner_margin(egui::Margin {
+                    left: 12,
+                    right: 12,
+                    top: 11,
+                    bottom: 12,
+                })
                 .show(ui, |ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(8.0, 5.0);
-                ui.add(egui::Label::new(egui::RichText::new(card.title).strong().size(13.0)).truncate());
-                body(self, ui);
-            });
+                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 5.0);
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(card.title).strong().size(13.0))
+                            .truncate(),
+                    );
+                    body(self, ui);
+                });
             cover_rect
         })
     }
@@ -10824,214 +11277,231 @@ impl App {
     /// toolbar and the block card grid.
     fn content_wall(&mut self, ui: &mut egui::Ui, w: &mut WallState) {
         body_frame().show(ui, |ui| {
-        if self.pick.is_some() {
-            self.pick_bar(ui);
-        }
-        if self.pick.is_none() {
-        ui.horizontal(|ui| {
-            if self.deep_source == Some(Page::Home) {
-                if text_action(ui, "‹ 返回主页", palette_color(ACCENT_DEEP), 13.0) {
-                    self.deep_source = None;
-                    self.page = Page::Home;
+            if self.pick.is_some() {
+                self.pick_bar(ui);
+            }
+            if self.pick.is_none() {
+                ui.horizontal(|ui| {
+                    if self.deep_source == Some(Page::Home) {
+                        if text_action(ui, "‹ 返回主页", palette_color(ACCENT_DEEP), 13.0) {
+                            self.deep_source = None;
+                            self.page = Page::Home;
+                        }
+                    }
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut w.search_text)
+                            .hint_text("搜索")
+                            .desired_width(300.0)
+                            .margin(egui::vec2(14.0, 7.0)),
+                    );
+                    if resp.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
+                        match self.call_work(
+                            "GET",
+                            &format!("/v1/search?q={}", query_component(&w.search_text)),
+                            None,
+                        ) {
+                            Ok(v) => w.search_hits = Some(v),
+                            Err(e) => self.msg = e,
+                        }
+                    }
+                    if text_action(ui, "智能分块导入", palette_color(TEXT_MAIN), 13.0) {
+                        self.act_import_split();
+                    }
+                    if text_action(ui, "导入 PPT", palette_color(TEXT_MAIN), 13.0) {
+                        self.act_import_ppt();
+                    }
+                    ui.label(
+                        egui::RichText::new("导入到组")
+                            .size(13.0)
+                            .color(palette_color(TEXT_WEAK)),
+                    );
+                    let cur_group = self.group_name(&self.content.import_group.clone());
+                    egui::ComboBox::from_id_salt("import_group")
+                        .width(150.0)
+                        .selected_text(cur_group)
+                        .show_ui(ui, |ui| {
+                            for g in self.groups.clone() {
+                                ui.selectable_value(
+                                    &mut self.content.import_group,
+                                    s(&g, "id"),
+                                    s(&g, "name"),
+                                );
+                            }
+                        });
+                });
+            } // pick.is_none() toolbar block
+            ui.add_space(12.0);
+            if let Some(hits) = w.search_hits.clone() {
+                ui.label(egui::RichText::new("搜索结果").strong());
+                if let Some(arr) = hits.get("hits").and_then(|h| h.as_array()) {
+                    for h in arr {
+                        let u = h.get("unit").cloned().unwrap_or(json!({}));
+                        let v = h.get("version").cloned().unwrap_or(json!({}));
+                        if ui
+                            .button(format!("{} · v{}", s(&u, "name"), s(&v, "semver")))
+                            .clicked()
+                        {
+                            self.open_unit_detail(&s(&u, "id"));
+                        }
+                    }
                 }
+                ui.add_space(8.0);
             }
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut w.search_text)
-                    .hint_text("搜索")
-                    .desired_width(300.0)
-                    .margin(egui::vec2(14.0, 7.0)),
-            );
-            if resp.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
-                match self.call_work("GET", &format!("/v1/search?q={}", query_component(&w.search_text)), None) {
-                    Ok(v) => w.search_hits = Some(v),
-                    Err(e) => self.msg = e,
-                }
-            }
-            if text_action(ui, "智能分块导入", palette_color(TEXT_MAIN), 13.0) {
-                self.act_import_split();
-            }
-            if text_action(ui, "导入 PPT", palette_color(TEXT_MAIN), 13.0) {
-                self.act_import_ppt();
-            }
-            ui.label(
-                egui::RichText::new("导入到组")
-                    .size(13.0)
-                    .color(palette_color(TEXT_WEAK)),
-            );
-            let cur_group = self.group_name(&self.content.import_group.clone());
-            egui::ComboBox::from_id_salt("import_group")
-                .width(150.0)
-                .selected_text(cur_group)
-                .show_ui(ui, |ui| {
-                    for g in self.groups.clone() {
-                        ui.selectable_value(
-                            &mut self.content.import_group,
-                            s(&g, "id"),
-                            s(&g, "name"),
+            let my_name = self
+                .user
+                .as_ref()
+                .map(|u| s(u, "display_name"))
+                .unwrap_or_default();
+            self.content_clip_bar(ui, w);
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
+                // Card grid (prototype .grid): fluid columns, min
+                // 220px wide, 12px gaps.
+                let avail = ui.available_width();
+                let per_row = ((avail + 12.0) / 232.0).floor().max(1.0);
+                let card_w = (avail + 12.0) / per_row - 12.0;
+                let cover_h = card_w * 9.0 / 16.0;
+                let card_h = cover_h + 89.0;
+                ui.horizontal_wrapped(|ui| {
+                    for item in self.units.clone() {
+                        let unit = item.get("unit").cloned().unwrap_or(json!({}));
+                        if let Some(f) = &self.content.folder_filter {
+                            if unit.get("folder_id").and_then(|x| x.as_str()) != Some(f.as_str()) {
+                                continue;
+                            }
+                        }
+                        let uid = s(&unit, "id");
+                        let rends = item
+                            .get("renditions")
+                            .and_then(|r| r.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        let latest = rends
+                            .first()
+                            .and_then(|r| r.get("latest"))
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        let title = s(&unit, "name");
+                        let cover = s(&latest, "id");
+                        let outer = self.wall_card(
+                            ui,
+                            WallCard {
+                                width: card_w,
+                                min_height: card_h,
+                                title: &title,
+                                cover: &cover,
+                                selected: w.selected.as_deref() == Some(uid.as_str())
+                                    || w.multi.contains(&uid),
+                                scope: None,
+                                variant: if !my_name.is_empty() && s(&unit, "maintainer") == my_name
+                                {
+                                    CardVariant::Mine
+                                } else {
+                                    CardVariant::Normal
+                                },
+                            },
+                            |app, ui| {
+                                ui.horizontal(|ui| {
+                                    if latest.is_object() {
+                                        chip(
+                                            ui,
+                                            &format!("v{}", s(&latest, "semver")),
+                                            palette_color(ACCENT_DEEP),
+                                            CHIP_BLUE_BG,
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{} 页",
+                                                i(&latest, "page_count")
+                                            ))
+                                            .small()
+                                            .color(palette_color(TEXT_WEAK)),
+                                        );
+                                    } else {
+                                        ui.label(
+                                            egui::RichText::new("暂无版本")
+                                                .small()
+                                                .color(palette_color(TEXT_WEAK)),
+                                        );
+                                    }
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "{} · {}",
+                                                    app.folder_name(
+                                                        unit.get("folder_id")
+                                                            .and_then(|x| x.as_str())
+                                                            .unwrap_or("")
+                                                    ),
+                                                    s(&unit, "maintainer")
+                                                ))
+                                                .small()
+                                                .color(palette_color(TEXT_WEAK)),
+                                            );
+                                        },
+                                    );
+                                });
+                                if matches!(app.pick, Some(PickState::Insert { .. })) {
+                                    ui.add_space(8.0);
+                                    if ui
+                                        .add_sized(
+                                            [72.0, 28.0],
+                                            egui::Button::new(
+                                                egui::RichText::new("插入")
+                                                    .size(13.0)
+                                                    .color(egui::Color32::WHITE),
+                                            )
+                                            .fill(ACCENT)
+                                            .corner_radius(6),
+                                        )
+                                        .clicked()
+                                    {
+                                        app.insert_pick_unit(&item);
+                                    }
+                                }
+                            },
                         );
+                        // Click handling rides on an explicit interact over
+                        // the card rect: allocate_ui's own response carries no
+                        // click sense, which is why double-click never fired
+                        // (James 2026-11-15). Single click selects, double
+                        // click opens the maintenance drill-down — the same
+                        // contract as the web prototype.
+                        let click = ui.interact(
+                            outer.response.rect,
+                            egui::Id::unique(("unit_card", &uid)),
+                            egui::Sense::click(),
+                        );
+                        if click.double_clicked() {
+                            if self.pick.is_none() {
+                                self.open_unit_detail(&uid);
+                            }
+                        } else if click.clicked() {
+                            // Ctrl/⌘-click toggles the card in the
+                            // multi-selection （组合 / 剪贴板的前置）;
+                            // a plain click stays the single selection.
+                            let multi_key = ui
+                                .ctx()
+                                .input(|inp| inp.modifiers.command || inp.modifiers.ctrl);
+                            if multi_key {
+                                if let Some(pos) = w.multi.iter().position(|u| u == &uid) {
+                                    w.multi.remove(pos);
+                                } else {
+                                    w.multi.push(uid.clone());
+                                }
+                            }
+                            w.selected = Some(uid.clone());
+                        }
+                    }
+                    // grid-end add card (I): same footprint as a content
+                    // card; two entries — blank block / paste PPT pages
+                    if self.pick.is_none() {
+                        self.content_add_card(ui, card_w, card_h);
                     }
                 });
-        });
-        } // pick.is_none() toolbar block
-        ui.add_space(12.0);
-        if let Some(hits) = w.search_hits.clone() {
-            ui.label(egui::RichText::new("搜索结果").strong());
-            if let Some(arr) = hits.get("hits").and_then(|h| h.as_array()) {
-                for h in arr {
-                    let u = h.get("unit").cloned().unwrap_or(json!({}));
-                    let v = h.get("version").cloned().unwrap_or(json!({}));
-                    if ui
-                        .button(format!("{} · v{}", s(&u, "name"), s(&v, "semver")))
-                        .clicked()
-                    {
-                        self.open_unit_detail(&s(&u, "id"));
-                    }
-                }
-            }
-            ui.add_space(8.0);
-        }
-        let my_name = self
-            .user
-            .as_ref()
-            .map(|u| s(u, "display_name"))
-            .unwrap_or_default();
-        self.content_clip_bar(ui, w);
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
-            // Card grid (prototype .grid): fluid columns, min
-            // 220px wide, 12px gaps.
-            let avail = ui.available_width();
-            let per_row = ((avail + 12.0) / 232.0).floor().max(1.0);
-            let card_w = (avail + 12.0) / per_row - 12.0;
-            let cover_h = card_w * 9.0 / 16.0;
-            let card_h = cover_h + 89.0;
-            ui.horizontal_wrapped(|ui| {
-                for item in self.units.clone() {
-                    let unit = item.get("unit").cloned().unwrap_or(json!({}));
-                    if let Some(f) = &self.content.folder_filter {
-                        if unit.get("folder_id").and_then(|x| x.as_str()) != Some(f.as_str()) {
-                            continue;
-                        }
-                    }
-                    let uid = s(&unit, "id");
-                    let rends = item.get("renditions").and_then(|r| r.as_array()).cloned().unwrap_or_default();
-                    let latest = rends
-                        .first()
-                        .and_then(|r| r.get("latest"))
-                        .cloned()
-                        .unwrap_or(Value::Null);
-                    let title = s(&unit, "name");
-                    let cover = s(&latest, "id");
-                    let outer = self.wall_card(ui, WallCard {
-                        width: card_w, min_height: card_h, title: &title, cover: &cover,
-                        selected: w.selected.as_deref() == Some(uid.as_str())
-                            || w.multi.contains(&uid),
-                        scope: None,
-                        variant: if !my_name.is_empty() && s(&unit, "maintainer") == my_name {
-                            CardVariant::Mine
-                        } else {
-                            CardVariant::Normal
-                        },
-                    }, |app, ui| {
-                        ui.horizontal(|ui| {
-                            if latest.is_object() {
-                                chip(
-                                    ui,
-                                    &format!("v{}", s(&latest, "semver")),
-                                    palette_color(ACCENT_DEEP),
-                                    CHIP_BLUE_BG,
-                                );
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{} 页",
-                                        i(&latest, "page_count")
-                                    ))
-                                    .small()
-                                    .color(palette_color(TEXT_WEAK)),
-                                );
-                            } else {
-                                ui.label(
-                                    egui::RichText::new("暂无版本")
-                                        .small()
-                                        .color(palette_color(TEXT_WEAK)),
-                                );
-                            }
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "{} · {}",
-                                            app.folder_name(
-                                                unit.get("folder_id")
-                                                    .and_then(|x| x.as_str())
-                                                    .unwrap_or("")
-                                            ),
-                                            s(&unit, "maintainer")
-                                        ))
-                                        .small()
-                                        .color(palette_color(TEXT_WEAK)),
-                                    );
-                                },
-                            );
-                        });
-                        if matches!(app.pick, Some(PickState::Insert { .. })) {
-                            ui.add_space(8.0);
-                            if ui
-                                .add_sized(
-                                    [72.0, 28.0],
-                                    egui::Button::new(
-                                        egui::RichText::new("插入")
-                                            .size(13.0)
-                                            .color(egui::Color32::WHITE),
-                                    )
-                                    .fill(ACCENT)
-                                    .corner_radius(6),
-                                )
-                                .clicked()
-                            {
-                                app.insert_pick_unit(&item);
-                            }
-                        }
-                    });
-                    // Click handling rides on an explicit interact over
-                    // the card rect: allocate_ui's own response carries no
-                    // click sense, which is why double-click never fired
-                    // (James 2026-11-15). Single click selects, double
-                    // click opens the maintenance drill-down — the same
-                    // contract as the web prototype.
-                    let click = ui.interact(
-                        outer.response.rect,
-                        egui::Id::unique(("unit_card", &uid)),
-                        egui::Sense::click(),
-                    );
-                    if click.double_clicked() {
-                        if self.pick.is_none() {
-                            self.open_unit_detail(&uid);
-                        }
-                    } else if click.clicked() {
-                        // Ctrl/⌘-click toggles the card in the
-                        // multi-selection （组合 / 剪贴板的前置）;
-                        // a plain click stays the single selection.
-                        let multi_key =
-                            ui.ctx().input(|inp| inp.modifiers.command || inp.modifiers.ctrl);
-                        if multi_key {
-                            if let Some(pos) = w.multi.iter().position(|u| u == &uid) {
-                                w.multi.remove(pos);
-                            } else {
-                                w.multi.push(uid.clone());
-                            }
-                        }
-                        w.selected = Some(uid.clone());
-                    }
-                }
-                // grid-end add card (I): same footprint as a content
-                // card; two entries — blank block / paste PPT pages
-                if self.pick.is_none() {
-                    self.content_add_card(ui, card_w, card_h);
-                }
             });
-        });
         });
     }
 
@@ -11094,14 +11564,12 @@ impl App {
                 0.0
             };
             let bar_w = ui.available_width().min(560.0);
-            let (track, _) =
-                ui.allocate_exact_size(egui::vec2(bar_w, 6.0), egui::Sense::hover());
-            ui.painter().rect_filled(track, 3.0, palette_color(HOVER_BG));
+            let (track, _) = ui.allocate_exact_size(egui::vec2(bar_w, 6.0), egui::Sense::hover());
+            ui.painter()
+                .rect_filled(track, 3.0, palette_color(HOVER_BG));
             if pct > 0.0 {
-                let fill_rect = egui::Rect::from_min_size(
-                    track.min,
-                    egui::vec2(track.width() * pct, 6.0),
-                );
+                let fill_rect =
+                    egui::Rect::from_min_size(track.min, egui::vec2(track.width() * pct, 6.0));
                 ui.painter().rect_filled(fill_rect, 3.0, ACCENT);
             }
             ui.label(
@@ -11130,8 +11598,7 @@ impl App {
                 .show(ui, |ui| {
                     for e in &entries {
                         let key = s(e, "key");
-                        let is_pinned =
-                            e.get("pinned").and_then(|v| v.as_bool()) == Some(true);
+                        let is_pinned = e.get("pinned").and_then(|v| v.as_bool()) == Some(true);
                         egui::Frame::NONE
                             .fill(palette_color(PANEL_BG))
                             .stroke(egui::Stroke::new(1.0, palette_color(FIELD_BORDER)))
@@ -11215,11 +11682,9 @@ impl App {
                     0 => self.open_cache(&key),
                     2 => self.remove_cache(&key),
                     _ => {
-                        if let Some(e) =
-                            self.cache_entries.iter_mut().find(|e| s(e, "key") == key)
+                        if let Some(e) = self.cache_entries.iter_mut().find(|e| s(e, "key") == key)
                         {
-                            let now =
-                                e.get("pinned").and_then(|v| v.as_bool()).unwrap_or(false);
+                            let now = e.get("pinned").and_then(|v| v.as_bool()).unwrap_or(false);
                             e["pinned"] = json!(!now);
                         }
                         save_cache_index(&self.cache_entries);
@@ -11263,11 +11728,11 @@ impl App {
             // page by page with checkboxes (initial state = the entry's
             // existing excerpt, all pages when there is none)
             let pick_vid = match &self.pick {
-                Some(PickState::Pages { unit_id, version_id, .. })
-                    if *unit_id == s(&unit, "id") =>
-                {
-                    Some(version_id.clone())
-                }
+                Some(PickState::Pages {
+                    unit_id,
+                    version_id,
+                    ..
+                }) if *unit_id == s(&unit, "id") => Some(version_id.clone()),
                 _ => None,
             };
             if let Some(vid) = pick_vid {
@@ -11276,13 +11741,11 @@ impl App {
                     .and_then(|r| r.as_array())
                     .and_then(|arr| {
                         arr.iter().find_map(|r| {
-                            r.get("versions")
-                                .and_then(|v| v.as_array())
-                                .and_then(|vs| {
-                                    vs.iter()
-                                        .find(|v| s(v, "id") == vid)
-                                        .map(|v| i(v, "page_count") as usize)
-                                })
+                            r.get("versions").and_then(|v| v.as_array()).and_then(|vs| {
+                                vs.iter()
+                                    .find(|v| s(v, "id") == vid)
+                                    .map(|v| i(v, "page_count") as usize)
+                            })
                         })
                     })
                     .unwrap_or(0);
@@ -11328,12 +11791,8 @@ impl App {
                 for r in rends.clone() {
                     let rend = r.get("rendition").cloned().unwrap_or(json!({}));
                     ui.label(
-                        egui::RichText::new(format!(
-                            "{} · {}",
-                            s(&rend, "form"),
-                            s(&rend, "lang")
-                        ))
-                        .strong(),
+                        egui::RichText::new(format!("{} · {}", s(&rend, "form"), s(&rend, "lang")))
+                            .strong(),
                     );
                     if let Some(versions) = r.get("versions").and_then(|v| v.as_array()) {
                         for v in versions {
@@ -11349,8 +11808,7 @@ impl App {
                                 ));
                                 if s(v, "status") == "recalled" {
                                     ui.label(
-                                        egui::RichText::new("已撤回")
-                                            .color(palette_color(ROSE)),
+                                        egui::RichText::new("已撤回").color(palette_color(ROSE)),
                                     );
                                 }
                                 if !s(v, "note").is_empty() {
@@ -11362,7 +11820,9 @@ impl App {
                                         &format!("/v1/versions/{}/fragment", s(v, "id")),
                                         None,
                                     ) {
-                                        if let Some(data) = resp.get("data_base64").and_then(|x| x.as_str()) {
+                                        if let Some(data) =
+                                            resp.get("data_base64").and_then(|x| x.as_str())
+                                        {
                                             if let (Ok(bytes), Some(path)) = (
                                                 b64d(data),
                                                 rfd::FileDialog::new()
@@ -11400,7 +11860,8 @@ impl App {
                                     );
                                     self.open_unit_detail(&st.unit_id.clone());
                                 }
-                                if s(v, "status") != "recalled" && ui.button("编辑页面").clicked() {
+                                if s(v, "status") != "recalled" && ui.button("编辑页面").clicked()
+                                {
                                     // Page-level visual editing (overlay):
                                     // text runs + speaker notes of this
                                     // version; saving publishes a new
@@ -11491,28 +11952,12 @@ impl App {
                     .selected_text(cur_label)
                     .show_ui(ui, |ui| {
                         if self.lang_options.is_empty() {
-                            ui.selectable_value(
-                                &mut st.translate_to,
-                                "zh".into(),
-                                "中文",
-                            );
-                            ui.selectable_value(
-                                &mut st.translate_to,
-                                "en".into(),
-                                "英语",
-                            );
-                            ui.selectable_value(
-                                &mut st.translate_to,
-                                "ja".into(),
-                                "日语",
-                            );
+                            ui.selectable_value(&mut st.translate_to, "zh".into(), "中文");
+                            ui.selectable_value(&mut st.translate_to, "en".into(), "英语");
+                            ui.selectable_value(&mut st.translate_to, "ja".into(), "日语");
                         } else {
                             for (code, label) in self.lang_options.clone() {
-                                ui.selectable_value(
-                                    &mut st.translate_to,
-                                    code,
-                                    label,
-                                );
+                                ui.selectable_value(&mut st.translate_to, code, label);
                             }
                         }
                     });
@@ -11531,7 +11976,10 @@ impl App {
                     Some(_) => "翻译中…".to_string(),
                     None => "翻译最新版本".to_string(),
                 };
-                if ui.add_enabled(!busy && translate_ready, egui::Button::new(btn_text)).clicked() {
+                if ui
+                    .add_enabled(!busy && translate_ready, egui::Button::new(btn_text))
+                    .clicked()
+                {
                     // latest version of the first rendition in the detail
                     let first_version = st
                         .detail
@@ -11577,17 +12025,17 @@ impl App {
                                                 ));
                                                 match s(&p, "state").as_str() {
                                                     "succeeded" => {
-                                                        let _ = tx.send(TranslateEvent::Done(
-                                                            Ok(p.get("result")
+                                                        let _ =
+                                                            tx.send(TranslateEvent::Done(Ok(p
+                                                                .get("result")
                                                                 .cloned()
-                                                                .unwrap_or(Value::Null)),
-                                                        ));
+                                                                .unwrap_or(Value::Null))));
                                                         break;
                                                     }
                                                     "failed" => {
-                                                        let _ = tx.send(TranslateEvent::Done(
-                                                            Err(s(&p, "error")),
-                                                        ));
+                                                        let _ = tx.send(TranslateEvent::Done(Err(
+                                                            s(&p, "error"),
+                                                        )));
                                                         break;
                                                     }
                                                     _ => std::thread::sleep(
@@ -11652,7 +12100,11 @@ impl App {
                         .pick_file();
                 }
                 if let Some(p) = &st.publish_file {
-                    ui.label(p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
+                    ui.label(
+                        p.file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default(),
+                    );
                 }
             });
             ui.horizontal(|ui| {
@@ -11668,10 +12120,7 @@ impl App {
                 ui.text_edit_singleline(&mut st.publish_note);
             });
             if ui
-                .add_enabled(
-                    st.publish_file.is_some(),
-                    egui::Button::new("发布"),
-                )
+                .add_enabled(st.publish_file.is_some(), egui::Button::new("发布"))
                 .clicked()
             {
                 if let Some(path) = st.publish_file.clone() {
@@ -11741,11 +12190,7 @@ impl App {
                         .selected_text(cur)
                         .show_ui(ui, |ui| {
                             for v in &all_versions {
-                                ui.selectable_value(
-                                    &mut st.bind_from,
-                                    v.0.clone(),
-                                    &v.1,
-                                );
+                                ui.selectable_value(&mut st.bind_from, v.0.clone(), &v.1);
                             }
                         });
                     ui.label("对应");
@@ -11794,12 +12239,16 @@ impl App {
                         ui.vertical(|ui| {
                             let vid = st.bind_to.clone();
                             self.thumb_ui(ui, &vid, p as usize, 84.0);
-                            let existing = st.bindings.iter().find(|b| {
-                                s(b, "from_version_id") == st.bind_from
-                                    && st.bind_from_slot == Some(i(b, "from_slot"))
-                                    && s(b, "to_version_id") == st.bind_to
-                                    && i(b, "to_slot") == p
-                            }).map(|b| s(b, "id"));
+                            let existing = st
+                                .bindings
+                                .iter()
+                                .find(|b| {
+                                    s(b, "from_version_id") == st.bind_from
+                                        && st.bind_from_slot == Some(i(b, "from_slot"))
+                                        && s(b, "to_version_id") == st.bind_to
+                                        && i(b, "to_slot") == p
+                                })
+                                .map(|b| s(b, "id"));
                             match (st.bind_from_slot, existing) {
                                 (Some(_), Some(bid)) => {
                                     if ui
@@ -11814,33 +12263,31 @@ impl App {
                                         .clicked()
                                     {
                                         let uid = st.unit_id.clone();
-                                            let _ = self.call_work(
-                                                "POST",
-                                                &format!("/v1/units/{uid}/page-bindings/{bid}/delete"),
-                                                None,
-                                            );
-                                            self.open_unit_detail(&uid);
+                                        let _ = self.call_work(
+                                            "POST",
+                                            &format!("/v1/units/{uid}/page-bindings/{bid}/delete"),
+                                            None,
+                                        );
+                                        self.open_unit_detail(&uid);
                                     }
                                 }
                                 (Some(fs), None) => {
                                     if ui.button("绑定").clicked() {
                                         let uid = st.unit_id.clone();
-                                            let r = self.call_work(
-                                                "POST",
-                                                &format!("/v1/units/{uid}/page-bindings"),
-                                                Some(json!({
-                                                    "from_version_id": st.bind_from,
-                                                    "from_slot": fs,
-                                                    "to_version_id": st.bind_to,
-                                                    "to_slot": p,
-                                                })),
-                                            );
-                                            match r {
-                                                Ok(_) => self.open_unit_detail(&uid),
-                                                Err(e) => {
-                                                    self.msg = format!("绑定失败：{e}")
-                                                }
-                                            }
+                                        let r = self.call_work(
+                                            "POST",
+                                            &format!("/v1/units/{uid}/page-bindings"),
+                                            Some(json!({
+                                                "from_version_id": st.bind_from,
+                                                "from_slot": fs,
+                                                "to_version_id": st.bind_to,
+                                                "to_slot": p,
+                                            })),
+                                        );
+                                        match r {
+                                            Ok(_) => self.open_unit_detail(&uid),
+                                            Err(e) => self.msg = format!("绑定失败：{e}"),
+                                        }
                                     }
                                 }
                                 _ => {
@@ -11881,9 +12328,51 @@ impl App {
         }
         let mut action: Option<Act> = None;
         let all_icon = ChromeIcon::Settings;
-        if tree_row(ui, selected.is_none(), 0.0, Some(all_icon), "全部", 12.5).clicked() {
-            *selected = None;
-        }
+        let width = ui.available_width();
+        ui.horizontal(|ui| {
+            ui.set_width(width);
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let (rect, response) = ui.allocate_exact_size(
+                egui::vec2((width - 30.0).max(1.0), 28.0),
+                egui::Sense::click(),
+            );
+            let selected_all = selected.is_none();
+            if selected_all {
+                ui.painter().rect_filled(rect, 6.0, palette_color(SEL_BG));
+            } else if response.hovered() {
+                ui.painter().rect_filled(rect, 6.0, palette_color(HOVER_BG));
+            }
+            let icon_rect = egui::Rect::from_min_size(
+                egui::pos2(rect.min.x + 10.0, rect.center().y - 7.5),
+                egui::vec2(15.0, 15.0),
+            );
+            ChromeIcons.paint(
+                ui,
+                all_icon,
+                icon_rect.center(),
+                15.0,
+                palette_color(ICON_TINT),
+            );
+            let text_color = if selected_all {
+                palette_color(ACCENT_DEEP)
+            } else {
+                palette_color(TEXT_MAIN)
+            };
+            ui.painter().text(
+                egui::pos2(rect.min.x + 31.0, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                tr("全部"),
+                egui::FontId::proportional(12.5),
+                text_color,
+            );
+            if response.clicked() {
+                *selected = None;
+            }
+
+            if self.small_icon_button(ui, ChromeIcon::FolderPlus, tr("新建文件夹")) {
+                action = Some(Act::NewSibling(None));
+            }
+        });
         // an inline editor for a NEW root folder sits right under 全部
         if matches!(&self.folder_edit, Some(e) if e.target.is_none() && e.parent.is_none()) {
             self.folder_edit_row(ui, 0.0);
@@ -11953,20 +12442,17 @@ impl App {
                 } else {
                     ChromeIcon::Folder
                 };
-                let resp = tree_row(
-                    ui,
-                    is_sel,
-                    d as f32 * 15.0,
-                    Some(ficon),
-                    &fname,
-                    12.5,
-                );
+                let resp = tree_row(ui, is_sel, d as f32 * 15.0, Some(ficon), &fname, 12.5);
                 if resp.clicked() {
                     *selected = Some(fid.clone());
                 }
                 let (a, b, c, dd) = (
                     fid.clone(),
-                    if fparent.is_empty() { None } else { Some(fparent.clone()) },
+                    if fparent.is_empty() {
+                        None
+                    } else {
+                        Some(fparent.clone())
+                    },
                     fname.clone(),
                     fid.clone(),
                 );
@@ -11990,7 +12476,8 @@ impl App {
                 });
             }
             // an inline editor for a NEW child of this folder
-            if matches!(&self.folder_edit, Some(e) if e.target.is_none() && e.parent.as_deref() == Some(fid.as_str())) {
+            if matches!(&self.folder_edit, Some(e) if e.target.is_none() && e.parent.as_deref() == Some(fid.as_str()))
+            {
                 self.folder_edit_row(ui, (d + 1) as f32 * 14.0);
                 ui.add_space(2.0);
             }
@@ -12044,10 +12531,7 @@ impl App {
         ui.horizontal(|ui| {
             ui.add_space(indent + 2.0);
             if let Some(edit) = &mut self.folder_edit {
-                let resp = ui.add_sized(
-                    [190.0, 30.0],
-                    egui::TextEdit::singleline(&mut edit.text),
-                );
+                let resp = ui.add_sized([190.0, 30.0], egui::TextEdit::singleline(&mut edit.text));
                 if self.folder_edit_focus {
                     resp.request_focus();
                     self.folder_edit_focus = false;
@@ -12112,7 +12596,11 @@ impl App {
 
     fn reload_folders(&mut self) {
         if let Ok(v) = self.call_work("GET", "/v1/folders", None) {
-            self.folders = v.get("folders").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+            self.folders = v
+                .get("folders")
+                .and_then(|f| f.as_array())
+                .cloned()
+                .unwrap_or_default();
         }
     }
 
@@ -12238,11 +12726,8 @@ impl App {
                                 let is_cur = vid == cur_id;
                                 ui.vertical(|ui| {
                                     if self.thumb_button(ui, &vid, 0, 110.0, is_cur) {
-                                        switch = Some((
-                                            vid.clone(),
-                                            s(v, "semver"),
-                                            vid == latest_id,
-                                        ));
+                                        switch =
+                                            Some((vid.clone(), s(v, "semver"), vid == latest_id));
                                     }
                                     ui.label(
                                         egui::RichText::new(format!(
@@ -12251,11 +12736,13 @@ impl App {
                                             i(v, "page_count")
                                         ))
                                         .small()
-                                        .color(palette_color(if is_cur {
-                                            ACCENT_DEEP
-                                        } else {
-                                            TEXT_WEAK
-                                        })),
+                                        .color(
+                                            palette_color(if is_cur {
+                                                ACCENT_DEEP
+                                            } else {
+                                                TEXT_WEAK
+                                            }),
+                                        ),
                                     );
                                 });
                             }
@@ -12302,7 +12789,11 @@ impl App {
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ui.ctx(), |ui| {
                 ui.set_width(360.0);
-                ui.label(egui::RichText::new(&c.body).size(12.5).color(palette_color(TEXT_MAIN)));
+                ui.label(
+                    egui::RichText::new(&c.body)
+                        .size(12.5)
+                        .color(palette_color(TEXT_MAIN)),
+                );
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -12330,11 +12821,7 @@ impl App {
                     let mut ok = 0usize;
                     for id in &ids {
                         if self
-                            .call_work(
-                                "POST",
-                                &format!("/v1/trash/{id}/purge"),
-                                Some(json!({})),
-                            )
+                            .call_work("POST", &format!("/v1/trash/{id}/purge"), Some(json!({})))
                             .is_ok()
                         {
                             ok += 1;
@@ -12351,12 +12838,10 @@ impl App {
                     match self.call_work("POST", "/v1/trash/purge-all", Some(json!({}))) {
                         Ok(_) => {
                             self.msg = "已清空回收站".into();
-                            self.trash.stack = NavStack::new(TrashFrame::List(
-                                TrashListState {
-                                    filter: 0,
-                                    selected: Default::default(),
-                                },
-                            ));
+                            self.trash.stack = NavStack::new(TrashFrame::List(TrashListState {
+                                filter: 0,
+                                selected: Default::default(),
+                            }));
                             self.trash.loaded = false;
                             self.refresh_all();
                         }
@@ -12519,25 +13004,27 @@ impl App {
                 ui.add_space(6.0);
                 if self.indexes.is_empty() {
                     ui.label(
-                        egui::RichText::new(tr("暂无可用模板：先创建一个索引，之后就能以它为模板新建。"))
-                            .size(12.0)
-                            .color(palette_color(TEXT_WEAK)),
+                        egui::RichText::new(tr(
+                            "暂无可用模板：先创建一个索引，之后就能以它为模板新建。",
+                        ))
+                        .size(12.0)
+                        .color(palette_color(TEXT_WEAK)),
                     );
                 } else {
                     egui::ScrollArea::vertical()
                         .max_height(180.0)
                         .show(ui, |ui| {
                             for idx in self.indexes.clone() {
-                                ui.radio_value(
-                                    &mut t.template_id,
-                                    s(&idx, "id"),
-                                    s(&idx, "name"),
-                                );
+                                ui.radio_value(&mut t.template_id, s(&idx, "id"), s(&idx, "name"));
                             }
                         });
                 }
                 ui.add_space(10.0);
-                ui.label(egui::RichText::new(tr("新索引名称")).size(12.5).color(palette_color(TEXT_MAIN)));
+                ui.label(
+                    egui::RichText::new(tr("新索引名称"))
+                        .size(12.5)
+                        .color(palette_color(TEXT_MAIN)),
+                );
                 ui.add(
                     egui::TextEdit::singleline(&mut t.new_name)
                         .desired_width(360.0)
@@ -12546,8 +13033,7 @@ impl App {
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let ready = !t.new_name.trim().is_empty()
-                            && !t.template_id.is_empty();
+                        let ready = !t.new_name.trim().is_empty() && !t.template_id.is_empty();
                         if ui
                             .add_enabled(ready, egui::Button::new(tr("创建")))
                             .clicked()
@@ -12578,10 +13064,7 @@ impl App {
             if let Ok(detail) =
                 self.call_work("GET", &format!("/v1/indexes/{}", t.template_id), None)
             {
-                if let Some(res) = detail
-                    .get("resolved_entries")
-                    .and_then(|r| r.as_array())
-                {
+                if let Some(res) = detail.get("resolved_entries").and_then(|r| r.as_array()) {
                     for re in res {
                         if let Some(e) = re.get("entry") {
                             entries_raw.push(e.clone());
@@ -12713,8 +13196,7 @@ impl App {
             .fixed_pos(screen.min)
             .order(egui::Order::Foreground)
             .show(ui.ctx(), |ui| {
-                let (rect, resp) =
-                    ui.allocate_exact_size(screen.size(), egui::Sense::click());
+                let (rect, resp) = ui.allocate_exact_size(screen.size(), egui::Sense::click());
                 let painter = ui.painter();
                 // A28 stage black (prototype value, an intentional
                 // exception to the app token set).
@@ -12731,12 +13213,8 @@ impl App {
                     if let Some(tex) = self.thumb(vid, *page) {
                         let ts = tex.size_vec2();
                         if ts.x > 0.0 && ts.y > 0.0 {
-                            let scale =
-                                (stage.width() / ts.x).min(stage.height() / ts.y);
-                            let r = egui::Rect::from_center_size(
-                                stage.center(),
-                                ts * scale,
-                            );
+                            let scale = (stage.width() / ts.x).min(stage.height() / ts.y);
+                            let r = egui::Rect::from_center_size(stage.center(), ts * scale);
                             painter.image(
                                 tex.id(),
                                 r,
@@ -12771,11 +13249,7 @@ impl App {
                         p.pages.len()
                     );
                     let font = egui::FontId::new(13.0, egui::FontFamily::Proportional);
-                    let g = painter.layout_no_wrap(
-                        bar_text,
-                        font,
-                        egui::Color32::from_gray(220),
-                    );
+                    let g = painter.layout_no_wrap(bar_text, font, egui::Color32::from_gray(220));
                     painter.galley(
                         egui::pos2(rect.min.x + 16.0, rect.min.y + 12.0),
                         g,
@@ -12787,11 +13261,7 @@ impl App {
                         egui::pos2(rect.max.x - rail_w, rect.min.y + top_h),
                         rect.max,
                     );
-                    painter.rect_filled(
-                        rail,
-                        0.0,
-                        egui::Color32::from_rgb(0x14, 0x17, 0x16),
-                    );
+                    painter.rect_filled(rail, 0.0, egui::Color32::from_rgb(0x14, 0x17, 0x16));
                     let mut y = rail.min.y + 14.0;
                     let small = egui::FontId::new(11.5, egui::FontFamily::Proportional);
                     let gray = egui::Color32::from_gray(160);
@@ -12830,13 +13300,8 @@ impl App {
                     let g = painter.layout_no_wrap(tr("讲稿").to_string(), small.clone(), gray);
                     painter.galley(egui::pos2(rail.min.x + 14.0, y), g, gray);
                     y += 22.0;
-                    let script = p
-                        .scripts
-                        .get(p.cur)
-                        .cloned()
-                        .unwrap_or_default();
-                    let body_font =
-                        egui::FontId::new(12.5, egui::FontFamily::Proportional);
+                    let script = p.scripts.get(p.cur).cloned().unwrap_or_default();
+                    let body_font = egui::FontId::new(12.5, egui::FontFamily::Proportional);
                     let g = painter.layout(
                         if script.is_empty() {
                             tr("（本页无讲稿）").to_string()
@@ -12847,14 +13312,22 @@ impl App {
                         egui::Color32::from_gray(225),
                         rail.width() - 28.0,
                     );
-                    painter.galley(egui::pos2(rail.min.x + 14.0, y), g, egui::Color32::from_gray(225));
+                    painter.galley(
+                        egui::pos2(rail.min.x + 14.0, y),
+                        g,
+                        egui::Color32::from_gray(225),
+                    );
                 }
                 if resp.clicked() && !p.speaker {
                     p.cur = (p.cur + 1).min(p.pages.len() - 1);
                 }
                 resp.context_menu(|ui| {
                     if ui
-                        .button(if p.blackout { tr("黑屏 ✓") } else { tr("黑屏") })
+                        .button(if p.blackout {
+                            tr("黑屏 ✓")
+                        } else {
+                            tr("黑屏")
+                        })
                         .clicked()
                     {
                         toggle_black = true;
@@ -12987,8 +13460,7 @@ impl App {
                     pe.base.insert(page, runs.clone());
                     pe.work.insert(page, runs);
                     if let Some(els) = v.get("elements").and_then(|x| x.as_array()) {
-                        let list: Vec<ElWork> =
-                            read_elements(els);
+                        let list: Vec<ElWork> = read_elements(els);
                         pe.elems.insert(page, list.clone());
                         pe.elems_base.insert(page, list);
                         pe.slide_cx = i(&v, "slide_cx");
@@ -13030,267 +13502,284 @@ impl App {
             .fixed_pos(screen.min)
             .order(egui::Order::Foreground)
             .show(ui.ctx(), |ui| {
-                egui::Frame::NONE.fill(palette_color(PANEL_BG)).show(ui, |ui| {
-                    ui.set_min_size(screen.size());
-                    ui.add_space(10.0);
-                    ui.horizontal(|ui| {
-                        ui.add_space(14.0);
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{} · v{} · {}",
-                                pe.unit_name,
-                                pe.semver,
-                                tr("页面编辑")
-                            ))
-                            .size(14.0)
-                            .color(palette_color(TEXT_MAIN)),
-                        );
+                egui::Frame::NONE
+                    .fill(palette_color(PANEL_BG))
+                    .show(ui, |ui| {
+                        ui.set_min_size(screen.size());
                         ui.add_space(10.0);
-                        if ui
-                            .add_enabled(
-                                !pe.undo.is_empty(),
-                                egui::Button::new(tr("撤销")),
-                            )
-                            .clicked()
-                        {
-                            undo_req = true;
-                        }
-                        if ui
-                            .add_enabled(
-                                !pe.redo.is_empty(),
-                                egui::Button::new(tr("重做")),
-                            )
-                            .clicked()
-                        {
-                            redo_req = true;
-                        }
-                        ui.add_enabled_ui(v2, |ui| {
-                            ui.menu_button(tr("添加元素"), |ui| {
-                                for (kind, label) in [("text", "文本"), ("shape", "形状"), ("line", "线条"), ("picture", "图片")] {
-                                    if ui.button(tr(label)).clicked() {
-                                        add_element = Some(kind);
-                                        ui.close();
-                                    }
-                                }
-                            });
-                        });
-                        ui.add_enabled_ui(pe.can_align(), |ui| {
-                            ui.menu_button(tr("多选对齐"), |ui| {
-                                for (direction, label) in ALIGNMENTS {
-                                    if ui.button(tr(label)).clicked() {
-                                        alignment = Some(*direction);
-                                        ui.close();
-                                    }
-                                }
-                            });
-                        });
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.add_space(14.0);
-                                if text_action(ui, "✕ 关闭", palette_color(TEXT_MAIN), 13.0) {
-                                    close = true;
-                                }
-                            },
-                        );
-                    });
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.horizontal_top(|ui| {
-                        ui.vertical(|ui| {
-                            if btn_default_enabled(ui, pe.added_pages() < 100, tr("＋ 加页")).clicked() {
-                                add_page = true;
+                        ui.horizontal(|ui| {
+                            ui.add_space(14.0);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} · v{} · {}",
+                                    pe.unit_name,
+                                    pe.semver,
+                                    tr("页面编辑")
+                                ))
+                                .size(14.0)
+                                .color(palette_color(TEXT_MAIN)),
+                            );
+                            ui.add_space(10.0);
+                            if ui
+                                .add_enabled(!pe.undo.is_empty(), egui::Button::new(tr("撤销")))
+                                .clicked()
+                            {
+                                undo_req = true;
                             }
-                            egui::ScrollArea::vertical()
-                                .id_salt("editor-page-rail")
-                                .max_width(124.0)
-                                .max_height((screen.height() - 176.0).max(132.0))
-                                .show(ui, |ui| {
-                                    for pno in 0..pe.page_count {
-                                        let clicked = if pno < pe.original_page_count {
-                                            self.thumb_button(ui, &pe.version_id, pno, 104.0, pno == pe.page)
-                                        } else {
-                                            ui.add_sized([104.0, 58.0], egui::Button::new(format!("{} {}", tr("第"), pno + 1))
-                                                .selected(pno == pe.page)).clicked()
-                                        };
-                                        if clicked {
-                                            nav = Some(pno);
+                            if ui
+                                .add_enabled(!pe.redo.is_empty(), egui::Button::new(tr("重做")))
+                                .clicked()
+                            {
+                                redo_req = true;
+                            }
+                            ui.add_enabled_ui(v2, |ui| {
+                                ui.menu_button(tr("添加元素"), |ui| {
+                                    for (kind, label) in [
+                                        ("text", "文本"),
+                                        ("shape", "形状"),
+                                        ("line", "线条"),
+                                        ("picture", "图片"),
+                                    ] {
+                                        if ui.button(tr(label)).clicked() {
+                                            add_element = Some(kind);
+                                            ui.close();
                                         }
                                     }
                                 });
-                        });
-                        ui.separator();
-                        // Center: the stage with element boxes (v2) or
-                        // the v1 thumbnail + flat run editors.
-                        if v2 {
-                            ui.vertical(|ui| {
-                                self.page_edit_stage(ui, &mut pe);
-                                pe.preview.status(ui);
-                                ui.add_space(8.0);
-                                let hint = match pe.sel.and_then(|s| {
-                                    pe.elems
-                                        .get(&pe.page)
-                                        .and_then(|l| l.get(s))
-                                }) {
-                                    Some(el) => format!(
-                                        "{} · {}",
-                                        el_kind_label(&el.kind),
-                                        if el.name.is_empty() {
-                                            tr("未命名元素")
-                                        } else {
-                                            el.name.as_str()
-                                        }
-                                    ),
-                                    None => tr("点选元素，按住 Ctrl 或 Shift 多选。")
-                                        .to_string(),
-                                };
-                                ui.label(
-                                    egui::RichText::new(hint)
-                                        .size(12.0)
-                                        .color(palette_color(TEXT_WEAK)),
-                                );
                             });
-                        } else {
-                            egui::ScrollArea::vertical().show(ui, |ui| {
-                                self.thumb_ui(ui, &pe.version_id.clone(), pe.page, 620.0);
-                                ui.add_space(10.0);
-                                ui.label(
-                                    egui::RichText::new(tr("文本内容（逐段编辑，保存后生成新版本）"))
-                                        .size(12.5)
-                                        .color(palette_color(TEXT_MAIN)),
-                                );
-                                ui.add_space(6.0);
-                                let has_runs = pe
-                                    .work
-                                    .get(&pe.page)
-                                    .map(|r| !r.is_empty())
-                                    .unwrap_or(false);
-                                if !has_runs {
+                            ui.add_enabled_ui(pe.can_align(), |ui| {
+                                ui.menu_button(tr("多选对齐"), |ui| {
+                                    for (direction, label) in ALIGNMENTS {
+                                        if ui.button(tr(label)).clicked() {
+                                            alignment = Some(*direction);
+                                            ui.close();
+                                        }
+                                    }
+                                });
+                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.add_space(14.0);
+                                    if text_action(ui, "✕ 关闭", palette_color(TEXT_MAIN), 13.0)
+                                    {
+                                        close = true;
+                                    }
+                                },
+                            );
+                        });
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.horizontal_top(|ui| {
+                            ui.vertical(|ui| {
+                                if btn_default_enabled(ui, pe.added_pages() < 100, tr("＋ 加页"))
+                                    .clicked()
+                                {
+                                    add_page = true;
+                                }
+                                egui::ScrollArea::vertical()
+                                    .id_salt("editor-page-rail")
+                                    .max_width(124.0)
+                                    .max_height((screen.height() - 176.0).max(132.0))
+                                    .show(ui, |ui| {
+                                        for pno in 0..pe.page_count {
+                                            let clicked = if pno < pe.original_page_count {
+                                                self.thumb_button(
+                                                    ui,
+                                                    &pe.version_id,
+                                                    pno,
+                                                    104.0,
+                                                    pno == pe.page,
+                                                )
+                                            } else {
+                                                ui.add_sized(
+                                                    [104.0, 58.0],
+                                                    egui::Button::new(format!(
+                                                        "{} {}",
+                                                        tr("第"),
+                                                        pno + 1
+                                                    ))
+                                                    .selected(pno == pe.page),
+                                                )
+                                                .clicked()
+                                            };
+                                            if clicked {
+                                                nav = Some(pno);
+                                            }
+                                        }
+                                    });
+                            });
+                            ui.separator();
+                            // Center: the stage with element boxes (v2) or
+                            // the v1 thumbnail + flat run editors.
+                            if v2 {
+                                ui.vertical(|ui| {
+                                    self.page_edit_stage(ui, &mut pe);
+                                    pe.preview.status(ui);
+                                    ui.add_space(8.0);
+                                    let hint =
+                                        match pe.sel.and_then(|s| {
+                                            pe.elems.get(&pe.page).and_then(|l| l.get(s))
+                                        }) {
+                                            Some(el) => format!(
+                                                "{} · {}",
+                                                el_kind_label(&el.kind),
+                                                if el.name.is_empty() {
+                                                    tr("未命名元素")
+                                                } else {
+                                                    el.name.as_str()
+                                                }
+                                            ),
+                                            None => tr("点选元素，按住 Ctrl 或 Shift 多选。")
+                                                .to_string(),
+                                        };
                                     ui.label(
-                                        egui::RichText::new(tr("本页没有可编辑的文本段。"))
+                                        egui::RichText::new(hint)
                                             .size(12.0)
                                             .color(palette_color(TEXT_WEAK)),
                                     );
-                                }
-                                if let Some(runs) = pe.work.get_mut(&pe.page) {
-                                    for (ri, run) in runs.iter_mut().enumerate() {
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "{} {}",
-                                                    tr("文本"),
-                                                    ri + 1
-                                                ))
-                                                .size(11.5)
-                                                .color(palette_color(TEXT_FAINT)),
+                                });
+                            } else {
+                                egui::ScrollArea::vertical().show(ui, |ui| {
+                                    self.thumb_ui(ui, &pe.version_id.clone(), pe.page, 620.0);
+                                    ui.add_space(10.0);
+                                    ui.label(
+                                        egui::RichText::new(tr(
+                                            "文本内容（逐段编辑，保存后生成新版本）",
+                                        ))
+                                        .size(12.5)
+                                        .color(palette_color(TEXT_MAIN)),
+                                    );
+                                    ui.add_space(6.0);
+                                    let has_runs = pe
+                                        .work
+                                        .get(&pe.page)
+                                        .map(|r| !r.is_empty())
+                                        .unwrap_or(false);
+                                    if !has_runs {
+                                        ui.label(
+                                            egui::RichText::new(tr("本页没有可编辑的文本段。"))
+                                                .size(12.0)
+                                                .color(palette_color(TEXT_WEAK)),
+                                        );
+                                    }
+                                    if let Some(runs) = pe.work.get_mut(&pe.page) {
+                                        for (ri, run) in runs.iter_mut().enumerate() {
+                                            ui.horizontal(|ui| {
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "{} {}",
+                                                        tr("文本"),
+                                                        ri + 1
+                                                    ))
+                                                    .size(11.5)
+                                                    .color(palette_color(TEXT_FAINT)),
+                                                );
+                                                let resp = ui.add(
+                                                    egui::TextEdit::singleline(run)
+                                                        .desired_width(520.0)
+                                                        .margin(egui::vec2(8.0, 5.0)),
+                                                );
+                                                if resp.gained_focus() {
+                                                    want_snapshot = true;
+                                                }
+                                            });
+                                        }
+                                    }
+                                    ui.add_space(12.0);
+                                });
+                            }
+                            ui.separator();
+                            // Side panel: element list + inspector (v2)
+                            // or the page position alone (v1), then the
+                            // speaker notes for both.
+                            ui.vertical(|ui| {
+                                ui.set_width(if v2 { 308.0 } else { 210.0 });
+                                egui::ScrollArea::vertical()
+                                    .id_salt("editor-inspector")
+                                    .max_height((screen.height() - 176.0).max(132.0))
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{} {} / {} {}",
+                                                tr("第"),
+                                                pe.page + 1,
+                                                pe.page_count,
+                                                tr("页")
+                                            ))
+                                            .size(12.0)
+                                            .color(palette_color(TEXT_WEAK)),
+                                        );
+                                        if v2 {
+                                            ui.add_space(8.0);
+                                            page_edit_inspector(
+                                                ui,
+                                                &pe,
+                                                &mut want_snapshot,
+                                                &mut commit,
+                                                &mut sel_req,
                                             );
+                                        }
+                                        ui.add_space(10.0);
+                                        ui.label(
+                                            egui::RichText::new(tr("讲稿"))
+                                                .size(12.5)
+                                                .color(palette_color(TEXT_MAIN)),
+                                        );
+                                        if pe.page < pe.scripts.len() {
                                             let resp = ui.add(
-                                                egui::TextEdit::singleline(run)
-                                                    .desired_width(520.0)
-                                                    .margin(egui::vec2(8.0, 5.0)),
+                                                egui::TextEdit::multiline(&mut pe.scripts[pe.page])
+                                                    .desired_width(if v2 { 292.0 } else { 196.0 })
+                                                    .desired_rows(10),
                                             );
                                             if resp.gained_focus() {
                                                 want_snapshot = true;
                                             }
-                                        });
-                                    }
-                                }
-                                ui.add_space(12.0);
-                            });
-                        }
-                        ui.separator();
-                        // Side panel: element list + inspector (v2)
-                        // or the page position alone (v1), then the
-                        // speaker notes for both.
-                        ui.vertical(|ui| {
-                            ui.set_width(if v2 { 308.0 } else { 210.0 });
-                            egui::ScrollArea::vertical()
-                                .id_salt("editor-inspector")
-                                .max_height((screen.height() - 176.0).max(132.0))
-                                .show(ui, |ui| {
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{} {} / {} {}",
-                                        tr("第"),
-                                        pe.page + 1,
-                                        pe.page_count,
-                                        tr("页")
-                                    ))
-                                    .size(12.0)
-                                    .color(palette_color(TEXT_WEAK)),
-                                );
-                                if v2 {
-                                    ui.add_space(8.0);
-                                    page_edit_inspector(
-                                        ui,
-                                        &pe,
-                                        &mut want_snapshot,
-                                        &mut commit,
-                                        &mut sel_req,
-                                    );
-                                }
-                                ui.add_space(10.0);
-                                ui.label(
-                                    egui::RichText::new(tr("讲稿"))
-                                        .size(12.5)
-                                        .color(palette_color(TEXT_MAIN)),
-                                );
-                                if pe.page < pe.scripts.len() {
-                                    let resp = ui.add(
-                                        egui::TextEdit::multiline(
-                                            &mut pe.scripts[pe.page],
-                                        )
-                                        .desired_width(if v2 { 292.0 } else { 196.0 })
-                                        .desired_rows(10),
-                                    );
-                                    if resp.gained_focus() {
-                                        want_snapshot = true;
-                                    }
-                                }
+                                        }
+                                    });
                             });
                         });
+                        ui.separator();
+                        // Footer (B5): bump choice per the §8 rule, the
+                        // publish note, cancel / save-as-new-version.
+                        ui.horizontal(|ui| {
+                            ui.add_space(14.0);
+                            if let Some(b) = segmented(
+                                ui,
+                                &[tr("大版本"), tr("小版本"), tr("修订号")],
+                                pe.bump,
+                                SegStyle::Soft,
+                            ) {
+                                pe.bump = b;
+                            }
+                            ui.add(
+                                egui::TextEdit::singleline(&mut pe.note)
+                                    .hint_text(tr("发布说明"))
+                                    .desired_width(220.0)
+                                    .margin(egui::vec2(8.0, 5.0)),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.add_space(14.0);
+                                    let can_save = pe.dirty();
+                                    if ui
+                                        .add_enabled(
+                                            can_save,
+                                            egui::Button::new(tr("保存并发布新版本")),
+                                        )
+                                        .clicked()
+                                    {
+                                        save = true;
+                                    }
+                                    if btn_default(ui, tr("取消")).clicked() {
+                                        close = true;
+                                    }
+                                },
+                            );
+                        });
+                        ui.add_space(10.0);
                     });
-                    ui.separator();
-                    // Footer (B5): bump choice per the §8 rule, the
-                    // publish note, cancel / save-as-new-version.
-                    ui.horizontal(|ui| {
-                        ui.add_space(14.0);
-                        if let Some(b) = segmented(
-                            ui,
-                            &[tr("大版本"), tr("小版本"), tr("修订号")],
-                            pe.bump,
-                            SegStyle::Soft,
-                        ) {
-                            pe.bump = b;
-                        }
-                        ui.add(
-                            egui::TextEdit::singleline(&mut pe.note)
-                                .hint_text(tr("发布说明"))
-                                .desired_width(220.0)
-                                .margin(egui::vec2(8.0, 5.0)),
-                        );
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.add_space(14.0);
-                                let can_save = pe.dirty();
-                                if ui
-                                    .add_enabled(
-                                        can_save,
-                                        egui::Button::new(tr("保存并发布新版本")),
-                                    )
-                                    .clicked()
-                                {
-                                    save = true;
-                                }
-                                if btn_default(ui, tr("取消")).clicked() {
-                                    close = true;
-                                }
-                            },
-                        );
-                    });
-                    ui.add_space(10.0);
-                });
             });
         // Keyboard undo/redo, only when no text field holds focus
         // (a focused TextEdit keeps Ctrl+Z for its own buffer).
@@ -13324,7 +13813,12 @@ impl App {
             }
         }
         if let Some(selection) = sel_req {
-            pe.select_element(selection, ui.input(|input| input.modifiers.command || input.modifiers.ctrl || input.modifiers.shift));
+            pe.select_element(
+                selection,
+                ui.input(|input| {
+                    input.modifiers.command || input.modifiers.ctrl || input.modifiers.shift
+                }),
+            );
         }
         if let Some(page) = nav {
             pe.page = page;
@@ -13335,7 +13829,11 @@ impl App {
             pe.add_page();
         }
         if let Some(kind) = add_element {
-            let picture = if kind == "picture" { pick_editor_picture() } else { None };
+            let picture = if kind == "picture" {
+                pick_editor_picture()
+            } else {
+                None
+            };
             if kind != "picture" || picture.is_some() {
                 pe.add_element(kind, picture);
             }
@@ -13376,35 +13874,63 @@ impl App {
         let page = pe.page;
         let width = (ui.ctx().content_rect().width() - 480.0).clamp(300.0, 850.0);
         let height = width * pe.slide_cy.max(1) as f32 / pe.slide_cx.max(1) as f32;
-        let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click_and_drag());
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click_and_drag());
         let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
         let picture = pe.preview.texture(page).or_else(|| {
-            (page < pe.original_page_count).then(|| self.thumb(&pe.version_id, page)).flatten()
+            (page < pe.original_page_count)
+                .then(|| self.thumb(&pe.version_id, page))
+                .flatten()
         });
         if let Some(texture) = picture {
-            painter.image(texture.id(), rect, egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+            painter.image(
+                texture.id(),
+                rect,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
         } else {
-            painter.rect_filled(rect, 0.0, if page >= pe.original_page_count { egui::Color32::WHITE } else { palette_color(HOVER_BG) });
+            painter.rect_filled(
+                rect,
+                0.0,
+                if page >= pe.original_page_count {
+                    egui::Color32::WHITE
+                } else {
+                    palette_color(HOVER_BG)
+                },
+            );
         }
         let elements = pe.elems.get(&page).map(Vec::as_slice).unwrap_or(&[]);
         let scale = width / pe.slide_cx.max(1) as f32;
         let root = StageTransform {
-            origin: rect.min, x_axis: egui::vec2(scale, 0.0), y_axis: egui::vec2(0.0, scale),
+            origin: rect.min,
+            x_axis: egui::vec2(scale, 0.0),
+            y_axis: egui::vec2(0.0, scale),
         };
         let transforms = stage_transforms(elements, root);
-        let bounds: Vec<_> = elements.iter().zip(&transforms)
-            .map(|(element, transform)| transform.project(element)).collect();
-        let handle = |element: egui::Rect| egui::Rect::from_min_size(
-            element.max - egui::vec2(9.0, 9.0), egui::vec2(9.0, 9.0),
-        );
+        let bounds: Vec<_> = elements
+            .iter()
+            .zip(&transforms)
+            .map(|(element, transform)| transform.project(element))
+            .collect();
+        let handle = |element: egui::Rect| {
+            egui::Rect::from_min_size(element.max - egui::vec2(9.0, 9.0), egui::vec2(9.0, 9.0))
+        };
         for (index, area) in bounds.iter().copied().enumerate() {
             let selected = pe.selection.contains(&index);
             if elements[index].has_xfrm {
                 painter.rect_stroke(
-                    area, 0.0, egui::Stroke::new(
+                    area,
+                    0.0,
+                    egui::Stroke::new(
                         if selected { 1.8 } else { 0.6 },
-                        if selected { ACCENT } else { palette_color(TEXT_FAINT).gamma_multiply(0.55) },
-                    ), egui::StrokeKind::Middle,
+                        if selected {
+                            ACCENT
+                        } else {
+                            palette_color(TEXT_FAINT).gamma_multiply(0.55)
+                        },
+                    ),
+                    egui::StrokeKind::Middle,
                 );
                 if pe.sel == Some(index) && pe.selection.len() == 1 {
                     painter.rect_filled(handle(area), 0.0, ACCENT);
@@ -13412,15 +13938,25 @@ impl App {
             }
         }
         let Some(pointer) = response.interact_pointer_pos() else {
-            if response.drag_stopped() { pe.drag = None; }
+            if response.drag_stopped() {
+                pe.drag = None;
+            }
             return;
         };
-        let hit = || bounds.iter().enumerate().rev().find(|(index, area)| {
-            elements[*index].has_xfrm && area.contains(pointer)
-        }).map(|(index, _)| index);
+        let hit = || {
+            bounds
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(index, area)| elements[*index].has_xfrm && area.contains(pointer))
+                .map(|(index, _)| index)
+        };
         if response.drag_started() {
             let resize = pe.sel.filter(|&index| {
-                pe.selection.len() == 1 && bounds.get(index).is_some_and(|area| handle(*area).expand(2.0).contains(pointer))
+                pe.selection.len() == 1
+                    && bounds
+                        .get(index)
+                        .is_some_and(|area| handle(*area).expand(2.0).contains(pointer))
             });
             if let Some(index) = resize.or_else(hit) {
                 let element = &elements[index];
@@ -13429,20 +13965,29 @@ impl App {
                     resize: resize.is_some(),
                     start_pos: pointer,
                     transform: transforms[index],
-                    x: element.x, y: element.y, cx: element.cx, cy: element.cy,
+                    x: element.x,
+                    y: element.y,
+                    cx: element.cx,
+                    cy: element.cy,
                 };
                 pe.select_element(Some(index), false);
                 pe.push_undo();
                 pe.drag = Some(drag);
             }
         } else if response.clicked() {
-            let extend = ui.input(|input| input.modifiers.command || input.modifiers.ctrl || input.modifiers.shift);
+            let extend = ui.input(|input| {
+                input.modifiers.command || input.modifiers.ctrl || input.modifiers.shift
+            });
             pe.select_element(hit(), extend);
         }
         if response.dragged() {
             if let Some(drag) = pe.drag {
                 let delta = drag.transform.world_delta(pointer - drag.start_pos);
-                if let Some(element) = pe.elems.get_mut(&page).and_then(|items| items.get_mut(drag.el)) {
+                if let Some(element) = pe
+                    .elems
+                    .get_mut(&page)
+                    .and_then(|items| items.get_mut(drag.el))
+                {
                     if drag.resize {
                         element.cx = (drag.cx + delta.x as i64).max(20_000);
                         element.cy = (drag.cy + delta.y as i64).max(20_000);
@@ -13822,11 +14367,19 @@ impl App {
                         }
                     }
                 }
-                Some(IndexDetailAction::OpenGraphTarget { index, branch, commit }) => {
+                Some(IndexDetailAction::OpenGraphTarget {
+                    index,
+                    branch,
+                    commit,
+                }) => {
                     self.open_index_detail_as(&index, branch.clone());
                     if let IndexFrame::Detail(st) = self.index.stack.top_mut() {
                         if st.index_id == index && st.branch == branch {
-                            st.view = if commit.is_some() { IndexDetailView::Commits } else { IndexDetailView::Lineage };
+                            st.view = if commit.is_some() {
+                                IndexDetailView::Commits
+                            } else {
+                                IndexDetailView::Lineage
+                            };
                             st.selected_commit = commit;
                         }
                     }
@@ -13923,90 +14476,158 @@ impl App {
             let card_w = outer_width - 2.0;
             let cover_h = card_w * 9.0 / 16.0;
             let card_h = cover_h + 70.0;
-            ui.with_layout(
-                egui::Layout::left_to_right(egui::Align::Min).with_main_wrap(true),
-                |ui| {
-                    for x in items {
-                        let xid = s(&x, "id");
-                        let selected = ov.selected.as_deref() == Some(xid.as_str());
-                        let scope_color = IndexScope::of(&x).color();
-                        let title = s(&x, "name");
-                        let cover = self.index_covers.get(&xid).cloned().unwrap_or_default();
-                        let resp = self.wall_card(ui, WallCard {
-                            width: card_w, min_height: card_h, title: &title, cover: &cover, selected,
-                            scope: Some(scope_color),
-                            variant: if !my_name.is_empty() && s(&x, "maintainer") == my_name {
-                                CardVariant::Mine
+            let mut groups: Vec<(String, Vec<Value>)> = Vec::new();
+            for item in items {
+                let folder_id = s(&item, "folder_id");
+                let folder = if folder_id.is_empty() {
+                    "根目录".to_string()
+                } else {
+                    self.folders
+                        .iter()
+                        .find(|folder| s(folder, "id") == folder_id)
+                        .map(|folder| {
+                            let path = s(folder, "path");
+                            if path.is_empty() {
+                                s(folder, "name")
                             } else {
-                                CardVariant::Normal
-                            },
-                        }, |app, ui| {
-                            ui.horizontal(|ui| {
-                                if let Some(tag) = app.index_tags.get(&xid) {
-                                    chip(
-                                        ui,
-                                        &format!("V{tag}"),
-                                        palette_color(ACCENT_DEEP),
-                                        CHIP_BLUE_BG,
-                                    );
-                                }
-                                // 主索引 capsule: this index is
-                                // its home folder's designated
-                                // main index (spec §3.10).
-                                let home = s(&x, "folder_id");
-                                let is_main = !home.is_empty()
-                                    && app.folders.iter().any(|f| {
-                                        s(f, "id") == home
-                                            && s(f, "main_index_id") == xid
+                                path
+                            }
+                        })
+                        .unwrap_or_else(|| "未分类".into())
+                };
+                if let Some((_, group)) = groups.iter_mut().find(|(name, _)| *name == folder) {
+                    group.push(item);
+                } else {
+                    groups.push((folder, vec![item]));
+                }
+            }
+            for (folder, mut group) in groups {
+                group.sort_by_key(|item| {
+                    let id = s(item, "id");
+                    let folder_id = s(item, "folder_id");
+                    !self.folders.iter().any(|folder| {
+                        s(folder, "id") == folder_id && s(folder, "main_index_id") == id
+                    })
+                });
+                let active = group
+                    .iter()
+                    .filter(|item| item["lifecycle"] != "history")
+                    .count();
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(folder).size(14.0).strong());
+                    ui.label(
+                        egui::RichText::new(format!("使用中 {active} 份"))
+                            .size(11.5)
+                            .color(palette_color(TEXT_WEAK)),
+                    );
+                });
+                ui.add_space(4.0);
+                ui.with_layout(
+                    egui::Layout::left_to_right(egui::Align::Min).with_main_wrap(true),
+                    |ui| {
+                        for x in group {
+                            let xid = s(&x, "id");
+                            let selected = ov.selected.as_deref() == Some(xid.as_str());
+                            let scope_color = IndexScope::of(&x).color();
+                            let title = s(&x, "name");
+                            let cover = self.index_covers.get(&xid).cloned().unwrap_or_default();
+                            let resp = self.wall_card(
+                                ui,
+                                WallCard {
+                                    width: card_w,
+                                    min_height: card_h,
+                                    title: &title,
+                                    cover: &cover,
+                                    selected,
+                                    scope: Some(scope_color),
+                                    variant: if !my_name.is_empty()
+                                        && s(&x, "maintainer") == my_name
+                                    {
+                                        CardVariant::Mine
+                                    } else {
+                                        CardVariant::Normal
+                                    },
+                                },
+                                |app, ui| {
+                                    ui.horizontal(|ui| {
+                                        if let Some(tag) = app.index_tags.get(&xid) {
+                                            chip(
+                                                ui,
+                                                &format!("V{tag}"),
+                                                palette_color(ACCENT_DEEP),
+                                                CHIP_BLUE_BG,
+                                            );
+                                        }
+                                        // 主索引 capsule: this index is
+                                        // its home folder's designated
+                                        // main index (spec §3.10).
+                                        let home = s(&x, "folder_id");
+                                        let is_main = !home.is_empty()
+                                            && app.folders.iter().any(|f| {
+                                                s(f, "id") == home && s(f, "main_index_id") == xid
+                                            });
+                                        if is_main {
+                                            chip(
+                                                ui,
+                                                "主索引",
+                                                palette_color(ACCENT_DEEP),
+                                                CHIP_BLUE_BG,
+                                            );
+                                        }
+                                        match s(&x, "lifecycle").as_str() {
+                                            "history" => chip(
+                                                ui,
+                                                "历史",
+                                                palette_color(TEXT_WEAK),
+                                                palette_color(CHIP_GRAY_BG),
+                                            ),
+                                            "void" => chip(
+                                                ui,
+                                                "已作废",
+                                                palette_color(ROSE),
+                                                ROSE_SOFT_BG,
+                                            ),
+                                            _ => {}
+                                        }
                                     });
-                                if is_main {
-                                    chip(
-                                        ui,
-                                        "主索引",
-                                        palette_color(ACCENT_DEEP),
-                                        CHIP_BLUE_BG,
-                                    );
-                                }
-                                match s(&x, "lifecycle").as_str() {
-                                    "history" => chip(
-                                        ui,
-                                        "历史",
-                                        palette_color(TEXT_WEAK),
-                                        palette_color(CHIP_GRAY_BG),
-                                    ),
-                                    "void" => {
-                                        chip(ui, "已作废", palette_color(ROSE), ROSE_SOFT_BG)
-                                    }
-                                    _ => {}
-                                }
-                            });
-                        });
-                        let rect = resp.response.rect;
-                        let click = ui
-                            .interact(rect, ui.scope_id().with(("idx_card", &xid)), egui::Sense::click())
-                            .on_hover_text(format!(
-                                "{} · {}",
-                                s(&x, "maintainer"),
-                                fmt_time(i(&x, "created_ms"))
-                            ));
-                        let stroke = if !selected && (click.hovered() || click.has_focus()) {
-                            Some(egui::Stroke::new(1.0, palette_color(FIELD_BORDER)))
-                        } else {
-                            None
-                        };
-                        if let Some(stroke) = stroke {
-                            ui.painter()
-                                .rect_stroke(rect, 6.0, stroke, egui::StrokeKind::Inside);
+                                },
+                            );
+                            let rect = resp.response.rect;
+                            let click = ui
+                                .interact(
+                                    rect,
+                                    ui.scope_id().with(("idx_card", &xid)),
+                                    egui::Sense::click(),
+                                )
+                                .on_hover_text(format!(
+                                    "{} · {}",
+                                    s(&x, "maintainer"),
+                                    fmt_time(i(&x, "created_ms"))
+                                ));
+                            let stroke = if !selected && (click.hovered() || click.has_focus()) {
+                                Some(egui::Stroke::new(1.0, palette_color(FIELD_BORDER)))
+                            } else {
+                                None
+                            };
+                            if let Some(stroke) = stroke {
+                                ui.painter().rect_stroke(
+                                    rect,
+                                    6.0,
+                                    stroke,
+                                    egui::StrokeKind::Inside,
+                                );
+                            }
+                            if click.clicked() {
+                                ov.selected = Some(xid.clone());
+                            }
+                            if click.double_clicked() {
+                                open = Some(xid);
+                            }
                         }
-                        if click.clicked() {
-                            ov.selected = Some(xid.clone());
-                        }
-                        if click.double_clicked() {
-                            open = Some(xid);
-                        }
-                    }
-                },
-            );
+                    },
+                );
+                ui.add_space(8.0);
+            }
         });
         open
     }
@@ -14079,7 +14700,12 @@ impl App {
                         {
                             ui.checkbox(
                                 &mut slot.2,
-                                format!("{} · {} · {}", s(&unit, "name"), s(&rend, "form"), s(&rend, "lang")),
+                                format!(
+                                    "{} · {} · {}",
+                                    s(&unit, "name"),
+                                    s(&rend, "form"),
+                                    s(&rend, "lang")
+                                ),
                             );
                         }
                     }
@@ -14112,7 +14738,11 @@ impl App {
         });
         ui.add_space(2.0);
         ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("分支").size(11.5).color(palette_color(TEXT_WEAK)));
+            ui.label(
+                egui::RichText::new("分支")
+                    .size(11.5)
+                    .color(palette_color(TEXT_WEAK)),
+            );
             let current_branch = if st.branch.is_empty() {
                 "main"
             } else {
@@ -14195,7 +14825,13 @@ impl App {
                     .desired_width(110.0)
                     .margin(egui::vec2(8.0, 2.0)),
             );
-            if text_action_enabled(ui, !st.new_branch.is_empty(), "拉分支", palette_color(TEXT_MAIN), 13.0) {
+            if text_action_enabled(
+                ui,
+                !st.new_branch.is_empty(),
+                "拉分支",
+                palette_color(TEXT_MAIN),
+                13.0,
+            ) {
                 let id = st.index_id.clone();
                 let r = self.call_work(
                     "POST",
@@ -14531,7 +15167,9 @@ impl App {
                 }
             }
             if conflicts.is_empty() {
-                ui.label(egui::RichText::new("无冲突，可自动合并").color(palette_color(CHIP_GREEN_FG)));
+                ui.label(
+                    egui::RichText::new("无冲突，可自动合并").color(palette_color(CHIP_GREEN_FG)),
+                );
             } else {
                 ui.label(format!("{} 个条目冲突，逐条裁决：", conflicts.len()));
                 for c in &conflicts {
@@ -14663,7 +15301,9 @@ impl App {
                         ConnStatus::Connected => ("已连接", palette_color(CHIP_GREEN_FG)),
                         ConnStatus::Failed => ("连接失败", palette_color(ROSE)),
                         ConnStatus::LoggedOut => ("未登录", palette_color(TEXT_WEAK)),
-                        ConnStatus::Anonymous => ("匿名连接", egui::Color32::from_rgb(0x2F, 0x6B, 0xF5)),
+                        ConnStatus::Anonymous => {
+                            ("匿名连接", egui::Color32::from_rgb(0x2F, 0x6B, 0xF5))
+                        }
                     };
                     ui.horizontal(|ui| {
                         ui.label(
@@ -14672,8 +15312,8 @@ impl App {
                             } else {
                                 format!("{} · {}", c.url, c.username)
                             })
-                                .size(11.5)
-                                .color(palette_color(TEXT_WEAK)),
+                            .size(11.5)
+                            .color(palette_color(TEXT_WEAK)),
                         );
                         ui.label(egui::RichText::new(status).size(11.5).color(color));
                     });
@@ -14683,22 +15323,7 @@ impl App {
         if let Some((i, op)) = action {
             match op {
                 "activate" => self.activate(i),
-                "disconnect" => {
-                    if let Some(c) = self.conns.get_mut(i) {
-                        c.token = None;
-                        c.status = if c.anon {
-                            ConnStatus::Anonymous
-                        } else {
-                            ConnStatus::LoggedOut
-                        };
-                    }
-                    if self.active == Some(i) {
-                        self.token = None;
-                        self.user = None;
-                    }
-                    self.persist_conns();
-                    self.msg = "已断开该服务器（保存的地址保留）".into();
-                }
+                "disconnect" => self.disconnect_conn(i),
                 "delete" => {
                     if i < self.conns.len() {
                         self.conns.remove(i);
@@ -14739,6 +15364,7 @@ impl App {
                 .color(palette_color(TEXT_MAIN)),
         );
         ui.add_space(6.0);
+        let mut fetch_name = false;
         egui::Grid::new("add_server_grid")
             .num_columns(2)
             .spacing([10.0, 10.0])
@@ -14750,8 +15376,29 @@ impl App {
                         .hint_text("http://192.168.1.10:8730"),
                 );
                 ui.end_row();
+                ui.label("服务器名称");
+                ui.horizontal(|ui| {
+                    ui.set_width(380.0);
+                    ui.add_sized(
+                        [282.0, 30.0],
+                        egui::TextEdit::singleline(&mut self.add_name)
+                            .hint_text("自定义名称，或从服务器获取"),
+                    );
+                    fetch_name = ui
+                        .add_enabled(
+                            !self.add_url.trim().is_empty(),
+                            egui::Button::new("获取名称")
+                                .corner_radius(6)
+                                .min_size(egui::vec2(90.0, 30.0)),
+                        )
+                        .clicked();
+                });
+                ui.end_row();
                 ui.label("账号");
-                ui.add_sized([380.0, 30.0], egui::TextEdit::singleline(&mut self.add_user));
+                ui.add_sized(
+                    [380.0, 30.0],
+                    egui::TextEdit::singleline(&mut self.add_user),
+                );
                 ui.end_row();
                 ui.label("密码");
                 ui.add_sized(
@@ -14760,15 +15407,20 @@ impl App {
                 );
                 ui.end_row();
             });
+        if fetch_name {
+            self.fetch_add_server_name();
+        }
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
                     !self.add_url.trim().is_empty(),
-                    egui::Button::new(egui::RichText::new("登录并添加").color(egui::Color32::WHITE))
-                        .fill(ACCENT)
-                        .corner_radius(6)
-                        .min_size(egui::vec2(120.0, 30.0)),
+                    egui::Button::new(
+                        egui::RichText::new("登录并添加").color(egui::Color32::WHITE),
+                    )
+                    .fill(ACCENT)
+                    .corner_radius(6)
+                    .min_size(egui::vec2(120.0, 30.0)),
                 )
                 .clicked()
             {
@@ -14797,7 +15449,11 @@ impl App {
                     .color(palette_color(TEXT_MAIN)),
             );
             if self.disc_scanning {
-                ui.label(egui::RichText::new("搜索中…").size(11.5).color(palette_color(TEXT_WEAK)));
+                ui.label(
+                    egui::RichText::new("搜索中…")
+                        .size(11.5)
+                        .color(palette_color(TEXT_WEAK)),
+                );
             } else if ui.button("搜索局域网服务器").clicked() {
                 self.start_discovery();
             }
@@ -14810,7 +15466,7 @@ impl App {
                     .color(palette_color(TEXT_WEAK)),
             );
         }
-        let mut use_url: Option<String> = None;
+        let mut use_server: Option<(String, String)> = None;
         for d in self.discovered.clone() {
             let name = s(&d, "name");
             let url = s(&d, "url");
@@ -14823,9 +15479,13 @@ impl App {
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(
-                            egui::RichText::new(if name.is_empty() { "启幕服务器" } else { &name })
-                                .size(13.0)
-                                .color(palette_color(TEXT_MAIN)),
+                            egui::RichText::new(if name.is_empty() {
+                                "启幕服务器"
+                            } else {
+                                &name
+                            })
+                            .size(13.0)
+                            .color(palette_color(TEXT_MAIN)),
                         );
                         ui.label(
                             egui::RichText::new(format!("{url} · v{ver}"))
@@ -14834,16 +15494,23 @@ impl App {
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("添加并登录").clicked() {
-                                use_url = Some(url.clone());
+                                use_server = Some((url.clone(), name.clone()));
                             }
                         });
                     });
                 });
             ui.add_space(8.0);
         }
-        if let Some(u) = use_url {
-            self.add_url = u;
-            self.msg = "地址已填入上方表单：输入账号密码点「登录并添加」，或点「匿名添加」浏览公开内容".into();
+        if let Some((url, name)) = use_server {
+            self.add_url = url;
+            self.add_name = if name.is_empty() {
+                "启幕服务器".to_string()
+            } else {
+                name
+            };
+            self.msg =
+                "服务器名称和地址已填入上方表单：输入账号密码点「登录并添加」，或点「匿名添加」浏览公开内容"
+                    .into();
         }
         ui.add_space(14.0);
         ui.label(
@@ -14865,7 +15532,11 @@ impl App {
         });
         if let Some(note) = &self.upd_note {
             ui.add_space(4.0);
-            ui.label(egui::RichText::new(note.clone()).size(11.5).color(palette_color(ACCENT_DEEP)));
+            ui.label(
+                egui::RichText::new(note.clone())
+                    .size(11.5)
+                    .color(palette_color(ACCENT_DEEP)),
+            );
         }
     }
 
@@ -14929,9 +15600,7 @@ impl App {
                 } else {
                     match std::fs::create_dir_all(&p) {
                         Ok(()) => {
-                            save_client_settings(
-                                json!({ "cache_dir": p.to_string_lossy() }),
-                            );
+                            save_client_settings(json!({ "cache_dir": p.to_string_lossy() }));
                             self.cache_entries = load_cache_index();
                             self.msg = "缓存路径已保存，新缓存将写入新目录".into();
                         }
@@ -15015,8 +15684,13 @@ impl App {
                             self.cache_path_ui(ui);
                         }
                         "演示偏好" => {
-                            if ui.checkbox(&mut self.dc_auto_quit, tr("放映结束自动关闭 DeckCraft")).changed() {
-                                save_client_settings(json!({ "deckcraft_auto_quit": self.dc_auto_quit }));
+                            if ui
+                                .checkbox(&mut self.dc_auto_quit, tr("放映结束自动关闭 DeckCraft"))
+                                .changed()
+                            {
+                                save_client_settings(
+                                    json!({ "deckcraft_auto_quit": self.dc_auto_quit }),
+                                );
                             }
                         }
                         "我的提交" => {
@@ -15081,15 +15755,11 @@ impl App {
                                 ui.add_space(64.0);
                                 ui.vertical(|ui| {
                                     ui.label(
-                                        egui::RichText::new("个人绑定预览")
-                                            .strong()
-                                            .size(16.0),
+                                        egui::RichText::new("个人绑定预览").strong().size(16.0),
                                     );
                                     ui.add_space(8.0);
                                     let p = &self.settings.profile;
-                                    let get = |k: &str| {
-                                        p.get(k).cloned().unwrap_or_default()
-                                    };
+                                    let get = |k: &str| p.get(k).cloned().unwrap_or_default();
                                     let dname = self
                                         .user
                                         .as_ref()
@@ -15220,17 +15890,13 @@ impl App {
                                 ui.label("姓名");
                                 ui.add_sized(
                                     [150.0, 26.0],
-                                    egui::TextEdit::singleline(
-                                        &mut self.settings.user_display,
-                                    ),
+                                    egui::TextEdit::singleline(&mut self.settings.user_display),
                                 );
                                 ui.label("密码");
                                 ui.add_sized(
                                     [150.0, 26.0],
-                                    egui::TextEdit::singleline(
-                                        &mut self.settings.user_password,
-                                    )
-                                    .password(true),
+                                    egui::TextEdit::singleline(&mut self.settings.user_password)
+                                        .password(true),
                                 );
                                 if ui
                                     .add_enabled(
@@ -15398,10 +16064,7 @@ impl App {
                                             .company
                                             .entry(key.to_string())
                                             .or_default();
-                                        ui.add_sized(
-                                            [300.0, 26.0],
-                                            egui::TextEdit::singleline(v),
-                                        );
+                                        ui.add_sized([300.0, 26.0], egui::TextEdit::singleline(v));
                                         ui.end_row();
                                     }
                                 });
@@ -15433,9 +16096,7 @@ impl App {
                                 ui.label("内容语言清单");
                                 ui.add_sized(
                                     [300.0, 26.0],
-                                    egui::TextEdit::singleline(
-                                        &mut self.settings.languages_text,
-                                    ),
+                                    egui::TextEdit::singleline(&mut self.settings.languages_text),
                                 );
                                 if ui.button("保存").clicked() {
                                     let langs: Vec<String> = self
@@ -15463,24 +16124,14 @@ impl App {
                                     self.settings.ai_provider = s(&v, "provider");
                                     self.settings.ai_endpoint = s(&v, "endpoint");
                                     self.settings.ai_model = s(&v, "model");
-                                    self.settings.ai_has_key = v
-                                        .get("has_key")
-                                        .and_then(|x| x.as_bool())
-                                        .unwrap_or(false);
+                                    self.settings.ai_has_key =
+                                        v.get("has_key").and_then(|x| x.as_bool()).unwrap_or(false);
                                 }
                                 if let Ok(v) = self.call("GET", "/v1/settings/glossary", None) {
-                                    if let Some(pairs) =
-                                        v.get("pairs").and_then(|x| x.as_array())
-                                    {
+                                    if let Some(pairs) = v.get("pairs").and_then(|x| x.as_array()) {
                                         self.settings.glossary_text = pairs
                                             .iter()
-                                            .map(|pr| {
-                                                format!(
-                                                    "{}={}",
-                                                    s(pr, "src"),
-                                                    s(pr, "dst")
-                                                )
-                                            })
+                                            .map(|pr| format!("{}={}", s(pr, "src"), s(pr, "dst")))
                                             .collect::<Vec<_>>()
                                             .join("\n");
                                     }
@@ -15509,17 +16160,13 @@ impl App {
                                     ui.label("接口地址");
                                     ui.add_sized(
                                         [300.0, 26.0],
-                                        egui::TextEdit::singleline(
-                                            &mut self.settings.ai_endpoint,
-                                        ),
+                                        egui::TextEdit::singleline(&mut self.settings.ai_endpoint),
                                     );
                                     ui.end_row();
                                     ui.label("模型");
                                     ui.add_sized(
                                         [300.0, 26.0],
-                                        egui::TextEdit::singleline(
-                                            &mut self.settings.ai_model,
-                                        ),
+                                        egui::TextEdit::singleline(&mut self.settings.ai_model),
                                     );
                                     ui.end_row();
                                     ui.label("API 密钥");
@@ -15709,11 +16356,7 @@ fn main() {
         viewport,
         ..Default::default()
     };
-    match eframe::run_native(
-        "启幕",
-        options,
-        Box::new(|cc| Ok(Box::new(App::new(cc)))),
-    ) {
+    match eframe::run_native("启幕", options, Box::new(|cc| Ok(Box::new(App::new(cc))))) {
         Ok(()) => startup_log("qimu-client exited normally"),
         Err(e) => {
             // Previously main returned this Err and the process died
@@ -15739,9 +16382,12 @@ mod i18n_tests {
 
     #[test]
     fn catalogs_parse_and_switch() {
-        let (i18n, _problems) =
-            craft_i18n::I18n::new(&I18N_EMBEDDED, &["zh-hans", "en-us"]);
-        assert!(i18n.check_all().is_empty(), "catalog problems: {:?}", i18n.check_all());
+        let (i18n, _problems) = craft_i18n::I18n::new(&I18N_EMBEDDED, &["zh-hans", "en-us"]);
+        assert!(
+            i18n.check_all().is_empty(),
+            "catalog problems: {:?}",
+            i18n.check_all()
+        );
         let zh = i18n.from_code("zh-hans").expect("zh-hans offered");
         let en = i18n.from_code("en-us").expect("en-us offered");
         // Default locale is the identity: UI text renders verbatim.
@@ -15789,9 +16435,24 @@ mod appearance_tests {
     fn app_theme_overrides_system_theme_for_text_and_controls() {
         let ctx = egui::Context::default();
         for (light, theme, system_theme, foreground) in [
-            (false, egui::Theme::Dark, egui::Theme::Light, egui::Color32::WHITE),
-            (true, egui::Theme::Light, egui::Theme::Dark, egui::Color32::BLACK),
-            (false, egui::Theme::Dark, egui::Theme::Light, egui::Color32::WHITE),
+            (
+                false,
+                egui::Theme::Dark,
+                egui::Theme::Light,
+                egui::Color32::WHITE,
+            ),
+            (
+                true,
+                egui::Theme::Light,
+                egui::Theme::Dark,
+                egui::Color32::BLACK,
+            ),
+            (
+                false,
+                egui::Theme::Dark,
+                egui::Theme::Light,
+                egui::Color32::WHITE,
+            ),
         ] {
             LIGHT_THEME.set(light);
             apply_modern_style(&ctx);

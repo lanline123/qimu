@@ -24,7 +24,10 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Log in and store the session token in ~/.qimu/session.json.
-    Login { username: String, password: String },
+    Login {
+        username: String,
+        password: String,
+    },
     Logout,
     Me,
     /// Operations on a single .pptx file (local + update flow).
@@ -82,7 +85,9 @@ enum Command {
         #[command(subcommand)]
         cmd: IndexCommand,
     },
-    Search { query: String },
+    Search {
+        query: String,
+    },
     Org {
         #[command(subcommand)]
         cmd: OrgCommand,
@@ -175,22 +180,34 @@ enum BridgeCommand {
 
 #[derive(Subcommand)]
 enum DeckCommand {
-    Info { path: String },
-    SplitVerify { path: String },
+    Info {
+        path: String,
+    },
+    SplitVerify {
+        path: String,
+    },
     /// Print the embedded manifest of a managed deck.
-    Manifest { path: String },
+    Manifest {
+        path: String,
+    },
     /// Ask the server what changed for this deck (the colleague flow).
-    Check { path: String },
+    Check {
+        path: String,
+    },
     /// Accept content updates IN PLACE: the same file at the same path
     /// is updated surgically; structural changes are reported as pending
     /// (they are release-gated, §5.7). Exit 2 if conflicts were found.
-    Apply { path: String },
+    Apply {
+        path: String,
+    },
 }
 
 #[derive(Subcommand)]
 enum UnitsCommand {
     List,
-    Get { id: String },
+    Get {
+        id: String,
+    },
     Create {
         #[arg(long)]
         name: String,
@@ -202,7 +219,9 @@ enum UnitsCommand {
         lang: Option<String>,
     },
     /// List a unit's per-page language bindings.
-    Bindings { id: String },
+    Bindings {
+        id: String,
+    },
     /// Bind one page of one version to a page of another version (same unit).
     Bind {
         id: String,
@@ -232,8 +251,12 @@ enum UnitsCommand {
 
 #[derive(Subcommand)]
 enum VersionsCommand {
-    Recall { id: String },
-    Delete { id: String },
+    Recall {
+        id: String,
+    },
+    Delete {
+        id: String,
+    },
     /// Download a version's fragment PPTX.
     Fragment {
         id: String,
@@ -268,7 +291,9 @@ enum TagCommand {
         #[arg(long)]
         strength: Option<String>,
     },
-    List { version: String },
+    List {
+        version: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -482,17 +507,9 @@ enum ShowroomCommand {
 #[derive(Subcommand)]
 enum TeamsCommand {
     List,
-    Create {
-        name: String,
-    },
-    AddMember {
-        id: String,
-        user_id: String,
-    },
-    RemoveMember {
-        id: String,
-        user_id: String,
-    },
+    Create { name: String },
+    AddMember { id: String, user_id: String },
+    RemoveMember { id: String, user_id: String },
 }
 
 #[derive(Subcommand)]
@@ -507,9 +524,7 @@ enum InboxCommand {
 
 #[derive(Subcommand)]
 enum LibraryCommand {
-    Remove {
-        id: String,
-    },
+    Remove { id: String },
 }
 
 #[derive(Subcommand)]
@@ -535,7 +550,9 @@ enum AssembliesCommand {
 
 fn session_path() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    std::path::PathBuf::from(home).join(".qimu").join("session.json")
+    std::path::PathBuf::from(home)
+        .join(".qimu")
+        .join("session.json")
 }
 
 fn load_session() -> Value {
@@ -564,9 +581,16 @@ impl Ctx {
         let server = flag
             .clone()
             .or_else(|| std::env::var("QIMU_SERVER").ok())
-            .or_else(|| sess.get("server").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .or_else(|| {
+                sess.get("server")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
             .unwrap_or_else(|| "http://127.0.0.1:8730".to_string());
-        let token = sess.get("token").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let token = sess
+            .get("token")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         Ctx { server, token }
     }
 
@@ -594,7 +618,11 @@ impl Ctx {
                 let text = r.into_string().unwrap_or_default();
                 let msg = serde_json::from_str::<Value>(&text)
                     .ok()
-                    .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(|s| s.to_string()))
+                    .and_then(|v| {
+                        v.get("error")
+                            .and_then(|e| e.as_str())
+                            .map(|s| s.to_string())
+                    })
                     .unwrap_or(text);
                 Err(msg)
             }
@@ -690,7 +718,11 @@ fn deck_apply(ctx: &Ctx, path: &str) -> Result<i32, String> {
             "structural_pending": structural,
             "note": if updates.is_empty() { "已是最新" } else { "没有可直接接受的内容更新" },
         }));
-        return Ok(if structural.is_empty() && recalled.is_empty() { 0 } else { 2 });
+        return Ok(if structural.is_empty() && recalled.is_empty() {
+            0
+        } else {
+            2
+        });
     }
 
     // Map new fragments by rendition.
@@ -702,12 +734,22 @@ fn deck_apply(ctx: &Ctx, path: &str) -> Result<i32, String> {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let frag = b64d(p.get("fragment_base64").and_then(|v| v.as_str()).unwrap_or(""))?;
+        let frag = b64d(
+            p.get("fragment_base64")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+        )?;
         new_frag.insert(
             rid,
             (
-                p.get("version_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                p.get("semver").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                p.get("version_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                p.get("semver")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
                 frag,
             ),
         );
@@ -741,8 +783,8 @@ fn deck_apply(ctx: &Ctx, path: &str) -> Result<i32, String> {
             }
         }
         let n = b.page_fps.len();
-        let local_ok = pos + n <= cur_fps.len()
-            && (0..n).all(|k| cur_fps[pos + k] == b.page_fps[k]);
+        let local_ok =
+            pos + n <= cur_fps.len() && (0..n).all(|k| cur_fps[pos + k] == b.page_fps[k]);
         if let Some((vid, semver, frag_bytes)) = new_frag.get(&b.rendition_id) {
             if !local_ok {
                 conflicts.push(json!({
@@ -768,8 +810,7 @@ fn deck_apply(ctx: &Ctx, path: &str) -> Result<i32, String> {
             }
             new_bindings[bi].version_id = vid.clone();
             new_bindings[bi].version_semver = semver.clone();
-            new_bindings[bi].page_fps =
-                frag_slides.iter().map(|s| s.fingerprint.clone()).collect();
+            new_bindings[bi].page_fps = frag_slides.iter().map(|s| s.fingerprint.clone()).collect();
             applied.push(json!({
                 "rendition_id": b.rendition_id,
                 "from": b.version_semver,
@@ -820,7 +861,11 @@ fn deck_apply(ctx: &Ctx, path: &str) -> Result<i32, String> {
         "structural_pending": structural,
         "path": path,
     }));
-    Ok(if conflicts.is_empty() && structural.is_empty() { 0 } else { 2 })
+    Ok(if conflicts.is_empty() && structural.is_empty() {
+        0
+    } else {
+        2
+    })
 }
 
 // ---------------- run ----------------
@@ -921,11 +966,7 @@ fn run() -> Result<i32, String> {
                         "/v1/import/propose",
                         Some(json!({ "data_base64": b64e(&bytes) })),
                     )?;
-                    Some(
-                        p.get("blocks")
-                            .cloned()
-                            .ok_or("提块结果缺少 blocks")?,
-                    )
+                    Some(p.get("blocks").cloned().ok_or("提块结果缺少 blocks")?)
                 }
                 (None, false) => None,
             };
@@ -961,9 +1002,9 @@ fn run() -> Result<i32, String> {
                         "name": name, "group_id": group, "folder_id": folder, "lead_lang": lang
                     })),
                 )?),
-                UnitsCommand::Bindings { id } => print(
-                    &ctx.call("GET", &format!("/v1/units/{id}/page-bindings"), None)?,
-                ),
+                UnitsCommand::Bindings { id } => {
+                    print(&ctx.call("GET", &format!("/v1/units/{id}/page-bindings"), None)?)
+                }
                 UnitsCommand::Bind {
                     id,
                     from_version,
@@ -1085,8 +1126,7 @@ fn run() -> Result<i32, String> {
                 }
                 VersionsCommand::SetScripts { id, file } => {
                     let text = std::fs::read_to_string(&file).map_err(|e| e.to_string())?;
-                    let scripts: Value =
-                        serde_json::from_str(&text).map_err(|e| e.to_string())?;
+                    let scripts: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
                     print(&ctx.call(
                         "PUT",
                         &format!("/v1/versions/{id}/scripts"),
@@ -1100,9 +1140,7 @@ fn run() -> Result<i32, String> {
             match cmd {
                 IndexCommand::List => print(&ctx.call("GET", "/v1/indexes", None)?),
                 IndexCommand::Get { id, branch } => {
-                    let q = branch
-                        .map(|b| format!("?branch={b}"))
-                        .unwrap_or_default();
+                    let q = branch.map(|b| format!("?branch={b}")).unwrap_or_default();
                     print(&ctx.call("GET", &format!("/v1/indexes/{id}{q}"), None)?)
                 }
                 IndexCommand::Create {
@@ -1147,9 +1185,7 @@ fn run() -> Result<i32, String> {
                     )?);
                 }
                 IndexCommand::Commits { id, branch } => {
-                    let q = branch
-                        .map(|b| format!("?branch={b}"))
-                        .unwrap_or_default();
+                    let q = branch.map(|b| format!("?branch={b}")).unwrap_or_default();
                     print(&ctx.call("GET", &format!("/v1/indexes/{id}/commits{q}"), None)?)
                 }
                 IndexCommand::Branch { id, name, from } => print(&ctx.call(
@@ -1291,11 +1327,9 @@ fn run() -> Result<i32, String> {
                     &format!("/v1/folders/{id}/rename"),
                     Some(json!({ "name": name })),
                 )?),
-                FoldersCommand::Delete { id } => print(&ctx.call(
-                    "DELETE",
-                    &format!("/v1/folders/{id}"),
-                    None,
-                )?),
+                FoldersCommand::Delete { id } => {
+                    print(&ctx.call("DELETE", &format!("/v1/folders/{id}"), None)?)
+                }
                 FoldersCommand::SetMain { id, index } => print(&ctx.call(
                     "POST",
                     &format!("/v1/folders/{id}/main-index"),
@@ -1323,9 +1357,11 @@ fn run() -> Result<i32, String> {
                         })),
                     )?);
                 }
-                AttachmentsCommand::List { parent_id } => {
-                    print(&ctx.call("GET", &format!("/v1/attachments?parent_id={parent_id}"), None)?)
-                }
+                AttachmentsCommand::List { parent_id } => print(&ctx.call(
+                    "GET",
+                    &format!("/v1/attachments?parent_id={parent_id}"),
+                    None,
+                )?),
                 AttachmentsCommand::Get { id, out } => {
                     let r = ctx.call("GET", &format!("/v1/attachments/{id}/download"), None)?;
                     let data = r
@@ -1344,7 +1380,11 @@ fn run() -> Result<i32, String> {
                     let q = state.map(|s| format!("?state={s}")).unwrap_or_default();
                     print(&ctx.call("GET", &format!("/v1/showroom{q}"), None)?)
                 }
-                ShowroomCommand::Submit { title, intro, index } => print(&ctx.call(
+                ShowroomCommand::Submit {
+                    title,
+                    intro,
+                    index,
+                } => print(&ctx.call(
                     "POST",
                     "/v1/showroom",
                     Some(json!({ "title": title, "intro": intro, "source_index_id": index })),
@@ -1400,7 +1440,11 @@ fn run() -> Result<i32, String> {
                 (Some(u), None, None) => ("user", u),
                 (None, Some(d), None) => ("dept", d),
                 (None, None, Some(g)) => ("group", g),
-                _ => return Err("必须且只能给出一个分享目标：--to-user / --to-dept / --to-team".into()),
+                _ => {
+                    return Err(
+                        "必须且只能给出一个分享目标：--to-user / --to-dept / --to-team".into(),
+                    )
+                }
             };
             print(&ctx.call(
                 "POST",
@@ -1426,9 +1470,11 @@ fn run() -> Result<i32, String> {
         Command::Library { cmd } => {
             match cmd {
                 None => print(&ctx.call("GET", "/v1/library", None)?),
-                Some(LibraryCommand::Remove { id }) => {
-                    print(&ctx.call("POST", &format!("/v1/library/{id}/delete"), Some(json!({})))?)
-                }
+                Some(LibraryCommand::Remove { id }) => print(&ctx.call(
+                    "POST",
+                    &format!("/v1/library/{id}/delete"),
+                    Some(json!({})),
+                )?),
             }
             Ok(0)
         }
@@ -1489,7 +1535,11 @@ fn run() -> Result<i32, String> {
                     json!(it.next().unwrap_or("")),
                 );
             }
-            print(&ctx.call("PUT", "/v1/company-profile", Some(json!({ "fields": fields })))?);
+            print(&ctx.call(
+                "PUT",
+                "/v1/company-profile",
+                Some(json!({ "fields": fields })),
+            )?);
             Ok(0)
         }
         Command::Bridge { cmd } => match cmd {

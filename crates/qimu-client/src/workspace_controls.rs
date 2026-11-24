@@ -1,4 +1,6 @@
 use super::*;
+use crate::account_menu::{AccountMenu, AccountMenuAction, AccountMenuEntry};
+use crate::server_menu::{ServerMenu, ServerMenuAction, ServerMenuEntry};
 use std::cell::Cell;
 use std::collections::{HashSet, VecDeque};
 use std::fmt::Write as _;
@@ -14,10 +16,16 @@ pub(super) fn palette_color(dark: egui::Color32) -> egui::Color32 {
     }
     let rgb = if dark == APP_BG {
         0xf5f6f8
+    } else if dark == CARD_BG {
+        0xffffff
     } else if dark == PANEL_BG {
         0xffffff
     } else if dark == HOVER_BG {
         0xf1f2f5
+    } else if dark == FIELD_BG {
+        0xf1f2f5
+    } else if dark == CARD_BORDER {
+        0xe3e5ea
     } else if dark == PRESSED_BG {
         0xe4e6ec
     } else if dark == SEPARATOR {
@@ -84,6 +92,11 @@ impl SearchTarget {
     }
 }
 
+struct WorkspaceMessage {
+    body: String,
+    at: f64,
+}
+
 #[derive(Default)]
 pub(super) struct WorkspaceControls {
     search_text: String,
@@ -91,17 +104,21 @@ pub(super) struct WorkspaceControls {
     search_open: bool,
     search_hits: Vec<(String, SearchTarget)>,
     search_error: Option<String>,
-    messages_open: bool,
-    messages: VecDeque<String>,
+    messages: VecDeque<WorkspaceMessage>,
     unread: usize,
+    server_menu: ServerMenu,
+    account_menu: AccountMenu,
 }
 
 impl WorkspaceControls {
-    pub(super) fn record_message(&mut self, message: &str) {
+    pub(super) fn record_message(&mut self, message: &str, now: f64, mark_unread: bool) {
         if !message.is_empty() {
-            self.messages.push_front(message.into());
+            self.messages.push_front(WorkspaceMessage {
+                body: message.into(),
+                at: now,
+            });
             self.messages.truncate(30);
-            if !self.messages_open {
+            if mark_unread {
                 self.unread = (self.unread + 1).min(30);
             }
         }
@@ -119,7 +136,7 @@ fn menu_item(ui: &mut egui::Ui, label: &str) -> bool {
 
 impl App {
     pub(super) fn workspace_edit_menu(&mut self, ui: &mut egui::Ui) {
-        ui.menu_button(tr("编辑"), |ui| {
+        ui.menu_button(egui::RichText::new(tr("编辑")).size(13.5), |ui| {
             if menu_item(ui, "全局搜索") {
                 self.workspace_controls.focus_search = true;
             }
@@ -135,7 +152,7 @@ impl App {
     }
 
     pub(super) fn workspace_context_menus(&mut self, ui: &mut egui::Ui) {
-        ui.menu_button(tr("索引"), |ui| {
+        ui.menu_button(egui::RichText::new(tr("索引")).size(13.5), |ui| {
             if menu_item(ui, "索引总览") {
                 self.navigate_to(Page::Index);
                 self.index.stack.pop_to(0);
@@ -150,14 +167,14 @@ impl App {
                 }
             }
         });
-        ui.menu_button(tr("演示"), |ui| {
+        ui.menu_button(egui::RichText::new(tr("演示")).size(13.5), |ui| {
             if menu_item(ui, "演示厅") {
                 self.navigate_to(Page::Showroom);
                 self.showroom.zone = "plaza".into();
                 self.showroom.stack.pop_to(0);
             }
         });
-        ui.menu_button(tr("组织"), |ui| {
+        ui.menu_button(egui::RichText::new(tr("组织")).size(13.5), |ui| {
             let sections = self.settings_sections();
             for (section, label) in sections.into_iter().enumerate() {
                 if matches!(label, "个人资料" | "组织管理" | "内容组与授权" | "审批队列")
@@ -171,7 +188,7 @@ impl App {
                 self.login_open = true;
             }
         });
-        ui.menu_button(tr("窗口"), |ui| {
+        ui.menu_button(egui::RichText::new(tr("窗口")).size(13.5), |ui| {
             if menu_item(ui, "最小化") {
                 ui.ctx()
                     .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
@@ -196,6 +213,144 @@ impl App {
         });
         if ui.button(tr("设置")).clicked() {
             self.navigate_to(Page::Settings);
+        }
+    }
+
+    pub(super) fn workspace_account_button(&mut self, ui: &mut egui::Ui) {
+        use craft_ui::buttons::{ButtonVisuals, IconButton, IconButtonStyle};
+        let name = self
+            .user
+            .as_ref()
+            .map(|user| s(user, "display_name"))
+            .filter(|name| !name.is_empty())
+            .unwrap_or_default();
+        let text = if self.user.is_some() {
+            if name.is_empty() {
+                self.role()
+            } else {
+                format!("{name} · {}", self.role())
+            }
+        } else if self.anon_active() {
+            tr("匿名账户").to_string()
+        } else {
+            tr("未登录").to_string()
+        };
+        let label = ui.painter().layout_no_wrap(
+            text.clone(),
+            egui::FontId::proportional(12.0),
+            palette_color(TEXT_WEAK),
+        );
+        let rest = ButtonVisuals {
+            fill: egui::Color32::TRANSPARENT,
+            stroke: egui::Stroke::NONE,
+            icon: palette_color(TEXT_WEAK),
+        };
+        let hovered = ButtonVisuals {
+            fill: palette_color(PRESSED_BG),
+            icon: palette_color(TEXT_MAIN),
+            ..rest
+        };
+        let style = IconButtonStyle {
+            normal: rest,
+            hovered,
+            pressed: Some(hovered),
+            selected: hovered,
+            corner_radius: egui::CornerRadius::same(6),
+            focus_stroke: egui::Stroke::new(1.0, ACCENT),
+        };
+        let width = (label.size().x + 20.0).clamp(92.0, 204.0);
+        if IconButton::new(tr("账户信息"), egui::vec2(width, 24.0), &style)
+            .selected(self.workspace_controls.account_menu.is_open())
+            .show(ui, |ui, rect, tint| {
+                ui.painter()
+                    .with_clip_rect(rect)
+                    .galley_with_override_text_color(
+                        egui::pos2(rect.left() + 10.0, rect.center().y - label.size().y / 2.0),
+                        label.clone(),
+                        tint,
+                    );
+            })
+            .on_hover_text(tr("账户信息"))
+            .clicked()
+        {
+            self.workspace_controls.server_menu.close();
+            self.workspace_controls
+                .account_menu
+                .set_open(!self.workspace_controls.account_menu.is_open());
+        }
+    }
+
+    pub(super) fn workspace_server_button(&mut self, ui: &mut egui::Ui) {
+        use craft_ui::buttons::{ButtonVisuals, IconButton, IconButtonStyle};
+        let placeholder = tr("暂无服务器");
+        let active_name = self
+            .active
+            .and_then(|index| self.conns.get(index))
+            .filter(|conn| {
+                !conn.anon && conn.token.is_some() && conn.status == ConnStatus::Connected
+            })
+            .map(|conn| conn.name.clone());
+        let name = active_name.unwrap_or_else(|| placeholder.to_string());
+        let mut widest: Option<(&str, f32)> = None;
+        for conn in self.conns.iter().filter(|conn| {
+            !conn.anon && conn.token.is_some() && conn.status == ConnStatus::Connected
+        }) {
+            let width = ui
+                .painter()
+                .layout_no_wrap(
+                    conn.name.clone(),
+                    egui::FontId::proportional(12.0),
+                    palette_color(TEXT_WEAK),
+                )
+                .size()
+                .x;
+            if widest.is_none_or(|(_, current)| width > current) {
+                widest = Some((&conn.name, width));
+            }
+        }
+        let label = ui.painter().layout_no_wrap(
+            name.clone(),
+            egui::FontId::proportional(12.0),
+            palette_color(TEXT_WEAK),
+        );
+        let rest = ButtonVisuals {
+            fill: egui::Color32::TRANSPARENT,
+            stroke: egui::Stroke::NONE,
+            icon: palette_color(TEXT_WEAK),
+        };
+        let hovered = ButtonVisuals {
+            fill: palette_color(PRESSED_BG),
+            icon: palette_color(TEXT_MAIN),
+            ..rest
+        };
+        let style = IconButtonStyle {
+            normal: rest,
+            hovered,
+            pressed: Some(hovered),
+            selected: hovered,
+            corner_radius: egui::CornerRadius::same(6),
+            focus_stroke: egui::Stroke::new(1.0, ACCENT),
+        };
+        let text_width = widest.map_or(label.size().x, |(_, width)| width);
+        let width = (text_width + 20.0).max(72.0);
+        if IconButton::new(tr("切换服务器"), egui::vec2(width, 24.0), &style)
+            .selected(self.workspace_controls.server_menu.is_open())
+            .show(ui, |ui, rect, tint| {
+                ui.painter()
+                    .with_clip_rect(rect)
+                    .galley_with_override_text_color(
+                        egui::pos2(rect.left() + 10.0, rect.center().y - label.size().y / 2.0),
+                        label.clone(),
+                        tint,
+                    );
+            })
+            .on_hover_text(format!("{} · {name}", tr("切换服务器")))
+            .clicked()
+        {
+            self.workspace_controls.account_menu.close();
+            self.workspace_controls
+                .server_menu
+                .set_open(!self.workspace_controls.server_menu.is_open());
         }
     }
 
@@ -279,7 +434,7 @@ impl App {
         let count_width = count.as_ref().map_or(0.0, |count| count.size().x + 15.0);
         let width = 35.0 + label.size().x + count_width;
         if IconButton::new(tr("消息中心"), egui::vec2(width, 24.0), &style)
-            .selected(self.workspace_controls.messages_open)
+            .selected(self.page == Page::Messages)
             .show(ui, |ui, rect, tint| {
                 let y = rect.center().y;
                 icons.paint(
@@ -316,13 +471,13 @@ impl App {
             })
             .clicked()
         {
-            self.workspace_controls.messages_open = !self.workspace_controls.messages_open;
             self.workspace_controls.unread = 0;
+            self.navigate_to(Page::Messages);
         }
 
         egui::Frame::NONE
             .fill(palette_color(FIELD_BG))
-            .stroke(egui::Stroke::new(1.0, palette_color(SEPARATOR)))
+            .stroke(egui::Stroke::new(1.0, palette_color(FIELD_BORDER)))
             .corner_radius(6)
             .inner_margin(2)
             .show(ui, |ui| {
@@ -336,10 +491,14 @@ impl App {
                             egui::RichText::new(label)
                                 .size(11.5)
                                 .strong()
-                                .color(palette_color(if selected { TEXT_MAIN } else { TEXT_WEAK })),
+                                .color(if selected {
+                                    egui::Color32::WHITE
+                                } else {
+                                    palette_color(TEXT_WEAK)
+                                }),
                         )
                         .fill(if selected {
-                            palette_color(PRESSED_BG)
+                            ACCENT
                         } else {
                             egui::Color32::TRANSPARENT
                         })
@@ -438,6 +597,120 @@ impl App {
     }
 
     pub(super) fn workspace_control_windows(&mut self, ctx: &egui::Context) {
+        if self.workspace_controls.account_menu.is_open() {
+            let display_name = self
+                .user
+                .as_ref()
+                .map(|user| s(user, "display_name"))
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| {
+                    if self.user.is_some() {
+                        s(self.user.as_ref().unwrap(), "username")
+                    } else {
+                        tr("匿名账户").to_string()
+                    }
+                });
+            let username = self
+                .user
+                .as_ref()
+                .map(|user| s(user, "username"))
+                .unwrap_or_default();
+            let role = if self.user.is_some() {
+                self.role()
+            } else {
+                String::new()
+            };
+            let server = self.active_server_label();
+            let email = if self.user.is_some() {
+                self.settings.profile.get("email").cloned().unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let phone = if self.user.is_some() {
+                self.settings.profile.get("phone").cloned().unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let entry = AccountMenuEntry {
+                name: &display_name,
+                role: &role,
+                username: &username,
+                email: &email,
+                phone: &phone,
+                server: &server,
+                signed_in: self.user.is_some(),
+            };
+            let controls = &mut self.workspace_controls;
+            if let Some(action) =
+                controls
+                    .account_menu
+                    .show(ctx, egui::Id::unique("workspace-account-menu"), &entry)
+            {
+                controls.account_menu.close();
+                match action {
+                    AccountMenuAction::OpenProfile => {
+                        if let Some(section) = self
+                            .settings_sections()
+                            .iter()
+                            .position(|label| *label == "个人资料")
+                        {
+                            self.navigate_to(Page::Settings);
+                            self.settings.section = section;
+                        }
+                    }
+                    AccountMenuAction::Logout => self.logout(),
+                    AccountMenuAction::Login => self.login_open = true,
+                }
+            }
+        }
+        if self.workspace_controls.server_menu.is_open() {
+            let entries: Vec<_> = self
+                .conns
+                .iter()
+                .enumerate()
+                .map(|(index, conn)| {
+                    let detail = if conn.anon {
+                        format!("{} · 匿名", conn.url)
+                    } else if conn.username.is_empty() {
+                        conn.url.clone()
+                    } else {
+                        format!("{} · {}", conn.url, conn.username)
+                    };
+                    let (status, color) = match conn.status {
+                        ConnStatus::Connected => ("已连接", palette_color(CHIP_GREEN_FG)),
+                        ConnStatus::Anonymous => ("匿名连接", ACCENT),
+                        ConnStatus::Failed => ("连接失败", palette_color(ROSE)),
+                        ConnStatus::LoggedOut if conn.anon => {
+                            ("匿名已断开", palette_color(TEXT_WEAK))
+                        }
+                        ConnStatus::LoggedOut => ("未登录", palette_color(TEXT_WEAK)),
+                    };
+                    ServerMenuEntry {
+                        name: &conn.name,
+                        detail,
+                        status,
+                        status_color: color,
+                        active: self.active == Some(index),
+                    }
+                })
+                .collect();
+            let controls = &mut self.workspace_controls;
+            if let Some(action) =
+                controls
+                    .server_menu
+                    .show(ctx, egui::Id::unique("workspace-server-menu"), &entries)
+            {
+                controls.server_menu.close();
+                match action {
+                    ServerMenuAction::AddServer => {
+                        self.navigate_to(Page::Settings);
+                        self.settings.section = 0;
+                    }
+                    ServerMenuAction::Select(index) => self.activate(index),
+                    ServerMenuAction::Disconnect(index) => self.disconnect_conn(index),
+                }
+            }
+        }
         let controls = &mut self.workspace_controls;
         if controls.search_open {
             let mut selected = None;
@@ -490,40 +763,80 @@ impl App {
                 }
             }
         }
-        let controls = &mut self.workspace_controls;
-        if controls.messages_open {
-            let mut inbox = false;
-            egui::Window::new(tr("消息中心"))
-                .id(egui::Id::unique("workspace-messages"))
-                .open(&mut controls.messages_open)
-                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 68.0))
-                .default_width(330.0)
-                .show(ctx, |ui| {
-                    if self.user.is_some()
-                        && ui
-                            .button(format!("{} · {}", tr("收到的分享"), self.inbox.len()))
-                            .clicked()
-                    {
-                        inbox = true;
-                    }
-                    if controls.messages.is_empty() {
-                        ui.label(tr("本次会话暂无消息"));
-                    }
-                    egui::ScrollArea::vertical()
-                        .max_height(310.0)
-                        .show(ui, |ui| {
-                            for message in &controls.messages {
-                                ui.label(message);
-                                ui.separator();
-                            }
-                        });
-                });
-            if inbox {
-                controls.messages_open = false;
-                self.navigate_to(Page::Showroom);
-                self.showroom.zone = "inbox".into();
-                self.showroom.stack.pop_to(0);
-            }
-        }
+    }
+
+    pub(super) fn page_messages(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::NONE
+            .inner_margin(egui::Margin::symmetric(22, 20))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    egui::RichText::new(tr("消息中心"))
+                        .size(20.0)
+                        .strong()
+                        .color(palette_color(TEXT_MAIN)),
+                );
+                ui.add_space(12.0);
+                if self.workspace_controls.messages.is_empty() {
+                    ui.label(
+                        egui::RichText::new(tr("本次会话暂无消息"))
+                            .size(12.5)
+                            .color(palette_color(TEXT_WEAK)),
+                    );
+                    return;
+                }
+                let now = ui.input(|input| input.time);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        for message in &self.workspace_controls.messages {
+                            egui::Frame::NONE
+                                .fill(palette_color(CARD_BG))
+                                .stroke(egui::Stroke::new(1.0, palette_color(CARD_BORDER)))
+                                .corner_radius(6)
+                                .inner_margin(egui::Margin::symmetric(16, 12))
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(tr("会话消息"))
+                                                .size(14.0)
+                                                .strong()
+                                                .color(palette_color(TEXT_MAIN)),
+                                        );
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    egui::RichText::new(message_age(
+                                                        message.at, now,
+                                                    ))
+                                                    .size(11.5)
+                                                    .color(palette_color(TEXT_WEAK)),
+                                                );
+                                            },
+                                        );
+                                    });
+                                    ui.add_space(6.0);
+                                    ui.label(
+                                        egui::RichText::new(&message.body)
+                                            .size(12.5)
+                                            .color(palette_color(TEXT_WEAK)),
+                                    );
+                                });
+                            ui.add_space(14.0);
+                        }
+                    });
+            });
+    }
+}
+
+fn message_age(at: f64, now: f64) -> String {
+    let seconds = (now - at).max(0.0) as u64;
+    match seconds {
+        0..=59 => tr("刚刚").to_string(),
+        60..=3599 => format!("{} {}", seconds / 60, tr("分钟前")),
+        _ => format!("{} {}", seconds / 3600, tr("小时前")),
     }
 }

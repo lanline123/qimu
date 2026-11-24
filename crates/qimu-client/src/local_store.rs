@@ -480,19 +480,17 @@ impl LocalStore {
         Some(run())
     }
 
-    /// Build the P3 submission package for one index of this
-    /// library at a branch head (design §6.3): the pinned commit's
-    /// entries, each resolved to the exact version the export path
-    /// would use, plus every referenced fragment's bytes. The
-    /// returned JSON is the POST /v1/submissions body minus the
-    /// caller-supplied fields (title / intro / note / supersedes /
-    /// source_index_id). `None` when the index is not in this
-    /// library at all — the content is organization-side and the
-    /// caller keeps the legacy reference path for it.
+    /// Build the P3 submission package for one local index at the
+    /// exact published tag shown by the push preview. The preview's
+    /// entry/version pins keep follow-latest entries from drifting to
+    /// a newer version between preview and submission. `None` means
+    /// the index is organization-side and uses the legacy reference
+    /// submission path.
     pub fn build_submission_package(
         &self,
         index_id: &str,
-        branch: &str,
+        published_tag_id: &str,
+        pinned_versions: &[(qimu_core::model::IndexEntry, String)],
     ) -> Option<Result<Value, String>> {
         let store = self.store.lock().unwrap();
         let index = match store.get_index(index_id) {
@@ -500,19 +498,34 @@ impl LocalStore {
             Err(_) => return None,
         };
         let run = || -> Result<Value, String> {
-            let head = store
-                .branch_head(index_id, branch)?
-                .ok_or_else(|| "分支尚无提交".to_string())?;
-            let commit = store.get_commit(&head)?;
+            let tag = store
+                .list_tags(index_id)?
+                .into_iter()
+                .find(|tag| tag.id == published_tag_id)
+                .ok_or_else(|| "发布版本不存在或不属于该索引".to_string())?;
+            if tag.branch != "main" {
+                return Err("只能推送主分支的发布版本".into());
+            }
+            let commit = store.get_commit(&tag.commit_id)?;
+            let mut remaining = pinned_versions.to_vec();
             let mut units: Vec<qimu_core::store::SubmissionUnit> = Vec::new();
             let mut renditions: Vec<qimu_core::store::SubmissionRendition> = Vec::new();
             let mut versions: Vec<qimu_core::store::SubmissionVersion> = Vec::new();
             let mut entries: Vec<qimu_core::store::SubmissionEntry> = Vec::new();
             let mut files = serde_json::Map::new();
             for e in &commit.entries {
-                let version = store.resolve_entry_version(e)?.ok_or_else(|| {
-                    "有条目无法解析到版本（内容块尚无已发布版本）".to_string()
-                })?;
+                let position = remaining
+                    .iter()
+                    .position(|(entry, _)| entry == e)
+                    .ok_or_else(|| "推送摘要已过期，请重新读取后再提交".to_string())?;
+                let (_, version_id) = remaining.remove(position);
+                let version = store.get_version(&version_id)?;
+                if version.rendition_id != e.rendition_id.0 {
+                    return Err("推送摘要与发布版本不匹配，请重新读取后再提交".into());
+                }
+                if version.status != "normal" {
+                    return Err("推送摘要中的内容块版本已失效，请重新发布后再提交".into());
+                }
                 if !units.iter().any(|u| u.id == e.unit_id.0) {
                     let u = store.get_unit(&e.unit_id.0)?;
                     units.push(qimu_core::store::SubmissionUnit {
@@ -558,12 +571,15 @@ impl LocalStore {
                     version_id: version.id.clone(),
                 });
             }
+            if !remaining.is_empty() {
+                return Err("推送摘要与发布版本不匹配，请重新读取后再提交".into());
+            }
             let manifest = qimu_core::store::SubmissionManifest {
                 format: 1,
                 index_name: index.name.clone(),
                 index_scope: index.scope.clone(),
                 commit: qimu_core::store::SubmissionCommit {
-                    branch: branch.to_string(),
+                    branch: "main".to_string(),
                     message: commit.message.clone(),
                     entries,
                 },
@@ -626,6 +642,40 @@ impl LocalStore {
             "head": serde_json::to_value(&head).unwrap_or(Value::Null),
             "resolved_entries": entries,
         }))
+    }
+
+    pub fn push_preview(&self, id: &str, branch: &str) -> Option<Result<Value, String>> {
+        let store = self.store.lock().unwrap();
+        store.get_index(id).ok()?;
+        if branch != "main" {
+            return Some(Err("只能推送主分支的发布版本".into()));
+        }
+        let run = || -> Result<Value, String> {
+            let mut tags = store
+                .list_tags(id)?
+                .into_iter()
+                .filter(|tag| tag.branch == branch)
+                .collect::<Vec<_>>();
+            tags.sort_by(|a, b| {
+                qimu_core::semver::SemVer::parse(&b.name)
+                    .ok()
+                    .cmp(&qimu_core::semver::SemVer::parse(&a.name).ok())
+            });
+            let published = tags.into_iter().next();
+            let current = published
+                .as_ref()
+                .and_then(|tag| store.get_commit(&tag.commit_id).ok());
+            Ok(json!({
+                "published_version": published.as_ref().map(|tag| tag.name.clone()),
+                "published_tag_id": published.as_ref().map(|tag| tag.id.clone()),
+                "current_entries": current
+                    .as_ref()
+                    .map(|commit| resolved_entries(&store, commit))
+                    .unwrap_or_default(),
+                "previous_entries": [],
+            }))
+        };
+        Some(run())
     }
 
     /// Working-data dispatcher (local-first P1/P4): serves the REST
@@ -1094,6 +1144,13 @@ impl LocalStore {
                     let branch = query_param(q, "branch").unwrap_or_else(|| "main".to_string());
                     match self.index_detail(id, &branch) {
                         Some(d) => Ok(d),
+                        None => Err(NOT_FOUND.to_string()),
+                    }
+                }
+                ("GET", ["v1", "indexes", id, "push-preview"]) => {
+                    let branch = query_param(q, "branch").unwrap_or_else(|| "main".to_string());
+                    match self.push_preview(id, &branch) {
+                        Some(preview) => preview,
                         None => Err(NOT_FOUND.to_string()),
                     }
                 }
@@ -1661,5 +1718,217 @@ fn percent_decode(s: &str) -> String {
 impl Drop for LocalStore {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.lock_path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qimu_core::model::{EntryPolicy, Id, IndexEntry};
+    use qimu_core::semver::SemVer;
+
+    struct TestDir(std::path::PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            Self(std::env::temp_dir().join(format!(
+                "qimu-client-local-test-{}-{nonce}",
+                std::process::id()
+            )))
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &byte in data {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            }
+        }
+        !crc
+    }
+
+    fn fragment_bytes() -> Vec<u8> {
+        let parts = [
+            (
+                "[Content_Types].xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/><Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/></Types>"#,
+            ),
+            (
+                "_rels/.rels",
+                r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/></Relationships>"#,
+            ),
+            (
+                "ppt/presentation.xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?><p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst><p:sldSz cx="9144000" cy="5143500"/></p:presentation>"#,
+            ),
+            (
+                "ppt/_rels/presentation.xml.rels",
+                r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/></Relationships>"#,
+            ),
+            (
+                "ppt/slides/slide1.xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Preview pin</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#,
+            ),
+        ];
+        let mut out = Vec::new();
+        let mut central = Vec::new();
+        for (name, text) in parts {
+            let data = text.as_bytes();
+            let crc = crc32(data);
+            let offset = out.len() as u32;
+            out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+            out.extend_from_slice(&20u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(data);
+            central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&crc.to_le_bytes());
+            central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&offset.to_le_bytes());
+            central.extend_from_slice(name.as_bytes());
+        }
+        let central_start = out.len() as u32;
+        out.extend_from_slice(&central);
+        out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&(parts.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(parts.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(central.len() as u32).to_le_bytes());
+        out.extend_from_slice(&central_start.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn submission_uses_the_exact_versions_pinned_by_the_preview() {
+        let dir = TestDir::new();
+        let local = LocalStore::open(&dir.0).unwrap();
+        let fragment = fragment_bytes();
+        let (tag, first, index_id, rendition_id, entry) = {
+            let store = local.store.lock().unwrap();
+            let unit = store
+                .create_unit(
+                    "内容块",
+                    None,
+                    &local.default_group_id,
+                    &local.owner.display_name,
+                    "zh",
+                    "",
+                )
+                .unwrap();
+            let rendition = store
+                .get_or_create_rendition(&unit.id, "deck", "zh")
+                .unwrap();
+            let first = store
+                .insert_version(
+                    &rendition.id,
+                    SemVer::parse("1.0.0").unwrap(),
+                    1,
+                    "tester",
+                    "",
+                    &fragment,
+                    "normal",
+                )
+                .unwrap();
+            let entry = IndexEntry {
+                unit_id: Id(unit.id.clone()),
+                rendition_id: Id(rendition.id.clone()),
+                policy: EntryPolicy::FollowLatest,
+                locked_semver: None,
+                excerpt_slots: None,
+            };
+            let index = store
+                .create_index(
+                    "索引",
+                    None,
+                    &local.default_group_id,
+                    "tester",
+                    "private",
+                    vec![entry.clone()],
+                )
+                .unwrap();
+            let tag = store.create_tag(&index.id, "main", "1.0.0").unwrap();
+            (tag, first, index.id.clone(), rendition.id.clone(), entry)
+        };
+        let preview = local.push_preview(&index_id, "main").unwrap().unwrap();
+        assert_eq!(preview["published_tag_id"], tag.id);
+        assert_eq!(preview["current_entries"][0]["resolved"]["id"], first.id);
+        assert!(local.push_preview(&index_id, "dev").unwrap().is_err());
+        let pins = preview["current_entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    serde_json::from_value::<IndexEntry>(row["entry"].clone()).unwrap(),
+                    row["resolved"]["id"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let store = local.store.lock().unwrap();
+        let second = store
+            .insert_version(
+                &rendition_id,
+                SemVer::parse("1.1.0").unwrap(),
+                1,
+                "tester",
+                "",
+                &fragment,
+                "normal",
+            )
+            .unwrap();
+        store
+            .create_commit(&index_id, "main", "tester", "new head", vec![entry])
+            .unwrap();
+        assert_eq!(store.latest_version(&rendition_id).unwrap().unwrap().id, second.id);
+        drop(store);
+
+        let package = local
+            .build_submission_package(&index_id, &tag.id, &pins)
+            .unwrap()
+            .unwrap();
+        assert_eq!(package["manifest"]["versions"][0]["id"], first.id);
+        assert_eq!(package["manifest"]["versions"][0]["semver"], "1.0.0");
+        assert_eq!(package["files"][first.fragment_hash.as_str()], crate::b64e(&fragment));
+        assert!(local
+            .build_submission_package(&index_id, &tag.id, &[])
+            .unwrap()
+            .is_err());
     }
 }

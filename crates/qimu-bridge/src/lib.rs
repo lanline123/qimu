@@ -116,7 +116,9 @@ impl PowerPointBridge for StubBridge {
             running: false,
             version: None,
             active_path: None,
-            detail: "COM 桥仅在 Windows + PowerPoint 环境可用；当前平台走文件级流程（qimu deck apply）".into(),
+            detail:
+                "COM 桥仅在 Windows + PowerPoint 环境可用；当前平台走文件级流程（qimu deck apply）"
+                    .into(),
         }
     }
 

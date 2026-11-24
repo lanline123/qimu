@@ -97,7 +97,7 @@ fn embed_exe_icon() {
         println!("cargo:warning=qimu-client: assets/logo.png.b64 unreadable; exe icon skipped");
         return;
     };
-    let (Some(png), ) = (b64_decode(&b64),) else {
+    let (Some(png),) = (b64_decode(&b64),) else {
         println!("cargo:warning=qimu-client: logo.png.b64 decode failed; exe icon skipped");
         return;
     };
@@ -105,9 +105,7 @@ fn embed_exe_icon() {
         println!("cargo:warning=qimu-client: logo PNG not wrappable as .ico; exe icon skipped");
         return;
     };
-    let out_dir = std::path::PathBuf::from(
-        std::env::var("OUT_DIR").unwrap_or_else(|_| ".".into()),
-    );
+    let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap_or_else(|_| ".".into()));
     let ico_path = out_dir.join("qimu.ico");
     if std::fs::write(&ico_path, &ico).is_err() {
         println!("cargo:warning=qimu-client: cannot write qimu.ico; exe icon skipped");

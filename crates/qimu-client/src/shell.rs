@@ -22,6 +22,7 @@ impl Page {
             Self::Index => "索引页",
             Self::Trash => "回收站",
             Self::Settings => "设置",
+            Self::Messages => "消息中心",
         }
     }
 
@@ -33,9 +34,9 @@ impl Page {
             Self::Content => ChromeIcon::Content,
             Self::Trash => ChromeIcon::Trash,
             Self::Settings => ChromeIcon::Settings,
+            Self::Messages => ChromeIcon::Bell,
         }
     }
-
 }
 
 impl App {
@@ -53,9 +54,11 @@ impl App {
                     Page::Index => self.ix_main_body(ui),
                     Page::Trash => self.page_trash(ui),
                     Page::Settings => self.st_main_body(ui),
+                    Page::Messages => self.page_messages(ui),
                 });
             });
         self.workspace_control_windows(ui.ctx());
+        self.prototype_dialogs_ui(ui.ctx());
     }
 
     pub(super) fn navigate_to(&mut self, page: Page) {
@@ -101,7 +104,7 @@ impl App {
                     Page::Index => 90.0,
                     Page::Content => 96.0,
                     Page::Showroom | Page::Trash => 52.0,
-                    Page::Settings => 0.0,
+                    Page::Messages | Page::Settings => 0.0,
                 };
                 if action_height > 0.0 {
                     egui::Panel::bottom("sidebar_actions")
@@ -129,6 +132,7 @@ impl App {
                                 Page::Index => self.ix_nav_body(ui),
                                 Page::Trash => self.trash_nav_body(ui),
                                 Page::Settings => self.st_nav_body(ui),
+                                Page::Messages => {}
                             }
                         });
                 });
@@ -173,10 +177,8 @@ impl App {
     /// One .sp-link row: 15px glyph + 12.5px label, muted at rest,
     /// accent on hover, the whole 28px row clickable.
     fn community_link(&mut self, ui: &mut egui::Ui, icon: ChromeIcon, label: &str, url: &str) {
-        let (rect, resp) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), 28.0),
-            egui::Sense::click(),
-        );
+        let (rect, resp) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), egui::Sense::click());
         let hovered = resp.hovered();
         let text_color = if hovered {
             ACCENT
@@ -239,27 +241,13 @@ impl App {
             } else {
                 tr("本地缓存")
             };
-            let button = egui::Button::new(
-                egui::RichText::new(label).color(egui::Color32::WHITE),
-            )
-            .fill(ACCENT)
-            .corner_radius(6);
+            let button = egui::Button::new(egui::RichText::new(label).color(egui::Color32::WHITE))
+                .fill(ACCENT)
+                .corner_radius(6);
             if ui.add_sized([ui.available_width(), 32.0], button).clicked() {
                 self.content.stack.pop_to(0);
                 self.content.cache_open = !self.content.cache_open;
             }
-        }
-        let can_add_folder = matches!(page, Page::Content | Page::Index)
-            || (page == Page::Showroom && self.showroom.zone == "plaza");
-        if can_add_folder
-            && self.small_icon_button(ui, ChromeIcon::FolderPlus, tr("新建文件夹"))
-        {
-            self.folder_edit = Some(FolderEdit {
-                target: None,
-                parent: None,
-                text: "新文件夹".into(),
-            });
-            self.folder_edit_focus = true;
         }
         if page == Page::Trash
             && btn_default_enabled(
@@ -289,9 +277,8 @@ impl App {
         // ====
         // Row 1 — menu bar (.menubar-row): the text menus on the
         // left; on the right, the session cluster in the
-        // prototype's slots — the server and the user as quiet
-        // icon-btn text, sign-in as the .pill-primary, sign-out as
-        // an icon tool.
+        // prototype's slots — the server and account as quiet
+        // text controls, with account details and logout in a card.
         egui::Panel::top("menu_row")
             .exact_size(32.0)
             .frame(
@@ -308,129 +295,63 @@ impl App {
                 // the top of the row, leaving every menu label
                 // and right-cluster control riding high.
                 ui.horizontal_centered(|ui| {
-                egui::MenuBar::new().ui(ui, |ui| {
-                    ui.menu_button(egui::RichText::new(tr("文件")).size(12.0), |ui| {
-                        ui.set_min_width(160.0);
-                        if ui.button(tr("新建索引")).clicked() {
-                            self.act_new_index();
-                            ui.close();
-                        }
-                        if ui.button(tr("导入 PPT")).clicked() {
-                            self.navigate_to(Page::Content);
-                            self.act_import_ppt();
-                            ui.close();
-                        }
-                        ui.separator();
-                        if self.user.is_some() {
-                            if ui.button(tr("退出登录")).clicked() {
-                                self.logout();
+                    egui::MenuBar::new().ui(ui, |ui| {
+                        ui.menu_button(egui::RichText::new(tr("文件")).size(13.5), |ui| {
+                            ui.set_min_width(160.0);
+                            if ui.button(tr("新建索引")).clicked() {
+                                self.act_new_index();
                                 ui.close();
                             }
-                        } else if ui.button(tr("登录")).clicked() {
-                            self.login_open = true;
-                            ui.close();
-                        }
-                        if ui.button(tr("退出")).clicked() {
-                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                            ui.close();
-                        }
-                    });
-                    self.workspace_edit_menu(ui);
-                    ui.menu_button(egui::RichText::new(tr("视图")).size(12.0), |ui| {
-                        ui.set_min_width(160.0);
-                        for page in Page::ALL {
-                            if ui.button(tr(page.label())).clicked() {
-                                self.navigate_to(page);
+                            if ui.button(tr("导入 PPT")).clicked() {
+                                self.navigate_to(Page::Content);
+                                self.act_import_ppt();
                                 ui.close();
                             }
-                        }
-                    });
-                    self.workspace_context_menus(ui);
-                    ui.menu_button(egui::RichText::new(tr("帮助")).size(12.0), |ui| {
-                        ui.set_min_width(160.0);
-                        if ui.button(tr("检查更新")).clicked() {
-                            self.check_lan_update(true);
-                            ui.close();
-                        }
-                        if ui.button(tr("关于启幕")).clicked() {
-                            self.about_open = true;
-                            ui.close();
-                        }
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        self.workspace_preferences(ui);
-                        if self.user.is_some() {
-                            if self.tool_slot(ui, false, tr("退出"), ChromeIcon::Power) {
-                                self.logout();
+                            ui.separator();
+                            if self.user.is_some() {
+                                if ui.button(tr("退出登录")).clicked() {
+                                    self.logout();
+                                    ui.close();
+                                }
+                            } else if ui.button(tr("登录")).clicked() {
+                                self.login_open = true;
+                                ui.close();
                             }
-                        } else if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new(tr("登录"))
-                                        .size(12.5)
-                                        .color(egui::Color32::WHITE),
-                                )
-                                .fill(ACCENT)
-                                .stroke(egui::Stroke::NONE)
-                                .corner_radius(255)
-                                .min_size(egui::vec2(0.0, 26.0)),
-                            )
-                            .clicked()
-                        {
-                            self.login_open = true;
-                        }
-                        ui.add_space(6.0);
-                        let user_text = if self.user.is_some() {
-                            let name = self
-                                .user
-                                .as_ref()
-                                .map(|u| s(u, "display_name"))
-                                .unwrap_or_default();
-                            format!("{name} · {}", self.role())
-                        } else if self.anon_active() {
-                            format!("匿名 · 已连接 {}", self.active_server_label())
-                        } else {
-                            tr("未登录").to_string()
-                        };
-                        let user_label = egui::Label::new(egui::RichText::new(&user_text).size(12.0).color(palette_color(TEXT_WEAK)))
-                            .truncate();
-                        ui.add_sized([108.0, 24.0], user_label).on_hover_text(user_text);
-                        ui.add_space(6.0);
-                        // Current server: click cycles through the other
-                        // connected servers, or opens 服务器 settings.
-                        let srv_label = craft_i18n::fmt(
-                            tr("服务器：{name}"),
-                            &[("name", &self.active_server_label())],
-                        );
-                        if ui
-                            .add_sized(
-                                [if ui.ctx().content_rect().width() < 1120.0 { 92.0 } else { 156.0 }, 24.0],
-                                egui::Button::new(
-                                    egui::RichText::new(&srv_label).size(12.0).color(palette_color(TEXT_WEAK)),
-                                )
-                                .fill(egui::Color32::TRANSPARENT)
-                                .stroke(egui::Stroke::NONE)
-                                .corner_radius(6)
-                                .truncate(),
-                            )
-                            .on_hover_text(srv_label)
-                            .clicked()
-                        {
-                            let connected: Vec<usize> = (0..self.conns.len())
-                                .filter(|&i| self.conns[i].status == ConnStatus::Connected)
-                                .collect();
-                            if connected.len() > 1 {
-                                let cur = self.active.unwrap_or(usize::MAX);
-                                let pos = connected.iter().position(|&i| i == cur).unwrap_or(0);
-                                let next = connected[(pos + 1) % connected.len()];
-                                self.activate(next);
-                            } else {
-                                self.navigate_to(Page::Settings);
-                                self.settings.section = 0;
+                            if ui.button(tr("退出")).clicked() {
+                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                                ui.close();
                             }
-                        }
+                        });
+                        self.workspace_edit_menu(ui);
+                        ui.menu_button(egui::RichText::new(tr("视图")).size(13.5), |ui| {
+                            ui.set_min_width(160.0);
+                            for page in Page::ALL {
+                                if ui.button(tr(page.label())).clicked() {
+                                    self.navigate_to(page);
+                                    ui.close();
+                                }
+                            }
+                        });
+                        self.workspace_context_menus(ui);
+                        ui.menu_button(egui::RichText::new(tr("帮助")).size(13.5), |ui| {
+                            ui.set_min_width(160.0);
+                            if ui.button(tr("检查更新")).clicked() {
+                                self.check_lan_update(true);
+                                ui.close();
+                            }
+                            if ui.button(tr("关于启幕")).clicked() {
+                                self.about_open = true;
+                                ui.close();
+                            }
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            self.workspace_preferences(ui);
+                            ui.add_space(6.0);
+                            self.workspace_account_button(ui);
+                            ui.add_space(6.0);
+                            self.workspace_server_button(ui);
+                        });
                     });
-                });
                 });
                 let r = ui.max_rect();
                 ui.painter().hline(
@@ -457,7 +378,14 @@ impl App {
                 ui.horizontal_centered(|ui| {
                     ui.spacing_mut().item_spacing.x = 3.0;
                     for page in Page::ALL {
-                        let tab = ChromeIcons.tool(ui, page.icon(), page.label(), true, self.page == page, false);
+                        let tab = ChromeIcons.tool(
+                            ui,
+                            page.icon(),
+                            page.label(),
+                            true,
+                            self.page == page,
+                            false,
+                        );
                         if page == Page::Index && tab.double_clicked() {
                             self.index.stack.pop_to(0);
                         }
@@ -491,22 +419,17 @@ impl App {
                                 self.act_import_ppt();
                             }
                             ui.add_space(2.0);
-                            if self.tool_slot(
-                                ui,
-                                false,
-                                tr("粘贴新建"),
-                                ChromeIcon::Clipboard,
-                            ) {
+                            if self.tool_slot(ui, false, tr("粘贴新建"), ChromeIcon::Clipboard)
+                            {
                                 self.create_unit_from_paste();
                             }
                         }
                         Page::Index => {
-                            if self.tool_slot(ui, false, tr("新建索引"), ChromeIcon::NewIndex)
-                            {
+                            if self.tool_slot(ui, false, tr("新建索引"), ChromeIcon::NewIndex) {
                                 self.act_new_index();
                             }
                         }
-                        Page::Home | Page::Trash => {}
+                        Page::Home | Page::Trash | Page::Messages => {}
                         Page::Settings => {}
                     }
                     self.index_toolbar(ui);
@@ -537,22 +460,14 @@ impl App {
         ui.spacing_mut().item_spacing.x = 6.0;
         // Snapshot of the open deck, cloned out of the frame: the
         // handlers below need &mut self.
-        let (item, pages, from, view, cached) = match self.showroom.stack.top() {
-            SrFrame::Deck(st) => {
-                let cache_key = format!("sr_{}", s(&st.item, "id"));
-                let cached = self
-                    .cache_entries
-                    .iter()
-                    .any(|e| s(e, "key") == cache_key);
-                (
-                    Some(st.item.clone()),
-                    Some(st.pages.clone()),
-                    st.selected_page.unwrap_or(0),
-                    st.view,
-                    cached,
-                )
-            }
-            _ => (None, None, 0, DeckView::Thumbnails, false),
+        let (item, pages, from, view) = match self.showroom.stack.top() {
+            SrFrame::Deck(st) => (
+                Some(st.item.clone()),
+                Some(st.pages.clone()),
+                st.selected_page.unwrap_or(0),
+                st.view,
+            ),
+            _ => (None, None, 0, DeckView::Thumbnails),
         };
         let deck_open = item.is_some();
         // Editor snapshot for sdBlockSave / sdBlockPublish: the
@@ -573,24 +488,23 @@ impl App {
         // a one-block set. Copy targets, in order: the wall
         // selection, the open deck, a plaza-selected deck
         // (prototype: 演示厅复制选中整套稿的全部页).
-        let (wall_targets, wall_multi): (Vec<String>, Vec<String>) =
-            if self.page == Page::Content {
-                match self.content.stack.top() {
-                    ContentFrame::Wall(w) => {
-                        let targets = if !w.multi.is_empty() {
-                            w.multi.clone()
-                        } else if let Some(sel) = &w.selected {
-                            vec![sel.clone()]
-                        } else {
-                            Vec::new()
-                        };
-                        (targets, w.multi.clone())
-                    }
-                    _ => (Vec::new(), Vec::new()),
+        let (wall_targets, wall_multi): (Vec<String>, Vec<String>) = if self.page == Page::Content {
+            match self.content.stack.top() {
+                ContentFrame::Wall(w) => {
+                    let targets = if !w.multi.is_empty() {
+                        w.multi.clone()
+                    } else if let Some(sel) = &w.selected {
+                        vec![sel.clone()]
+                    } else {
+                        Vec::new()
+                    };
+                    (targets, w.multi.clone())
                 }
-            } else {
-                (Vec::new(), Vec::new())
-            };
+                _ => (Vec::new(), Vec::new()),
+            }
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let has_clip = self.ppt_clip.is_some();
         let can_combine = wall_multi.len() >= 2;
         let plaza_item: Option<Value> =
@@ -643,17 +557,20 @@ impl App {
             .clicked()
         {
             let (item, pages) = (item.clone().unwrap(), pages.clone().unwrap());
-            if !self.present_via_deckcraft(
-                &s(&item, "id"),
-                &s(&item, "title"),
-                DcMode::Play,
-                from,
-            ) {
+            if !self.present_via_deckcraft(&s(&item, "id"), &s(&item, "title"), DcMode::Play, from)
+            {
                 self.start_presentation(ui, &item, &pages);
             }
         }
         if ChromeIcons
-            .tool(ui, ChromeIcon::Presenter, "演示者视图", deck_open, false, true)
+            .tool(
+                ui,
+                ChromeIcon::Presenter,
+                "演示者视图",
+                deck_open,
+                false,
+                true,
+            )
             .clicked()
         {
             let (item, pages) = (item.clone().unwrap(), pages.clone().unwrap());
@@ -730,7 +647,14 @@ impl App {
         // page's segmented 讲稿 tab — so the button lands there;
         // it carries no mode-selected state of its own.
         if ChromeIcons
-            .tool(ui, ChromeIcon::Eye, "预览 / 讲稿视图", deck_open, false, true)
+            .tool(
+                ui,
+                ChromeIcon::Eye,
+                "预览 / 讲稿视图",
+                deck_open,
+                false,
+                true,
+            )
             .clicked()
         {
             if let SrFrame::Deck(st) = self.showroom.stack.top_mut() {
@@ -750,11 +674,7 @@ impl App {
             // server offers no unit/version-granular submission.
             // Placeholder until that link exists; the package
             // report declares the gap in full.
-            self.deckbar_placeholder(
-                ui,
-                ChromeIcon::BlockPublish,
-                "保存并发布到演示厅（建设中）",
-            );
+            self.deckbar_placeholder(ui, ChromeIcon::BlockPublish, "保存并发布到演示厅（建设中）");
             // sdBlockSave — the page editor's own save driven
             // from the bar; one save implementation, not two
             // (see deckbar_save_block / App::save_page_edit).
@@ -776,8 +696,8 @@ impl App {
         // existing handler exists: the open content block (the
         // unit detail's own 删除内容块 path). Everywhere else it
         // greys with the group, as in the prototype.
-        let unit_open = self.page == Page::Content
-            && matches!(self.content.stack.top(), ContentFrame::Unit(_));
+        let unit_open =
+            self.page == Page::Content && matches!(self.content.stack.top(), ContentFrame::Unit(_));
         if ChromeIcons
             .tool(
                 ui,
@@ -917,29 +837,22 @@ impl App {
             let (it, pgs) = info_target.clone().unwrap();
             self.open_deck_info(&it, pgs);
         }
-        // sdCache — the prototype's sdPull slot (T6 ruling
-        // 2026-11-24: the slot is 缓存, not 收进我的 — the
-        // prototype itself was wrong). Accent-filled while the
-        // open deck sits in the local cache (the same cache-entry
-        // probe the deck header uses); clicking (re)caches through
-        // the deck header's own cache handler.
+        // sdSave — save a server-side library reference. Cached decks
+        // remain openable offline; this action and sharing require a
+        // live organization connection.
         if ChromeIcons
-            .tool(ui, ChromeIcon::Cache, "缓存到本地", deck_open, cached, true)
+            .tool(ui, ChromeIcon::Import, "保存到我的库", deck_open && self.org_online(), false, true)
             .clicked()
         {
             let item = item.clone().unwrap();
-            self.cache_showroom_deck(&item);
+            self.open_pull_dialog(&item, None);
         }
-        // sdShare — group head (T7 ruling 2026-11-24: kept).
-        // Sharing in the current phase is export-style only, so
-        // the button produces the deck's share file through the
-        // same export handler as the deck header's 导出.
         if ChromeIcons
-            .tool(ui, ChromeIcon::Share, "分享给…", deck_open, false, true)
+            .tool(ui, ChromeIcon::Share, "分享给…", deck_open && self.org_online(), false, true)
             .clicked()
         {
             let item = item.clone().unwrap();
-            self.export_showroom_pptx(&item);
+            self.open_share_dialog(&item);
         }
     }
 
@@ -957,8 +870,7 @@ impl App {
     /// sdCopyPpt, sdCutPpt and sdCombine lit up with the
     /// clipboard package.
     fn deckbar_placeholder(&mut self, ui: &mut egui::Ui, icon: ChromeIcon, label: &str) {
-        let (rect, resp) =
-            ui.allocate_exact_size(egui::vec2(30.0, 28.0), egui::Sense::hover());
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(30.0, 28.0), egui::Sense::hover());
         let glyph = palette_color(TEXT_WEAK).gamma_multiply(0.5);
         ChromeIcons.paint(ui, icon, rect.center(), 16.0, glyph);
         resp.on_hover_text(tr(label));
@@ -1020,11 +932,7 @@ impl App {
                 TrashFrame::List(_) => Some("回主页"),
             },
             Page::Settings => {
-                if self
-                    .settings_sections()
-                    .get(self.settings.section)
-                    .copied()
-                    == Some("审批队列")
+                if self.settings_sections().get(self.settings.section).copied() == Some("审批队列")
                     && matches!(self.review.stack.top(), ReviewFrame::Detail(_))
                 {
                     Some("返回上一层")
@@ -1032,6 +940,7 @@ impl App {
                     Some("回主页")
                 }
             }
+            Page::Messages => Some("回主页"),
         }
     }
 
@@ -1088,11 +997,7 @@ impl App {
                 }
             }
             Page::Settings => {
-                if self
-                    .settings_sections()
-                    .get(self.settings.section)
-                    .copied()
-                    == Some("审批队列")
+                if self.settings_sections().get(self.settings.section).copied() == Some("审批队列")
                     && matches!(self.review.stack.top(), ReviewFrame::Detail(_))
                 {
                     self.review.stack.pop();
@@ -1100,6 +1005,7 @@ impl App {
                     self.navigate_to(Page::Home);
                 }
             }
+            Page::Messages => self.navigate_to(Page::Home),
         }
     }
 
@@ -1148,6 +1054,7 @@ impl App {
                         Page::Index => "#7",
                         Page::Settings => "#8",
                         Page::Trash => "#9",
+                        Page::Messages => "#10",
                     };
                     let (badge, _) =
                         ui.allocate_exact_size(egui::vec2(34.0, 26.0), egui::Sense::hover());

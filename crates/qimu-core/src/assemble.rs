@@ -21,8 +21,7 @@
 //! boundaries live in the manifest alone.
 
 use crate::pptx::{
-    described_part, parse_rels, parse_xml, rels_xml, resolve_target, serialize_xml, slides,
-    Package,
+    described_part, parse_rels, parse_xml, rels_xml, resolve_target, serialize_xml, slides, Package,
 };
 use craft_xml::{El, Local, Node};
 use std::collections::BTreeMap;
@@ -160,8 +159,8 @@ pub fn assemble(fragments: &[Package]) -> Result<Package, String> {
             let bytes = frag.get(old)?;
             if old.ends_with(".rels") {
                 let owner = described_part(old);
-                let text = String::from_utf8(bytes.to_vec())
-                    .map_err(|_| format!("{old} is not UTF-8"))?;
+                let text =
+                    String::from_utf8(bytes.to_vec()).map_err(|_| format!("{old} is not UTF-8"))?;
                 let rewritten = rewrite_rels(&text, &owner, &map, &base_notes_master);
                 out.parts.insert(new.clone(), rewritten.into_bytes());
             } else {
@@ -255,18 +254,23 @@ pub fn assemble(fragments: &[Package]) -> Result<Package, String> {
             })
             .collect();
     }
-    out.parts.insert(PRESENTATION.to_string(), serialize_xml(&pres_root));
+    out.parts
+        .insert(PRESENTATION.to_string(), serialize_xml(&pres_root));
 
     // presentation rels: base rels (document order) + new entries
-    let mut rel_items: Vec<(String, String, String, bool)> = parse_rels(&out.get_text(PRESENTATION_RELS)?)
-        .into_iter()
-        .map(|r| (r.id, r.ty, r.target, r.external))
-        .collect();
+    let mut rel_items: Vec<(String, String, String, bool)> =
+        parse_rels(&out.get_text(PRESENTATION_RELS)?)
+            .into_iter()
+            .map(|r| (r.id, r.ty, r.target, r.external))
+            .collect();
     rel_items.extend(new_pres_rel_items);
-    out.parts
-        .insert(PRESENTATION_RELS.to_string(), rels_xml(&rel_items).into_bytes());
+    out.parts.insert(
+        PRESENTATION_RELS.to_string(),
+        rels_xml(&rel_items).into_bytes(),
+    );
 
-    out.parts.insert(CONTENT_TYPES.to_string(), serialize_xml(&ct_root));
+    out.parts
+        .insert(CONTENT_TYPES.to_string(), serialize_xml(&ct_root));
     Ok(out)
 }
 
@@ -350,13 +354,23 @@ mod debug_tests {
                     1,
                     "doubled Relationships root in {name}"
                 );
-                assert!(text.trim_end().ends_with("</Relationships>"), "unterminated rels in {name}");
+                assert!(
+                    text.trim_end().ends_with("</Relationships>"),
+                    "unterminated rels in {name}"
+                );
             }
         }
         let report = split_reassemble_verify(&merged).unwrap();
-        println!("verify: slides={} fp_match={} errors={:?}", report.slide_count, report.fingerprints_match, report.structural_errors);
+        println!(
+            "verify: slides={} fp_match={} errors={:?}",
+            report.slide_count, report.fingerprints_match, report.structural_errors
+        );
         let errs = crate::pptx::structural_errors(&merged);
-        println!("structural on merged: {} {:?}", errs.len(), &errs[..errs.len().min(5)]);
+        println!(
+            "structural on merged: {} {:?}",
+            errs.len(),
+            &errs[..errs.len().min(5)]
+        );
         assert!(report.ok, "nested assembly failed verification");
     }
 }
@@ -390,7 +404,9 @@ mod debug_charts {
             .filter(|k| k.contains("chart"))
             .collect();
         println!("merged charts: {charts:?}");
-        assert!(charts.iter().any(|c| c.contains("chart1")), "charts lost in assemble");
+        assert!(
+            charts.iter().any(|c| c.contains("chart1")),
+            "charts lost in assemble"
+        );
     }
 }
-

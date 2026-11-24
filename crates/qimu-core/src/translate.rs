@@ -218,8 +218,13 @@ pub fn translate_package_chunked(
         .map(|(_, t)| t.clone())
         .filter(|t| !t.trim().is_empty())
         .collect();
-    let (translated, report) =
-        translate_texts_chunked(translator, &translatable, target_lang, glossary, on_progress)?;
+    let (translated, report) = translate_texts_chunked(
+        translator,
+        &translatable,
+        target_lang,
+        glossary,
+        on_progress,
+    )?;
     let mut out = pkg.clone();
     let mut idx = 0;
     // group replacements per slide to apply sequentially
@@ -316,10 +321,9 @@ mod tests {
             .map(|n| format!("t{n}"))
             .collect();
         let mut seen: Vec<(usize, usize)> = Vec::new();
-        let (out, rep) = translate_texts_chunked(&Echo, &texts, "en", &[], &mut |d, t| {
-            seen.push((d, t))
-        })
-        .unwrap();
+        let (out, rep) =
+            translate_texts_chunked(&Echo, &texts, "en", &[], &mut |d, t| seen.push((d, t)))
+                .unwrap();
         assert_eq!(out.len(), texts.len());
         assert_eq!(out[0], "en:t0");
         assert_eq!(
