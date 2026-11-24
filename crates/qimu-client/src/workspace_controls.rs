@@ -136,7 +136,7 @@ fn menu_item(ui: &mut egui::Ui, label: &str) -> bool {
 
 impl App {
     pub(super) fn workspace_edit_menu(&mut self, ui: &mut egui::Ui) {
-        ui.menu_button(egui::RichText::new(tr("编辑")).size(13.5), |ui| {
+        ui.menu_button(egui::RichText::new(tr("编辑")).size(12.0), |ui| {
             if menu_item(ui, "全局搜索") {
                 self.workspace_controls.focus_search = true;
             }
@@ -152,7 +152,7 @@ impl App {
     }
 
     pub(super) fn workspace_context_menus(&mut self, ui: &mut egui::Ui) {
-        ui.menu_button(egui::RichText::new(tr("索引")).size(13.5), |ui| {
+        ui.menu_button(egui::RichText::new(tr("索引")).size(12.0), |ui| {
             if menu_item(ui, "索引总览") {
                 self.navigate_to(Page::Index);
                 self.index.stack.pop_to(0);
@@ -167,14 +167,14 @@ impl App {
                 }
             }
         });
-        ui.menu_button(egui::RichText::new(tr("演示")).size(13.5), |ui| {
+        ui.menu_button(egui::RichText::new(tr("演示")).size(12.0), |ui| {
             if menu_item(ui, "演示厅") {
                 self.navigate_to(Page::Showroom);
                 self.showroom.zone = "plaza".into();
                 self.showroom.stack.pop_to(0);
             }
         });
-        ui.menu_button(egui::RichText::new(tr("组织")).size(13.5), |ui| {
+        ui.menu_button(egui::RichText::new(tr("组织")).size(12.0), |ui| {
             let sections = self.settings_sections();
             for (section, label) in sections.into_iter().enumerate() {
                 if matches!(label, "个人资料" | "组织管理" | "内容组与授权" | "审批队列")
@@ -188,7 +188,7 @@ impl App {
                 self.login_open = true;
             }
         });
-        ui.menu_button(egui::RichText::new(tr("窗口")).size(13.5), |ui| {
+        ui.menu_button(egui::RichText::new(tr("窗口")).size(12.0), |ui| {
             if menu_item(ui, "最小化") {
                 ui.ctx()
                     .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
@@ -492,13 +492,13 @@ impl App {
                                 .size(11.5)
                                 .strong()
                                 .color(if selected {
-                                    egui::Color32::WHITE
+                                    palette_color(TEXT_MAIN)
                                 } else {
                                     palette_color(TEXT_WEAK)
                                 }),
                         )
                         .fill(if selected {
-                            ACCENT
+                            palette_color(PRESSED_BG)
                         } else {
                             egui::Color32::TRANSPARENT
                         })

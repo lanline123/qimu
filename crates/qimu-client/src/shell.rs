@@ -296,7 +296,7 @@ impl App {
                 // and right-cluster control riding high.
                 ui.horizontal_centered(|ui| {
                     egui::MenuBar::new().ui(ui, |ui| {
-                        ui.menu_button(egui::RichText::new(tr("文件")).size(13.5), |ui| {
+                        ui.menu_button(egui::RichText::new(tr("文件")).size(12.0), |ui| {
                             ui.set_min_width(160.0);
                             if ui.button(tr("新建索引")).clicked() {
                                 self.act_new_index();
@@ -323,7 +323,7 @@ impl App {
                             }
                         });
                         self.workspace_edit_menu(ui);
-                        ui.menu_button(egui::RichText::new(tr("视图")).size(13.5), |ui| {
+                        ui.menu_button(egui::RichText::new(tr("视图")).size(12.0), |ui| {
                             ui.set_min_width(160.0);
                             for page in Page::ALL {
                                 if ui.button(tr(page.label())).clicked() {
@@ -333,7 +333,7 @@ impl App {
                             }
                         });
                         self.workspace_context_menus(ui);
-                        ui.menu_button(egui::RichText::new(tr("帮助")).size(13.5), |ui| {
+                        ui.menu_button(egui::RichText::new(tr("帮助")).size(12.0), |ui| {
                             ui.set_min_width(160.0);
                             if ui.button(tr("检查更新")).clicked() {
                                 self.check_lan_update(true);
