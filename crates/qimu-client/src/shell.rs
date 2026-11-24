@@ -687,18 +687,29 @@ impl App {
         }
         tool_vsep(ui);
         if editing {
-            // DECKBAR-PLACEHOLDER sdBlockPublish — the save half
-            // is real (sdBlockSave, below) but the publish half
-            // has no truthful target from the editor: the
-            // client's only publish-to-showroom path is
-            // index-granular (push_index_to_showroom — POST
-            // /v1/showroom with a source_index_id taken from the
-            // index detail), the editor context carries no index
-            // id (PageEditState holds a version id only), and the
-            // server offers no unit/version-granular submission.
-            // Placeholder until that link exists; the package
-            // report declares the gap in full.
-            self.deckbar_placeholder(ui, ChromeIcon::BlockPublish, "保存并发布到演示厅（建设中）");
+            // sdBlockPublish — the editor's save plus the
+            // publish half (deckbar_publish_block): when the
+            // saved block feeds exactly one local index whose
+            // published entries resolve it to the version the
+            // save just produced, that index is submitted
+            // through the P3 chain. Lit by the same dirty flag
+            // as sdBlockSave (the editor snapshot above): the
+            // button is the save+publish combo, and
+            // re-publishing an already-saved version stays with
+            // the index detail's push dialog.
+            if ChromeIcons
+                .tool(
+                    ui,
+                    ChromeIcon::BlockPublish,
+                    "保存并发布到演示厅",
+                    edit_dirty,
+                    false,
+                    true,
+                )
+                .clicked()
+            {
+                self.deckbar_publish_block();
+            }
             // sdBlockSave — the page editor's own save driven
             // from the bar; one save implementation, not two
             // (see deckbar_save_block / App::save_page_edit).
@@ -897,10 +908,12 @@ impl App {
     /// handler when the feature lands. It is painted by hand
     /// rather than through the disabled tool button because a
     /// disabled scope swallows hover — the tooltip must still
-    /// work. Registry: sdBlockPublish (in deckbar_actions) is
-    /// the one remaining entry; sdPasteSplit, sdPasteGroup,
-    /// sdCopyPpt, sdCutPpt and sdCombine lit up with the
-    /// clipboard package.
+    /// work. Registry: currently empty — sdPasteSplit,
+    /// sdPasteGroup, sdCopyPpt, sdCutPpt and sdCombine lit up
+    /// with the clipboard package, and sdBlockPublish, the
+    /// last entry, lit up with the P3 submission chain
+    /// (deckbar_publish_block). The helper stays for any
+    /// future slot.
     fn deckbar_placeholder(&mut self, ui: &mut egui::Ui, icon: ChromeIcon, label: &str) {
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(30.0, 28.0), egui::Sense::hover());
         let glyph = palette_color(TEXT_WEAK).gamma_multiply(0.5);
@@ -932,8 +945,182 @@ impl App {
             self.overlays.insert(pos, overlay);
             return;
         };
-        if !pe.dirty() || !self.save_page_edit(pe) {
+        if !pe.dirty() || self.save_page_edit(pe).is_none() {
             self.overlays.insert(pos, overlay);
+        }
+    }
+
+    /// sdBlockPublish: the editor's save (the identical
+    /// App::save_page_edit sdBlockSave runs) followed by the
+    /// publish half P3 §8 step 3 specified — in the local
+    /// library, find the indexes whose main-head entries carry
+    /// this block; exactly one, and its published entries
+    /// resolving this block to the version the save just
+    /// produced, submits that index through the same
+    /// App::push_index_to_showroom the index detail's push
+    /// dialog ends in. Zero or several candidate indexes, an
+    /// unpublished index, a published set that does not carry
+    /// the block, or one still locked to an older version all
+    /// stop after the save with a message that says so — the
+    /// button never claims a publish that did not happen.
+    fn deckbar_publish_block(&mut self) {
+        let Some(pos) = self
+            .overlays
+            .iter()
+            .rposition(|o| matches!(o, Overlay::PageEdit(_)))
+        else {
+            return;
+        };
+        if !matches!(self.overlays.last(), Some(Overlay::PageEdit(_))) {
+            return; // a confirm dialog sits over the editor
+        }
+        let overlay = self.overlays.remove(pos);
+        let Overlay::PageEdit(pe) = &overlay else {
+            self.overlays.insert(pos, overlay);
+            return;
+        };
+        if !pe.dirty() {
+            self.overlays.insert(pos, overlay);
+            return;
+        }
+        let Some(new_version_id) = self.save_page_edit(pe) else {
+            // Save failed; its message stands and the editor
+            // stays open, exactly as sdBlockSave leaves it.
+            self.overlays.insert(pos, overlay);
+            return;
+        };
+        // Save succeeded — the editor closes (the editor
+        // footer's own save semantics) and the publish half
+        // runs against the message the save left.
+        let saved_msg = self.msg.clone();
+        self.publish_saved_block(pe, &new_version_id, &saved_msg);
+    }
+
+    /// The publish half of sdBlockPublish (see
+    /// deckbar_publish_block): the candidate search runs in
+    /// the local library, the submission's home turf — an
+    /// organization-side block has no package to build here
+    /// and keeps the index detail's road.
+    fn publish_saved_block(&mut self, pe: &PageEditState, new_version_id: &str, saved_msg: &str) {
+        if pe.unit_id.is_empty() {
+            self.msg = format!("{saved_msg}；提交未成：缺少内容块上下文");
+            return;
+        }
+        let Some(local) = &self.local else {
+            self.msg = format!("{saved_msg}；提交未成：本地库未打开");
+            return;
+        };
+        let hits = local.indexes_with_unit_on_main(&pe.unit_id);
+        match hits.len() {
+            0 => {
+                self.msg = format!(
+                    "{saved_msg}；提交未成：本地库中没有包含此内容块的索引（先加入索引，或到索引详情提交）"
+                );
+            }
+            1 => {
+                let (index_id, index_name) = hits.into_iter().next().unwrap();
+                self.publish_saved_block_to_index(
+                    pe,
+                    new_version_id,
+                    saved_msg,
+                    &index_id,
+                    &index_name,
+                );
+            }
+            _ => {
+                self.msg = format!(
+                    "{saved_msg}；提交未成：此内容块属于多个索引，请到索引详情选择提交"
+                );
+            }
+        }
+    }
+
+    /// sdBlockPublish, the one-candidate step: the candidate's
+    /// published set (LocalStore::push_preview — the same
+    /// resolution the push dialog shows) must carry this block
+    /// and resolve it to the version the save produced; then
+    /// the submission itself is push_index_to_showroom with
+    /// the preview's tag and pins, and only that call's own
+    /// success verdict turns the message into 已保存并提交.
+    fn publish_saved_block_to_index(
+        &mut self,
+        pe: &PageEditState,
+        new_version_id: &str,
+        saved_msg: &str,
+        index_id: &str,
+        index_name: &str,
+    ) {
+        let Some(local) = &self.local else {
+            self.msg = format!("{saved_msg}；提交未成：本地库未打开");
+            return;
+        };
+        let preview = match local.push_preview(index_id, "main") {
+            Some(Ok(preview)) => preview,
+            Some(Err(e)) => {
+                self.msg = format!("{saved_msg}；提交未成：{e}");
+                return;
+            }
+            None => {
+                self.msg = format!("{saved_msg}；提交未成：索引不在本地库中");
+                return;
+            }
+        };
+        let Some(tag_id) = preview["published_tag_id"].as_str().map(str::to_owned) else {
+            self.msg = format!(
+                "{saved_msg}；提交未成：索引「{index_name}」尚未发布版本（请先在索引详情发布）"
+            );
+            return;
+        };
+        let empty: Vec<Value> = Vec::new();
+        let rows = preview["current_entries"].as_array().unwrap_or(&empty);
+        let mut unit_rows = 0usize;
+        let mut resolves_to_new = false;
+        let mut locked = false;
+        for row in rows {
+            if s(&row["entry"], "unit_id") != pe.unit_id {
+                continue;
+            }
+            unit_rows += 1;
+            if s(&row["resolved"], "id") == new_version_id {
+                resolves_to_new = true;
+            }
+            if row["entry"]["policy"].get("locked").is_some() {
+                locked = true;
+            }
+        }
+        if unit_rows == 0 {
+            self.msg = format!(
+                "{saved_msg}；提交未成：此内容块不在索引「{index_name}」的发布版中（请先在索引详情重新发布）"
+            );
+            return;
+        }
+        if !resolves_to_new {
+            self.msg = if locked {
+                format!(
+                    "{saved_msg}；提交未成：索引「{index_name}」仍锁定旧版本（请先在索引详情更新条目）"
+                )
+            } else {
+                format!(
+                    "{saved_msg}；提交未成：索引「{index_name}」发布版解析到的不是刚保存的新版本"
+                )
+            };
+            return;
+        }
+        let pins = match super::prototype_dialogs::preview_pins(rows) {
+            Ok(pins) => pins,
+            Err(e) => {
+                self.msg = format!("{saved_msg}；提交未成：{e}");
+                return;
+            }
+        };
+        self.push_index_to_showroom(index_id, index_name, &tag_id, &pins, pe.note.trim());
+        if self.msg == "已提交，等待审核" {
+            self.msg = format!("{saved_msg}，并已提交到演示厅，等待审核");
+        } else {
+            let why = self.msg.clone();
+            if why != saved_msg {
+                self.msg = format!("{saved_msg}；提交未成：{why}");
+            }
         }
     }
 

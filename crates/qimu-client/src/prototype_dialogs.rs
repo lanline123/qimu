@@ -108,7 +108,7 @@ fn resolved_version(rows: &[Value]) -> Vec<(String, String, String)> {
     out
 }
 
-fn preview_pins(rows: &[Value]) -> Result<Vec<(IndexEntry, String)>, String> {
+pub(super) fn preview_pins(rows: &[Value]) -> Result<Vec<(IndexEntry, String)>, String> {
     rows.iter()
         .map(|row| {
             let entry = serde_json::from_value(row["entry"].clone())

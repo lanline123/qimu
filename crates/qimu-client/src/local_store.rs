@@ -678,6 +678,30 @@ impl LocalStore {
         Some(run())
     }
 
+    /// sdBlockPublish's candidate search (P3 §8 step 3): the
+    /// local indexes whose main-branch head commit carries an
+    /// entry for `unit_id`, as (index_id, index_name) pairs in
+    /// library order. The submission package is built from this
+    /// same store, so the search runs here rather than over the
+    /// wire-shaped detail endpoints.
+    pub fn indexes_with_unit_on_main(&self, unit_id: &str) -> Vec<(String, String)> {
+        let store = self.store.lock().unwrap();
+        let mut out = Vec::new();
+        for index in store.list_indexes(None).unwrap_or_default() {
+            let head = store
+                .branch_head(&index.id, "main")
+                .ok()
+                .flatten()
+                .and_then(|cid| store.get_commit(&cid).ok());
+            if let Some(commit) = head {
+                if commit.entries.iter().any(|e| e.unit_id.0 == unit_id) {
+                    out.push((index.id.clone(), index.name.clone()));
+                }
+            }
+        }
+        out
+    }
+
     /// Working-data dispatcher (local-first P1/P4): serves the REST
     /// paths whose data is working data — import, units, indexes,
     /// folders, trash, search, page editing (page-text / edit-pages

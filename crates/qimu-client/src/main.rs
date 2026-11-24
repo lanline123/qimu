@@ -1892,6 +1892,10 @@ fn push_full_style_op(
 /// `work`) plus the v2 element working copies (`elems`).
 struct PageEditState {
     version_id: String,
+    // The block the edited version belongs to (sdBlockPublish's
+    // publish half searches indexes by it). Filled at both
+    // construction points, which all have the unit in hand.
+    unit_id: String,
     unit_name: String,
     semver: String,
     page_count: usize,
@@ -11916,6 +11920,7 @@ impl App {
         }
         self.overlays.push(Overlay::PageEdit(PageEditState {
             version_id: s(v, "id"),
+            unit_id: s(unit, "id"),
             unit_name: s(unit, "name"),
             semver: s(v, "semver"),
             page_count: pages,
@@ -12217,6 +12222,7 @@ impl App {
                                     }
                                     self.overlays.push(Overlay::PageEdit(PageEditState {
                                         version_id: s(v, "id"),
+                                        unit_id: st.unit_id.clone(),
                                         unit_name: s(&unit, "name"),
                                         semver: s(v, "semver"),
                                         page_count: pages,
@@ -13888,13 +13894,20 @@ impl App {
     /// the editor footer's 保存并发布新版本 and the bottom bar's
     /// 保存到索引 (sdBlockSave): the §8 bump-rule payload, the
     /// edit-pages call, the result message, the unit-detail
-    /// reopen and the refresh. Returns true when the editor
-    /// should close (saved, or nothing to save); false keeps it
-    /// open after a failed call, with the failure in self.msg.
-    fn save_page_edit(&mut self, pe: &PageEditState) -> bool {
+    /// reopen and the refresh. Returns Some(version id the
+    /// save landed on) when the editor should close (saved, or
+    /// nothing to save); None keeps it open after a failed
+    /// call, with the failure in self.msg.
+    fn save_page_edit(&mut self, pe: &PageEditState) -> Option<String> {
         let edits = pe.legacy_edits();
         let ops = pe.page_ops(None);
         let mut new_semver = String::new();
+        // The version the save lands on: the newly inserted
+        // version for content edits, the edited version itself
+        // for script-only and no-op saves. Returned for
+        // sdBlockPublish's resolved-version check; None is a
+        // failed save (its message is already set).
+        let mut saved_version_id = pe.version_id.clone();
         if !edits.is_empty() || !ops.is_empty() || pe.added_pages() > 0 {
             let bump = ["major", "minor", "patch"][pe.bump];
             let payload = json!({
@@ -13915,10 +13928,14 @@ impl App {
                 Ok(v) => {
                     let ver = v.get("version").cloned().unwrap_or(json!({}));
                     new_semver = s(&ver, "semver");
+                    let id = s(&ver, "id");
+                    if !id.is_empty() {
+                        saved_version_id = id;
+                    }
                 }
                 Err(e) => {
                     self.msg = format!("保存失败：{e}");
-                    return false;
+                    return None;
                 }
             }
         } else if pe.scripts != pe.scripts_base {
@@ -13928,7 +13945,7 @@ impl App {
                 Some(json!({ "scripts": pe.scripts })),
             ) {
                 self.msg = format!("讲稿保存失败：{e}");
-                return false;
+                return None;
             }
         }
         self.msg = if new_semver.is_empty() {
@@ -13944,7 +13961,7 @@ impl App {
             self.open_unit_detail(&uid);
         }
         self.refresh_all();
-        true
+        Some(saved_version_id)
     }
 
     /// Page-level visual editor (prototype A29 shell): page rail,
@@ -14383,7 +14400,7 @@ impl App {
             return None;
         }
         if save {
-            if self.save_page_edit(&pe) {
+            if self.save_page_edit(&pe).is_some() {
                 return None;
             }
             return Some(Overlay::PageEdit(pe));
