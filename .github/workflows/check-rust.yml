@@ -2,8 +2,8 @@
 # 改完先在 GitHub 上用最小范围验证改动文件能过编译，验证通过后再跑
 # build-windows 正式构建，避免整包构建跑到一半才发现低级编译错误）。
 #
-# 与 build-windows 同环境（ubuntu + mingw 交叉 windows-gnu、同工具链、
-# 同字体门），但只做 cargo check（不 codegen、不打包、不出安装包），
+# 与 build-windows 同环境（ubuntu + mingw 交叉 windows-gnu、同工具链；
+# 字体口径 2026-11-25 起全走系统字体, 两边均无字体门），但只做 cargo check（不 codegen、不打包、不出安装包），
 # 覆盖四个自有 crate：core / client / server / cli。今晚两遍正式构建
 # 失败的错误类（类型定义丢失 E0425、比较类型不符 E0277）都会在这里
 # 被提前拦住。注意：本门只验编译，打包类问题（如 NSI 缺文件）仍要靠
@@ -25,12 +25,6 @@ jobs:
         with:
           submodules: true
 
-      - uses: actions/checkout@v4
-        with:
-          repository: lanline123/craft-fonts
-          ref: 26a79230872f9b2acd3dd68500677e294350ab94
-          path: vendor/craft-fonts
-
       - name: Install mingw
         run: |
           sudo apt-get update
@@ -43,7 +37,4 @@ jobs:
           targets: x86_64-pc-windows-gnu
 
       - name: Cargo check (all own crates, staging profile, windows-gnu)
-        env:
-          CRAFT_FONTS_DIR: ${{ github.workspace }}/vendor/craft-fonts
-          CRAFT_FONTS_REQUIRED: "1"
         run: cargo check --profile staging --target x86_64-pc-windows-gnu -p qimu-core -p qimu-client -p qimu-server -p qimu-cli
