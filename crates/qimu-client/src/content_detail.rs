@@ -694,7 +694,15 @@ impl App {
                                             egui::RichText::new("这一页的备注（讲稿）").strong(),
                                         );
                                         let note = page_note(&light.version, light.slot);
-                                        ui.label(if note.is_empty() { "—" } else { &note });
+                                        // Prototype note-box: an
+                                        // empty note reads as a
+                                        // sentence, not a dash
+                                        // (drill re-audit R4).
+                                        ui.label(if note.is_empty() {
+                                            "这一页暂无备注。"
+                                        } else {
+                                            &note
+                                        });
                                     });
                             });
                             ui.add_space(14.0);

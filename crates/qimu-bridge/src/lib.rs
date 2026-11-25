@@ -55,8 +55,45 @@ pub struct ReplaceReport {
     pub slides_after: usize,
 }
 
+/// How PowerPoint should open a deck handed over for presentation:
+/// the client's three views （播放 / 普通视图 / 演示者视图） mapped
+/// onto the PowerPoint object model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresentMode {
+    /// Open the deck and start its slide show.
+    Play,
+    /// Open the deck only — no slide show; the user reads and
+    /// navigates in PowerPoint's normal view.
+    Reading,
+    /// Open the deck, start the slide show, and ask PowerPoint for
+    /// its presenter view (best effort — see the Windows impl).
+    Presenter,
+}
+
 pub trait PowerPointBridge {
     fn status(&self) -> BridgeStatus;
+
+    /// Open `path` in PowerPoint and present it per `mode`; the
+    /// show modes start the slide show at `from` (0-based page).
+    ///
+    /// Unlike the editing paths in this trait, this entry MAY start
+    /// PowerPoint when none is running: the user explicitly chose
+    /// to open the deck in PowerPoint, and the window comes up
+    /// visible. (The audit2 E-M8 rule — never let a probe or an
+    /// edit launch a hidden PowerPoint — still binds `status`,
+    /// `replace_slides_in_place`, `capture_copied_slides` and
+    /// `publish_slides_to_clipboard` exactly as before.)
+    ///
+    /// The default implementation reports the bridge as
+    /// unavailable; the Windows COM implementation overrides it.
+    fn open_and_present(
+        &self,
+        _path: &std::path::Path,
+        _mode: PresentMode,
+        _from: usize,
+    ) -> Result<(), String> {
+        Err("PowerPoint 打开仅在 Windows + PowerPoint 环境可用".into())
+    }
 
     /// Replace slides in the presentation that is *currently open* in
     /// PowerPoint. Fails unless the open presentation's path equals

@@ -16,12 +16,13 @@
 
 use windows::core::{Interface, BSTR, GUID, PCWSTR, VARIANT};
 use windows::Win32::System::Com::{
-    CLSIDFromProgID, CoInitializeEx, CoUninitialize, IDispatch, COINIT_APARTMENTTHREADED,
-    DISPATCH_METHOD, DISPATCH_PROPERTYGET, DISPPARAMS,
+    CLSIDFromProgID, CoCreateInstance, CoInitializeEx, CoUninitialize, IDispatch,
+    CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, DISPATCH_METHOD, DISPATCH_PROPERTYGET,
+    DISPATCH_PROPERTYPUT, DISPPARAMS,
 };
 use windows::Win32::System::Ole::GetActiveObject;
 
-use crate::{BridgeStatus, PowerPointBridge, ReplaceReport, SlideReplacement};
+use crate::{BridgeStatus, PowerPointBridge, PresentMode, ReplaceReport, SlideReplacement};
 
 pub struct WindowsBridge;
 
@@ -117,6 +118,37 @@ fn call(obj: &IDispatch, name: &str, args: &mut [VARIANT]) -> Result<VARIANT, St
     invoke(obj, name, DISPATCH_METHOD, args)
 }
 
+/// DISPID_PROPERTYPUT — the named-argument id a property put must
+/// carry in DISPPARAMS for IDispatch to treat the call as a write.
+const DISPID_PROPERTYPUT: i32 = -3;
+
+fn put_prop(obj: &IDispatch, name: &str, value: VARIANT) -> Result<(), String> {
+    let id = dispid(obj, name)?;
+    let mut named = DISPID_PROPERTYPUT;
+    let mut args = [value];
+    let params = DISPPARAMS {
+        rgvarg: args.as_mut_ptr(),
+        rgdispidNamedArgs: &mut named,
+        cArgs: 1,
+        cNamedArgs: 1,
+    };
+    let mut result = VARIANT::default();
+    unsafe {
+        obj.Invoke(
+            id,
+            &GUID::zeroed(),
+            0x0400,
+            DISPATCH_PROPERTYPUT,
+            &params,
+            Some(&mut result),
+            None,
+            None,
+        )
+    }
+    .map_err(|e| format!("Invoke({name}=) 失败: {e}"))?;
+    Ok(())
+}
+
 /// The running PowerPoint.Application, or an error if none is running.
 fn active_powerpoint() -> Result<IDispatch, String> {
     let progid = BSTR::from("PowerPoint.Application");
@@ -139,6 +171,31 @@ fn active_powerpoint() -> Result<IDispatch, String> {
     // hidden PowerPoint. GetActiveObject failing means: not
     // running, full stop.
     Err("PowerPoint 未在运行".into())
+}
+
+/// The PowerPoint.Application for an open-and-present request:
+/// the running instance when there is one; otherwise a freshly
+/// started one, made visible. Starting it here is deliberate and
+/// is NOT the audit2 E-M8 case: that rule keeps *probes and edits*
+/// from launching a hidden PowerPoint, while this entry exists
+/// because the user explicitly asked to open a deck in PowerPoint.
+/// A ProgID that does not resolve means PowerPoint is not
+/// installed at all, and says so.
+fn powerpoint_for_present() -> Result<IDispatch, String> {
+    if let Ok(app) = active_powerpoint() {
+        return Ok(app);
+    }
+    let progid = BSTR::from("PowerPoint.Application");
+    let clsid = unsafe { CLSIDFromProgID(PCWSTR(progid.as_ptr())) }
+        .map_err(|_| "PowerPoint 未安装：请先安装 Microsoft PowerPoint 后再试".to_string())?;
+    let app: IDispatch = unsafe { CoCreateInstance(&clsid, None, CLSCTX_LOCAL_SERVER) }
+        .map_err(|e| format!("启动 PowerPoint 失败: {e}"))?;
+    // A COM-started PowerPoint begins hidden; the user asked to
+    // watch the deck in it, so show the application window
+    // (Application.Visible is an MsoTriState — msoTrue = -1, the
+    // same i32-boolean convention as the rest of this bridge).
+    let _ = put_prop(&app, "Visible", VARIANT::from(-1i32));
+    Ok(app)
 }
 
 fn active_presentation(app: &IDispatch) -> Result<IDispatch, String> {
@@ -170,6 +227,69 @@ impl PowerPointBridge for WindowsBridge {
                 detail: e,
             },
         }
+    }
+
+    /// Open-and-present route (settings 「放映打开方式」=
+    /// PowerPoint, user ruling 2026-11-25): the deck file — a
+    /// disposable copy in the client's cache directory — is opened
+    /// with a window, and for the two show modes the slide show is
+    /// started immediately (the user ruled: not "open the file and
+    /// let them press play again").
+    ///   Play      → SlideShowSettings.Run()
+    ///   Presenter → ShowPresenterView = msoTrue first, then Run()
+    ///   Reading   → open only, no Run()
+    /// `from` (0-based) becomes SlideShowSettings.StartingSlide
+    /// (1-based). ShowPresenterView and StartingSlide are applied
+    /// best-effort: a PowerPoint build that rejects either still
+    /// gets its show, from the first slide / without the presenter
+    /// window, rather than no presentation at all. Run() itself is
+    /// NOT best-effort — its failure is the caller's error.
+    /// NOTE: written against the documented object model; like the
+    /// rest of this bridge it has NOT yet run on a real Windows +
+    /// PowerPoint machine (first live check pending).
+    fn open_and_present(
+        &self,
+        path: &std::path::Path,
+        mode: PresentMode,
+        from: usize,
+    ) -> Result<(), String> {
+        let _com = ComGuard::new()?;
+        let app = powerpoint_for_present()?;
+        let presentations = get_obj(&app, "Presentations")?;
+        // Open(FileName, ReadOnly = msoFalse, Untitled = msoFalse,
+        // WithWindow = msoTrue): a normal windowed open of the
+        // cache copy — the copy is disposable, so the user's saves
+        // or close-prompts behave exactly like any open file.
+        let opened = call(
+            &presentations,
+            "Open",
+            &mut [
+                VARIANT::from(BSTR::from(path.to_string_lossy().as_ref())),
+                VARIANT::from(0i32),
+                VARIANT::from(0i32),
+                VARIANT::from(-1i32),
+            ],
+        )?;
+        let pres =
+            IDispatch::try_from(&opened).map_err(|e| format!("打开演示文稿失败: {e}"))?;
+        if mode == PresentMode::Reading {
+            return Ok(());
+        }
+        let settings = get_obj(&pres, "SlideShowSettings")?;
+        if mode == PresentMode::Presenter {
+            // MsoTriState msoTrue = -1 (this bridge's i32-boolean
+            // convention).
+            let _ = put_prop(&settings, "ShowPresenterView", VARIANT::from(-1i32));
+        }
+        if from > 0 {
+            let _ = put_prop(
+                &settings,
+                "StartingSlide",
+                VARIANT::from(from as i32 + 1),
+            );
+        }
+        call(&settings, "Run", &mut [])?;
+        Ok(())
     }
 
     fn replace_slides_in_place(

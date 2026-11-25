@@ -1187,6 +1187,43 @@ fn load_dc_auto_quit() -> bool {
         .unwrap_or(false)
 }
 
+/// Which engine the unified view opener presents with
+/// （设置 → 演示偏好「放映打开方式」, user ruling 2026-11-25).
+/// Device-local preference in client-settings.json, persisted and
+/// loaded exactly like `deckcraft_auto_quit` next door.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PresentEngine {
+    /// The in-process hosted show; the DeckCraft jump remains its
+    /// fallback (the pre-setting behaviour, and the default).
+    Builtin,
+    /// The external DeckCraft app as the PRIMARY path (the jump,
+    /// promoted from fallback). A missing app or a failed jump is
+    /// reported — never a silent switch to another engine.
+    DeckCraft,
+    /// The deck is written into the cache directory and opened in
+    /// PowerPoint through the bridge, slide show auto-started.
+    PowerPoint,
+}
+
+impl PresentEngine {
+    /// The client-settings.json spelling of this choice.
+    fn key(self) -> &'static str {
+        match self {
+            PresentEngine::Builtin => "builtin",
+            PresentEngine::DeckCraft => "deckcraft",
+            PresentEngine::PowerPoint => "powerpoint",
+        }
+    }
+}
+
+fn load_present_engine() -> PresentEngine {
+    match client_settings()["present_engine"].as_str() {
+        Some("deckcraft") => PresentEngine::DeckCraft,
+        Some("powerpoint") => PresentEngine::PowerPoint,
+        _ => PresentEngine::Builtin,
+    }
+}
+
 /// One JSON-lines control connection to a DeckCraft instance.
 struct DcControl {
     reader: std::io::BufReader<std::net::TcpStream>,
@@ -1712,6 +1749,11 @@ struct IndexDetailState {
     more_action: Option<IndexMoreAction>,
     view: IndexDetailView,
     selected_commit: Option<String>,
+    /// Entry-wall remove confirmation (prototype .del-pop
+    /// inrow, drill re-audit N2): the entry position whose
+    /// inline 删除 confirmation is armed. The card's × only
+    /// arms it; the removal commits from the pop's 确认删除.
+    confirm_remove_entry: Option<usize>,
     /// rendition_id -> versions, semver desc（打开时预取）。
     unit_versions: std::collections::HashMap<String, Vec<Value>>,
     tag_name: String,
@@ -1738,6 +1780,7 @@ impl IndexDetailState {
             more_action: None,
             view: IndexDetailView::Wall,
             selected_commit: None,
+            confirm_remove_entry: None,
             unit_versions: Default::default(),
             tag_name: String::new(),
             focus_tag: false,
@@ -3295,6 +3338,9 @@ struct App {
     dc_rx: std::sync::mpsc::Receiver<DcEvent>,
     dc_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
     dc_auto_quit: bool,
+    /// 设置 → 演示偏好「放映打开方式」: which engine the unified
+    /// view opener routes to (ruling 2026-11-25).
+    present_engine: PresentEngine,
     /// T2 (DeckCraft transplant, strategy (b)): the in-process
     /// hosted show, while one is running. While Some, the eframe
     /// App forwards logic / raw_input_hook / ui to the guest
@@ -4390,6 +4436,7 @@ impl App {
             dc_rx,
             dc_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             dc_auto_quit: load_dc_auto_quit(),
+            present_engine: load_present_engine(),
             hosted: None,
             login_open: false,
             about_open: false,
@@ -10934,6 +10981,76 @@ impl App {
         self.open_deck_views_path(title, &path, page_count, mode, from)
     }
 
+    /// DeckCraft as the PRIMARY engine （设置「放映打开方式」=
+    /// DeckCraft, ruling 2026-11-25): the external jump, promoted
+    /// from its fallback seat. A missing DeckCraft app or a failed
+    /// jump is reported and ends the open — the user's chosen
+    /// engine never degrades silently into the hosted show, so
+    /// every outcome returns true ("handled": callers must not
+    /// drop into the built-in presenter behind the user's back).
+    /// `dc_jump`'s own failure messages stay as they are.
+    fn open_via_deckcraft_primary(
+        &mut self,
+        path: &std::path::Path,
+        title: &str,
+        mode: DcMode,
+        from: usize,
+    ) -> bool {
+        if deckcraft_app_path().is_none() {
+            self.msg = "未检测到 DeckCraft 桌面应用：放映打开方式已设为 DeckCraft，请先安装 DeckCraft 后再试（或在 设置 → 演示偏好 改回内置放映）".into();
+            return true;
+        }
+        self.dc_jump(path, title, mode, from);
+        true
+    }
+
+    /// PowerPoint as the engine （设置「放映打开方式」=
+    /// PowerPoint, ruling 2026-11-25): the deck bytes — already
+    /// resolved with notes by the caller's export path — land in
+    /// the cache directory under a content stamp (the same naming
+    /// discipline as the present/ copies, so a re-open never reads
+    /// back a stale deck), and the bridge opens them in
+    /// PowerPoint: 播放 starts the slide show, 演示者视图 also
+    /// asks for the presenter view, 普通视图 opens without a
+    /// show. Any failure is reported and ends the open; no silent
+    /// switch to another engine, so every outcome returns true.
+    fn open_via_powerpoint(
+        &mut self,
+        title: &str,
+        bytes: &[u8],
+        mode: DcMode,
+        from: usize,
+    ) -> bool {
+        let dir = cache_dir();
+        let path = dir.join(format!("present-{}.pptx", dc_content_stamp64(bytes)));
+        if let Err(e) =
+            std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, bytes))
+        {
+            self.msg = format!("PowerPoint 打开失败：写出演示文件失败：{e}");
+            return true;
+        }
+        let pmode = match mode {
+            DcMode::Play => qimu_bridge::PresentMode::Play,
+            DcMode::Reading => qimu_bridge::PresentMode::Reading,
+            DcMode::Presenter => qimu_bridge::PresentMode::Presenter,
+        };
+        match qimu_bridge::platform_bridge().open_and_present(&path, pmode, from) {
+            Ok(()) => {
+                self.msg = match mode {
+                    DcMode::Play => format!("已在 PowerPoint 开始演示：{title}"),
+                    DcMode::Reading => format!("已在 PowerPoint 打开：{title}"),
+                    DcMode::Presenter => {
+                        format!("已在 PowerPoint 开始演示：{title}（演示者视图）")
+                    }
+                };
+            }
+            Err(e) => {
+                self.msg = format!("PowerPoint 打开失败：{e}");
+            }
+        }
+        true
+    }
+
     /// THE unified view opener (views unification, user ruling
     /// 2026-11-25): the bottom-bar views — 播放 / 普通视图 /
     /// 演示者视图 — are one action, "open an index", and every
@@ -10943,7 +11060,11 @@ impl App {
     /// deck a published index, a history version a frozen page
     /// sequence). The three views are only this entry's mode
     /// parameter. `start_hosted_show` is the one show engine; the
-    /// external DeckCraft jump is the next fallback. When NEITHER
+    /// external DeckCraft jump is the next fallback. A non-default
+    /// 设置「放映打开方式」pre-empts that order at the top of
+    /// this entry (and of its path-fed twin): the chosen engine
+    /// takes the open outright, with its own failure reporting.
+    /// When NEITHER
     /// engine could start the show this returns false (audit2
     /// E-N2 disposition): showroom callers then fall back to the
     /// built-in presenter, and the doors without a fallback wired
@@ -10964,6 +11085,25 @@ impl App {
         } else {
             0
         };
+        // 设置「放映打开方式」routes the open before the default
+        // engine order below runs (ruling 2026-11-25): DeckCraft
+        // jumps as the primary path, PowerPoint takes the bytes
+        // through the bridge. Both report their own failures and
+        // never fall through to here.
+        if self.present_engine == PresentEngine::DeckCraft {
+            let dir = qimu_home().join("present");
+            let path = dir.join(format!("open-{}.pptx", dc_content_stamp64(bytes)));
+            if let Err(e) =
+                std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, bytes))
+            {
+                self.msg = format!("DeckCraft 打开失败：写出演示副本失败：{e}");
+                return true;
+            }
+            return self.open_via_deckcraft_primary(&path, title, mode, from);
+        }
+        if self.present_engine == PresentEngine::PowerPoint {
+            return self.open_via_powerpoint(title, bytes, mode, from);
+        }
         let hosted_err = match self.start_hosted_show(title, bytes, mode, from) {
             Ok(()) => return true,
             Err(e) => e,
@@ -11011,6 +11151,23 @@ impl App {
         } else {
             0
         };
+        // 设置「放映打开方式」routes the open first (ruling
+        // 2026-11-25), exactly as in the byte-fed door: the jump
+        // reuses this door's already-materialized export file;
+        // PowerPoint reads the bytes and re-stamps them into the
+        // cache directory inside open_via_powerpoint.
+        if self.present_engine == PresentEngine::DeckCraft {
+            return self.open_via_deckcraft_primary(path, title, mode, from);
+        }
+        if self.present_engine == PresentEngine::PowerPoint {
+            return match std::fs::read(path) {
+                Ok(bytes) => self.open_via_powerpoint(title, &bytes, mode, from),
+                Err(e) => {
+                    self.msg = format!("PowerPoint 打开失败：读取导出稿失败：{e}");
+                    true
+                }
+            };
+        }
         let hosted_err = match std::fs::read(path) {
             Ok(bytes) => match self.start_hosted_show(title, &bytes, mode, from) {
                 Ok(()) => return true,
@@ -11186,7 +11343,23 @@ impl App {
     /// on the file's bytes first, the external DeckCraft jump as
     /// fallback. Returns false when neither could take it — the
     /// caller then opens the file in the system app, as before T2.
+    /// A non-default 设置「放映打开方式」routes this door too
+    /// (ruling 2026-11-25) and always returns true: the chosen
+    /// engine's outcome — success or a reported failure — never
+    /// drops into the system-app fallback behind the user's back.
     fn present_local_via_deckcraft(&mut self, path: &std::path::Path, title: &str) -> bool {
+        if self.present_engine == PresentEngine::DeckCraft {
+            return self.open_via_deckcraft_primary(path, title, DcMode::Play, 0);
+        }
+        if self.present_engine == PresentEngine::PowerPoint {
+            return match std::fs::read(path) {
+                Ok(bytes) => self.open_via_powerpoint(title, &bytes, DcMode::Play, 0),
+                Err(e) => {
+                    self.msg = format!("PowerPoint 打开失败：读取本地稿失败：{e}");
+                    true
+                }
+            };
+        }
         let hosted_err = match std::fs::read(path) {
             Ok(bytes) => match self.start_hosted_show(title, &bytes, DcMode::Play, 0) {
                 Ok(()) => return true,
@@ -15972,14 +16145,6 @@ impl App {
                                                 ROSE_SOFT_BG,
                                             );
                                         }
-                                        ui.label(
-                                            egui::RichText::new(format!(
-                                                "{} 页",
-                                                i(v, "page_count")
-                                            ))
-                                            .size(12.0)
-                                            .color(palette_color(TEXT_WEAK)),
-                                        );
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
@@ -19565,6 +19730,14 @@ impl App {
             .flatten()
             .filter_map(|row| row.get("entry").cloned())
             .collect();
+        // An armed remove confirmation whose entry is gone
+        // (list shrank under it) disarms instead of pointing
+        // at whatever entry now sits at that position.
+        if let Some(p) = st.confirm_remove_entry {
+            if p >= entries.len() {
+                st.confirm_remove_entry = None;
+            }
+        }
         let resolved = detail
             .get("resolved_entries")
             .and_then(|r| r.as_array())
@@ -19653,12 +19826,16 @@ impl App {
                                         .size(17.0)
                                         .strong(),
                                 )
+                                .on_hover_text("从这个索引移除这个条目（内容块保留）")
                                 .clicked()
                             {
-                                let mut es = entries.clone();
-                                es.remove(pos);
-                                *action = Some(IndexDetailAction::Commit(es, "删除条目"));
-                                return;
+                                // Prototype .del-pop (drill
+                                // re-audit N2): × only arms the
+                                // inline confirmation rendered
+                                // below the action row; the
+                                // removal commits from its
+                                // 确认删除 button.
+                                st.confirm_remove_entry = Some(pos);
                             }
                             if ui
                                 .add_enabled(
@@ -19733,6 +19910,51 @@ impl App {
                                 chip(ui, "跟随最新", palette_color(CHIP_GREEN_FG), CHIP_GREEN_BG);
                             }
                             });
+                            // Inline remove confirmation
+                            // (prototype .del-pop inrow, drill
+                            // re-audit N2): rendered in the card
+                            // directly under the action row while
+                            // armed; copy follows the prototype
+                            // verbatim. 取消 just disarms; only
+                            // 确认删除 commits the removal (the
+                            // commit itself is the same one the
+                            // × used to fire directly).
+                            if st.confirm_remove_entry == Some(pos) {
+                                ui.add_space(4.0);
+                                let entry_name = re
+                                    .get("unit_name")
+                                    .and_then(|x| x.as_str())
+                                    .unwrap_or("");
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "删除条目「{entry_name}」？"
+                                    ))
+                                    .strong()
+                                    .size(12.5),
+                                );
+                                ui.label(
+                                    egui::RichText::new(
+                                        "只从这个索引里移除这一个条目，内容库里的内容块不受影响；删除会生成一条提交，可在下方提交图 / 历史版本里找回。",
+                                    )
+                                    .size(12.0)
+                                    .color(palette_color(TEXT_WEAK)),
+                                );
+                                ui.horizontal(|ui| {
+                                    if btn_weak(ui, "取消").clicked() {
+                                        st.confirm_remove_entry = None;
+                                    }
+                                    if btn_danger(ui, "确认删除").clicked() {
+                                        let mut es = entries.clone();
+                                        es.remove(pos);
+                                        *action = Some(IndexDetailAction::Commit(
+                                            es,
+                                            "删除条目",
+                                        ));
+                                        st.confirm_remove_entry = None;
+                                        return;
+                                    }
+                                });
+                            }
                             ui.horizontal(|ui| {
                                 if let Some(slots) =
                                     entry.get("excerpt_slots").and_then(|x| x.as_array())
@@ -20555,6 +20777,44 @@ impl App {
                             self.cache_path_ui(ui);
                         }
                         "演示偏好" => {
+                            // 放映打开方式 (ruling 2026-11-25): the
+                            // radio row follows the settings page's
+                            // existing 旧库处置 radio pattern; the
+                            // choice persists to client-settings.json
+                            // like the checkbox below it.
+                            ui.label(
+                                egui::RichText::new("放映打开方式")
+                                    .strong()
+                                    .size(14.0)
+                                    .color(palette_color(TEXT_MAIN)),
+                            );
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                for (val, label) in [
+                                    (PresentEngine::Builtin, "内置放映"),
+                                    (PresentEngine::DeckCraft, "DeckCraft"),
+                                    (PresentEngine::PowerPoint, "PowerPoint"),
+                                ] {
+                                    if ui.radio(self.present_engine == val, label).clicked()
+                                        && self.present_engine != val
+                                    {
+                                        self.present_engine = val;
+                                        save_client_settings(
+                                            json!({ "present_engine": val.key() }),
+                                        );
+                                        self.msg = format!("放映打开方式已设为「{label}」");
+                                    }
+                                }
+                            });
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new(
+                                    "播放、普通视图、演示者视图打开稿件时用哪种方式：「内置放映」在启幕内放映（默认）；「DeckCraft」用 DeckCraft 桌面应用打开；「PowerPoint」把稿件写到缓存目录并用 PowerPoint 打开，播放与演示者视图会自动开始放映。所选应用不可用时会明确提示，不会自动改用其他方式。",
+                                )
+                                .size(11.5)
+                                .color(palette_color(TEXT_WEAK)),
+                            );
+                            ui.add_space(12.0);
                             if ui
                                 .checkbox(&mut self.dc_auto_quit, tr("放映结束自动关闭 DeckCraft"))
                                 .changed()

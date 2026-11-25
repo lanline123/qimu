@@ -5,8 +5,10 @@
 //! through `present_via_deckcraft` / `present_local_via_deckcraft`,
 //! which try this shell first on the deck bytes; the external
 //! `dc_jump` path (DeckCraft app + control protocol) remains in the
-//! tree as the fallback when hosting cannot start, and is retired
-//! only in T3. Evidence for every claim made here is in
+//! tree as the fallback when hosting cannot start — and, since the
+//! 2026-11-25 「放映打开方式」 ruling, also as a user-selectable
+//! primary engine in 设置 → 演示偏好, so it is NOT retired.
+//! Evidence for every claim made here is in
 //! `~/workspace/qimu-transplant-t2-spike/SPIKE.md`.
 //!
 //! The shell mirrors DeckCraft's own desktop host
