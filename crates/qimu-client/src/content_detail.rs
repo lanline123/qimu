@@ -270,6 +270,10 @@ enum DetailAct {
     ReorderPages {
         version_id: String,
         page_ids: Vec<String>,
+        /// The page sequence BEFORE the drag (undo, Ctrl+Z):
+        /// the reorder's inverse is the same core call with
+        /// this sequence, so the act carries it along.
+        old_page_ids: Vec<String>,
     },
 }
 
@@ -375,6 +379,7 @@ impl App {
             DetailAct::ReorderPages {
                 version_id,
                 page_ids,
+                old_page_ids,
             } => {
                 match self.call_work(
                     "POST",
@@ -383,6 +388,17 @@ impl App {
                 ) {
                     Ok(_) => {
                         self.msg = "草稿页序已更新".into();
+                        // Undo (Ctrl+Z): re-running the reorder
+                        // with the pre-drag sequence restores the
+                        // old order (bindings re-permute with it).
+                        self.push_undo(
+                            "调整草稿页序".to_string(),
+                            UndoAction::ReorderDraft {
+                                version_id,
+                                unit_id: unit_id.to_string(),
+                                old_page_ids,
+                            },
+                        );
                         self.reload_unit_detail(unit_id);
                         // The wall card's cover follows the
                         // draft's first page.
@@ -867,6 +883,12 @@ impl App {
                                         pages.get(old).map(|p| s(p, "id")).unwrap_or_default()
                                     })
                                     .collect();
+                                // The pre-drag sequence, for the
+                                // undo entry the run side records.
+                                let old_page_ids: Vec<String> = pages
+                                    .iter()
+                                    .map(|p| s(p, "id"))
+                                    .collect();
                                 st.selected_page = Some(at);
                                 // The panel addresses pages of
                                 // the pre-reorder sequence; it
@@ -875,6 +897,7 @@ impl App {
                                 acts.push(DetailAct::ReorderPages {
                                     version_id: version_id.clone(),
                                     page_ids,
+                                    old_page_ids,
                                 });
                             }
                         }

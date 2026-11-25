@@ -656,6 +656,110 @@ pub struct TrashRec {
     pub deleted_ms: i64,
 }
 
+/// One unit's position in the wall order (undo support): its
+/// home folder and its global `sort` seat. `move_units`
+/// renumbers the whole library, so undoing a move restores a
+/// full-library snapshot of these triples — restoring only the
+/// dragged batch would leave every other card's seat at its
+/// post-move value and scramble the groups the batch crossed.
+#[derive(Debug, Clone)]
+pub struct UnitPosition {
+    pub id: String,
+    pub folder_id: Option<String>,
+    pub sort: i64,
+}
+
+/// One version row, verbatim (undo support): every column of
+/// the versions table, with `pages_json` / `scripts_json` kept
+/// as the stored strings so a snapshot compares byte-for-byte
+/// with the row it was taken from (a VersionRec round-trip
+/// would re-serialize the page list and could differ in
+/// whitespace or field order from what an earlier writer left).
+#[derive(Debug, Clone)]
+pub struct VersionRowSnap {
+    pub id: String,
+    pub rendition_id: String,
+    pub semver: String,
+    pub major: i64,
+    pub minor: i64,
+    pub patch: i64,
+    pub basis_revision: i64,
+    pub author: String,
+    pub note: String,
+    pub created_ms: i64,
+    pub fragment_hash: String,
+    pub page_count: i64,
+    pub pages_json: String,
+    pub text_all: String,
+    pub status: String,
+    pub scripts_json: String,
+}
+
+/// Everything `delete_unit_rows` would remove for one unit
+/// (undo support): the snapshot a merge-into-draft takes of its
+/// source before the source dissolves, so the undo can
+/// resurrect the unit exactly — same ids, same versions, same
+/// bindings — instead of rebuilding an approximation. Page
+/// entities and CAS files are not part of it: a dissolve never
+/// touches them, so there is nothing to restore. Trash overlay
+/// rows naming the unit or its versions ride along for the
+/// same reason (a version trashed before the merge keeps its
+/// row across the dissolve, and the resurrection restores it).
+#[derive(Debug, Clone)]
+pub struct UnitSnapshot {
+    pub unit: UnitRec,
+    pub renditions: Vec<RenditionRec>,
+    pub versions: Vec<VersionRowSnap>,
+    pub version_tags: Vec<VerTagRec>,
+    pub bindings: Vec<PageBindingRec>,
+    pub attachments: Vec<AttachmentRec>,
+    pub trash_rows: Vec<TrashRec>,
+}
+
+/// One folder's tree position (undo support): parent and
+/// `sort` seat within its sidebar scope. `move_folder`
+/// renumbers only its own scope, so a scope-wide snapshot of
+/// these triples is the exact inverse image of a folder move.
+#[derive(Debug, Clone)]
+pub struct FolderPosition {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub sort: i64,
+}
+
+/// One object a folder delete's trash mode sends behind the
+/// trash overlay (undo support): its kind and id, its title
+/// (for refusal messages), and whether it already had a trash
+/// row before the delete — those rows are the object's own
+/// earlier delete, not this one's, and the undo must leave
+/// them in place.
+#[derive(Debug, Clone)]
+pub struct FolderTrashContent {
+    pub kind: String,
+    pub object_id: String,
+    pub title: String,
+    pub had_trash_row: bool,
+}
+
+/// The pre-image of a `delete_folder` call (undo support):
+/// everything the delete rewrites, captured before it runs.
+/// Lift mode records the folder row plus the direct children /
+/// units / indexes whose home the delete rewrites to the
+/// folder's parent. Trash mode records the whole subtree's
+/// folder rows plus the contents the delete trashes (the
+/// contents themselves keep their rows — only the folder rows
+/// and the new trash overlay rows change).
+#[derive(Debug, Clone)]
+pub struct FolderDeleteSnapshot {
+    pub trash_mode: bool,
+    pub root: FolderRec,
+    pub subtree: Vec<FolderRec>,
+    pub lifted_children: Vec<String>,
+    pub lifted_units: Vec<String>,
+    pub lifted_indexes: Vec<String>,
+    pub contents: Vec<FolderTrashContent>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShowroomRec {
     pub id: String,
@@ -6724,6 +6828,790 @@ impl Store {
             .map_err(db_err)?;
         tx.commit().map_err(db_err)?;
         Ok(rec)
+    }
+
+    // ---------- undo snapshots & restores (client Ctrl+Z) ----------
+    //
+    // The client's session undo stack holds pre-operation
+    // snapshots taken through these faces; the restores here are
+    // the ONLY writers that consume them. Every restore is one
+    // transaction and checks its guards before writing: a
+    // snapshot whose world has moved on (the target draft edited
+    // again, an object purged from the trash, a folder id
+    // re-created) is refused with a user-readable reason and
+    // writes nothing — an undo must never half-land.
+
+    const VERSION_SNAP_COLS: &'static str = "id, rendition_id, semver, major, minor, patch, basis_revision, author, note, created_ms, fragment_hash, page_count, pages_json, text_all, status, scripts_json";
+
+    fn row_to_version_snap(r: &rusqlite::Row) -> rusqlite::Result<VersionRowSnap> {
+        Ok(VersionRowSnap {
+            id: r.get(0)?,
+            rendition_id: r.get(1)?,
+            semver: r.get(2)?,
+            major: r.get(3)?,
+            minor: r.get(4)?,
+            patch: r.get(5)?,
+            basis_revision: r.get(6)?,
+            author: r.get(7)?,
+            note: r.get(8)?,
+            created_ms: r.get(9)?,
+            fragment_hash: r.get(10)?,
+            page_count: r.get(11)?,
+            pages_json: r.get(12)?,
+            text_all: r.get(13)?,
+            status: r.get(14)?,
+            scripts_json: r.get(15)?,
+        })
+    }
+
+    fn version_snap_on(conn: &Connection, id: &str) -> SResult<Option<VersionRowSnap>> {
+        conn.query_row(
+            &format!(
+                "SELECT {} FROM versions WHERE id=?1",
+                Self::VERSION_SNAP_COLS
+            ),
+            params![id],
+            Self::row_to_version_snap,
+        )
+        .optional()
+        .map_err(db_err)
+    }
+
+    /// The content fields two snapshots of one version row are
+    /// compared on: identity / provenance columns (author,
+    /// created_ms, semver) cannot change in place, so equality
+    /// of the mutable payload is what "unchanged since the
+    /// snapshot" means.
+    fn version_snap_same(a: &VersionRowSnap, b: &VersionRowSnap) -> bool {
+        a.fragment_hash == b.fragment_hash
+            && a.page_count == b.page_count
+            && a.pages_json == b.pages_json
+            && a.text_all == b.text_all
+            && a.scripts_json == b.scripts_json
+            && a.status == b.status
+    }
+
+    fn object_exists_on(conn: &Connection, kind: &str, id: &str) -> SResult<bool> {
+        let table = match kind {
+            "unit" => "units",
+            "version" => "versions",
+            "index" => "indexes_tbl",
+            "showroom" => "showroom",
+            other => return Err(format!("unknown trash kind: {other}")),
+        };
+        conn.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE id=?1)"),
+            params![id],
+            |r| r.get(0),
+        )
+        .map_err(db_err)
+    }
+
+    /// Every unit's wall position (see UnitPosition).
+    pub fn snapshot_unit_positions(&self) -> SResult<Vec<UnitPosition>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, folder_id, sort FROM units")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(UnitPosition {
+                    id: r.get(0)?,
+                    folder_id: r.get(1)?,
+                    sort: r.get(2)?,
+                })
+            })
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(rows)
+    }
+
+    /// Write a unit-position snapshot back: each listed unit
+    /// regains its recorded home and seat. Units created since
+    /// the snapshot are not in it and keep their seats (their
+    /// relative order against the restored set can shift — the
+    /// snapshot predates them); units deleted since are skipped
+    /// by the UPDATE itself.
+    pub fn restore_unit_positions(&self, rows: &[UnitPosition]) -> SResult<()> {
+        let tx = self.conn.unchecked_transaction().map_err(db_err)?;
+        for row in rows {
+            tx.execute(
+                "UPDATE units SET folder_id=?2, sort=?3 WHERE id=?1",
+                params![row.id, row.folder_id, row.sort],
+            )
+            .map_err(db_err)?;
+        }
+        tx.commit().map_err(db_err)?;
+        Ok(())
+    }
+
+    /// One version row, verbatim (see VersionRowSnap).
+    pub fn snapshot_version_row(&self, version_id: &str) -> SResult<VersionRowSnap> {
+        Self::version_snap_on(&self.conn, version_id)?
+            .ok_or_else(|| "版本不存在".to_string())
+    }
+
+    /// The version `merge_unit_page_into` would extend for this
+    /// unit — the lead rendition's latest version — resolved by
+    /// the merge's own rule, so a pre-merge snapshot names
+    /// exactly the row the merge is about to touch.
+    pub fn snapshot_working_version(
+        &self,
+        unit_id: &str,
+    ) -> SResult<Option<VersionRowSnap>> {
+        let rends = self.list_renditions(unit_id)?;
+        let Some(rend) = rends.first() else {
+            return Ok(None);
+        };
+        let Some(ver) = self.latest_version(&rend.id)? else {
+            return Ok(None);
+        };
+        Ok(Some(self.snapshot_version_row(&ver.id)?))
+    }
+
+    /// The full pre-image of one unit (see UnitSnapshot).
+    /// Versions are read raw per rendition — NOT through
+    /// list_versions, whose trash-overlay filter would drop a
+    /// trashed version the dissolve still removes (and the
+    /// resurrection must therefore bring back).
+    pub fn snapshot_unit(&self, unit_id: &str) -> SResult<UnitSnapshot> {
+        let unit = self.get_unit(unit_id)?;
+        let renditions = self.list_renditions(unit_id)?;
+        let mut versions: Vec<VersionRowSnap> = Vec::new();
+        for rend in &renditions {
+            let mut stmt = self
+                .conn
+                .prepare(&format!(
+                    "SELECT {} FROM versions WHERE rendition_id=?1 ORDER BY created_ms, rowid",
+                    Self::VERSION_SNAP_COLS
+                ))
+                .map_err(db_err)?;
+            let rows = stmt
+                .query_map(params![rend.id], Self::row_to_version_snap)
+                .map_err(db_err)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(db_err)?;
+            versions.extend(rows);
+        }
+        let mut version_tags: Vec<VerTagRec> = Vec::new();
+        for ver in &versions {
+            version_tags.extend(self.list_version_tags(&ver.id)?);
+        }
+        let bindings = self.list_page_bindings(unit_id)?;
+        let attachments = self
+            .list_attachments(unit_id)?
+            .into_iter()
+            .filter(|a| a.parent_type == "unit")
+            .collect();
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, kind, object_id, title, origin, deleted_by, deleted_ms FROM trash_items WHERE (kind='unit' AND object_id=?1) OR (kind='version' AND object_id IN (SELECT v.id FROM versions v JOIN renditions r ON r.id = v.rendition_id WHERE r.unit_id=?1))",
+            )
+            .map_err(db_err)?;
+        let trash_rows = stmt
+            .query_map(params![unit_id], |r| {
+                Ok(TrashRec {
+                    id: r.get(0)?,
+                    kind: r.get(1)?,
+                    object_id: r.get(2)?,
+                    title: r.get(3)?,
+                    origin: r.get(4)?,
+                    deleted_by: r.get(5)?,
+                    deleted_ms: r.get(6)?,
+                })
+            })
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(UnitSnapshot {
+            unit,
+            renditions,
+            versions,
+            version_tags,
+            bindings,
+            attachments,
+            trash_rows,
+        })
+    }
+
+    /// Insert a unit snapshot's rows (the resurrection half of
+    /// `undo_merge`), on a caller-provided handle inside its
+    /// transaction. Callers verify absence first; the inserts
+    /// are plain, so a colliding id fails the whole undo rather
+    /// than overwriting a live row.
+    fn insert_unit_snapshot(tx: &Connection, snap: &UnitSnapshot) -> SResult<()> {
+        let u = &snap.unit;
+        tx.execute(
+            "INSERT INTO units(id, name, folder_id, group_id, maintainer, lead_lang, description, current_revision, created_ms, sort) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![
+                u.id,
+                u.name,
+                u.folder_id,
+                u.group_id,
+                u.maintainer,
+                u.lead_lang,
+                u.description,
+                u.current_revision,
+                u.created_ms,
+                u.sort
+            ],
+        )
+        .map_err(db_err)?;
+        for r in &snap.renditions {
+            tx.execute(
+                "INSERT INTO renditions(id, unit_id, form, lang) VALUES(?1,?2,?3,?4)",
+                params![r.id, r.unit_id, r.form, r.lang],
+            )
+            .map_err(db_err)?;
+        }
+        for v in &snap.versions {
+            tx.execute(
+                "INSERT INTO versions(id, rendition_id, semver, major, minor, patch, basis_revision, author, note, created_ms, fragment_hash, page_count, pages_json, text_all, status, scripts_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                params![
+                    v.id,
+                    v.rendition_id,
+                    v.semver,
+                    v.major,
+                    v.minor,
+                    v.patch,
+                    v.basis_revision,
+                    v.author,
+                    v.note,
+                    v.created_ms,
+                    v.fragment_hash,
+                    v.page_count,
+                    v.pages_json,
+                    v.text_all,
+                    v.status,
+                    v.scripts_json
+                ],
+            )
+            .map_err(db_err)?;
+        }
+        for t in &snap.version_tags {
+            tx.execute(
+                "INSERT INTO version_tags(id, version_id, dim, value, strength, author) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![t.id, t.version_id, t.dim, t.value, t.strength, t.author],
+            )
+            .map_err(db_err)?;
+        }
+        for b in &snap.bindings {
+            tx.execute(
+                "INSERT INTO page_bindings(id, unit_id, from_version_id, from_slot, to_version_id, to_slot, kind, author, created_ms, from_page_id, to_page_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                params![
+                    b.id,
+                    b.unit_id,
+                    b.from_version_id,
+                    b.from_slot,
+                    b.to_version_id,
+                    b.to_slot,
+                    b.kind,
+                    b.author,
+                    b.created_ms,
+                    b.from_page_id,
+                    b.to_page_id
+                ],
+            )
+            .map_err(db_err)?;
+        }
+        for a in &snap.attachments {
+            tx.execute(
+                "INSERT INTO attachments(id, parent_type, parent_id, filename, hash, size, uploader, created_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![
+                    a.id,
+                    a.parent_type,
+                    a.parent_id,
+                    a.filename,
+                    a.hash,
+                    a.size,
+                    a.uploader,
+                    a.created_ms
+                ],
+            )
+            .map_err(db_err)?;
+        }
+        for t in &snap.trash_rows {
+            // OR IGNORE mirrors trash_add's idempotence: a row
+            // for the same object minted after the dissolve (the
+            // object cannot have been re-trashed — it did not
+            // exist — but a same-(kind, object) row is the one
+            // collision that must never fail a resurrection).
+            tx.execute(
+                "INSERT OR IGNORE INTO trash_items(id, kind, object_id, title, origin, deleted_by, deleted_ms) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    t.id, t.kind, t.object_id, t.title, t.origin, t.deleted_by, t.deleted_ms
+                ],
+            )
+            .map_err(db_err)?;
+        }
+        Ok(())
+    }
+
+    /// Undo a `merge_unit_page_into`: restore the target draft
+    /// to its pre-merge row and resurrect the dissolved source
+    /// unit from its snapshot. `pre` is the target's working
+    /// version before the merge (the merge's own resolution,
+    /// see snapshot_working_version); `post` is the draft the
+    /// merge returned. When pre and post are the same row the
+    /// merge extended a draft in place and the undo writes the
+    /// pre-image back; when they differ the merge born a new
+    /// draft and the undo deletes that row (the published
+    /// working version was never touched). Guards, all before
+    /// any write: the post row must still equal its snapshot
+    /// (a draft edited after the merge refuses — restoring
+    /// would silently discard that edit); a born draft must not
+    /// have gained bindings or tags; an in-place draft must not
+    /// have gained a binding onto the appended page; the source
+    /// must not have been re-created meanwhile.
+    pub fn undo_merge(
+        &self,
+        source: &UnitSnapshot,
+        pre: &VersionRowSnap,
+        post: &VersionRowSnap,
+    ) -> SResult<()> {
+        let tx = self.conn.unchecked_transaction().map_err(db_err)?;
+        let cur_post = Self::version_snap_on(&tx, &post.id)?.ok_or(
+            "并入生成的草稿已不存在，无法撤回并入".to_string(),
+        )?;
+        if !Self::version_snap_same(&cur_post, post) {
+            return Err(
+                "目标草稿在并入后又被修改，无法撤回并入；请先处理草稿的后续修改".into(),
+            );
+        }
+        if pre.id == post.id {
+            // In-place: bindings created after the merge that
+            // address the appended page (slots at or beyond the
+            // pre-merge page count) would dangle over a page the
+            // restore removes.
+            let dangling: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM page_bindings WHERE (from_version_id=?1 AND from_slot>=?2) OR (to_version_id=?1 AND to_slot>=?2)",
+                    params![post.id, pre.page_count],
+                    |r| r.get(0),
+                )
+                .map_err(db_err)?;
+            if dangling > 0 {
+                return Err(
+                    "草稿在并入后新增了指向被并入页的页面绑定，无法撤回并入".into(),
+                );
+            }
+            let n = tx
+                .execute(
+                    "UPDATE versions SET fragment_hash=?2, page_count=?3, pages_json=?4, text_all=?5, scripts_json=?6 WHERE id=?1 AND status='draft'",
+                    params![
+                        pre.id,
+                        pre.fragment_hash,
+                        pre.page_count,
+                        pre.pages_json,
+                        pre.text_all,
+                        pre.scripts_json
+                    ],
+                )
+                .map_err(db_err)?;
+            if n == 0 {
+                return Err("目标草稿状态已变化，无法撤回并入".into());
+            }
+        } else {
+            let cur_pre = Self::version_snap_on(&tx, &pre.id)?
+                .ok_or("目标内容块的工作版本已不存在，无法撤回并入".to_string())?;
+            if !Self::version_snap_same(&cur_pre, pre) {
+                return Err("目标内容块的工作版本在并入后已变化，无法撤回并入".into());
+            }
+            let refs: i64 = tx
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM page_bindings WHERE from_version_id=?1 OR to_version_id=?1) + (SELECT COUNT(*) FROM version_tags WHERE version_id=?1)",
+                    params![post.id],
+                    |r| r.get(0),
+                )
+                .map_err(db_err)?;
+            if refs > 0 {
+                return Err(
+                    "并入生成的草稿已被引用（页面绑定或标签），无法撤回并入".into(),
+                );
+            }
+            tx.execute("DELETE FROM versions WHERE id=?1", params![post.id])
+                .map_err(db_err)?;
+        }
+        // Resurrect the source: every id it owned must still be
+        // free — a collision means the world rebuilt something
+        // under the same identity, and overwriting it would be
+        // worse than refusing.
+        if Self::object_exists_on(&tx, "unit", &source.unit.id)? {
+            return Err("源内容块已重新存在，无法撤回并入".into());
+        }
+        for v in &source.versions {
+            if Self::object_exists_on(&tx, "version", &v.id)? {
+                return Err("源内容块的版本已重新存在，无法撤回并入".into());
+            }
+        }
+        Self::insert_unit_snapshot(&tx, source)?;
+        tx.commit().map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Undo a batch of trash operations: drop the overlay rows
+    /// the operations created, so the objects reappear exactly
+    /// as they were. A row already gone with its object visible
+    /// again was restored by hand in the meantime and counts as
+    /// done; a row gone with its object ALSO gone means the
+    /// object was purged — the whole batch refuses and nothing
+    /// is restored (a partial undelete would misreport what the
+    /// undo achieved). A row replaced by a NEWER trash row for
+    /// the same object belongs to a later delete, not this one,
+    /// and refuses likewise.
+    pub fn undo_trash_restore(&self, rows: &[TrashRec]) -> SResult<()> {
+        let tx = self.conn.unchecked_transaction().map_err(db_err)?;
+        for row in rows {
+            let by_id: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM trash_items WHERE id=?1",
+                    params![row.id],
+                    |r| r.get(0),
+                )
+                .map_err(db_err)?;
+            if by_id > 0 {
+                tx.execute("DELETE FROM trash_items WHERE id=?1", params![row.id])
+                    .map_err(db_err)?;
+                continue;
+            }
+            if !Self::object_exists_on(&tx, &row.kind, &row.object_id)? {
+                return Err(format!(
+                    "「{}」已被彻底删除，无法撤回",
+                    if row.title.is_empty() {
+                        row.object_id.clone()
+                    } else {
+                        row.title.clone()
+                    }
+                ));
+            }
+            let replaced: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM trash_items WHERE kind=?1 AND object_id=?2",
+                    params![row.kind, row.object_id],
+                    |r| r.get(0),
+                )
+                .map_err(db_err)?;
+            if replaced > 0 {
+                return Err(format!(
+                    "「{}」已被再次移入回收站，无法撤回此前的删除",
+                    if row.title.is_empty() {
+                        row.object_id.clone()
+                    } else {
+                        row.title.clone()
+                    }
+                ));
+            }
+            // Object visible, no row: restored by hand already.
+        }
+        tx.commit().map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Every folder's tree position within one sidebar scope
+    /// (see FolderPosition).
+    pub fn snapshot_folder_positions(&self, scope: &str) -> SResult<Vec<FolderPosition>> {
+        Ok(self
+            .list_folders_in(scope)?
+            .into_iter()
+            .map(|f| FolderPosition {
+                id: f.id,
+                parent_id: f.parent_id,
+                sort: f.sort,
+            })
+            .collect())
+    }
+
+    /// Write a folder-position snapshot back (the inverse of a
+    /// folder move): each listed folder regains its recorded
+    /// parent and seat. Folders created since keep their rows;
+    /// folders deleted since are skipped by the UPDATE itself.
+    /// The snapshot is one consistent forest state, so writing
+    /// a subset of it back cannot mint a cycle.
+    pub fn restore_folder_positions(&self, rows: &[FolderPosition]) -> SResult<()> {
+        let tx = self.conn.unchecked_transaction().map_err(db_err)?;
+        for row in rows {
+            tx.execute(
+                "UPDATE folders SET parent_id=?2, sort=?3 WHERE id=?1",
+                params![row.id, row.parent_id, row.sort],
+            )
+            .map_err(db_err)?;
+        }
+        tx.commit().map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Whether a folder still holds anything (child folders,
+    /// units or indexes homed in it) — the create-undo guard:
+    /// un-creating a folder that has since gained content would
+    /// have to move that content somewhere, which is a different
+    /// operation than the undo of its creation.
+    pub fn folder_has_contents(&self, id: &str) -> SResult<bool> {
+        let n: i64 = self
+            .conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM folders WHERE parent_id=?1) + (SELECT COUNT(*) FROM units WHERE folder_id=?1) + (SELECT COUNT(*) FROM indexes_tbl WHERE folder_id=?1)",
+                params![id],
+                |r| r.get(0),
+            )
+            .map_err(db_err)?;
+        Ok(n > 0)
+    }
+
+    /// The pre-image of a folder delete (see
+    /// FolderDeleteSnapshot), gathered with the same walks
+    /// `delete_folder` performs — read-only, so taking the
+    /// snapshot never disturbs the delete that follows it.
+    pub fn snapshot_folder_delete(
+        &self,
+        id: &str,
+        mode: FolderDeleteMode,
+    ) -> SResult<FolderDeleteSnapshot> {
+        let all = self.list_folders()?;
+        let Some(root) = all.iter().find(|f| f.id == id) else {
+            return Err("文件夹不存在".into());
+        };
+        let root = root.clone();
+        match mode {
+            FolderDeleteMode::Lift => {
+                let lifted_children = all
+                    .iter()
+                    .filter(|f| f.parent_id.as_deref() == Some(id))
+                    .map(|f| f.id.clone())
+                    .collect();
+                let mut stmt = self
+                    .conn
+                    .prepare("SELECT id FROM units WHERE folder_id=?1")
+                    .map_err(db_err)?;
+                let lifted_units = stmt
+                    .query_map(params![id], |r| r.get::<_, String>(0))
+                    .map_err(db_err)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(db_err)?;
+                drop(stmt);
+                let mut stmt = self
+                    .conn
+                    .prepare("SELECT id FROM indexes_tbl WHERE folder_id=?1")
+                    .map_err(db_err)?;
+                let lifted_indexes = stmt
+                    .query_map(params![id], |r| r.get::<_, String>(0))
+                    .map_err(db_err)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(db_err)?;
+                Ok(FolderDeleteSnapshot {
+                    trash_mode: false,
+                    root,
+                    subtree: Vec::new(),
+                    lifted_children,
+                    lifted_units,
+                    lifted_indexes,
+                    contents: Vec::new(),
+                })
+            }
+            FolderDeleteMode::Trash => {
+                // The subtree walk, delete_folder's own: this
+                // folder plus every descendant, breadth by
+                // repeated passes over the folder list.
+                let mut subtree_ids: Vec<String> = vec![id.to_string()];
+                let mut grew = true;
+                while grew {
+                    grew = false;
+                    for f in &all {
+                        if let Some(p) = f.parent_id.as_deref() {
+                            if subtree_ids.iter().any(|x| x == p)
+                                && !subtree_ids.iter().any(|x| x == &f.id)
+                            {
+                                subtree_ids.push(f.id.clone());
+                                grew = true;
+                            }
+                        }
+                    }
+                }
+                let subtree: Vec<FolderRec> = subtree_ids
+                    .iter()
+                    .skip(1)
+                    .filter_map(|fid| all.iter().find(|f| &f.id == fid).cloned())
+                    .collect();
+                let mut contents: Vec<FolderTrashContent> = Vec::new();
+                let mut index_ids: Vec<String> = Vec::new();
+                for fid in &subtree_ids {
+                    let mut stmt = self
+                        .conn
+                        .prepare("SELECT id, name FROM units WHERE folder_id=?1")
+                        .map_err(db_err)?;
+                    let units = stmt
+                        .query_map(params![fid], |r| {
+                            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                        })
+                        .map_err(db_err)?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(db_err)?;
+                    drop(stmt);
+                    for (uid, name) in units {
+                        let had = self.trash_find("unit", &uid)?.is_some();
+                        contents.push(FolderTrashContent {
+                            kind: "unit".into(),
+                            object_id: uid,
+                            title: name,
+                            had_trash_row: had,
+                        });
+                    }
+                    let mut stmt = self
+                        .conn
+                        .prepare("SELECT id, name FROM indexes_tbl WHERE folder_id=?1")
+                        .map_err(db_err)?;
+                    let indexes = stmt
+                        .query_map(params![fid], |r| {
+                            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                        })
+                        .map_err(db_err)?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(db_err)?;
+                    drop(stmt);
+                    for (xid, name) in indexes {
+                        let had = self.trash_find("index", &xid)?.is_some();
+                        contents.push(FolderTrashContent {
+                            kind: "index".into(),
+                            object_id: xid.clone(),
+                            title: name,
+                            had_trash_row: had,
+                        });
+                        index_ids.push(xid);
+                    }
+                }
+                for xid in &index_ids {
+                    let mut stmt = self
+                        .conn
+                        .prepare("SELECT id, title FROM showroom WHERE source_index_id=?1")
+                        .map_err(db_err)?;
+                    let items = stmt
+                        .query_map(params![xid], |r| {
+                            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                        })
+                        .map_err(db_err)?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(db_err)?;
+                    drop(stmt);
+                    for (sid, title) in items {
+                        let had = self.trash_find("showroom", &sid)?.is_some();
+                        contents.push(FolderTrashContent {
+                            kind: "showroom".into(),
+                            object_id: sid,
+                            title,
+                            had_trash_row: had,
+                        });
+                    }
+                }
+                Ok(FolderDeleteSnapshot {
+                    trash_mode: true,
+                    root,
+                    subtree,
+                    lifted_children: Vec::new(),
+                    lifted_units: Vec::new(),
+                    lifted_indexes: Vec::new(),
+                    contents,
+                })
+            }
+        }
+    }
+
+    /// Undo a folder delete from its pre-image: re-insert the
+    /// folder rows, then reverse the mode's content effect —
+    /// trash mode drops the trash rows the delete created (rows
+    /// an object already had stay: they are an earlier delete's,
+    /// not this one's), lift mode homes the lifted children /
+    /// units / indexes back, but only those still sitting at
+    /// the recorded lift target (one re-homed since belongs to
+    /// its newer home, and the undo leaves it there). Guards
+    /// before any write: no folder row with a recorded id may
+    /// exist again, and in trash mode every content object must
+    /// still exist — a purged object refuses the whole restore
+    /// rather than resurrecting a folder around a hole.
+    pub fn restore_folder_delete(&self, snap: &FolderDeleteSnapshot) -> SResult<()> {
+        let tx = self.conn.unchecked_transaction().map_err(db_err)?;
+        for f in std::iter::once(&snap.root).chain(snap.subtree.iter()) {
+            let exists: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM folders WHERE id=?1",
+                    params![f.id],
+                    |r| r.get(0),
+                )
+                .map_err(db_err)?;
+            if exists > 0 {
+                return Err("该文件夹已被重新创建，无法撤回删除".into());
+            }
+        }
+        if snap.trash_mode {
+            for c in &snap.contents {
+                if !Self::object_exists_on(&tx, &c.kind, &c.object_id)? {
+                    return Err(format!(
+                        "「{}」已被彻底删除，无法撤回删除文件夹",
+                        if c.title.is_empty() {
+                            c.object_id.clone()
+                        } else {
+                            c.title.clone()
+                        }
+                    ));
+                }
+            }
+        }
+        for f in std::iter::once(&snap.root).chain(snap.subtree.iter()) {
+            tx.execute(
+                "INSERT INTO folders(id, name, parent_id, sort, main_index_id, scope, color, note, origin) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![
+                    f.id,
+                    f.name,
+                    f.parent_id,
+                    f.sort,
+                    f.main_index_id,
+                    f.scope,
+                    f.color,
+                    f.note,
+                    f.origin
+                ],
+            )
+            .map_err(db_err)?;
+        }
+        if snap.trash_mode {
+            for c in &snap.contents {
+                if c.had_trash_row {
+                    continue;
+                }
+                // A row already gone was restored by hand in the
+                // meantime; the DELETE simply finds nothing.
+                tx.execute(
+                    "DELETE FROM trash_items WHERE kind=?1 AND object_id=?2",
+                    params![c.kind, c.object_id],
+                )
+                .map_err(db_err)?;
+            }
+        } else {
+            let lift_to = snap.root.parent_id.clone();
+            for child in &snap.lifted_children {
+                tx.execute(
+                    "UPDATE folders SET parent_id=?2 WHERE id=?1 AND parent_id IS ?3",
+                    params![child, snap.root.id, lift_to],
+                )
+                .map_err(db_err)?;
+            }
+            for uid in &snap.lifted_units {
+                tx.execute(
+                    "UPDATE units SET folder_id=?2 WHERE id=?1 AND folder_id IS ?3",
+                    params![uid, snap.root.id, lift_to],
+                )
+                .map_err(db_err)?;
+            }
+            for xid in &snap.lifted_indexes {
+                tx.execute(
+                    "UPDATE indexes_tbl SET folder_id=?2 WHERE id=?1 AND folder_id IS ?3",
+                    params![xid, snap.root.id, lift_to],
+                )
+                .map_err(db_err)?;
+            }
+        }
+        tx.commit().map_err(db_err)?;
+        Ok(())
     }
 
     pub fn save_assembly(

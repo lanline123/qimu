@@ -31,7 +31,10 @@ use content_detail::{
 };
 use index_controls::{IndexMoreAction, IndexOverviewControls, IndexScope};
 use index_lineage::IndexGraphs;
-use qimu_core::store::IndexGraph;
+use qimu_core::store::{
+    FolderDeleteSnapshot, FolderPosition, IndexGraph, TrashRec, UnitPosition, UnitSnapshot,
+    VersionRowSnap,
+};
 use workspace_controls::{
     palette_color, query_component, WorkspaceControls, ENGLISH_UI, LIGHT_THEME,
 };
@@ -1226,6 +1229,22 @@ fn load_present_engine() -> PresentEngine {
     }
 }
 
+/// Session undo depth (Ctrl+Z, user ruling 2026-11-25): how
+/// many operations the client's undo stack keeps, newest on
+/// top; older entries fall off the bottom as new ones land.
+/// Device-local like the other preferences in
+/// client-settings.json; absent or unparseable means the
+/// default 30, and 0 turns undo off (the stack stays empty and
+/// Ctrl+Z is inert — deliberately NOT "unlimited": an unbounded
+/// stack of full-row snapshots is a memory liability, and a
+/// user who wants more history raises the number instead).
+fn load_undo_limit() -> i64 {
+    client_settings()["undo_limit"]
+        .as_i64()
+        .unwrap_or(30)
+        .clamp(0, 1000)
+}
+
 /// Plaza folder assignments (user ruling 2026-11-25, option (a)):
 /// a showroom item carries its OWN folder home in the plaza
 /// sidebar's "showroom"-scope folder tree — the wall filters by
@@ -2098,6 +2117,83 @@ struct DelTarget {
     kind: &'static str,
     id: String,
     label: String,
+}
+
+/// One undoable operation on the session undo stack (Ctrl+Z,
+/// user ruling 2026-11-25). Every variant carries the
+/// PRE-operation snapshot its inverse needs — captured from the
+/// local library before the operation ran (core undo faces in
+/// qimu_core::store) — and the inverse is a snapshot write-back,
+/// never a re-run of the forward logic with flipped arguments.
+/// Entries exist only for operations that landed in the local
+/// library: with no local library open there is nothing to
+/// snapshot from, and the stack stays empty (declared scope —
+/// the organization faces' server-side objects are excluded,
+/// except that a delete batch's locally-held rows still record
+/// while its server-held rows do not). The stack is
+/// session-only: it starts empty at launch and is cleared on
+/// account reset. There is deliberately no redo variant —
+/// undoing is one-way this round.
+enum UndoAction {
+    /// Card drag (move_units): restore every unit's recorded
+    /// home + seat (the move renumbers the whole library).
+    MoveUnits { positions: Vec<UnitPosition> },
+    /// Single-page merge into a draft: restore the target draft
+    /// row (pre) and resurrect the dissolved source unit. `post`
+    /// is the draft the merge produced — the undo's guard image.
+    MergePage {
+        target_id: String,
+        source: UnitSnapshot,
+        pre: VersionRowSnap,
+        post: VersionRowSnap,
+    },
+    /// Soft deletes (bottom-bar batch, Delete key, single-item
+    /// trash buttons, cut): drop these trash overlay rows.
+    TrashBatch { rows: Vec<TrashRec> },
+    /// Creations (combine, paste): the inverse of creating is
+    /// the app's own soft delete — the created blocks go to the
+    /// trash, from where the user can still restore them by
+    /// hand (there is no redo, so a hard delete would make an
+    /// accidental Ctrl+Z unrecoverable).
+    CreatedUnits { ids: Vec<String> },
+    /// 组合为索引： same soft-delete inverse for the index.
+    CreatedIndex { id: String },
+    /// 解除组合： trash the split blocks AND restore the
+    /// original from the trash, as one step.
+    Ungroup {
+        created: Vec<String>,
+        original: TrashRec,
+    },
+    /// #101 draft page reorder: re-run the reorder with the
+    /// pre-drag page sequence (the core reorder is its own
+    /// inverse for a same-set permutation, bindings included).
+    ReorderDraft {
+        version_id: String,
+        unit_id: String,
+        old_page_ids: Vec<String>,
+    },
+    /// Folder creation: delete the folder again — guarded on it
+    /// still being empty at undo time.
+    FolderCreated { id: String },
+    /// Folder rename (sidebar or folder-flow header): rename
+    /// back to the recorded name.
+    FolderRenamed { id: String, old_name: String },
+    /// Folder note edit (folder-flow header): write the
+    /// recorded note back.
+    FolderNote { id: String, old_note: String },
+    /// Sidebar folder drag: restore the scope's recorded tree
+    /// positions.
+    FolderMoved { positions: Vec<FolderPosition> },
+    /// Folder delete (either mode): restore from the delete's
+    /// pre-image snapshot.
+    FolderDeleted { snap: FolderDeleteSnapshot },
+}
+
+/// One undo stack entry: the user-readable label the undo
+/// toast names («已撤回：{label}») plus the inverse payload.
+struct UndoEntry {
+    label: String,
+    action: UndoAction,
 }
 
 /// Whether a trash row belongs to a positional trash filter
@@ -3840,6 +3936,25 @@ struct App {
     /// 设置 → 演示偏好「放映打开方式」: which engine the unified
     /// view opener routes to (ruling 2026-11-25).
     present_engine: PresentEngine,
+    /// Session undo stack (Ctrl+Z): newest entry last. Bounded
+    /// by `undo_limit`; pushing past the limit drops the oldest
+    /// entries. Session-only — never persisted (see UndoAction).
+    undo_stack: Vec<UndoEntry>,
+    /// The stack's depth limit (设置 → 演示偏好「撤回步数」,
+    /// client-settings.json `undo_limit`, default 30; 0 = off).
+    undo_limit: i64,
+    /// Recording suspension counter: composite operations
+    /// (ungroup, cut) that internally trash through the shared
+    /// trash_add funnel raise this while they run, so the funnel
+    /// does not record their sub-steps — the composite records
+    /// one entry of its own.
+    undo_suspend: u32,
+    /// Pre-image of an in-flight folder delete, captured when
+    /// the user picks a mode in the delete dialog (before the
+    /// worker thread runs): (folder id, folder name, snapshot).
+    /// The per-frame drain turns it into a stack entry when the
+    /// delete reports success and drops it on failure.
+    folder_del_undo: Option<(String, String, FolderDeleteSnapshot)>,
     /// T2 (DeckCraft transplant, strategy (b)): the in-process
     /// hosted show, while one is running. While Some, the eframe
     /// App forwards logic / raw_input_hook / ui to the guest
@@ -5089,6 +5204,10 @@ impl App {
             dc_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             dc_auto_quit: load_dc_auto_quit(),
             present_engine: load_present_engine(),
+            undo_stack: Vec::new(),
+            undo_limit: load_undo_limit(),
+            undo_suspend: 0,
+            folder_del_undo: None,
             plaza_item_folders: load_plaza_item_folders(),
             hosted: None,
             login_open: false,
@@ -6234,6 +6353,13 @@ impl App {
             )
         });
         self.folder_delete_confirm = None;
+        // Undo stack: entries snapshot the previous context's
+        // local operations; an account reset starts the stack
+        // empty (the same discipline as the DirtySet reset), and
+        // a pending folder-delete snapshot belongs to the old
+        // context too.
+        self.undo_stack.clear();
+        self.folder_del_undo = None;
         // In-flight translation belongs to the previous account:
         // its worker polls the old server with the old token.
         // Clear the busy state and bump the generation so the
@@ -8339,6 +8465,12 @@ impl App {
         };
         if let Some(uid) = self.publish_bytes_as_unit(&bytes, "未命名内容块", "剪贴板粘贴新建")
         {
+            // Undo (Ctrl+Z): the pasted block files into the
+            // trash (see UndoAction::CreatedUnits).
+            self.push_undo(
+                "粘贴新建内容块".to_string(),
+                UndoAction::CreatedUnits { ids: vec![uid.clone()] },
+            );
             self.msg = "已粘贴新建内容块".into();
             // Phase-1 (design §3.1 point 8): same read-after-
             // write shape as point 7.
@@ -8567,6 +8699,9 @@ impl App {
             .as_ref()
             .map(|m| s(m, "source"))
             .unwrap_or_default();
+        // Undo (Ctrl+Z): the blocks this paste creates, in
+        // either shape, recorded as one entry at the end.
+        let mut created: Vec<String> = Vec::new();
         if split_into_blocks {
             let pkg = match qimu_core::pptx::Package::load(&bytes) {
                 Ok(p) => p,
@@ -8595,11 +8730,11 @@ impl App {
                     failed += 1;
                     continue;
                 };
-                if self
-                    .publish_bytes_as_unit(&b, &name, "剪贴板逐页成块")
-                    .is_some()
+                if let Some(nid) =
+                    self.publish_bytes_as_unit(&b, &name, "剪贴板逐页成块")
                 {
                     made += 1;
+                    created.push(nid);
                 } else {
                     failed += 1;
                 }
@@ -8617,12 +8752,20 @@ impl App {
             } else {
                 source.clone()
             };
-            if self
-                .publish_bytes_as_unit(&bytes, &name, "剪贴板整组成块")
-                .is_some()
+            if let Some(nid) =
+                self.publish_bytes_as_unit(&bytes, &name, "剪贴板整组成块")
             {
+                created.push(nid);
                 self.msg = "已整组成块：新建 1 个内容块".into();
             }
+        }
+        if !created.is_empty() {
+            let label = if created.len() == 1 {
+                "粘贴成块".to_string()
+            } else {
+                format!("粘贴成块（{} 个）", created.len())
+            };
+            self.push_undo(label, UndoAction::CreatedUnits { ids: created });
         }
         // Phase-1 (design §3.1 point 9): both paste shapes only
         // ever add units.
@@ -8690,14 +8833,15 @@ impl App {
             .filter(|f| !f.is_empty());
         let total = singles.len();
         let mut made = 0usize;
+        let mut created: Vec<String> = Vec::new();
         for (idx, one) in singles.iter().enumerate() {
             let pname = clip_page_name(one, idx);
             let Ok(b) = one.to_bytes() else { continue };
-            if self
-                .publish_bytes_as_unit_to(&b, &pname, "解除组合", folder.clone())
-                .is_some()
+            if let Some(nid) =
+                self.publish_bytes_as_unit_to(&b, &pname, "解除组合", folder.clone())
             {
                 made += 1;
+                created.push(nid);
             }
         }
         // The recycle-bin outcome is part of the report (audit
@@ -8706,7 +8850,14 @@ impl App {
         // the bin while it still sat on the wall.
         let mut fully_done = false;
         if made == total {
-            if self.trash_add("unit", uid) {
+            // Undo recording is suspended across this trash_add:
+            // the ungroup records ONE composite entry below (the
+            // funnel would otherwise record the original's trash
+            // row as a standalone delete).
+            self.undo_suspend += 1;
+            let trashed = self.trash_add("unit", uid);
+            self.undo_suspend -= 1;
+            if trashed {
                 fully_done = true;
                 self.say(format!(
                     "已解除组合「{name}」：拆为 {made} 个单页内容块，原内容块已移入回收站"
@@ -8724,6 +8875,38 @@ impl App {
             self.say(format!(
                 "解除组合失败：未能新建任何单页内容块，原内容块「{name}」保留未动"
             ));
+        }
+        // Undo (Ctrl+Z): a full ungroup records one composite
+        // entry — trash the split blocks AND bring the original
+        // back. A partial ungroup (some pages landed, original
+        // untouched) records just the created blocks.
+        if fully_done {
+            if let Some(local) = self.local.clone() {
+                match local.undo_trash_find("unit", uid) {
+                    Some(row) => {
+                        self.push_undo(
+                            format!("解除组合「{name}」"),
+                            UndoAction::Ungroup {
+                                created,
+                                original: row,
+                            },
+                        );
+                    }
+                    None => {
+                        if !created.is_empty() {
+                            self.push_undo(
+                                format!("解除组合「{name}」"),
+                                UndoAction::CreatedUnits { ids: created },
+                            );
+                        }
+                    }
+                }
+            }
+        } else if !created.is_empty() {
+            self.push_undo(
+                format!("解除组合「{name}」（部分）"),
+                UndoAction::CreatedUnits { ids: created },
+            );
         }
         // Phase-1 (design §3.1 point 10): the split blocks are
         // new units; the original's move to the bin already
@@ -8886,11 +9069,25 @@ impl App {
                 }
                 // Per-unit trash outcomes are counted, not
                 // overwritten by the success wording (audit N2).
+                // Undo recording is suspended across the loop:
+                // the cut records ONE batch entry below, not one
+                // delete entry per source block.
+                self.undo_suspend += 1;
                 let mut trashed = 0usize;
+                let mut trashed_ids: Vec<String> = Vec::new();
                 for uid in unit_ids {
                     if self.trash_add("unit", uid) {
                         trashed += 1;
+                        trashed_ids.push(uid.clone());
                     }
+                }
+                self.undo_suspend -= 1;
+                if !trashed_ids.is_empty() {
+                    let pairs: Vec<(&str, &str)> = trashed_ids
+                        .iter()
+                        .map(|id| ("unit", id.as_str()))
+                        .collect();
+                    self.record_trash_undo(format!("剪切 {label}"), &pairs);
                 }
                 let all = trashed == unit_ids.len();
                 if all {
@@ -9046,11 +9243,16 @@ impl App {
                     self.unit_name(&unit_ids[0]),
                     unit_ids.len()
                 );
-                if self
-                    .publish_bytes_as_unit(&bytes, &name, "组合新建")
-                    .is_some()
+                if let Some(new_id) =
+                    self.publish_bytes_as_unit(&bytes, &name, "组合新建")
                 {
                     self.say(format!("已组合为新内容块「{name}」"));
+                    // Undo (Ctrl+Z): the created block files
+                    // into the trash (see UndoAction::CreatedUnits).
+                    self.push_undo(
+                        format!("组合为内容块「{name}」"),
+                        UndoAction::CreatedUnits { ids: vec![new_id] },
+                    );
                     // Phase-1 (design §3.1 point 14).
                     self.changed(Change::Units);
                     true
@@ -9103,6 +9305,15 @@ impl App {
         ) {
             Ok(v) => {
                 self.say(format!("已组合为新索引「{name}」"));
+                // Undo (Ctrl+Z): the created index files into
+                // the trash (see UndoAction::CreatedUnits).
+                let created_id = s(&v, "id");
+                if !created_id.is_empty() {
+                    self.push_undo(
+                        format!("组合为索引「{name}」"),
+                        UndoAction::CreatedIndex { id: created_id },
+                    );
+                }
                 // Phase-1 (design §3.1 point 15): a new index
                 // (meta for the new id) over a units-backed
                 // entry set; consumed at once — the caller acts
@@ -10457,6 +10668,256 @@ impl App {
         }
     }
 
+    // ---------------- undo (Ctrl+Z) ----------------
+
+    /// Record one completed operation on the undo stack.
+    /// Recording is local-library-only (see UndoAction): with
+    /// no local library open — or undo turned off in settings
+    /// (limit 0) — nothing is ever pushed, so Ctrl+Z stays
+    /// inert rather than half-working. Pushing past the limit
+    /// drops the OLDEST entries: the stack is a sliding window
+    /// of the most recent operations, in order.
+    fn push_undo(&mut self, label: String, action: UndoAction) {
+        if self.local.is_none() || self.undo_limit <= 0 {
+            return;
+        }
+        self.undo_stack.push(UndoEntry { label, action });
+        let limit = self.undo_limit as usize;
+        while self.undo_stack.len() > limit {
+            self.undo_stack.remove(0);
+        }
+    }
+
+    /// After a successful trash operation, gather the LOCAL
+    /// trash rows it created for the given (kind, object_id)
+    /// pairs and record them as one undo entry. Pairs whose
+    /// rows live on the server (organization showroom items)
+    /// are simply absent locally and drop out — the entry then
+    /// covers exactly the part of the batch this library owns.
+    /// Suspended while a composite operation (ungroup, cut) is
+    /// running its own sub-steps through the trash funnel.
+    fn record_trash_undo(&mut self, label: String, pairs: &[(&str, &str)]) {
+        if self.undo_suspend > 0 {
+            return;
+        }
+        let Some(local) = self.local.clone() else {
+            return;
+        };
+        let rows: Vec<TrashRec> = pairs
+            .iter()
+            .filter_map(|(kind, id)| local.undo_trash_find(kind, id))
+            .collect();
+        if rows.is_empty() {
+            return;
+        }
+        self.push_undo(label, UndoAction::TrashBatch { rows });
+    }
+
+    /// The soft-delete inverse for created objects (combine /
+    /// paste / ungroup leftovers): send them to the trash
+    /// through the same route every delete uses. Goes through
+    /// call_work directly (never the recording trash_add
+    /// funnel), so an undo never records itself.
+    fn undo_trash_created(&mut self, kind: &str, ids: &[String]) -> Result<(), String> {
+        let mut failed: Vec<String> = Vec::new();
+        for id in ids {
+            if self
+                .call_work(
+                    "POST",
+                    "/v1/trash",
+                    Some(json!({ "kind": kind, "object_id": id })),
+                )
+                .is_err()
+            {
+                failed.push(id.clone());
+            }
+        }
+        if failed.is_empty() {
+            self.trash.loaded = false;
+            Ok(())
+        } else {
+            Err(format!("{} 项未能移入回收站", failed.len()))
+        }
+    }
+
+    /// Ctrl+Z: run the newest entry's inverse. The entry is
+    /// consumed either way — a guard refusal reports why and
+    /// does NOT leave the entry on top (it could never succeed
+    /// later, and leaving it would wall off every older entry
+    /// behind it). Refresh rides the phase-1 change events,
+    /// scoped to the slices the inverse touched; the folder
+    /// arms reuse the folder operations' own re-reads.
+    fn do_undo(&mut self) {
+        let Some(entry) = self.undo_stack.pop() else {
+            return;
+        };
+        let label = entry.label.clone();
+        let result: Result<Vec<Change>, String> = match entry.action {
+            UndoAction::MoveUnits { positions } => match &self.local {
+                Some(local) => local
+                    .undo_restore_unit_positions(&positions)
+                    .map(|_| vec![Change::Units]),
+                None => Err("本地库不可用".into()),
+            },
+            UndoAction::MergePage {
+                target_id,
+                source,
+                pre,
+                post,
+            } => match &self.local {
+                Some(local) => match local.undo_merge(&source, &pre, &post) {
+                    Ok(()) => {
+                        let open_target = match self.content.stack.top() {
+                            ContentFrame::Unit(st) => st.unit_id == target_id,
+                            _ => false,
+                        };
+                        if open_target {
+                            self.reload_unit_detail(&target_id);
+                        }
+                        Ok(vec![Change::Units])
+                    }
+                    Err(e) => Err(e),
+                },
+                None => Err("本地库不可用".into()),
+            },
+            UndoAction::TrashBatch { rows } => match &self.local {
+                Some(local) => match local.undo_trash_restore(&rows) {
+                    Ok(()) => {
+                        self.trash.loaded = false;
+                        let mut changes = vec![Change::Trash];
+                        if rows.iter().any(|r| r.kind == "unit" || r.kind == "version") {
+                            changes.push(Change::Units);
+                        }
+                        if rows.iter().any(|r| r.kind == "index") {
+                            changes.push(Change::Indexes);
+                        }
+                        if rows.iter().any(|r| r.kind == "showroom") {
+                            changes.push(Change::ShowroomLive);
+                        }
+                        Ok(changes)
+                    }
+                    Err(e) => Err(e),
+                },
+                None => Err("本地库不可用".into()),
+            },
+            UndoAction::CreatedUnits { ids } => self
+                .undo_trash_created("unit", &ids)
+                .map(|_| vec![Change::Units, Change::Trash]),
+            UndoAction::CreatedIndex { id } => self
+                .undo_trash_created("index", std::slice::from_ref(&id))
+                .map(|_| vec![Change::Indexes, Change::Trash]),
+            UndoAction::Ungroup { created, original } => {
+                match self.undo_trash_created("unit", &created) {
+                    Ok(()) => match &self.local {
+                        Some(local) => local
+                            .undo_trash_restore(std::slice::from_ref(&original))
+                            .map(|_| vec![Change::Units, Change::Trash]),
+                        None => Err("本地库不可用".into()),
+                    },
+                    Err(e) => Err(e),
+                }
+            }
+            UndoAction::ReorderDraft {
+                version_id,
+                unit_id,
+                old_page_ids,
+            } => match self.call_work(
+                "POST",
+                &format!("/v1/versions/{version_id}/reorder-pages"),
+                Some(json!({ "page_ids": old_page_ids })),
+            ) {
+                Ok(_) => {
+                    let open_unit = match self.content.stack.top() {
+                        ContentFrame::Unit(st) => st.unit_id == unit_id,
+                        _ => false,
+                    };
+                    if open_unit {
+                        self.reload_unit_detail(&unit_id);
+                    }
+                    Ok(vec![Change::Units])
+                }
+                Err(e) => Err(e),
+            },
+            UndoAction::FolderCreated { id } => {
+                let has_contents = self
+                    .local
+                    .as_ref()
+                    .map(|l| l.undo_folder_has_contents(&id))
+                    .unwrap_or(true);
+                if has_contents {
+                    Err("文件夹里已有内容，不能撤回新建；可直接删除该文件夹".into())
+                } else {
+                    match self.call_work(
+                        "POST",
+                        &format!("/v1/folders/{id}/delete"),
+                        Some(json!({ "mode": "lift" })),
+                    ) {
+                        Ok(_) => {
+                            self.reload_folders();
+                            Ok(vec![Change::Folders])
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+            }
+            UndoAction::FolderRenamed { id, old_name } => match self.call_work(
+                "POST",
+                &format!("/v1/folders/{id}/rename"),
+                Some(json!({ "name": old_name })),
+            ) {
+                Ok(_) => {
+                    self.reload_folders();
+                    Ok(vec![Change::Folders])
+                }
+                Err(e) => Err(e),
+            },
+            UndoAction::FolderNote { id, old_note } => match self.call_work(
+                "POST",
+                &format!("/v1/folders/{id}/note"),
+                Some(json!({ "note": old_note })),
+            ) {
+                Ok(_) => {
+                    self.reload_folders();
+                    Ok(vec![Change::Folders])
+                }
+                Err(e) => Err(e),
+            },
+            UndoAction::FolderMoved { positions } => match &self.local {
+                Some(local) => match local.undo_restore_folder_positions(&positions) {
+                    Ok(()) => {
+                        self.reload_folders();
+                        Ok(vec![Change::Folders])
+                    }
+                    Err(e) => Err(e),
+                },
+                None => Err("本地库不可用".into()),
+            },
+            UndoAction::FolderDeleted { snap } => match &self.local {
+                Some(local) => match local.undo_restore_folder_delete(&snap) {
+                    Ok(()) => {
+                        // The delete drain's own refresh, mirrored:
+                        // folder tree + homed lists (+ trash
+                        // staleness in trash mode).
+                        let mode = if snap.trash_mode { "trash" } else { "lift" };
+                        self.refresh_after_folder_delete(mode);
+                        Ok(vec![Change::Folders])
+                    }
+                    Err(e) => Err(e),
+                },
+                None => Err("本地库不可用".into()),
+            },
+        };
+        match result {
+            Ok(changes) => {
+                for c in changes {
+                    self.changed(c);
+                }
+                self.say(format!("已撤回：{label}"));
+            }
+            Err(e) => self.say(format!("无法撤回「{label}」：{e}")),
+        }
+    }
+
     /// Move an object to the trash (soft delete) — the producers:
     /// unit detail, index detail, showroom cards.
     fn trash_add(&mut self, kind: &str, object_id: &str) -> bool {
@@ -10477,6 +10938,37 @@ impl App {
         ) {
             Ok(_) => {
                 self.say("已移入回收站，可随时恢复");
+                // Undo (Ctrl+Z): every single-item delete that
+                // lands in the local library records its trash
+                // row, so the detail pages' and cards' delete
+                // buttons are as undoable as the bottom bar's
+                // batch. Composite operations suspend recording
+                // while they run their sub-steps through here.
+                let undo_label = match kind {
+                    "unit" => format!("删除内容块「{}」", self.unit_name(object_id)),
+                    "index" => {
+                        let name = self
+                            .indexes
+                            .iter()
+                            .find(|x| s(x, "id") == object_id)
+                            .map(|x| s(x, "name"))
+                            .unwrap_or_default();
+                        format!("删除索引「{name}」")
+                    }
+                    "showroom" => {
+                        let name = self
+                            .showroom_live
+                            .iter()
+                            .chain(self.local_showroom.iter())
+                            .find(|x| s(x, "id") == object_id)
+                            .map(|x| s(x, "title"))
+                            .unwrap_or_default();
+                        format!("删除演示稿「{name}」")
+                    }
+                    "version" => "删除历史版本".to_string(),
+                    _ => "移入回收站".to_string(),
+                };
+                self.record_trash_undo(undo_label, &[(kind, object_id)]);
                 self.trash.loaded = false;
                 // Phase-1 (design §3.1 point 18): the source
                 // slice follows the trashed kind (this funnel
@@ -11407,8 +11899,29 @@ impl eframe::App for App {
                         // on this UI-thread drain were the
                         // remaining delete freeze (round 2).
                         self.refresh_after_folder_delete(&mode);
+                        // Undo (Ctrl+Z): the delete landed — its
+                        // pre-image (captured when the mode was
+                        // picked) becomes a stack entry.
+                        if let Some((fid, fname, snap)) = self.folder_del_undo.take() {
+                            if fid == id {
+                                self.push_undo(
+                                    format!("删除文件夹「{fname}」"),
+                                    UndoAction::FolderDeleted { snap },
+                                );
+                            }
+                        }
                     }
-                    Err(e) => self.msg = format!("删除失败：{e}"),
+                    Err(e) => {
+                        if self
+                            .folder_del_undo
+                            .as_ref()
+                            .map(|(fid, _, _)| fid == &id)
+                            .unwrap_or(false)
+                        {
+                            self.folder_del_undo = None;
+                        }
+                        self.msg = format!("删除失败：{e}");
+                    }
                 }
             }
             ctx.request_repaint();
@@ -11675,6 +12188,11 @@ impl eframe::App for App {
         // function has already claimed the keyboard while a
         // show is live.
         self.deckbar_delete_key(ui.ctx());
+
+        // Keyboard Ctrl+Z → the session undo stack (gates and
+        // execution live in shell.rs::undo_key). Same placement
+        // as the Delete key, for the same reason.
+        self.undo_key(ui.ctx());
 
         let screen = ui.max_rect();
         self.workspace_ui(ui);
@@ -18277,6 +18795,14 @@ impl App {
         if !self.need_identity_local("移动内容块") {
             return;
         }
+        // Undo snapshot (Ctrl+Z): move_units renumbers the
+        // whole library's seats, so the pre-image is every
+        // unit's home + seat, taken before the call.
+        let undo_positions = self
+            .local
+            .as_ref()
+            .map(|l| l.undo_snapshot_unit_positions());
+        let moved = ids.len();
         match self.call_work(
             "POST",
             "/v1/units/move",
@@ -18287,7 +18813,15 @@ impl App {
             })),
         ) {
             Ok(_) => {
-                self.msg = format!("已移动 {} 个内容块", ids.len());
+                self.msg = format!("已移动 {} 个内容块", moved);
+                if let Some(positions) = undo_positions {
+                    let label = if moved == 1 {
+                        "移动内容块".to_string()
+                    } else {
+                        format!("移动 {moved} 个内容块")
+                    };
+                    self.push_undo(label, UndoAction::MoveUnits { positions });
+                }
                 self.changed(Change::Units);
             }
             Err(e) => self.msg = format!("移动失败：{e}"),
@@ -18313,12 +18847,44 @@ impl App {
             })
             .map(|it| it.get("unit").map(|u| s(u, "name")).unwrap_or_default())
             .unwrap_or_default();
-        match self.call_work(
+        // Undo snapshots (Ctrl+Z): the source unit's full
+        // pre-image (the merge dissolves it) and the target's
+        // working-version row, resolved by the merge's own rule
+        // inside the store moments before the call. If either
+        // snapshot is unavailable the merge still runs — it
+        // simply records no undo entry.
+        let undo_snaps = self.local.as_ref().and_then(|l| {
+            let src = l.undo_snapshot_unit(source)?;
+            let pre = l.undo_snapshot_working_version(target)?;
+            Some((src, pre))
+        });
+        let merge_resp = self.call_work(
             "POST",
             &format!("/v1/units/{target}/merge-page"),
             Some(json!({ "source_id": source })),
-        ) {
-            Ok(_) => {
+        );
+        match merge_resp {
+            Ok(v) => {
+                if let (Some(local), Some((src_snap, pre_snap))) =
+                    (self.local.clone(), undo_snaps)
+                {
+                    let post_id = v
+                        .get("version")
+                        .map(|ver| s(ver, "id"))
+                        .filter(|id| !id.is_empty())
+                        .unwrap_or_else(|| s(&v, "id"));
+                    if let Some(post_snap) = local.undo_snapshot_version(&post_id) {
+                        self.push_undo(
+                            format!("并入页面到《{target_name}》"),
+                            UndoAction::MergePage {
+                                target_id: target.to_string(),
+                                source: src_snap,
+                                pre: pre_snap,
+                                post: post_snap,
+                            },
+                        );
+                    }
+                }
                 self.msg = format!("已并入《{target_name}》的草稿");
                 // The source unit is gone: prune it from the
                 // selection so the deck bar never counts a
@@ -18607,6 +19173,14 @@ impl App {
         let Some(edit) = w.flow_edit.take() else {
             return;
         };
+        // Undo (Ctrl+Z): the pre-image is the folder's current
+        // name / note in the loaded folder list.
+        let old_folder = self
+            .folders
+            .iter()
+            .find(|f| s(f, "id") == edit.folder_id)
+            .cloned()
+            .unwrap_or(json!({}));
         match edit.field {
             FlowField::Name => {
                 let name = edit.text.trim().to_string();
@@ -18621,6 +19195,16 @@ impl App {
                 ) {
                     Ok(_) => {
                         self.msg = "已重命名".into();
+                        let old = s(&old_folder, "name");
+                        if !old.is_empty() {
+                            self.push_undo(
+                                format!("重命名文件夹「{old}」"),
+                                UndoAction::FolderRenamed {
+                                    id: edit.folder_id.clone(),
+                                    old_name: old,
+                                },
+                            );
+                        }
                         self.reload_folders();
                     }
                     Err(e) => self.msg = format!("重命名失败：{e}"),
@@ -18635,6 +19219,13 @@ impl App {
                 ) {
                     Ok(_) => {
                         self.msg = "已保存备注".into();
+                        self.push_undo(
+                            "修改文件夹备注".to_string(),
+                            UndoAction::FolderNote {
+                                id: edit.folder_id.clone(),
+                                old_note: s(&old_folder, "note"),
+                            },
+                        );
                         self.reload_folders();
                     }
                     Err(e) => self.msg = format!("备注保存失败：{e}"),
@@ -20458,6 +21049,16 @@ impl App {
         let Some(edit) = self.folder_edit.take() else {
             return;
         };
+        // Undo (Ctrl+Z): a rename's pre-image is the current
+        // name in the loaded folder list; a creation's inverse
+        // needs only the new folder's id (from the response).
+        let old_name = edit.target.as_ref().and_then(|id| {
+            self.folders
+                .iter()
+                .find(|f| s(f, "id") == *id)
+                .map(|f| s(f, "name"))
+        });
+        let name_for_label = name.clone();
         match &edit.target {
             Some(id) => {
                 match self.call_work(
@@ -20467,6 +21068,15 @@ impl App {
                 ) {
                     Ok(_) => {
                         self.msg = "已重命名".into();
+                        if let Some(old) = old_name {
+                            self.push_undo(
+                                format!("重命名文件夹「{old}」"),
+                                UndoAction::FolderRenamed {
+                                    id: id.clone(),
+                                    old_name: old,
+                                },
+                            );
+                        }
                         self.reload_folders();
                     }
                     Err(e) => self.msg = format!("重命名失败：{e}"),
@@ -20482,8 +21092,15 @@ impl App {
                         "scope": edit.scope
                     })),
                 ) {
-                    Ok(_) => {
+                    Ok(v) => {
                         self.msg = "已新建文件夹".into();
+                        let new_id = s(&v, "id");
+                        if !new_id.is_empty() {
+                            self.push_undo(
+                                format!("新建文件夹「{name_for_label}」"),
+                                UndoAction::FolderCreated { id: new_id },
+                            );
+                        }
                         self.reload_folders();
                     }
                     Err(e) => self.msg = format!("新建失败：{e}"),
@@ -20500,6 +21117,22 @@ impl App {
         if !self.need_identity_local("移动文件夹") {
             return;
         }
+        // Undo snapshot (Ctrl+Z): move_folder renumbers only
+        // its own scope's tree, so the pre-image is that scope's
+        // folder positions, taken before the call.
+        let undo_positions = self.local.as_ref().and_then(|l| {
+            let scope = self
+                .folders
+                .iter()
+                .find(|f| s(f, "id") == id)
+                .map(|f| s(f, "scope"))
+                .unwrap_or_default();
+            if scope.is_empty() {
+                None
+            } else {
+                Some(l.undo_snapshot_folder_positions(&scope))
+            }
+        });
         match self.call_work(
             "POST",
             &format!("/v1/folders/{id}/move"),
@@ -20507,6 +21140,12 @@ impl App {
         ) {
             Ok(_) => {
                 self.msg = "已移动文件夹".into();
+                if let Some(positions) = undo_positions {
+                    self.push_undo(
+                        "移动文件夹".to_string(),
+                        UndoAction::FolderMoved { positions },
+                    );
+                }
                 self.reload_folders();
             }
             Err(e) => self.msg = format!("移动失败：{e}"),
@@ -22489,6 +23128,20 @@ impl App {
                 self.folder_deleting = Some((id.clone(), mode.to_string()));
                 let gen = self.folder_del_gen;
                 let local = self.local.clone();
+                // Undo snapshot (Ctrl+Z): the delete's pre-image,
+                // captured NOW, before the worker runs — after
+                // the delete lands, the folder rows it must
+                // restore no longer exist to be read. The drain
+                // turns the snapshot into a stack entry when the
+                // delete reports success (and drops it on
+                // failure). When the delete will be served by
+                // REST fallback (no local library) there is no
+                // snapshot and no entry — the undo system's
+                // declared local-only scope.
+                self.folder_del_undo = local
+                    .as_ref()
+                    .and_then(|l| l.undo_snapshot_folder_delete(&id, mode == "trash"))
+                    .map(|snap| (id.clone(), name.clone(), snap));
                 let server = self.server.clone();
                 let token = self.token.clone();
                 let tx = self.folder_del_tx.clone();
@@ -24584,6 +25237,53 @@ impl App {
                                     json!({ "deckcraft_auto_quit": self.dc_auto_quit }),
                                 );
                             }
+                            // 撤回步数 (Ctrl+Z undo depth, user
+                            // ruling 2026-11-25): a device-local
+                            // preference next to the other
+                            // presentation prefs. Changing it takes
+                            // effect at once — shrinking truncates
+                            // the live stack's oldest entries,
+                            // growing never resurrects dropped
+                            // ones, and 0 turns undo off (the
+                            // stack is emptied and stays empty).
+                            ui.add_space(12.0);
+                            ui.label(
+                                egui::RichText::new("撤回步数")
+                                    .strong()
+                                    .size(14.0)
+                                    .color(palette_color(TEXT_MAIN)),
+                            );
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.label("Ctrl+Z 可撤回的操作步数");
+                                let resp = ui.add(
+                                    egui::DragValue::new(&mut self.undo_limit)
+                                        .range(0..=200),
+                                );
+                                ui.label("步");
+                                if resp.changed() {
+                                    save_client_settings(
+                                        json!({ "undo_limit": self.undo_limit }),
+                                    );
+                                    let limit = self.undo_limit.max(0) as usize;
+                                    while self.undo_stack.len() > limit {
+                                        self.undo_stack.remove(0);
+                                    }
+                                    self.msg = if self.undo_limit <= 0 {
+                                        "撤回已关闭".into()
+                                    } else {
+                                        format!("撤回步数已设为 {} 步", self.undo_limit)
+                                    };
+                                }
+                            });
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new(
+                                    "移动、并入、删除、组合、粘贴与文件夹操作等可按 Ctrl+Z 逐步撤回（仅限本机库内的操作，本次运行内有效）。设为 0 关闭撤回；调小步数会立即丢弃最早的撤回记录。",
+                                )
+                                .size(11.5)
+                                .color(palette_color(TEXT_WEAK)),
+                            );
                         }
                         "我的提交" => {
                             self.my_submissions_body(ui);

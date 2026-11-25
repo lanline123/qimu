@@ -1659,6 +1659,60 @@ impl App {
         self.deckbar_delete_selection(targets);
     }
 
+    /// Keyboard Ctrl+Z → the session undo stack (user ruling
+    /// 2026-11-25). Same three gates as the Delete key, for the
+    /// same reasons:
+    /// - a plain Ctrl+Z press, first press only (key repeats
+    ///   are ignored: holding the chord down must not burn
+    ///   through the whole stack in one press), no Shift (that
+    ///   chord is redo's spelling — deliberately unclaimed this
+    ///   round), no Alt/Cmd;
+    /// - no widget holds focus — a focused TextEdit keeps
+    ///   Ctrl+Z for its own text buffer, and the page editor's
+    ///   own undo keeps working the same way (its overlay also
+    ///   trips the dialog gate below);
+    /// - no overlay or dialog is open (`delete_key_dialog_open`,
+    ///   shared verbatim): undo must never reach through a
+    ///   confirm or the login window at the wall behind it.
+    /// An empty stack is a silent no-op. On a hit the key is
+    /// consumed so nothing downstream re-reads the press.
+    pub(super) fn undo_key(&mut self, ctx: &egui::Context) {
+        let pressed = ctx.input(|i| {
+            i.events.iter().any(|e| match e {
+                egui::Event::Key {
+                    key,
+                    pressed,
+                    repeat,
+                    modifiers,
+                    ..
+                } => {
+                    *key == egui::Key::Z
+                        && *pressed
+                        && !*repeat
+                        && modifiers.ctrl
+                        && !modifiers.shift
+                        && !modifiers.alt
+                        && !modifiers.command
+                }
+                _ => false,
+            })
+        });
+        if !pressed {
+            return;
+        }
+        if ctx.memory(|m| m.focused().is_some()) {
+            return;
+        }
+        if self.delete_key_dialog_open() {
+            return;
+        }
+        if self.undo_stack.is_empty() {
+            return;
+        }
+        ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Z));
+        self.do_undo();
+    }
+
     /// Any overlay or standalone dialog that must shield the
     /// wall from the keyboard Delete shortcut. The overlay
     /// stack covers Confirm / Light / PickTemplate / PageEdit /
@@ -1867,6 +1921,22 @@ impl App {
             .iter()
             .filter(|t| !failed.contains(t.id.as_str()))
             .collect();
+        // Undo (Ctrl+Z): the batch records as ONE entry — the
+        // locally-held rows among the successes (organization
+        // showroom rows live on the server and drop out inside
+        // record_trash_undo).
+        if !succeeded.is_empty() {
+            let pairs: Vec<(&str, &str)> = succeeded
+                .iter()
+                .map(|t| (t.kind, t.id.as_str()))
+                .collect();
+            let undo_label = if succeeded.len() == 1 {
+                format!("删除「{}」", succeeded[0].label)
+            } else {
+                format!("删除 {} 项", succeeded.len())
+            };
+            self.record_trash_undo(undo_label, &pairs);
+        }
         let mut version_gone = false;
         for t in &succeeded {
             match t.kind {

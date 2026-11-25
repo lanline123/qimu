@@ -22,7 +22,10 @@
 
 use qimu_core::manifest::{Binding, Manifest, SourceRef};
 use qimu_core::pptx::{self, Package};
-use qimu_core::store::{FolderDeleteMode, FolderRec, Store, UserRec};
+use qimu_core::store::{
+    FolderDeleteMode, FolderDeleteSnapshot, FolderPosition, FolderRec, Store, TrashRec,
+    UnitPosition, UnitSnapshot, UserRec, VersionRowSnap,
+};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -1276,6 +1279,103 @@ impl LocalStore {
         let store = self.lock_timed("list_units");
         let units = store.list_units(None).unwrap_or_default();
         units.iter().map(|u| unit_json(&store, u)).collect()
+    }
+
+    // ---------- undo snapshots & restores (client Ctrl+Z) ----------
+    //
+    // The typed faces of the core store's undo support (see
+    // Store::snapshot_unit_positions and neighbours). The App's
+    // session undo stack captures pre-operation snapshots
+    // through the snapshot faces BEFORE an operation runs and
+    // hands them to the restore faces when the user undoes it;
+    // a restore's Err is the guard's refusal wording, shown to
+    // the user verbatim.
+
+    pub fn undo_snapshot_unit_positions(&self) -> Vec<UnitPosition> {
+        let store = self.store.lock().unwrap();
+        store.snapshot_unit_positions().unwrap_or_default()
+    }
+
+    pub fn undo_restore_unit_positions(&self, rows: &[UnitPosition]) -> Result<(), String> {
+        let store = self.store.lock().unwrap();
+        store.restore_unit_positions(rows)
+    }
+
+    pub fn undo_snapshot_unit(&self, unit_id: &str) -> Option<UnitSnapshot> {
+        let store = self.store.lock().unwrap();
+        store.snapshot_unit(unit_id).ok()
+    }
+
+    /// The version a merge into this unit would extend (the
+    /// merge's own resolution), snapshotted verbatim.
+    pub fn undo_snapshot_working_version(&self, unit_id: &str) -> Option<VersionRowSnap> {
+        let store = self.store.lock().unwrap();
+        store.snapshot_working_version(unit_id).ok().flatten()
+    }
+
+    pub fn undo_snapshot_version(&self, version_id: &str) -> Option<VersionRowSnap> {
+        let store = self.store.lock().unwrap();
+        store.snapshot_version_row(version_id).ok()
+    }
+
+    pub fn undo_merge(
+        &self,
+        source: &UnitSnapshot,
+        pre: &VersionRowSnap,
+        post: &VersionRowSnap,
+    ) -> Result<(), String> {
+        let store = self.store.lock().unwrap();
+        store.undo_merge(source, pre, post)
+    }
+
+    pub fn undo_trash_find(&self, kind: &str, object_id: &str) -> Option<TrashRec> {
+        let store = self.store.lock().unwrap();
+        store.trash_find(kind, object_id).ok().flatten()
+    }
+
+    pub fn undo_trash_restore(&self, rows: &[TrashRec]) -> Result<(), String> {
+        let store = self.store.lock().unwrap();
+        store.undo_trash_restore(rows)
+    }
+
+    pub fn undo_snapshot_folder_positions(&self, scope: &str) -> Vec<FolderPosition> {
+        let store = self.store.lock().unwrap();
+        store.snapshot_folder_positions(scope).unwrap_or_default()
+    }
+
+    pub fn undo_restore_folder_positions(
+        &self,
+        rows: &[FolderPosition],
+    ) -> Result<(), String> {
+        let store = self.store.lock().unwrap();
+        store.restore_folder_positions(rows)
+    }
+
+    pub fn undo_snapshot_folder_delete(
+        &self,
+        id: &str,
+        trash_mode: bool,
+    ) -> Option<FolderDeleteSnapshot> {
+        let store = self.store.lock().unwrap();
+        let mode = if trash_mode {
+            FolderDeleteMode::Trash
+        } else {
+            FolderDeleteMode::Lift
+        };
+        store.snapshot_folder_delete(id, mode).ok()
+    }
+
+    pub fn undo_restore_folder_delete(
+        &self,
+        snap: &FolderDeleteSnapshot,
+    ) -> Result<(), String> {
+        let store = self.store.lock().unwrap();
+        store.restore_folder_delete(snap)
+    }
+
+    pub fn undo_folder_has_contents(&self, id: &str) -> bool {
+        let store = self.store.lock().unwrap();
+        store.folder_has_contents(id).unwrap_or(true)
     }
 
     /// The version's fragment PPTX bytes from the local store
