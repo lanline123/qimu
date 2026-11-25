@@ -1918,7 +1918,7 @@ impl App {
     /// deliberately NOT a shield: it is a persistent companion
     /// the wall stays fully interactive under, so selecting a
     /// card and pressing Delete keeps working while it floats.
-    fn delete_key_dialog_open(&self) -> bool {
+    pub(super) fn delete_key_dialog_open(&self) -> bool {
         if !self.overlays.is_empty()
             || self.login_open
             || self.about_open
