@@ -1646,6 +1646,61 @@ async fn move_folder(
     Ok(Json(json!({ "ok": true })))
 }
 
+#[derive(Deserialize)]
+struct MoveUnitsReq {
+    ids: Vec<String>,
+    folder_id: Option<String>,
+    before_id: Option<String>,
+}
+
+/// POST /v1/units/move — content-wall card drag-and-drop:
+/// rehome a batch of units into `folder_id` (null = the
+/// folder-less tail group) and seat it in front of `before_id`
+/// there (null = last). Order persists in the store's
+/// units.sort renumber (the folders' caliber).
+async fn move_units(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Json(req): Json<MoveUnitsReq>,
+) -> Api<Value> {
+    let _ = auth(&st, &headers)?;
+    let store = st.store.lock().unwrap();
+    store
+        .move_units(&req.ids, req.folder_id.as_deref(), req.before_id.as_deref())
+        .map_err(bad)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct MergePageReq {
+    source_id: String,
+}
+
+/// POST /v1/units/:id/merge-page — card drag onto a card:
+/// append the source single-page unit's page to this unit's
+/// draft (born as a new draft when the working version is
+/// published) and dissolve the source unit. The store runs
+/// every guard (single split page, entity-backed target,
+/// publish-pin) before any write.
+async fn merge_unit_page(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<MergePageReq>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let unit = {
+        let store = st.store.lock().unwrap();
+        store.get_unit(&id).map_err(|_| not_found())?
+    };
+    need_cap(&st, &user, &unit.group_id, "publish")?;
+    let store = st.store.lock().unwrap();
+    let ver = store
+        .merge_unit_page_into(&id, &req.source_id, &user.display_name)
+        .map_err(bad)?;
+    Ok(Json(json!({ "version": ver })))
+}
+
 /// DELETE /v1/folders/:id — kept for compatibility; equivalent
 /// to POST /v1/folders/:id/delete with mode "lift" (only the
 /// folder goes away, its contents are lifted to the parent).
@@ -2201,6 +2256,38 @@ async fn publish_draft_version(
     let store = st.store.lock().unwrap();
     store.set_version_status(&id, "normal").map_err(bad)?;
     Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct ReorderPagesReq {
+    page_ids: Vec<String>,
+}
+
+/// POST /v1/versions/:id/reorder-pages — the #101 draft wall's
+/// drag reorder: rewrite a DRAFT version's page order in place
+/// (core `Store::reorder_draft_pages`). Drafts only — core
+/// refuses a published version, whose page sequence is immutable
+/// history. Same capability shape as publish-draft / scripts:
+/// an in-place working-copy edit on the version's own group.
+async fn reorder_version_pages(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<ReorderPagesReq>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let unit = {
+        let store = st.store.lock().unwrap();
+        let ver = store.get_version(&id).map_err(|_| not_found())?;
+        let rend = store.get_rendition(&ver.rendition_id).map_err(bad)?;
+        store.get_unit(&rend.unit_id).map_err(bad)?
+    };
+    need_cap(&st, &user, &unit.group_id, "publish")?;
+    let store = st.store.lock().unwrap();
+    let ver = store
+        .reorder_draft_pages(&id, &req.page_ids)
+        .map_err(bad)?;
+    Ok(Json(json!({ "version": ver })))
 }
 
 async fn delete_version(
@@ -6309,6 +6396,7 @@ async fn main() {
         .route("/v1/folders/:id/color", post(set_folder_color))
         .route("/v1/folders/:id/main-index", post(set_folder_main_index))
         .route("/v1/units", get(list_units).post(create_unit))
+        .route("/v1/units/move", post(move_units))
         .route("/v1/units/:id", get(get_unit).patch(patch_unit))
         .route(
             "/v1/units/:id/bump-revision",
@@ -6328,10 +6416,15 @@ async fn main() {
         .route("/v1/import", post(import_deck))
         .route("/v1/import/propose", post(import_propose))
         .route("/v1/units/:id/publish", post(publish))
+        .route("/v1/units/:id/merge-page", post(merge_unit_page))
         .route("/v1/versions/:id/recall", post(recall_version))
         .route(
             "/v1/versions/:id/publish-draft",
             post(publish_draft_version),
+        )
+        .route(
+            "/v1/versions/:id/reorder-pages",
+            post(reorder_version_pages),
         )
         .route("/v1/versions/:id/delete", post(delete_version))
         .route("/v1/versions/:id/fragment", get(version_fragment))

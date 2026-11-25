@@ -185,6 +185,15 @@ pub struct UnitRec {
     pub description: String,
     pub current_revision: i64,
     pub created_ms: i64,
+    /// Wall order within the unit's home folder — the folders'
+    /// `sort` caliber applied to units (card drag-and-drop,
+    /// user ruling 2026-11-25): `list_units` orders by it and
+    /// `move_units` renumbers it over the whole library, so a
+    /// folder's cards keep exactly the order the wall shows.
+    /// Rows from before the column existed all carry 0 and fall
+    /// back to the historical name order until the first move.
+    #[serde(default)]
+    pub sort: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -860,7 +869,7 @@ CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, user_id TEXT, create
 CREATE TABLE IF NOT EXISTS folders(id TEXT PRIMARY KEY, name TEXT NOT NULL, parent_id TEXT, sort INTEGER NOT NULL DEFAULT 0, main_index_id TEXT, scope TEXT NOT NULL DEFAULT '', color TEXT, note TEXT NOT NULL DEFAULT '', origin TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS groups_tbl(id TEXT PRIMARY KEY, name TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS group_grants(id TEXT PRIMARY KEY, group_id TEXT NOT NULL, subject_type TEXT NOT NULL, subject_id TEXT NOT NULL, capability TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS units(id TEXT PRIMARY KEY, name TEXT NOT NULL, folder_id TEXT, group_id TEXT NOT NULL, maintainer TEXT NOT NULL, lead_lang TEXT NOT NULL DEFAULT 'zh', description TEXT NOT NULL DEFAULT '', current_revision INTEGER NOT NULL DEFAULT 1, created_ms INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS units(id TEXT PRIMARY KEY, name TEXT NOT NULL, folder_id TEXT, group_id TEXT NOT NULL, maintainer TEXT NOT NULL, lead_lang TEXT NOT NULL DEFAULT 'zh', description TEXT NOT NULL DEFAULT '', current_revision INTEGER NOT NULL DEFAULT 1, created_ms INTEGER NOT NULL, sort INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS renditions(id TEXT PRIMARY KEY, unit_id TEXT NOT NULL, form TEXT NOT NULL, lang TEXT NOT NULL, UNIQUE(unit_id, form, lang));
 CREATE TABLE IF NOT EXISTS versions(id TEXT PRIMARY KEY, rendition_id TEXT NOT NULL, semver TEXT NOT NULL, major INTEGER NOT NULL, minor INTEGER NOT NULL, patch INTEGER NOT NULL, basis_revision INTEGER NOT NULL, author TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', created_ms INTEGER NOT NULL, fragment_hash TEXT NOT NULL, page_count INTEGER NOT NULL, pages_json TEXT NOT NULL, text_all TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'normal', scripts_json TEXT NOT NULL DEFAULT '[]');
 CREATE TABLE IF NOT EXISTS indexes_tbl(id TEXT PRIMARY KEY, name TEXT NOT NULL, folder_id TEXT, group_id TEXT NOT NULL, maintainer TEXT NOT NULL, lifecycle TEXT NOT NULL DEFAULT 'active', scope TEXT NOT NULL DEFAULT 'company', created_ms INTEGER NOT NULL);
@@ -977,6 +986,7 @@ impl Store {
             ("showroom_pins", "commit_id", "TEXT NOT NULL DEFAULT ''"),
             ("users", "must_change_password", "INTEGER NOT NULL DEFAULT 0"),
             ("pages", "desc", "TEXT NOT NULL DEFAULT ''"),
+            ("units", "sort", "INTEGER NOT NULL DEFAULT 0"),
         ] {
             let has: bool = conn
                 .prepare(&format!("PRAGMA table_info({table})"))
@@ -2688,6 +2698,7 @@ impl Store {
             description: r.get(6)?,
             current_revision: r.get(7)?,
             created_ms: r.get(8)?,
+            sort: r.get(9)?,
         })
     }
 
@@ -2743,10 +2754,18 @@ impl Store {
     ) -> SResult<UnitRec> {
         self.check_home_folder(folder_id, "content", "内容块")?;
         let id = new_id("unt");
+        // New units land at the end of the wall order (the
+        // folders' create does the same with its sort column).
+        let sort: i64 = self
+            .conn
+            .query_row("SELECT COALESCE(MAX(sort),0)+1 FROM units", [], |r| {
+                r.get(0)
+            })
+            .map_err(db_err)?;
         self.conn
             .execute(
-                "INSERT INTO units(id, name, folder_id, group_id, maintainer, lead_lang, description, current_revision, created_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,1,?8)",
-                params![id, name, folder_id, group_id, maintainer, lead_lang, description, now_ms()],
+                "INSERT INTO units(id, name, folder_id, group_id, maintainer, lead_lang, description, current_revision, created_ms, sort) VALUES(?1,?2,?3,?4,?5,?6,?7,1,?8,?9)",
+                params![id, name, folder_id, group_id, maintainer, lead_lang, description, now_ms(), sort],
             )
             .map_err(db_err)?;
         self.get_unit(&id)
@@ -2755,7 +2774,7 @@ impl Store {
     pub fn get_unit(&self, id: &str) -> SResult<UnitRec> {
         self.conn
             .query_row(
-                "SELECT id, name, folder_id, group_id, maintainer, lead_lang, description, current_revision, created_ms FROM units WHERE id=?1",
+                "SELECT id, name, folder_id, group_id, maintainer, lead_lang, description, current_revision, created_ms, sort FROM units WHERE id=?1",
                 params![id],
                 Self::row_to_unit,
             )
@@ -2766,7 +2785,7 @@ impl Store {
         let all = {
             let mut stmt = self
                 .conn
-                .prepare("SELECT id, name, folder_id, group_id, maintainer, lead_lang, description, current_revision, created_ms FROM units ORDER BY name")
+                .prepare("SELECT id, name, folder_id, group_id, maintainer, lead_lang, description, current_revision, created_ms, sort FROM units ORDER BY sort, name")
                 .map_err(db_err)?;
             let rows = stmt
                 .query_map([], Self::row_to_unit)
@@ -2962,6 +2981,116 @@ impl Store {
             )
             .map_err(db_err)?;
         Ok(self.get_unit(unit_id)?.current_revision)
+    }
+
+    /// Move one or more units (content-wall card drag-and-drop,
+    /// user ruling 2026-11-25): rehome the batch into
+    /// `target_folder` (None = the folder-less tail group) and
+    /// seat it in front of `before_id` there (None = last). The
+    /// batch keeps its current relative order. Persistence is
+    /// the folders' caliber, not a new one: the single global
+    /// `sort` column is renumbered over the whole library along
+    /// folder groups, which is exactly the order `list_units`
+    /// returns and the wall renders group by group, so every
+    /// folder's relative card order is preserved. The home gate
+    /// is `update_unit`'s (`check_home_folder`): the target must
+    /// be a content-scope folder, so a drag can never file a
+    /// block into another surface's tree. A `before_id` that is
+    /// inside the batch or absent from the target group seats
+    /// the batch at the group's end.
+    pub fn move_units(
+        &self,
+        ids: &[String],
+        target_folder: Option<&str>,
+        before_id: Option<&str>,
+    ) -> SResult<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        self.check_home_folder(target_folder, "content", "内容块")?;
+        let all = self.list_units(None)?;
+        let folders = self.list_folders()?;
+        // Group key of a unit: its folder's id when that folder
+        // still exists, "" for the folder-less tail group (the
+        // wall renders dangling-folder units in the tail group
+        // too, so the two share one order).
+        let key_of = |u: &UnitRec| -> String {
+            match &u.folder_id {
+                Some(fid) if folders.iter().any(|f| &f.id == fid) => fid.clone(),
+                _ => String::new(),
+            }
+        };
+        // The batch in current list (display) order.
+        let want: HashSet<&String> = ids.iter().collect();
+        let mut batch: Vec<String> = Vec::new();
+        for u in &all {
+            if want.contains(&u.id) && !batch.contains(&u.id) {
+                batch.push(u.id.clone());
+            }
+        }
+        if batch.len() != want.len() {
+            return Err("要移动的内容块不存在".into());
+        }
+        let target_key = match target_folder {
+            Some(fid) if !fid.is_empty() => fid.to_string(),
+            _ => String::new(),
+        };
+        // Per-folder groups, each in current list order.
+        let mut groups: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for u in &all {
+            groups.entry(key_of(u)).or_default().push(u.id.clone());
+        }
+        for list in groups.values_mut() {
+            list.retain(|x| !batch.contains(x));
+        }
+        let list = groups.entry(target_key.clone()).or_default();
+        let pos = before_id
+            .and_then(|b| list.iter().position(|x| x == b))
+            .unwrap_or(list.len());
+        for (off, id) in batch.iter().enumerate() {
+            list.insert(pos + off, id.clone());
+        }
+        // Renumber along the groups: folders in folder-list
+        // order, the tail group last. Only intra-group order is
+        // visible (the wall groups by folder), and this walk
+        // preserves every group's relative order.
+        let mut order: Vec<String> = Vec::new();
+        for f in &folders {
+            if let Some(list) = groups.get(&f.id) {
+                order.extend(list.iter().cloned());
+            }
+        }
+        if let Some(list) = groups.get("") {
+            order.extend(list.iter().cloned());
+        }
+        for (key, list) in &groups {
+            if !key.is_empty() && !folders.iter().any(|f| &f.id == key) {
+                order.extend(list.iter().cloned());
+            }
+        }
+        let tx = self.conn.unchecked_transaction().map_err(db_err)?;
+        let new_home: Option<&str> = if target_key.is_empty() {
+            None
+        } else {
+            Some(target_key.as_str())
+        };
+        for id in &batch {
+            tx.execute(
+                "UPDATE units SET folder_id=?2 WHERE id=?1",
+                params![id, new_home],
+            )
+            .map_err(db_err)?;
+        }
+        for (idx, uid) in order.iter().enumerate() {
+            tx.execute(
+                "UPDATE units SET sort=?2 WHERE id=?1",
+                params![uid, (idx + 1) as i64],
+            )
+            .map_err(db_err)?;
+        }
+        tx.commit().map_err(db_err)?;
+        Ok(())
     }
 
     pub fn get_or_create_rendition(
@@ -3375,6 +3504,136 @@ impl Store {
             return Err("版本不存在".into());
         }
         Ok(())
+    }
+
+    /// Rewrite a DRAFT version's page order in place (the #101
+    /// draft wall's drag reorder, user ruling 2026-11-25). The
+    /// draft is the working copy, so — like `set_version_scripts`
+    /// — the edit lands on the version row itself and never bumps
+    /// a version; published (normal / recalled) versions are
+    /// immutable history and are refused at this door.
+    /// `page_ids` must be exactly the draft's current page
+    /// references in the new order (same multiset; duplicates
+    /// matched by occurrence). Pages and their aligned scripts
+    /// move together, and the stored fragment is rebuilt from
+    /// the page packages in the new order through the birth
+    /// path's own `pptx::reassemble`, so fragment-order
+    /// consumers (fragment download, the page editor's base
+    /// package, legacy id-less thumbs) can never diverge from
+    /// the reference sequence. Bindings keep addressing the same
+    /// pages: their page-id columns already name them, and their
+    /// slot columns are rewritten through the same permutation
+    /// (a missing mark's to_slot = -1 addresses no page and
+    /// stays). An identity order is a no-op success — no write.
+    pub fn reorder_draft_pages(
+        &self,
+        version_id: &str,
+        page_ids: &[String],
+    ) -> SResult<VersionRec> {
+        let ver = self.get_version(version_id)?;
+        if ver.status != "draft" {
+            return Err("只有草稿版本可以调整页序".into());
+        }
+        let cur: Vec<String> = ver.pages.iter().map(|p| p.id.clone()).collect();
+        if cur.iter().any(|id| id.is_empty()) {
+            return Err("该草稿的页面尚未实体化，无法调整页序".into());
+        }
+        if page_ids.len() != cur.len() {
+            return Err("页序与草稿页面不一致，请刷新后重试".into());
+        }
+        // perm[new_pos] = old_pos, occurrence-stable so a page
+        // referenced twice keeps its two slots distinguishable.
+        let mut used = vec![false; cur.len()];
+        let mut perm: Vec<usize> = Vec::with_capacity(cur.len());
+        for id in page_ids {
+            match cur.iter().enumerate().find(|(i, c)| !used[*i] && *c == id) {
+                Some((i, _)) => {
+                    used[i] = true;
+                    perm.push(i);
+                }
+                None => return Err("页序与草稿页面不一致，请刷新后重试".into()),
+            }
+        }
+        if perm.iter().enumerate().all(|(new, old)| new == *old) {
+            return Ok(ver);
+        }
+        // Rebuild the fragment in the new order BEFORE touching
+        // the row: any failure here leaves the draft untouched.
+        let singles = self.version_page_packages(&ver)?;
+        if singles.len() != cur.len() {
+            return Err("草稿页面组包数量不一致，无法调整页序".into());
+        }
+        let ordered: Vec<Package> = perm.iter().map(|&old| singles[old].clone()).collect();
+        let frag = crate::pptx::reassemble(&ordered)?;
+        let hash = self.file_put(&frag.to_bytes()?)?;
+        let pages: Vec<PageInfo> = perm.iter().map(|&old| ver.pages[old].clone()).collect();
+        let scripts: Vec<String> = perm
+            .iter()
+            .map(|&old| ver.scripts.get(old).cloned().unwrap_or_default())
+            .collect();
+        // text_all is the pages' search concatenation: rebuild
+        // it in the new order when every page's text re-reads
+        // cleanly; a page that cannot be re-read keeps the
+        // stored concatenation (search matching is
+        // order-insensitive) rather than failing the reorder.
+        let text_all = ordered
+            .iter()
+            .map(|pkg| -> Option<String> {
+                let slide = crate::pptx::slides(pkg).ok()?.into_iter().next()?;
+                let xml = pkg.get_text(&slide.part).ok()?;
+                Some(crate::text::slide_full_text(&xml))
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(|texts| texts.join("\n"));
+        let pages_json = serde_json::to_string(&pages).unwrap_or_default();
+        let scripts_json = serde_json::to_string(&scripts).unwrap_or_default();
+        match text_all {
+            Some(text_all) => {
+                self.conn
+                    .execute(
+                        "UPDATE versions SET pages_json=?2, scripts_json=?3, fragment_hash=?4, text_all=?5 WHERE id=?1",
+                        params![version_id, pages_json, scripts_json, hash, text_all],
+                    )
+                    .map_err(db_err)?;
+            }
+            None => {
+                self.conn
+                    .execute(
+                        "UPDATE versions SET pages_json=?2, scripts_json=?3, fragment_hash=?4 WHERE id=?1",
+                        params![version_id, pages_json, scripts_json, hash],
+                    )
+                    .map_err(db_err)?;
+            }
+        }
+        // Binding slots that address this draft's pages follow
+        // the same permutation; their page-id columns already
+        // name the pages and do not change. Stale slots outside
+        // the draft's range are left as they lie.
+        let rend = self.get_rendition(&ver.rendition_id)?;
+        let mut new_pos_of = vec![0usize; perm.len()];
+        for (new, old) in perm.iter().enumerate() {
+            new_pos_of[*old] = new;
+        }
+        for b in self.list_page_bindings(&rend.unit_id)? {
+            let remap = |slot: i64, hit: bool| -> i64 {
+                if hit && slot >= 0 && (slot as usize) < new_pos_of.len() {
+                    new_pos_of[slot as usize] as i64
+                } else {
+                    slot
+                }
+            };
+            let from_slot = remap(b.from_slot, b.from_version_id == version_id);
+            let to_slot = remap(b.to_slot, b.to_version_id == version_id);
+            if from_slot != b.from_slot || to_slot != b.to_slot {
+                self.conn
+                    .execute(
+                        "UPDATE page_bindings SET from_slot=?2, to_slot=?3 WHERE id=?1",
+                        params![b.id, from_slot, to_slot],
+                    )
+                    .map_err(db_err)?;
+            }
+        }
+        self.get_version(version_id)
     }
 
     pub fn get_version(&self, id: &str) -> SResult<VersionRec> {
@@ -5983,6 +6242,159 @@ impl Store {
     /// a section (or a caller-supplied block) absorbs, and of
     /// pages no block covers. Page ENTITIES are not touched: a
     /// page outlives every wrapper that referenced it.
+    /// Merge a single-page unit into another unit's draft
+    /// (content-wall card drag onto a card, user ruling
+    /// 2026-11-25): the source's one page is appended to the END
+    /// of the target lead rendition's working page sequence, and
+    /// the source unit then dissolves — permanently, NOT through
+    /// the trash. What moves is the reference layer: the page
+    /// entity stays in the page store untouched, exactly like an
+    /// import fold absorbing its wrapper units. The write stays
+    /// inside the version system: when the target's working
+    /// version is a draft, the page is appended to that draft
+    /// row itself (a draft is unpublished work — the in-place
+    /// field updates `set_version_scripts` and
+    /// `set_version_fragment_hash` are the precedent); when the
+    /// working version is published, a NEW draft version (next
+    /// minor number, status draft) is born carrying the extended
+    /// sequence and the published version is never touched. A
+    /// fresh draft also sorts first in the history list (highest
+    /// number), ahead of the numbered versions newest-to-oldest.
+    /// Guards, all checked before any write: the source must be
+    /// a different unit whose lead working version holds exactly
+    /// one already-split, entity-backed page; the target's
+    /// working version must be fully entity-backed; and the
+    /// source passes `delete_unit_permanent`'s publish-pin guard
+    /// up front, so a merge can never half-land (page appended,
+    /// source stuck) on a pinned source.
+    pub fn merge_unit_page_into(
+        &self,
+        target_id: &str,
+        source_id: &str,
+        author: &str,
+    ) -> SResult<VersionRec> {
+        if target_id == source_id {
+            return Err("不能把内容块并入它自己".into());
+        }
+        // --- source: one split page, entity-backed ---
+        let src_unit = self.get_unit(source_id)?;
+        let src_rends = self.list_renditions(&src_unit.id)?;
+        let src_rend = src_rends.first().ok_or("源内容块暂无版本")?;
+        let src_ver = self
+            .latest_version(&src_rend.id)?
+            .ok_or("源内容块暂无版本")?;
+        if src_ver.pages.len() != 1 {
+            return Err("只能把单页内容块并入其他内容块".into());
+        }
+        if src_ver.fragment_hash.is_empty() {
+            return Err("源内容块尚未拆分完成，不能并入".into());
+        }
+        let src_page = src_ver.pages[0].clone();
+        if src_page.id.is_empty() || self.get_page(&src_page.id)?.is_none() {
+            return Err("源页面尚未实体化，不能并入".into());
+        }
+        // Publish-pin guard, up front (`delete_unit_permanent`
+        // re-checks it at the dissolve step; the store's callers
+        // are serialized, so the verdict cannot move between the
+        // two reads).
+        let pinned_live: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM showroom_pins p JOIN showroom s ON s.id = p.showroom_id JOIN versions v ON v.id = p.version_id JOIN renditions r ON r.id = v.rendition_id WHERE r.unit_id = ?1 AND s.state = 'live'",
+                params![source_id],
+                |r| r.get(0),
+            )
+            .map_err(db_err)?;
+        if pinned_live > 0 {
+            return Err(
+                "该内容块的版本正被演示厅条目钉为正式版，不能并入；请先更新该条目的演示推送或将其下架"
+                    .into(),
+            );
+        }
+        // --- target: working version, entity-backed pages ---
+        let tgt_unit = self.get_unit(target_id)?;
+        let tgt_rends = self.list_renditions(&tgt_unit.id)?;
+        let tgt_rend = tgt_rends.first().ok_or("目标内容块暂无版本")?;
+        let working = self
+            .latest_version(&tgt_rend.id)?
+            .ok_or("目标内容块暂无版本")?;
+        if working.fragment_hash.is_empty() {
+            return Err("目标内容块尚未拆分完成，不能并入".into());
+        }
+        if working.pages.iter().any(|p| p.id.is_empty()) {
+            return Err("目标内容块含未实体化的页面，不能并入".into());
+        }
+        // --- build the extended sequence ---
+        let mut pages: Vec<PageInfo> = working.pages.clone();
+        pages.push(src_page);
+        let mut scripts: Vec<String> = working.scripts.clone();
+        scripts.resize(working.pages.len(), String::new());
+        scripts.push(src_ver.scripts.first().cloned().unwrap_or_default());
+        // Fragment + per-page texts from the page packages (the
+        // import fold's assembly, generalized): the working
+        // version's packages in reference order, then the source
+        // page's own. Per-page texts feed only the search index
+        // (`text_all`); scripts come from the stored rows above
+        // so hand-edited scripts survive.
+        let mut pkgs = self.version_page_packages(&working)?;
+        if pkgs.len() != working.pages.len() {
+            return Err("目标内容块的页面组包不完整，不能并入".into());
+        }
+        let src_pkgs = self.version_page_packages(&src_ver)?;
+        if src_pkgs.len() != 1 {
+            return Err("源页面的组包不完整，不能并入".into());
+        }
+        pkgs.extend(src_pkgs);
+        let mut texts: Vec<String> = Vec::with_capacity(pkgs.len());
+        for pkg in &pkgs {
+            let slide_refs = crate::pptx::slides(pkg)?;
+            let first = slide_refs.first().ok_or("页面组包缺少幻灯片")?;
+            let xml = pkg.get_text(&first.part)?;
+            texts.push(slide_full_text(&xml));
+        }
+        let frag = crate::assemble::assemble(&pkgs)?;
+        let frag_bytes = frag.to_bytes()?;
+        // --- land it in the draft layer ---
+        let draft = if working.status == "draft" {
+            let hash = self.file_put(&frag_bytes)?;
+            let n = self
+                .conn
+                .execute(
+                    "UPDATE versions SET fragment_hash=?2, page_count=?3, pages_json=?4, text_all=?5, scripts_json=?6 WHERE id=?1 AND status='draft'",
+                    params![
+                        working.id,
+                        hash,
+                        pages.len() as i64,
+                        serde_json::to_string(&pages).unwrap_or_default(),
+                        texts.join("\n"),
+                        serde_json::to_string(&scripts).unwrap_or_default()
+                    ],
+                )
+                .map_err(db_err)?;
+            if n == 0 {
+                return Err("目标草稿状态已变化，请重试".into());
+            }
+            self.get_version(&working.id)?
+        } else {
+            let next = SemVer::parse(&working.semver)?.bumped(crate::semver::Increment::Minor);
+            self.insert_version_from_pages(
+                &tgt_rend.id,
+                next,
+                tgt_unit.current_revision,
+                author,
+                "并入页面",
+                "draft",
+                &pages,
+                &texts,
+                &scripts,
+                Some(&frag_bytes),
+            )?
+        };
+        // --- dissolve the source (its page entity stays) ---
+        self.delete_unit_permanent(source_id)?;
+        Ok(draft)
+    }
+
     pub fn delete_unit_permanent(&self, unit_id: &str) -> SResult<()> {
         // Same publish-pin guard as delete_version (pin audit
         // N1): permanently deleting a unit whose version a live

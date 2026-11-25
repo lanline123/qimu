@@ -267,6 +267,10 @@ enum DetailAct {
     },
     PublishDraft(String),
     DropVersion(String),
+    ReorderPages {
+        version_id: String,
+        page_ids: Vec<String>,
+    },
 }
 
 impl App {
@@ -366,6 +370,25 @@ impl App {
                         self.changed(Change::Units);
                     }
                     Err(e) => self.msg = format!("放弃草稿失败：{e}"),
+                }
+            }
+            DetailAct::ReorderPages {
+                version_id,
+                page_ids,
+            } => {
+                match self.call_work(
+                    "POST",
+                    &format!("/v1/versions/{version_id}/reorder-pages"),
+                    Some(json!({ "page_ids": page_ids })),
+                ) {
+                    Ok(_) => {
+                        self.msg = "草稿页序已更新".into();
+                        self.reload_unit_detail(unit_id);
+                        // The wall card's cover follows the
+                        // draft's first page.
+                        self.changed(Change::Units);
+                    }
+                    Err(e) => self.msg = format!("调整页序失败：{e}"),
                 }
             }
         }
@@ -620,6 +643,35 @@ impl App {
         });
         ui.add_space(6.0);
         let picking = st.bind_pick.is_some();
+        // Draft page drag (user ruling 2026-11-25): only a shown
+        // DRAFT's wall is draggable — a published version's page
+        // sequence is frozen — and only when every page carries
+        // its entity id, since the reorder write addresses pages
+        // by id (core refuses an id-less draft by name). The
+        // per-slot rects are collected during the wall's draw
+        // below and resolved afterwards, the N4 showroom wall's
+        // pattern.
+        let draggable = !picking
+            && s(&shown.version, "status") == "draft"
+            && page_count >= 2
+            && shown
+                .version
+                .get("pages")
+                .and_then(Value::as_array)
+                .is_some_and(|pages| {
+                    pages.len() == page_count
+                        && pages.iter().all(|p| !s(p, "id").is_empty())
+                });
+        let mut thumb_rects: Vec<(usize, egui::Rect)> = Vec::new();
+        let mut cell_rects: Vec<(usize, egui::Rect)> = Vec::new();
+        if draggable {
+            ui.label(
+                egui::RichText::new("草稿 · 拖动页卡可调整页序")
+                    .size(11.5)
+                    .color(palette_color(TEXT_FAINT)),
+            );
+            ui.add_space(2.0);
+        }
         let saved_spacing = ui.spacing().item_spacing;
         ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
         let avail = ui.available_width();
@@ -643,6 +695,7 @@ impl App {
                                 inner_w,
                                 st.selected_page == Some(slot),
                             );
+                            thumb_rects.push((slot, response.rect));
                             if picking {
                                 if response.clicked() {
                                     if let Some(pick) = st.bind_pick.clone() {
@@ -657,10 +710,13 @@ impl App {
                                     }
                                 }
                             } else {
-                                if response.clicked() {
+                                // While a page drag is armed the
+                                // release belongs to the drop, not
+                                // to the click (N4's rule).
+                                if response.clicked() && st.page_drag.is_none() {
                                     st.selected_page = Some(slot);
                                 }
-                                if response.double_clicked() {
+                                if response.double_clicked() && st.page_drag.is_none() {
                                     self.open_light(st, &shown.version, slot);
                                 }
                             }
@@ -692,6 +748,7 @@ impl App {
                             ui.add_space(10.0);
                         });
                     });
+                cell_rects.push((slot, frame_resp.response.rect));
                 if picking {
                     // .thumb-grid.picking: a 2px dashed accent
                     // outline per cell — egui strokes have no
@@ -707,6 +764,128 @@ impl App {
             }
         });
         ui.spacing_mut().item_spacing = saved_spacing;
+        // Draft page drag resolution (the N4 showroom wall's
+        // raw-pointer pattern): the press is tracked against the
+        // THUMB rects — a press on the bind bar below a thumb
+        // never arms a drag — movement past the threshold arms
+        // it, the seam paints at the target CELL, the dragged
+        // page's thumb floats with the pointer, and the drop
+        // persists straight into the draft via DetailAct (there
+        // is no working-order state to save later; the reload
+        // after the write is what proves the stored order).
+        // Escape cancels. Non-draft walls never enter this block.
+        if draggable {
+            let pointer = ui.input(|i| i.pointer.interact_pos());
+            let primary_down = ui.input(|i| i.pointer.primary_down());
+            let primary_released = ui.input(|i| i.pointer.primary_released());
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                st.page_press = None;
+                st.page_drag = None;
+            }
+            if let Some(pos) = pointer {
+                if primary_down && st.page_drag.is_none() {
+                    if st.page_press.is_none() {
+                        if let Some((idx, _)) =
+                            thumb_rects.iter().find(|(_, r)| r.contains(pos))
+                        {
+                            st.page_press = Some((*idx, pos));
+                        }
+                    }
+                    if let Some((from, start)) = st.page_press {
+                        if start.distance(pos) > 8.0 {
+                            st.page_drag = Some(from);
+                        }
+                    }
+                }
+                if let Some(from) = st.page_drag {
+                    let target = deck_drag_target(&cell_rects, pos);
+                    let painter = ui.painter();
+                    // Insertion seam at the target cell's left
+                    // edge (or the last cell's right).
+                    if let Some((_, r)) = cell_rects.get(target) {
+                        let x = r.left() - 6.0;
+                        painter.line_segment(
+                            [egui::pos2(x, r.top()), egui::pos2(x, r.bottom())],
+                            egui::Stroke::new(2.5, ACCENT),
+                        );
+                    } else if let Some((_, r)) = cell_rects.last() {
+                        let x = r.right() + 6.0;
+                        painter.line_segment(
+                            [egui::pos2(x, r.top()), egui::pos2(x, r.bottom())],
+                            egui::Stroke::new(2.5, ACCENT),
+                        );
+                    }
+                    // The dragged page floats with the pointer.
+                    let ghost = egui::Rect::from_min_size(
+                        pos - egui::vec2(inner_w / 2.0, 10.0),
+                        egui::vec2(inner_w, inner_w * 9.0 / 16.0),
+                    );
+                    if let Some(tex) = self.thumb(&version_id, from) {
+                        painter.image(
+                            tex.id(),
+                            ghost,
+                            egui::Rect::from_min_max(
+                                egui::pos2(0.0, 0.0),
+                                egui::pos2(1.0, 1.0),
+                            ),
+                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 205),
+                        );
+                    } else {
+                        painter.rect_filled(ghost, 0.0, palette_color(HOVER_BG));
+                    }
+                    painter.rect_stroke(
+                        ghost,
+                        0.0,
+                        egui::Stroke::new(1.5, ACCENT),
+                        egui::StrokeKind::Middle,
+                    );
+                }
+                if primary_released {
+                    if let Some(from) = st.page_drag.take() {
+                        let target = deck_drag_target(&cell_rects, pos);
+                        // Move semantics mirror deck_move_page:
+                        // the seam indexes the pre-move sequence.
+                        let mut order: Vec<usize> = (0..page_count).collect();
+                        if from < order.len() {
+                            let moved = order.remove(from);
+                            let mut at = target;
+                            if at > from {
+                                at -= 1;
+                            }
+                            at = at.min(order.len());
+                            order.insert(at, moved);
+                            if order.iter().enumerate().any(|(n, o)| n != *o) {
+                                let pages = shown
+                                    .version
+                                    .get("pages")
+                                    .and_then(Value::as_array)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                let page_ids: Vec<String> = order
+                                    .iter()
+                                    .map(|&old| {
+                                        pages.get(old).map(|p| s(p, "id")).unwrap_or_default()
+                                    })
+                                    .collect();
+                                st.selected_page = Some(at);
+                                // The panel addresses pages of
+                                // the pre-reorder sequence; it
+                                // closes with the drop.
+                                st.bind_panel = None;
+                                acts.push(DetailAct::ReorderPages {
+                                    version_id: version_id.clone(),
+                                    page_ids,
+                                });
+                            }
+                        }
+                    }
+                    st.page_press = None;
+                }
+            } else if !primary_down {
+                st.page_press = None;
+                st.page_drag = None;
+            }
+        }
         // The bind panel renders directly after the wall
         // (prototype @2603 concatenation order).
         if !picking && st.bind_panel.is_some() {
@@ -1429,10 +1608,24 @@ impl App {
             let Some(versions) = row.get("versions").and_then(|v| v.as_array()) else {
                 continue;
             };
+            // Presentation order (user ruling 2026-11-25): the
+            // draft rides FIRST, ahead of every numbered version;
+            // numbered versions keep the payload order, which
+            // core's list_versions already sorts newest-first
+            // (semver DESC, then created_ms DESC). The partition
+            // is stable — several drafts keep their relative
+            // order, and recalled versions keep their semver
+            // place among the numbered. (The payload order alone
+            // could not promise this: a draft sits wherever its
+            // stored semver sorts, e.g. a translation draft's
+            // 1.0.0 under a rendition's 2.x line.)
+            let mut ordered: Vec<&Value> = Vec::with_capacity(versions.len());
+            ordered.extend(versions.iter().filter(|v| s(v, "status") == "draft"));
+            ordered.extend(versions.iter().filter(|v| s(v, "status") != "draft"));
             let saved_spacing = ui.spacing().item_spacing;
             ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
             ui.horizontal_wrapped(|ui| {
-                for v in versions {
+                for v in ordered {
                     let vid = s(v, "id");
                     let is_draft = s(v, "status") == "draft";
                     let is_recalled = s(v, "status") == "recalled";

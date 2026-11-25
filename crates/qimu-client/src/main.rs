@@ -1579,6 +1579,24 @@ struct WallState {
     /// zoom change rescales every font metric and invalidates
     /// the measurements.
     flow_metrics_ppp: f32,
+    /// Card rects of the current frame's folder flow, in
+    /// display order: (unit id, home folder — None for the
+    /// folder-less tail group, rect). Rebuilt by every
+    /// content_wall render; the card drag's seam / merge
+    /// resolution reads them after the scroll area, the way the
+    /// folder tree reads its row rects. Only real-built cards
+    /// appear — a virtualized spacer row has no rect and cannot
+    /// be a drop target.
+    card_rects: Vec<(String, Option<String>, egui::Rect)>,
+    /// Folder-block regions of the current frame's flow: (home
+    /// folder, region from the block's header top to its grid's
+    /// end). A drop inside a block but not on a card appends to
+    /// that block's folder.
+    block_rects: Vec<(Option<String>, egui::Rect)>,
+    /// Empty-folder placeholder rects of the current frame: an
+    /// append drop onto an empty folder paints its feedback
+    /// frame on the placeholder itself.
+    empty_rects: Vec<(Option<String>, egui::Rect)>,
 }
 
 /// Card count at which the content wall's folder flow switches
@@ -1711,6 +1729,12 @@ struct UnitState {
     /// reloads (reload mutates the frame in place).
     selected_version: Option<String>,
     selected_page: Option<usize>,
+    /// #101 draft wall page drag (mirrors DeckState's N4 fields):
+    /// the slot the pointer press started on and where it
+    /// started, and the slot being dragged once the press arms.
+    /// Only ever set while the shown version is a draft.
+    page_press: Option<(usize, egui::Pos2)>,
+    page_drag: Option<usize>,
     bind_pick: Option<PageBindingPick>,
     /// The #101 bind panel's open state (prototype bindPanel):
     /// which page of the shown version it serves, and the target
@@ -1743,6 +1767,8 @@ impl UnitState {
             selected_rendition: None,
             selected_version: None,
             selected_page: None,
+            page_press: None,
+            page_drag: None,
             bind_pick: None,
             bind_panel: None,
             meta_edit: None,
@@ -3605,6 +3631,9 @@ struct App {
     /// The folder row currently being pressed (long-press drag
     /// gate); see FolderPress.
     folder_press: Option<FolderPress>,
+    /// The content-wall card currently being pressed (long-press
+    /// card drag gate); see CardPress.
+    card_press: Option<CardPress>,
     /// Folder sync dialog (user ruling 2026-11-25): open flag,
     /// the server folder list fetched when the dialog opened,
     /// and the ids the user has ticked for pulling down. Sync is
@@ -4059,6 +4088,38 @@ struct FolderEdit {
 /// the folder being dragged (see `App::folder_tree`).
 #[derive(Clone)]
 struct FolderDrag(String);
+
+/// Drag-and-drop payload for the content wall's card drag: the
+/// unit ids being dragged, in display order (see
+/// `App::content_wall`). A separate payload type from
+/// FolderDrag, so the two drags can never read each other.
+#[derive(Clone)]
+struct CardDrag {
+    ids: Vec<String>,
+}
+
+/// One in-progress press on a content-wall card, tracked by
+/// `App::content_wall` — the folder tree's FolderPress pattern
+/// applied to cards (user ruling 2026-11-25): the press must
+/// rest for FOLDER_LONG_PRESS_SECS within
+/// FOLDER_PRESS_MOVE_TOLERANCE before the drag arms, so plain
+/// clicks and scroll starts never become drags. `ids` is the
+/// dragged set in display order — the deck bar's effective
+/// selection (multi when non-empty, else the single selection)
+/// when the pressed card belongs to it, the pressed card alone
+/// otherwise. `grab` is the pointer's offset from the pressed
+/// card's top-left corner, so the ghost keeps the same grip;
+/// `size` is the pressed card's size, which the ghost wears.
+#[derive(Clone)]
+struct CardPress {
+    ids: Vec<String>,
+    title: String,
+    since: f64,
+    origin: egui::Pos2,
+    grab: egui::Vec2,
+    size: egui::Vec2,
+    armed: bool,
+}
 
 /// A finished folder delete, posted by its worker thread:
 /// (generation, folder id, mode, result). See
@@ -4916,6 +4977,7 @@ impl App {
             folder_del_rx,
             folder_del_gen: 0,
             folder_press: None,
+            card_press: None,
             folder_sync_open: false,
             folder_sync_list: vec![],
             folder_sync_checked: std::collections::HashSet::new(),
@@ -17401,6 +17463,82 @@ impl App {
     /// The maintenance wall (root frame body): the block card
     /// grid (plus the deep-jump back link when arriving from Home).
     fn content_wall(&mut self, ui: &mut egui::Ui, w: &mut WallState) {
+        // Card drag long-press gate (user ruling 2026-11-25):
+        // the folder tree's gate in the same shape — a press on
+        // a card arms only after it has rested
+        // FOLDER_LONG_PRESS_SECS within
+        // FOLDER_PRESS_MOVE_TOLERANCE; until then the card is a
+        // plain click target and the wall scrolls exactly as
+        // before. The press itself is created in flow_unit_card;
+        // the drop is resolved after the render
+        // (card_drag_resolve), when every card rect is known.
+        enum CardPressStep {
+            Keep,
+            Cancel,
+            Arm,
+        }
+        let step = match &self.card_press {
+            None => CardPressStep::Keep,
+            Some(press) => {
+                let (down, pos, now) = ui.input(|i| {
+                    (
+                        i.pointer.primary_down(),
+                        i.pointer.interact_pos().or_else(|| i.pointer.hover_pos()),
+                        i.time,
+                    )
+                });
+                if !down || press.armed {
+                    CardPressStep::Keep
+                } else if pos.map_or(false, |p| {
+                    p.distance(press.origin) > FOLDER_PRESS_MOVE_TOLERANCE
+                }) {
+                    // The gesture is a scroll, not a press.
+                    CardPressStep::Cancel
+                } else if now - press.since >= FOLDER_LONG_PRESS_SECS {
+                    CardPressStep::Arm
+                } else {
+                    CardPressStep::Keep
+                }
+            }
+        };
+        match step {
+            CardPressStep::Cancel => self.card_press = None,
+            CardPressStep::Arm => {
+                if let Some(press) = &mut self.card_press {
+                    press.armed = true;
+                    egui::DragAndDrop::set_payload(
+                        ui.ctx(),
+                        CardDrag {
+                            ids: press.ids.clone(),
+                        },
+                    );
+                }
+            }
+            CardPressStep::Keep => {}
+        }
+        if let Some(press) = &self.card_press {
+            if press.armed {
+                // Keep the payload warm every frame, the way
+                // dnd_drag_source does for its own drags.
+                egui::DragAndDrop::set_payload(
+                    ui.ctx(),
+                    CardDrag {
+                        ids: press.ids.clone(),
+                    },
+                );
+            }
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(30));
+        }
+        // Escape aborts a drag at the plugin level (the payload
+        // is cleared at pass start): mirror that in the press
+        // state so the ghost disappears too.
+        if matches!(&self.card_press, Some(p) if p.armed)
+            && egui::DragAndDrop::payload::<CardDrag>(ui.ctx()).is_none()
+            && ui.input(|i| i.pointer.primary_down())
+        {
+            self.card_press = None;
+        }
         body_frame().show(ui, |ui| {
             if self.pick.is_some() {
                 self.pick_bar(ui);
@@ -17541,6 +17679,12 @@ impl App {
                         w.flow_metrics = FlowMetrics::default();
                         w.flow_metrics_ppp = ui.ctx().pixels_per_point();
                     }
+                    // This frame's card geometry for the card
+                    // drag's drop resolution — filled by the
+                    // folder loop below, read after the render.
+                    w.card_rects.clear();
+                    w.block_rects.clear();
+                    w.empty_rects.clear();
                     let per_row_n = (per_row as usize).max(1);
                     let mut first_block = true;
                     for f in &ordered {
@@ -17555,6 +17699,10 @@ impl App {
                             ui.add_space(14.0);
                         }
                         first_block = false;
+                        // The block's drop region for the card
+                        // drag starts at its header (registered
+                        // after the block's grid, below).
+                        let block_top = ui.cursor().min.y;
                         let is_anchor =
                             do_scroll && want_anchor.as_deref() == Some(fid.as_str());
                         let editing_this =
@@ -17618,6 +17766,7 @@ impl App {
                                 egui::vec2(card_w, card_h),
                                 egui::Sense::hover(),
                             );
+                            w.empty_rects.push((Some(fid.clone()), rect));
                             ui.painter().rect_stroke(
                                 rect,
                                 6.0,
@@ -17718,6 +17867,7 @@ impl App {
                                 card_h,
                                 cover_h,
                                 per_row_n,
+                                Some(&fid),
                                 &my_name,
                                 band,
                                 is_anchor,
@@ -17730,9 +17880,17 @@ impl App {
                                 card_w,
                                 card_h,
                                 per_row_n,
+                                Some(&fid),
                                 &my_name,
                             );
                         }
+                        w.block_rects.push((
+                            Some(fid.clone()),
+                            egui::Rect::from_min_max(
+                                egui::pos2(clip.min.x, block_top),
+                                egui::pos2(clip.max.x, ui.cursor().min.y),
+                            ),
+                        ));
                         ui.add_space(12.0);
                     }
                     // Folder-less blocks (and blocks whose folder
@@ -17753,6 +17911,7 @@ impl App {
                         if !first_block {
                             ui.add_space(14.0);
                         }
+                        let root_top = ui.cursor().min.y;
                         if virt {
                             self.flow_grid_virtual(
                                 ui,
@@ -17762,6 +17921,7 @@ impl App {
                                 card_h,
                                 cover_h,
                                 per_row_n,
+                                None,
                                 &my_name,
                                 band,
                                 false,
@@ -17774,15 +17934,403 @@ impl App {
                                 card_w,
                                 card_h,
                                 per_row_n,
+                                None,
                                 &my_name,
                             );
                         }
+                        w.block_rects.push((
+                            None,
+                            egui::Rect::from_min_max(
+                                egui::pos2(clip.min.x, root_top),
+                                egui::pos2(clip.max.x, ui.cursor().min.y),
+                            ),
+                        ));
                     }
                     if do_scroll {
                         w.flow_anchor = Some(want_anchor);
                     }
                 });
+            // Card drag: resolve the drop against this frame's
+            // card geometry and paint the seam / ghost (see the
+            // gate at the top of this function). A drop on a
+            // sidebar folder has already been consumed by the
+            // folder tree, which renders before this panel and
+            // cleared the press.
+            self.card_drag_resolve(ui, w);
+            // The press watch ends with the gesture.
+            if !ui.input(|i| i.pointer.primary_down()) {
+                self.card_press = None;
+            }
         });
+    }
+
+    /// The page count of a unit's latest version, from the wall
+    /// payload (None when the unit is unknown or has no latest
+    /// version). The card drag reads it for the merge gate: a
+    /// source must be exactly one page, a target at least one.
+    fn unit_page_count(&self, uid: &str) -> Option<i64> {
+        let item = self.units.iter().find(|it| {
+            it.get("unit").and_then(|u| u.get("id")).and_then(|v| v.as_str())
+                == Some(uid)
+        })?;
+        let latest = item.get("renditions")?.as_array()?.first()?.get("latest")?;
+        if !latest.is_object() {
+            return None;
+        }
+        Some(i(latest, "page_count"))
+    }
+
+    /// The card drag's drop resolution, run after the wall's
+    /// render with this frame's card geometry — the folder
+    /// tree's post-loop shape. While the drag is armed it paints
+    /// the insertion seam (or the merge target's dashed frame)
+    /// and the ghost; on release it performs the drop. Sidebar
+    /// drops are consumed by the folder tree, which renders
+    /// before the wall, so a release over the sidebar never
+    /// reaches this code with a live press.
+    fn card_drag_resolve(&mut self, ui: &mut egui::Ui, w: &mut WallState) {
+        let Some(press) = self.card_press.clone() else {
+            return;
+        };
+        if !press.armed {
+            return;
+        }
+        let pos = ui.input(|i| i.pointer.interact_pos().or_else(|| i.pointer.hover_pos()));
+        let Some(pos) = pos else {
+            return;
+        };
+        let clip = ui.clip_rect();
+        if !clip.contains(pos) {
+            return;
+        }
+        // The drop target under the pointer: Seam(home folder,
+        // seat) — a seat of Some(id) inserts in front of that
+        // card, None appends to the folder's group — or a merge
+        // target card.
+        enum Drop {
+            Seam(Option<String>, Option<String>),
+            Merge(String),
+        }
+        let mut target: Option<Drop> = None;
+        if let Some((hid, hfolder, hrect)) = w
+            .card_rects
+            .iter()
+            .find(|(_, _, r)| r.contains(pos))
+            .map(|(id, f, r)| (id.clone(), f.clone(), *r))
+        {
+            // Merge eligibility (user ruling 2026-11-25): a
+            // lone, fully split single-page source dropped on a
+            // different, fully split target. Anything else — a
+            // multi-page source, a multi-select drag, an
+            // unsplit side — falls through to the plain seam,
+            // so a mistaken merge can never happen.
+            let merge_ok = press.ids.len() == 1
+                && press.ids[0] != hid
+                && self.unit_page_count(&press.ids[0]) == Some(1)
+                && !self.lazy_unit_page.contains_key(&hid)
+                && self.unit_page_count(&hid).is_some_and(|n| n >= 1);
+            let centre = egui::Rect::from_center_size(hrect.center(), hrect.size() * 0.5);
+            if merge_ok && centre.contains(pos) {
+                // ONTO feedback: the folder tree's dashed frame.
+                let r = hrect.shrink(0.5);
+                let stroke = egui::Stroke::new(1.0, palette_color(ACCENT));
+                let corners = [
+                    r.left_top(),
+                    r.right_top(),
+                    r.right_bottom(),
+                    r.left_bottom(),
+                    r.left_top(),
+                ];
+                for shape in egui::Shape::dashed_line(&corners, stroke, 5.0, 4.0) {
+                    ui.painter().add(shape);
+                }
+                target = Some(Drop::Merge(hid));
+            } else if pos.x < hrect.center().x {
+                target = Some(Drop::Seam(hfolder, Some(hid)));
+            } else {
+                // After the hovered card: seat in front of its
+                // successor in the same folder group, or at the
+                // group's end.
+                let next = w
+                    .card_rects
+                    .iter()
+                    .skip_while(|(id, _, _)| id != &hid)
+                    .nth(1)
+                    .filter(|(_, f, _)| *f == hfolder)
+                    .map(|(id, _, _)| id.clone());
+                target = Some(Drop::Seam(hfolder, next));
+            }
+        } else if let Some((bfolder, _)) = w
+            .block_rects
+            .iter()
+            .find(|(_, r)| r.contains(pos))
+            .map(|(f, r)| (f.clone(), *r))
+        {
+            // Inside a folder's block but not on a card:
+            // append to that block's folder.
+            target = Some(Drop::Seam(bfolder, None));
+        } else if !w.block_rects.is_empty() {
+            // Above the first block / below the last one: seat
+            // at the nearest block's edge.
+            let first = w.block_rects[0].clone();
+            let last = w.block_rects[w.block_rects.len() - 1].clone();
+            if pos.y < first.1.top() {
+                let before = w
+                    .card_rects
+                    .iter()
+                    .find(|(_, f, _)| *f == first.0)
+                    .map(|(id, _, _)| id.clone());
+                target = Some(Drop::Seam(first.0, before));
+            } else {
+                target = Some(Drop::Seam(last.0, None));
+            }
+        }
+        // Seam feedback, in the folder drag's language: a 2pt
+        // accent line in the gap at the seat.
+        if let Some(Drop::Seam(folder, before)) = &target {
+            let accent = egui::Stroke::new(2.0, palette_color(ACCENT));
+            match before {
+                Some(bid) => {
+                    if let Some((_, _, r)) = w.card_rects.iter().find(|(id, _, _)| id == bid) {
+                        let x = (r.left() - 6.0).max(clip.left() + 1.0);
+                        ui.painter().line_segment(
+                            [
+                                egui::pos2(x, r.top() + 2.0),
+                                egui::pos2(x, r.bottom() - 2.0),
+                            ],
+                            accent,
+                        );
+                    }
+                }
+                None => {
+                    // Append: after the folder's last card on
+                    // its row, under the last row when the row
+                    // is full, or the empty placeholder's frame
+                    // when the folder holds no cards.
+                    let last_in = w
+                        .card_rects
+                        .iter()
+                        .filter(|(_, f, _)| f == folder)
+                        .last()
+                        .map(|(id, f, r)| (id.clone(), f.clone(), *r));
+                    if let Some((_, _, r)) = last_in {
+                        if r.right() + 12.0 < clip.right() {
+                            let x = r.right() + 6.0;
+                            ui.painter().line_segment(
+                                [
+                                    egui::pos2(x, r.top() + 2.0),
+                                    egui::pos2(x, r.bottom() - 2.0),
+                                ],
+                                accent,
+                            );
+                        } else {
+                            let y = r.bottom() + 6.0;
+                            ui.painter().line_segment(
+                                [
+                                    egui::pos2(clip.left() + 4.0, y),
+                                    egui::pos2(clip.right() - 4.0, y),
+                                ],
+                                accent,
+                            );
+                        }
+                    } else if let Some((_, r)) =
+                        w.empty_rects.iter().find(|(f, _)| f == folder)
+                    {
+                        ui.painter().rect_stroke(
+                            *r,
+                            6.0,
+                            egui::Stroke::new(1.0, palette_color(ACCENT)),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                }
+            }
+        }
+        // The ghost, painted last so it floats over the wall —
+        // the folder ghost's language: transparent, accent
+        // outline and text only, wearing the pressed card's
+        // size and grip, clamped into the wall. A multi-card
+        // drag says how many cards are travelling.
+        let mut top_left = pos - press.grab;
+        top_left.x = top_left
+            .x
+            .clamp(clip.left(), (clip.right() - press.size.x).max(clip.left()));
+        top_left.y = top_left
+            .y
+            .clamp(clip.top(), (clip.bottom() - press.size.y).max(clip.top()));
+        let ghost = egui::Rect::from_min_size(top_left, press.size);
+        let painter = ui.painter();
+        painter.rect_stroke(
+            ghost,
+            6.0,
+            egui::Stroke::new(1.0, palette_color(ACCENT)),
+            egui::StrokeKind::Inside,
+        );
+        let font = egui::FontId::new(12.5, egui::FontFamily::Proportional);
+        let galley = painter.layout_no_wrap(
+            press.title.clone(),
+            font.clone(),
+            palette_color(ACCENT),
+        );
+        painter.galley(
+            ghost.min + egui::vec2(12.0, 10.0),
+            galley,
+            palette_color(ACCENT),
+        );
+        if press.ids.len() > 1 {
+            let galley = painter.layout_no_wrap(
+                format!("共 {} 张", press.ids.len()),
+                font,
+                palette_color(ACCENT),
+            );
+            painter.galley(
+                ghost.min + egui::vec2(12.0, 30.0),
+                galley,
+                palette_color(ACCENT),
+            );
+        }
+        // Perform the drop on release.
+        if ui.input(|i| i.pointer.any_released()) {
+            match target {
+                Some(Drop::Merge(tid)) => {
+                    let src = press.ids[0].clone();
+                    self.card_drag_merge(&src, &tid, w);
+                }
+                Some(Drop::Seam(folder, before)) => {
+                    self.card_drag_move(press.ids.clone(), folder, before);
+                }
+                None => {}
+            }
+        }
+    }
+
+    /// Perform a card drag's move: rehome the batch into
+    /// `folder` (None = the folder-less tail group) seated in
+    /// front of `before` (None = the group's end). Dropping the
+    /// batch in front of one of its own members, or exactly
+    /// where it already sits, is a quiet no-op — the folder
+    /// drag's caliber. Used by the wall's own resolution and by
+    /// the sidebar folder tree's card drop.
+    fn card_drag_move(
+        &mut self,
+        ids: Vec<String>,
+        folder: Option<String>,
+        before: Option<String>,
+    ) {
+        if let Some(b) = &before {
+            if ids.contains(b) {
+                return;
+            }
+        }
+        // Already exactly there? Only a same-folder drop can
+        // be: simulate it on the display order and compare.
+        let cur_folder = |id: &str| -> Option<String> {
+            let f = self
+                .units
+                .iter()
+                .find(|it| {
+                    it.get("unit").and_then(|u| u.get("id")).and_then(|v| v.as_str())
+                        == Some(id)
+                })
+                .map(|it| {
+                    it.get("unit")
+                        .and_then(|u| u.get("folder_id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                })
+                .unwrap_or_default();
+            if !f.is_empty() && self.folders.iter().any(|x| s(x, "id") == f) {
+                Some(f)
+            } else {
+                None
+            }
+        };
+        if ids.iter().all(|id| cur_folder(id) == folder) {
+            let order = self.wall_display_order();
+            let mut next: Vec<String> = order
+                .iter()
+                .filter(|id| !ids.contains(id))
+                .cloned()
+                .collect();
+            let at = match &before {
+                Some(b) => next.iter().position(|id| id == b).unwrap_or(next.len()),
+                None => {
+                    // The target group's end in display order:
+                    // just past its last remaining member.
+                    let mut end = next.len();
+                    for (idx, id) in next.iter().enumerate() {
+                        if cur_folder(id) == folder {
+                            end = idx + 1;
+                        }
+                    }
+                    end
+                }
+            };
+            for (k, id) in ids.iter().enumerate() {
+                next.insert(at + k, id.clone());
+            }
+            if next == order {
+                return;
+            }
+        }
+        if !self.need_identity_local("移动内容块") {
+            return;
+        }
+        match self.call_work(
+            "POST",
+            "/v1/units/move",
+            Some(json!({
+                "ids": ids,
+                "folder_id": folder,
+                "before_id": before,
+            })),
+        ) {
+            Ok(_) => {
+                self.msg = format!("已移动 {} 个内容块", ids.len());
+                self.changed(Change::Units);
+            }
+            Err(e) => self.msg = format!("移动失败：{e}"),
+        }
+    }
+
+    /// Perform a card drag's merge: append the source
+    /// single-page unit's page to the target's draft and
+    /// dissolve the source (see Store::merge_unit_page_into —
+    /// the source does NOT go to the trash; what merged was the
+    /// reference layer, and its page entity stays in the page
+    /// store).
+    fn card_drag_merge(&mut self, source: &str, target: &str, w: &mut WallState) {
+        if !self.need_identity_local("并入页面") {
+            return;
+        }
+        let target_name = self
+            .units
+            .iter()
+            .find(|it| {
+                it.get("unit").and_then(|u| u.get("id")).and_then(|v| v.as_str())
+                    == Some(target)
+            })
+            .map(|it| it.get("unit").map(|u| s(u, "name")).unwrap_or_default())
+            .unwrap_or_default();
+        match self.call_work(
+            "POST",
+            &format!("/v1/units/{target}/merge-page"),
+            Some(json!({ "source_id": source })),
+        ) {
+            Ok(_) => {
+                self.msg = format!("已并入《{target_name}》的草稿");
+                // The source unit is gone: prune it from the
+                // selection so the deck bar never counts a
+                // dissolved card.
+                w.multi.retain(|id| id != source);
+                if w.selected.as_deref() == Some(source) {
+                    w.selected = None;
+                }
+                self.changed(Change::Units);
+            }
+            Err(e) => self.msg = format!("并入失败：{e}"),
+        }
     }
 
     /// The folder-flow card grid on the plain (below-threshold)
@@ -17811,12 +18359,13 @@ impl App {
         card_w: f32,
         card_h: f32,
         per_row: usize,
+        folder: Option<&str>,
         my_name: &str,
     ) {
         for row in items.chunks(per_row.max(1)) {
             ui.horizontal(|ui| {
                 for item in row {
-                    self.flow_unit_card(ui, w, item, card_w, card_h, my_name);
+                    self.flow_unit_card(ui, w, item, card_w, card_h, folder, my_name);
                 }
             });
         }
@@ -17846,6 +18395,7 @@ impl App {
         card_h: f32,
         cover_h: f32,
         per_row: usize,
+        folder: Option<&str>,
         my_name: &str,
         band: egui::Rect,
         force_real: bool,
@@ -17895,7 +18445,7 @@ impl App {
             } else {
                 ui.horizontal(|ui| {
                     for item in row {
-                        self.flow_unit_card(ui, w, item, card_w, card_h, my_name);
+                        self.flow_unit_card(ui, w, item, card_w, card_h, folder, my_name);
                     }
                 });
             }
@@ -18105,6 +18655,7 @@ impl App {
         item: &Value,
         card_w: f32,
         card_h: f32,
+        folder: Option<&str>,
         my_name: &str,
     ) {
         let unit = item.get("unit").cloned().unwrap_or(json!({}));
@@ -18215,6 +18766,28 @@ impl App {
         let insert = matches!(self.pick, Some(PickState::Insert { .. }));
         w.flow_metrics.card_body[insert as usize][latest.is_object() as usize] =
             Some(outer.response.rect.height() - card_w * 9.0 / 16.0);
+        // Card drag bookkeeping: register this card's rect for
+        // the drop resolution after the render, and dim the
+        // dragged set's own slots the way the folder tree dims
+        // its lifted row (the ghost floats over the wall).
+        w.card_rects.push((
+            uid.clone(),
+            folder.map(|f| f.to_string()),
+            outer.response.rect,
+        ));
+        let drag_armed = matches!(&self.card_press, Some(p) if p.armed);
+        if drag_armed
+            && self
+                .card_press
+                .as_ref()
+                .is_some_and(|p| p.ids.iter().any(|id| id == &uid))
+        {
+            ui.painter().rect_filled(
+                outer.response.rect,
+                6.0,
+                palette_color(APP_BG).gamma_multiply(0.55),
+            );
+        }
         // Click handling rides on an explicit interact over
         // the card rect: allocate_ui's own response carries no
         // click sense, which is why double-click never fired
@@ -18236,7 +18809,66 @@ impl App {
         );
         let import_locked =
             self.importing.is_some() && self.import_open_units.iter().any(|u| u == &uid);
-        if let Some((pid, idx)) = &lazy_page {
+        // A fresh primary press on this card starts the card
+        // drag's long-press watch (the gate at content_wall's
+        // top arms it). Unsplit and import-locked cards never
+        // start one — their clicks are spoken for (boost / a
+        // toast) — and neither do cards while a pick is running
+        // or another press is already live.
+        if self.card_press.is_none()
+            && self.pick.is_none()
+            && !unsplit
+            && !import_locked
+            && ui.input(|i| {
+                i.pointer.primary_pressed()
+                    && i.pointer
+                        .interact_pos()
+                        .is_some_and(|p| outer.response.rect.contains(p))
+            })
+        {
+            let origin = ui
+                .input(|i| i.pointer.interact_pos())
+                .unwrap_or(outer.response.rect.center());
+            // The dragged set: the deck bar's effective
+            // selection when the pressed card belongs to it —
+            // `multi` when non-empty, else the single selection
+            // — re-ordered into display order; the pressed card
+            // alone otherwise. Unsplit members are dropped
+            // defensively (they cannot be dragged).
+            let effective: Vec<String> = if !w.multi.is_empty() {
+                w.multi.clone()
+            } else if let Some(sel) = &w.selected {
+                vec![sel.clone()]
+            } else {
+                Vec::new()
+            };
+            let mut ids: Vec<String> = if effective.iter().any(|id| id == &uid) {
+                self.wall_display_order()
+                    .into_iter()
+                    .filter(|id| effective.contains(id))
+                    .collect()
+            } else {
+                vec![uid.clone()]
+            };
+            ids.retain(|id| !self.lazy_unit_page.contains_key(id));
+            if !ids.is_empty() {
+                let now = ui.input(|i| i.time);
+                self.card_press = Some(CardPress {
+                    ids,
+                    title: title.clone(),
+                    since: now,
+                    origin,
+                    grab: origin - outer.response.rect.min,
+                    size: outer.response.rect.size(),
+                    armed: false,
+                });
+            }
+        }
+        if drag_armed {
+            // An armed drag owns this gesture: no select, no
+            // open — content_wall resolves the drop after the
+            // render.
+        } else if let Some((pid, idx)) = &lazy_page {
             // Unsplit page: any click only moves the page to the
             // front of the split queue (the user's one explicit
             // priority entry) and says so. No selection, no open.
@@ -19588,6 +20220,48 @@ impl App {
                         if ui.input(|i| i.pointer.any_released()) {
                             self.folder_drag_move(drag, parent, before);
                         }
+                    }
+                }
+            }
+        }
+        // Card drag-and-drop from the content wall (user ruling
+        // 2026-11-25): while a card drag is armed, hovering a
+        // folder row of the CONTENT tree marks it as the move
+        // target (the folder drag's dashed onto frame);
+        // releasing there files the dragged batch into that
+        // folder. Only the content tree takes part — the wall
+        // lives on the content board and its units can only home
+        // in content folders (the store's home gate would refuse
+        // any other scope anyway). The sidebar renders before
+        // the wall, so consuming the drop here (and clearing
+        // the press) keeps the wall from resolving it twice.
+        // The 全部 / 未分类 rows are not in row_rects and are not
+        // drop targets.
+        if scope == "content" {
+            let card_ids: Option<Vec<String>> =
+                egui::DragAndDrop::payload::<CardDrag>(ui.ctx()).map(|p| p.ids.clone());
+            let card_pos =
+                ui.input(|i| i.pointer.interact_pos().or_else(|| i.pointer.hover_pos()));
+            if let (Some(ids), Some(pos)) = (card_ids, card_pos) {
+                if let Some((tid, _, rect)) =
+                    row_rects.iter().find(|(_, _, r)| r.contains(pos))
+                {
+                    let (tid, rect) = (tid.clone(), *rect);
+                    let r = rect.shrink(0.5);
+                    let stroke = egui::Stroke::new(1.0, palette_color(ACCENT));
+                    let corners = [
+                        r.left_top(),
+                        r.right_top(),
+                        r.right_bottom(),
+                        r.left_bottom(),
+                        r.left_top(),
+                    ];
+                    for shape in egui::Shape::dashed_line(&corners, stroke, 5.0, 4.0) {
+                        ui.painter().add(shape);
+                    }
+                    if ui.input(|i| i.pointer.any_released()) {
+                        self.card_press = None;
+                        self.card_drag_move(ids, Some(tid), None);
                     }
                 }
             }

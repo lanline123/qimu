@@ -907,7 +907,9 @@ fn heavy_arm(method: &str, path: &str) -> bool {
             | ("POST", "/v1/import")
             | ("POST", "/v1/attachments")
             | ("GET", "/v1/trash")
-    ) || (method == "POST" && p.starts_with("/v1/versions/") && p.ends_with("/edit-pages"))
+    ) || (method == "POST"
+        && p.starts_with("/v1/versions/")
+        && (p.ends_with("/edit-pages") || p.ends_with("/reorder-pages")))
         || (method == "POST" && p.starts_with("/v1/folders/") && p.ends_with("/delete"))
         || (method == "POST" && p.starts_with("/v1/indexes/") && p.ends_with("/export"))
 }
@@ -1998,6 +2000,28 @@ impl LocalStore {
                     )?;
                     Ok(serde_json::to_value(&u).unwrap_or(Value::Null))
                 }
+                ("POST", ["v1", "units", "move"]) => {
+                    // Content-wall card drag-and-drop (server
+                    // `move_units` handler): rehome + reseat a
+                    // batch of units; order persists in the
+                    // units.sort renumber inside the store.
+                    let store = self.store.lock().unwrap();
+                    let ids: Vec<String> = body
+                        .get("ids")
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    store.move_units(
+                        &ids,
+                        opt_str_field(&body, "folder_id"),
+                        opt_str_field(&body, "before_id"),
+                    )?;
+                    Ok(json!({ "ok": true }))
+                }
                 ("GET", ["v1", "units", id]) => {
                     // A unit this library does not hold may be an
                     // organization unit (merged search hits, F7,
@@ -2035,6 +2059,20 @@ impl LocalStore {
                         str_field(&body, "description").as_deref(),
                     )?;
                     Ok(serde_json::to_value(&u).unwrap_or(Value::Null))
+                }
+                ("POST", ["v1", "units", id, "merge-page"]) => {
+                    // Card drag onto a card (server
+                    // `merge_unit_page` handler): append the
+                    // source single-page unit's page to this
+                    // unit's draft and dissolve the source. The
+                    // store runs every guard before any write.
+                    let store = self.store.lock().unwrap();
+                    let ver = store.merge_unit_page_into(
+                        id,
+                        &str_field(&body, "source_id").unwrap_or_default(),
+                        &self.owner.display_name,
+                    )?;
+                    Ok(json!({ "version": serde_json::to_value(&ver).unwrap_or(Value::Null) }))
                 }
                 ("POST", ["v1", "units", id, "publish"]) => {
                     let store = self.store.lock().unwrap();
@@ -2131,6 +2169,31 @@ impl LocalStore {
                     }
                     store.set_version_status(id, "normal")?;
                     Ok(json!({ "ok": true }))
+                }
+                ("POST", ["v1", "versions", id, "reorder-pages"]) => {
+                    // #101 draft wall drag reorder (server
+                    // reorder_version_pages): core rewrites the
+                    // draft's page order in place and refuses
+                    // non-drafts. Like the scripts arm, a version
+                    // this library does not hold falls through to
+                    // REST — the draft may live on the server.
+                    let store = self.store.lock().unwrap();
+                    if store.get_version(id).is_err() {
+                        return Err(UNHANDLED.to_string());
+                    }
+                    let page_ids: Vec<String> = body
+                        .get("page_ids")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .map(|x| x.as_str().unwrap_or("").to_string())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let ver = store.reorder_draft_pages(id, &page_ids)?;
+                    Ok(json!({
+                        "version": serde_json::to_value(&ver).unwrap_or(Value::Null),
+                    }))
                 }
                 ("POST", ["v1", "versions", id, "delete"]) => {
                     // #101 history card 「放弃」 on a draft (server
