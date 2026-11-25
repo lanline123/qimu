@@ -27,19 +27,11 @@ jobs:
         with:
           submodules: true
 
-      # craft-fonts (transplant T0): the client now links
-      # deckcraft-fonts in-process, and that crate's build script
-      # embeds the font set named by CRAFT_FONTS_DIR (latin +
-      # presentation + simplified-chinese manifests — the
-      # 2026-11-23 fonts ruling: Chinese + Latin only). Checked
-      # out here because it is not a submodule of this repo;
-      # pinned to the fork's current main — bump it alongside the
-      # other storytold pins.
-      - uses: actions/checkout@v4
-        with:
-          repository: lanline123/craft-fonts
-          ref: 26a79230872f9b2acd3dd68500677e294350ab94
-          path: vendor/craft-fonts
+      # 字体口径 (用户 2026-11-25 改定, 覆盖 2026-11-23 内嵌口径与
+      # transplant T0 字体门): 全走系统字体, 不再内嵌 craft-fonts。
+      # deckcraft-fonts 的 build.rs 在 CRAFT_FONTS_DIR 缺省时不嵌入
+      # 任何字体, 渲染走系统字体目录 (中文 Windows 自带雅黑/宋体)。
+      # 原 craft-fonts checkout 步骤与 CRAFT_FONTS_* 环境变量已撤下。
 
       - name: Install mingw + NSIS
         run: |
@@ -57,14 +49,6 @@ jobs:
           targets: x86_64-pc-windows-gnu
 
       - name: Build client only (staging profile, windows-gnu)
-        env:
-          # deckcraft-fonts embedding for the client's in-process
-          # renderer (transplant T0): REQUIRED turns a missing
-          # manifest into a build failure instead of silently
-          # shipping .notdef CJK. Only the client's graph links
-          # the fonts crate; server/cli are unaffected.
-          CRAFT_FONTS_DIR: ${{ github.workspace }}/vendor/craft-fonts
-          CRAFT_FONTS_REQUIRED: "1"
         run: cargo build --profile staging --target x86_64-pc-windows-gnu -p qimu-client -p qimu-cli
 
       # NOTE (ruling 2026-11-24): the client installer does NOT
