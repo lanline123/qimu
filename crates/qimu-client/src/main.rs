@@ -3161,6 +3161,18 @@ struct App {
     folder_edit: Option<FolderEdit>,
     folder_edit_focus: bool,
     folder_delete_confirm: Option<(String, String)>,
+    /// Folder delete in flight on its worker thread: (folder id,
+    /// mode). The delete never runs on the UI thread (see
+    /// folder_delete_window); this doubles as the single-flight
+    /// guard for the worker channel below.
+    folder_deleting: Option<(String, String)>,
+    folder_del_tx: std::sync::mpsc::Sender<FolderDeleteEvent>,
+    folder_del_rx: std::sync::mpsc::Receiver<FolderDeleteEvent>,
+    /// Generation of the current folder-delete context, same
+    /// discipline as translate_gen: bumped by every account
+    /// reset; a worker result from an older generation is
+    /// dropped, never applied.
+    folder_del_gen: u64,
     /// The folder row currently being pressed (long-press drag
     /// gate); see FolderPress.
     folder_press: Option<FolderPress>,
@@ -3589,6 +3601,12 @@ struct FolderEdit {
 /// the folder being dragged (see `App::folder_tree`).
 #[derive(Clone)]
 struct FolderDrag(String);
+
+/// A finished folder delete, posted by its worker thread:
+/// (generation, folder id, mode, result). See
+/// `App::folder_delete_window` for why the delete runs off the
+/// UI thread at all.
+type FolderDeleteEvent = (u64, String, String, Result<Value, String>);
 
 /// How long the pointer must rest on a folder row before the row
 /// becomes draggable (user ruling 2026-11-24: a plain press must
@@ -4309,6 +4327,7 @@ impl App {
         let (translate_tx, translate_rx) = std::sync::mpsc::channel();
         let (import_tx, import_rx) = std::sync::mpsc::channel();
         let (dc_tx, dc_rx) = std::sync::mpsc::channel();
+        let (folder_del_tx, folder_del_rx) = std::sync::mpsc::channel();
         let mut app = App {
             server: env_login_seed().0,
             current_server_name: String::new(),
@@ -4333,6 +4352,10 @@ impl App {
             folder_edit: None,
             folder_edit_focus: false,
             folder_delete_confirm: None,
+            folder_deleting: None,
+            folder_del_tx,
+            folder_del_rx,
+            folder_del_gen: 0,
             folder_press: None,
             page: match std::env::var("QIMU_PAGE").as_deref() {
                 Ok("showroom") => Page::Showroom,
@@ -5471,6 +5494,11 @@ impl App {
         // this context (audit H1).
         self.translating = None;
         self.translate_gen += 1;
+        // Same for an in-flight folder delete: in REST-fallback
+        // mode it runs against the previous context's server, so
+        // its result must not land here either.
+        self.folder_deleting = None;
+        self.folder_del_gen += 1;
         // The forced-change gate belongs to the identity that
         // raised it.
         self.must_change_pw = false;
@@ -8249,7 +8277,12 @@ impl App {
                 }
                 if matches!(&self.folder_edit, Some(e) if e.target.is_none() && e.parent.is_none())
                 {
-                    self.folder_edit_row(ui, 0.0);
+                    self.folder_edit_row(
+                        ui,
+                        0.0,
+                        ChromeIcon::Folder,
+                        palette_color(ICON_TINT),
+                    );
                     ui.add_space(2.0);
                 }
                 // Sidebar tree rows lead with an icon (prototype
@@ -8316,7 +8349,12 @@ impl App {
                     if idx == 0
                         && matches!(&self.folder_edit, Some(e) if e.target.is_none() && e.parent.is_none())
                     {
-                        self.folder_edit_row(ui, 0.0);
+                        self.folder_edit_row(
+                            ui,
+                            0.0,
+                            ChromeIcon::Folder,
+                            palette_color(ICON_TINT),
+                        );
                         ui.add_space(2.0);
                     }
                 }
@@ -9762,6 +9800,40 @@ impl eframe::App for App {
                     if manual {
                         self.msg = format!("检查更新失败：{e}");
                     }
+                }
+            }
+            ctx.request_repaint();
+        }
+        // Collect a finished folder delete (worker thread; the
+        // dialog closed the moment the user picked a mode — see
+        // folder_delete_window). Applies exactly what the old
+        // synchronous path applied on completion.
+        while let Ok((gen, id, mode, res)) = self.folder_del_rx.try_recv() {
+            if gen == self.folder_del_gen {
+                self.folder_deleting = None;
+                match res {
+                    Ok(_) => {
+                        self.msg = if mode == "trash" {
+                            "已删除文件夹，内容已移到回收站".into()
+                        } else {
+                            "已删除文件夹".into()
+                        };
+                        if self.content.folder_filter.as_deref() == Some(id.as_str()) {
+                            self.content.folder_filter = None;
+                        }
+                        if self.showroom.folder.as_deref() == Some(id.as_str()) {
+                            self.showroom.folder = None;
+                        }
+                        if self.index.overview_folder.as_deref() == Some(id.as_str()) {
+                            self.index.overview_folder = None;
+                        }
+                        // Contents moved (lift) or vanished into
+                        // the trash (trash): the cached unit /
+                        // index / showroom lists are stale either
+                        // way.
+                        self.refresh_all();
+                    }
+                    Err(e) => self.msg = format!("删除失败：{e}"),
                 }
             }
             ctx.request_repaint();
@@ -16642,7 +16714,7 @@ impl App {
         });
         // an inline editor for a NEW root folder sits right under 全部
         if matches!(&self.folder_edit, Some(e) if e.target.is_none() && e.parent.is_none()) {
-            self.folder_edit_row(ui, 0.0);
+            self.folder_edit_row(ui, 0.0, ChromeIcon::Folder, palette_color(ICON_TINT));
             ui.add_space(2.0);
         }
         // Index page only (uncat): 未分类, the home of every index
@@ -16760,7 +16832,22 @@ impl App {
             let editing_this =
                 matches!(&self.folder_edit, Some(e) if e.target.as_deref() == Some(fid.as_str()));
             if editing_this {
-                self.folder_edit_row(ui, d as f32 * 14.0);
+                // The editor row carries the same icon and tint
+                // the normal row (else branch) paints for this
+                // folder: selected = FolderOpen in accent, a
+                // custom folder color next, default tint last.
+                let esel = selected.as_deref() == Some(fid.as_str());
+                let eicon = if esel {
+                    ChromeIcon::FolderOpen
+                } else {
+                    ChromeIcon::Folder
+                };
+                let etint = if esel {
+                    palette_color(ACCENT)
+                } else {
+                    folder_color_of(f).unwrap_or_else(|| palette_color(ICON_TINT))
+                };
+                self.folder_edit_row(ui, d as f32 * 15.0, eicon, etint);
             } else {
                 let is_sel = selected.as_deref() == Some(fid.as_str());
                 let ficon = if is_sel {
@@ -16896,7 +16983,12 @@ impl App {
             // an inline editor for a NEW child of this folder
             if matches!(&self.folder_edit, Some(e) if e.target.is_none() && e.parent.as_deref() == Some(fid.as_str()))
             {
-                self.folder_edit_row(ui, (d + 1) as f32 * 14.0);
+                self.folder_edit_row(
+                    ui,
+                    (d + 1) as f32 * 15.0,
+                    ChromeIcon::Folder,
+                    palette_color(ICON_TINT),
+                );
                 ui.add_space(2.0);
             }
         }
@@ -17040,8 +17132,9 @@ impl App {
         // the row's own slot; its y is the slot's y plus the
         // pointer's vertical travel, clamped to the tree's
         // extent — it moves only up and down, inside the sidebar.
-        // The lift reads as a soft shadow under an accent-soft,
-        // accent-outlined copy of the row in its selected state.
+        // The lift is drawn transparent — accent outline, icon and
+        // name only — so the drop seam and the rows underneath
+        // stay visible through it (user report 2026-11-25).
         if let Some(press) = &self.folder_press {
             if press.armed {
                 let slot = row_rects
@@ -17063,13 +17156,13 @@ impl App {
                         slot.size(),
                     );
                     let painter = ui.painter();
-                    painter.rect_filled(
-                        ghost.translate(egui::vec2(0.0, 3.0)),
-                        6.0,
-                        egui::Color32::from_black_alpha(90),
-                    );
-                    painter.rect_filled(ghost, 6.0, palette_color(APP_BG));
-                    painter.rect_filled(ghost, 6.0, palette_color(SEL_BG));
+                    // No plate under the ghost (user report
+                    // 2026-11-25): this used to stack a drop
+                    // shadow and an opaque APP_BG fill (SEL_BG
+                    // tint on top), which hid the insertion seam
+                    // and the rows below while dragging. Only the
+                    // outline, icon and name are painted now, all
+                    // in accent, exactly as before.
                     painter.rect_stroke(
                         ghost,
                         6.0,
@@ -17140,22 +17233,50 @@ impl App {
     }
 
     /// One inline folder-name editor row (rename or new folder).
-    fn folder_edit_row(&mut self, ui: &mut egui::Ui, indent: f32) {
+    /// Built exactly like a normal tree row (`tree_row_ex`): the
+    /// folder icon leads at the same offset under the same tint
+    /// rules and the text field starts where the label would, so
+    /// entering edit mode never makes the icon vanish (user
+    /// report 2026-11-25).
+    fn folder_edit_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        indent: f32,
+        icon: ChromeIcon,
+        icon_tint: egui::Color32,
+    ) {
         let mut commit = false;
         let mut cancel = false;
         ui.horizontal(|ui| {
-            ui.add_space(indent + 2.0);
+            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.add_space(10.0 + indent);
+            let (irect, _) =
+                ui.allocate_exact_size(egui::vec2(15.0, 15.0), egui::Sense::empty());
+            icon.image(15.0, icon_tint).paint_at(ui, irect);
+            ui.add_space(6.0);
             if let Some(edit) = &mut self.folder_edit {
-                let resp = ui.add_sized([190.0, 30.0], egui::TextEdit::singleline(&mut edit.text));
+                let w = ui.available_width().min(190.0).max(60.0);
+                let resp =
+                    ui.add_sized([w, 30.0], egui::TextEdit::singleline(&mut edit.text));
                 if self.folder_edit_focus {
                     resp.request_focus();
                     self.folder_edit_focus = false;
                 }
-                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    commit = true;
-                }
+                // Ending the edit (user report 2026-11-25): Enter
+                // commits, clicking anywhere else commits too, Esc
+                // cancels — every path clears `folder_edit` so the
+                // row snaps back to its normal rendering. The old
+                // code committed ONLY on lost_focus+Enter, so a
+                // plain click-away left the editor open forever:
+                // the row stayed in editor form (no icon, no
+                // normal styling) until some later Enter happened
+                // by. Esc is checked first because egui also
+                // surrenders the TextEdit's focus on Escape, and
+                // that blur must not be misread as a commit.
                 if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                     cancel = true;
+                } else if resp.lost_focus() {
+                    commit = true;
                 }
             }
         });
@@ -18902,35 +19023,54 @@ impl App {
                 });
             });
         if let Some(mode) = mode {
-            match self.call_work(
-                "POST",
-                &format!("/v1/folders/{id}/delete"),
-                Some(json!({ "mode": mode })),
-            ) {
-                Ok(_) => {
-                    self.msg = if mode == "trash" {
-                        "已删除文件夹，内容已移到回收站".into()
-                    } else {
-                        "已删除文件夹".into()
-                    };
-                    if self.content.folder_filter.as_deref() == Some(id.as_str()) {
-                        self.content.folder_filter = None;
+            // Picking a mode closes the dialog IMMEDIATELY and the
+            // delete runs on a worker thread (freeze fix,
+            // 2026-11-25): this used to call call_work
+            // synchronously right here, with the dialog held open
+            // until it returned. In "trash" mode the work scales
+            // with the subtree — per-folder content queries,
+            // per-index showroom scans, one trash insert per
+            // object — and in REST-fallback mode it is a network
+            // call on the REST agent's 120s read timeout, so a
+            // big folder (or a wedged server) parked the UI
+            // thread inside the click, dialog frozen on screen,
+            // indistinguishable from a hang. "lift" is four SQL
+            // statements, which is why it never showed the
+            // symptom. The worker posts its result to
+            // folder_del_rx; the per-frame drain applies the same
+            // message / filter clearing / refresh the synchronous
+            // path did. Semantics are unchanged: same route, same
+            // body, same core operation with its guards.
+            self.folder_delete_confirm = None;
+            if self.folder_deleting.is_some() {
+                self.msg = "正在删除文件夹，请稍候".into();
+            } else {
+                self.folder_deleting = Some((id.clone(), mode.to_string()));
+                let gen = self.folder_del_gen;
+                let local = self.local.clone();
+                let server = self.server.clone();
+                let token = self.token.clone();
+                let tx = self.folder_del_tx.clone();
+                let wake = self.egui_ctx.clone();
+                let path = format!("/v1/folders/{id}/delete");
+                let body = json!({ "mode": mode });
+                std::thread::spawn(move || {
+                    let res = work_call_thread(
+                        &local,
+                        &server,
+                        token.as_deref(),
+                        "POST",
+                        &path,
+                        Some(body),
+                    );
+                    let _ = tx.send((gen, id, mode.to_string(), res));
+                    if let Some(ctx) = &wake {
+                        ctx.request_repaint();
                     }
-                    if self.showroom.folder.as_deref() == Some(id.as_str()) {
-                        self.showroom.folder = None;
-                    }
-                    if self.index.overview_folder.as_deref() == Some(id.as_str()) {
-                        self.index.overview_folder = None;
-                    }
-                    // Contents moved (lift) or vanished into the
-                    // trash (trash): the cached unit / index /
-                    // showroom lists are stale either way.
-                    self.refresh_all();
-                }
-                Err(e) => self.msg = format!("删除失败：{e}"),
+                });
             }
         }
-        if mode.is_some() || cancel || !open {
+        if cancel || !open {
             self.folder_delete_confirm = None;
         }
     }
