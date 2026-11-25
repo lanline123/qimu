@@ -2320,7 +2320,7 @@ fn version_unit(
 }
 
 #[derive(Deserialize)]
-struct NoteReq {
+struct PublishNoteReq {
     note: Option<String>,
 }
 
@@ -2352,7 +2352,7 @@ async fn publish_working(
     State(st): State<St>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    body: Option<Json<NoteReq>>,
+    body: Option<Json<PublishNoteReq>>,
 ) -> Api<Value> {
     let user = auth(&st, &headers)?;
     let unit = {
