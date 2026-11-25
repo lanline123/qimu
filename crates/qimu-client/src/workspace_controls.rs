@@ -105,7 +105,7 @@ pub(super) struct WorkspaceControls {
     search_hits: Vec<(String, SearchTarget)>,
     search_error: Option<String>,
     messages: VecDeque<WorkspaceMessage>,
-    unread: usize,
+    pub(super) unread: usize,
     server_menu: ServerMenu,
     account_menu: AccountMenu,
 }
