@@ -50,10 +50,10 @@ FunctionEnd
 Section "启幕服务器" SEC_SERVER
   SectionIn RO
   SetOutPath "$INSTDIR"
-  ; X13: 服务器开着 (开机自启) 时装新版, 锁住的 exe 走重启替换
-  File /REBOOTOK "win/qimu-server.exe"
+  ; X13(修订): 同客户端脚本, File 不接受 /REBOOTOK, 撤下待标准写法验证
+  File "win/qimu-server.exe"
   File "win/qimu.ico"
-  File /REBOOTOK "win/deckcraft-cli.exe"
+  File "win/deckcraft-cli.exe"
   ; 数据目录预建: 服务器 exe 同目录有 qimu-data 时优先用它
   CreateDirectory "$INSTDIR\qimu-data"
   CreateDirectory "$SMPROGRAMS\启幕"

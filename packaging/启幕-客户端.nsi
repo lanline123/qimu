@@ -53,9 +53,11 @@ FunctionEnd
 Section "启幕客户端" SEC_CLIENT
   SectionIn RO
   SetOutPath "$INSTDIR"
-  ; X13: 程序开着时装新版, 锁住的 exe 走重启替换而不是留混合版本
-  File /REBOOTOK "win/qimu-client.exe"
-  File /REBOOTOK "win/qimu.exe"
+  ; X13(修订): File 指令不接受 /REBOOTOK (makensis 会把它当文件名,
+  ; 2026-11-25 构建实证), 锁住 exe 的重启替换本轮撤下, 待用
+  ; File→临时名 + Rename /REBOOTOK 的标准写法单独验证后再上
+  File "win/qimu-client.exe"
+  File "win/qimu.exe"
   ; X8: 清理旧捆绑包遗留的 deckcraft.exe —— 它会遮蔽用户另行安装的
   ; DeckCraft (客户端按 exe 同级优先解析), 本包早已不再捆绑它
   Delete "$INSTDIR\deckcraft.exe"
