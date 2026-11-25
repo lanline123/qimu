@@ -40,7 +40,11 @@ use std::sync::Mutex;
 /// probed and the fullest one is relocated (copied, then verified)
 /// into the standard directory, so an upgrade no longer opens onto
 /// a blank library while the user's data sits in an old install
-/// dir. The whole resolution runs once per process.
+/// dir. The configured roots (bootstrap, legacy setting) carry the
+/// same floor: one that reads *empty* runs the same discovery
+/// before it is adopted, so a configured-but-empty library can
+/// never silently short-circuit the scan (2026-11-25 rescan line).
+/// The whole resolution runs once per process.
 pub fn library_dir() -> PathBuf {
     library_resolution().dir
 }
@@ -115,6 +119,19 @@ pub struct Bootstrap {
     /// library resolution and surfaced (then cleared) by the app
     /// so a failed or cancelled move is never silent.
     pub relocate_notice: Option<String>,
+    /// The client version that last completed library resolution
+    /// (2026-11-25 rescan line): a stamp that differs from the
+    /// running build marks this launch as the first after an
+    /// upgrade/reinstall. The stamp only *records* that fact —
+    /// the discovery floor in `resolve_library` runs on every
+    /// launch (its cost is one probe of the configured directory,
+    /// plus candidate probes only when that directory reads
+    /// empty), so an empty configured library can never silently
+    /// short-circuit discovery the way it could before this
+    /// field existed; the stamp never drives a relocation by
+    /// itself (a relocation still requires the resolved library
+    /// to be empty and a candidate to hold content).
+    pub app_version: Option<String>,
 }
 
 impl Bootstrap {
@@ -157,6 +174,10 @@ pub fn read_bootstrap() -> Bootstrap {
             .get("relocate_notice")
             .and_then(|x| x.as_str())
             .map(|s| s.to_string()),
+        app_version: v
+            .get("app_version")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
     }
 }
 
@@ -185,6 +206,9 @@ pub fn write_bootstrap(b: &Bootstrap) {
     }
     if let Some(n) = &b.relocate_notice {
         obj.insert("relocate_notice".to_string(), json!(n));
+    }
+    if let Some(v) = &b.app_version {
+        obj.insert("app_version".to_string(), json!(v));
     }
     let dir = crate::qimu_home();
     let _ = std::fs::create_dir_all(&dir);
@@ -401,11 +425,14 @@ pub fn relocate_library(
 /// `D:\Program Files\启幕客户端`), `启幕.nsi`
 /// (`$PROGRAMFILES64\启幕` / `D:\Program Files\启幕`),
 /// `启幕-服务器.nsi` (`$PROGRAMFILES64\启幕服务器` /
-/// `D:\Program Files\启幕服务器`). The standard directory itself is
-/// excluded (it is the relocation target, not a candidate). Note
-/// `D:\Qimu` is deliberately absent: that root belongs to the
-/// offline *cache* (`platform_cache_default`), no version ever
-/// rooted the library there.
+/// `D:\Program Files\启幕服务器`), plus the install roots the
+/// three scripts recorded in the registry (`InstallDir`), which
+/// cover custom install paths the fixed list cannot know. The
+/// standard directory itself is excluded (it is the relocation
+/// target, not a candidate). Note `D:\Qimu` is deliberately
+/// absent: that root belongs to the offline *cache*
+/// (`platform_cache_default`), no version ever rooted the
+/// library there.
 pub fn candidate_library_dirs() -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     let mut push = |p: PathBuf| {
@@ -426,9 +453,67 @@ pub fn candidate_library_dirs() -> Vec<PathBuf> {
                 push(base.join(app).join("qimu-data"));
             }
         }
+        // Historical install roots the fixed list above cannot
+        // know: wherever an older installer actually put the app
+        // (a custom path chosen in the wizard). All three NSIS
+        // scripts record it as `InstallDir` under their HKLM key
+        // and their `.onInit` reads it back on upgrade — the
+        // client now reads the same keys for discovery, so a
+        // library left in a custom install dir is found too
+        // (2026-11-25 rescan line; before this, such a library
+        // was invisible to discovery no matter its content).
+        for root in registry_install_dirs() {
+            push(root.join("qimu-data"));
+        }
     }
     let standard = standard_library_dir();
     out.retain(|p| *p != standard);
+    out
+}
+
+/// Install roots recorded by the three NSIS packages
+/// (`HKLM\Software\QimuClient` / `Qimu` / `QimuServer`, value
+/// `InstallDir`). Read through `reg.exe` — the same
+/// standard-tool subprocess pattern `pid_alive` uses for
+/// tasklist; every failure (key absent, reg missing, unparsable
+/// output) reads as "no recorded root", never as an error.
+#[cfg(target_os = "windows")]
+fn registry_install_dirs() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for key in ["QimuClient", "Qimu", "QimuServer"] {
+        let mut cmd = std::process::Command::new("reg");
+        cmd.args([
+            "query",
+            &format!("HKLM\\Software\\{key}"),
+            "/v",
+            "InstallDir",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        let Ok(o) = cmd.output() else { continue };
+        if !o.status.success() {
+            continue;
+        }
+        // Output line shape: `    InstallDir    REG_SZ    D:\Apps\启幕`.
+        // Split on the type token rather than on columns of
+        // spaces (the path itself may contain spaces).
+        let text = String::from_utf8_lossy(&o.stdout);
+        for line in text.lines() {
+            if let Some((_, path)) = line.split_once("REG_SZ") {
+                let p = path.trim();
+                if !p.is_empty() {
+                    let pb = PathBuf::from(p);
+                    if !out.contains(&pb) {
+                        out.push(pb);
+                    }
+                }
+            }
+        }
+    }
     out
 }
 
@@ -485,7 +570,125 @@ pub fn library_resolution() -> LibraryResolution {
     RES.get_or_init(resolve_library).clone()
 }
 
+/// The fullest content-bearing library waiting in a historical
+/// location, if any: candidates another client is writing are
+/// skipped (see `library_in_use`), content-free candidates never
+/// qualify, and the fullest wins (ties broken by the database's
+/// modification time). Shared by the standard-directory
+/// discovery and the empty-configured-library floor.
+fn discover_best_candidate() -> Option<PathBuf> {
+    let mut best: Option<(LibraryCounts, std::time::SystemTime, PathBuf)> = None;
+    for cand in candidate_library_dirs() {
+        if library_in_use(&cand) {
+            continue;
+        }
+        let Some(c) = probe_library(&cand) else {
+            continue;
+        };
+        if !c.has_content() {
+            continue;
+        }
+        let mtime = std::fs::metadata(cand.join("qimu.db"))
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let better = match &best {
+            None => true,
+            Some((bc, bm, _)) => (c.rank(), mtime) > (bc.rank(), *bm),
+        };
+        if better {
+            best = Some((c, mtime, cand));
+        }
+    }
+    best.map(|(_, _, src)| src)
+}
+
+/// The empty-configured-library floor (2026-11-25 rescan line):
+/// relocate the fullest discovered old library into `target` —
+/// an explicitly configured library root that currently reads
+/// empty — and resolve to `target`. On relocation failure,
+/// resolve to the old library *in place* instead (never to the
+/// empty target), leaving a notice; the configured path is kept
+/// unchanged so the next launch retries the move. `None` when
+/// no candidate holds content — the caller then opens the empty
+/// target as a fresh library, exactly as before. On success the
+/// resolution carries `migrated_from`, so the stored
+/// disposition policy applies to the source exactly as it does
+/// for a standard-directory migration; because the trigger is
+/// "target reads empty", a completed relocation can never
+/// re-trigger (the target is non-empty from then on).
+fn rescue_into_configured(
+    target: &std::path::Path,
+    boot: &Bootstrap,
+    origin: LibraryOrigin,
+) -> Option<LibraryResolution> {
+    // Historical locations first (fullest wins); the standard
+    // directory is the last-resort source — it is the relocation
+    // *target* of the unconfigured flow, never a candidate, but
+    // a configured root that reads empty while the standard
+    // directory holds the user's library (a settings experiment
+    // left `data_dir` pointing at a fresh path) must not strand
+    // that library either.
+    let src = discover_best_candidate().or_else(|| {
+        let std_dir = standard_library_dir();
+        if std_dir != target
+            && !library_in_use(&std_dir)
+            && probe_library(&std_dir).map(|c| c.has_content()).unwrap_or(false)
+        {
+            Some(std_dir)
+        } else {
+            None
+        }
+    })?;
+    if src == target {
+        return None;
+    }
+    match relocate_library(&src, target) {
+        Ok(_) => Some(LibraryResolution {
+            dir: target.to_path_buf(),
+            origin,
+            migrated_from: Some(src),
+        }),
+        Err(e) => {
+            eprintln!(
+                "[qimu] 旧库搬入配置目录失败（{e}），改按原目录打开：{}",
+                src.display()
+            );
+            let mut nb = boot.clone();
+            nb.relocate_notice = Some(format!(
+                "在旧位置 {} 找到有内容的旧库，但搬入数据目录 {} 失败（{e}）；已按原目录打开，数据没有丢失，数据目录设置未变更，下次启动会重试搬迁",
+                src.display(),
+                target.display()
+            ));
+            write_bootstrap(&nb);
+            Some(LibraryResolution {
+                dir: src,
+                origin: LibraryOrigin::FallbackSource,
+                migrated_from: None,
+            })
+        }
+    }
+}
+
+/// Record the running build's version in the bootstrap config
+/// (see `Bootstrap::app_version`). Runs after resolution, as a
+/// read-modify-write, so it preserves whatever the resolution
+/// itself just wrote (a new `data_dir`, a notice).
+fn stamp_app_version() {
+    let cur = env!("CARGO_PKG_VERSION");
+    let mut b = read_bootstrap();
+    if b.app_version.as_deref() != Some(cur) {
+        b.app_version = Some(cur.to_string());
+        write_bootstrap(&b);
+    }
+}
+
 fn resolve_library() -> LibraryResolution {
+    let resolved = resolve_library_inner();
+    stamp_app_version();
+    resolved
+}
+
+fn resolve_library_inner() -> LibraryResolution {
     let res = |dir: PathBuf, origin: LibraryOrigin, migrated_from: Option<PathBuf>| {
         LibraryResolution {
             dir,
@@ -541,23 +744,44 @@ fn resolve_library() -> LibraryResolution {
             }
         }
     }
-    // 1. The bootstrap config wins outright and skips all scanning.
-    //    A configured path that exists as a *file* is invalid and
-    //    falls through to discovery; a not-yet-existing directory is
-    //    valid (a fresh library at the configured place). A path
-    //    that exists, is non-empty and holds no `qimu.db` is NOT
-    //    adopted as a library root (audit P4): it may be a stray
-    //    folder sitting where the library used to live, and
-    //    silently opening a fresh library there is exactly the
-    //    "upgrade lost my data" symptom — discovery runs instead,
-    //    and the configured path only gets its fresh library when
-    //    discovery finds nothing anywhere.
+    // 1. The bootstrap config wins — but with a floor under it
+    //    (2026-11-25 rescan line). The pre-floor rule adopted the
+    //    configured path whenever it was missing, empty, or held
+    //    any `qimu.db` at all, and skipped discovery entirely:
+    //    a configured directory an intermediate build had opened
+    //    once (leaving a valid but content-free `qimu.db`), or a
+    //    configured path whose directory was later moved away,
+    //    therefore opened onto an empty library forever while
+    //    the user's real library sat undiscovered in a historical
+    //    location. Now the configured path is adopted outright
+    //    only when it provably holds content — or when its
+    //    database will not even probe (corrupt, hot journal):
+    //    not provably empty, so it is adopted as before and
+    //    Store::open surfaces whatever is wrong. When it reads
+    //    as an *empty* library root — no directory yet, an empty
+    //    directory, or a library with zero content — discovery
+    //    runs first (`rescue_into_configured`), and a
+    //    content-bearing old library is relocated into the
+    //    configured place: the user's chosen home stays the
+    //    home. A path that exists, is non-empty and holds no
+    //    `qimu.db` is still NOT adopted (audit P4): it may be a
+    //    stray folder sitting where the library used to live —
+    //    discovery runs, and the configured path only gets its
+    //    fresh library when discovery finds nothing anywhere.
     let mut configured_stray: Option<PathBuf> = None;
     if let Some(d) = boot.data_dir.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         let p = PathBuf::from(d);
+        let probed = probe_library(&p);
         if p.exists() && !p.is_dir() {
             // a file: invalid, fall through
-        } else if !p.exists() || p.join("qimu.db").is_file() || dir_is_empty(&p) {
+        } else if p.join("qimu.db").is_file() && probed.is_none() {
+            return res(p, LibraryOrigin::Bootstrap, None);
+        } else if probed.map(|c| c.has_content()).unwrap_or(false) {
+            return res(p, LibraryOrigin::Bootstrap, None);
+        } else if !p.exists() || dir_is_empty(&p) || p.join("qimu.db").is_file() {
+            if let Some(r) = rescue_into_configured(&p, &boot, LibraryOrigin::Bootstrap) {
+                return r;
+            }
             return res(p, LibraryOrigin::Bootstrap, None);
         } else {
             configured_stray = Some(p);
@@ -570,7 +794,22 @@ fn resolve_library() -> LibraryResolution {
         .and_then(|v| v.as_str())
         .filter(|s| !s.trim().is_empty())
     {
-        return res(PathBuf::from(p), LibraryOrigin::LegacySetting, None);
+        let p = PathBuf::from(p);
+        // The same empty-library floor as the bootstrap path
+        // (2026-11-25 rescan line): a legacy-configured root
+        // that reads empty must not short-circuit discovery
+        // either. Anything else about this compat hook is
+        // unchanged.
+        let reads_empty = match probe_library(&p) {
+            Some(c) => !c.has_content(),
+            None => !p.join("qimu.db").is_file() && (!p.exists() || dir_is_empty(&p)),
+        };
+        if reads_empty {
+            if let Some(r) = rescue_into_configured(&p, &boot, LibraryOrigin::LegacySetting) {
+                return r;
+            }
+        }
+        return res(p, LibraryOrigin::LegacySetting, None);
     }
     // 3. An explicit data-dir environment variable: the
     //    client-specific QIMU_CLIENT_DATA_DIR first, the legacy
@@ -592,29 +831,7 @@ fn resolve_library() -> LibraryResolution {
     if probe_library(&standard).map(|c| c.has_content()).unwrap_or(false) {
         return res(standard, LibraryOrigin::Standard, None);
     }
-    let mut best: Option<(LibraryCounts, std::time::SystemTime, PathBuf)> = None;
-    for cand in candidate_library_dirs() {
-        if library_in_use(&cand) {
-            continue;
-        }
-        let Some(c) = probe_library(&cand) else {
-            continue;
-        };
-        if !c.has_content() {
-            continue;
-        }
-        let mtime = std::fs::metadata(cand.join("qimu.db"))
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        let better = match &best {
-            None => true,
-            Some((bc, bm, _)) => (c.rank(), mtime) > (bc.rank(), *bm),
-        };
-        if better {
-            best = Some((c, mtime, cand));
-        }
-    }
-    if let Some((_, _, src)) = best {
+    if let Some(src) = discover_best_candidate() {
         match relocate_library(&src, &standard) {
             Ok(_) => {
                 let mut nb = boot.clone();

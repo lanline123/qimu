@@ -5041,6 +5041,25 @@ impl App {
         if self.token.is_none() || self.anon_active() {
             self.refresh_guest();
         }
+        // Startup local load (2026-11-25 rescan fix): the
+        // working lists (folders / groups / units / indexes)
+        // are this machine's own data and must be loaded at
+        // startup whatever the connection restore decided.
+        // Until now they loaded only as a side effect of
+        // refresh_all, which this function calls solely when
+        // the picked connection validated as Connected; on the
+        // anonymous / failed / logged-out outcomes only
+        // refresh_guest ran (showroom + cache index — never the
+        // local lists), so a first launch after a reinstall
+        // showed empty walls over a full local library until
+        // the first write op's trailing refresh_all happened
+        // to load them. refresh_local is idempotent (four
+        // local reads plus the per-index detail pass), so on
+        // the Connected path this is one extra cheap pass; on
+        // every other path it is the load itself.
+        if self.local.is_some() {
+            self.refresh_local();
+        }
     }
 
     fn fetch_add_server_name(&mut self) {
