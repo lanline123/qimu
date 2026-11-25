@@ -5658,6 +5658,148 @@ impl App {
         }
     }
 
+    /// Re-read a chosen subset of the working-data lists
+    /// (folders / units / indexes) from whichever face serves
+    /// them — the local library, or REST in fallback mode —
+    /// carrying the same per-list side effects refresh_local /
+    /// refresh_all_rest attach: overview-graph invalidation and
+    /// the per-index cover/tag pass on an indexes re-read (the
+    /// pass only touches indexes whose tags are not remembered
+    /// yet, so its cost is bounded by genuinely new indexes, not
+    /// by the library size), wall-selection pruning on a units
+    /// re-read. Groups are never part of the subset: no delete
+    /// path touches them. The post-delete refresh paths use this
+    /// instead of refresh_all, whose org sweep (14 sequential
+    /// REST GETs in local mode; 18+N round trips in fallback
+    /// mode) cannot be affected by a local delete.
+    fn refresh_work_lists(&mut self, folders: bool, units: bool, indexes: bool) {
+        if let Some(local) = self.local.clone() {
+            if folders {
+                self.folders = local.list_folders();
+            }
+            if units {
+                self.units = local.list_units();
+            }
+            if indexes {
+                if let IndexFrame::Overview(overview) = self.index.stack.root_mut() {
+                    overview.graphs = None;
+                }
+                self.indexes = local.list_indexes();
+                for x in self.indexes.clone() {
+                    let xid = s(&x, "id");
+                    if xid.is_empty() || self.index_search_tags.contains_key(&xid) {
+                        continue;
+                    }
+                    if let Some(d) = local.index_detail(&xid, "main") {
+                        if self
+                            .index_covers
+                            .get(&xid)
+                            .map(|c| c.is_empty())
+                            .unwrap_or(true)
+                        {
+                            if let Some(vid) = d
+                                .get("resolved_entries")
+                                .and_then(|r| r.as_array())
+                                .and_then(|a| a.first())
+                                .and_then(|e| e.get("resolved"))
+                                .and_then(|r| r.get("id"))
+                                .and_then(|v| v.as_str())
+                            {
+                                self.index_covers.insert(xid.clone(), vid.to_string());
+                            }
+                        }
+                        self.remember_index_tags(&xid, &d);
+                    }
+                }
+            }
+        } else {
+            if folders {
+                if let Ok(v) = self.call("GET", "/v1/folders", None) {
+                    self.folders = v
+                        .get("folders")
+                        .and_then(|f| f.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                }
+            }
+            if units {
+                if let Ok(v) = self.call("GET", "/v1/units", None) {
+                    self.units = v
+                        .get("units")
+                        .and_then(|f| f.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                }
+            }
+            if indexes {
+                if let Ok(v) = self.call("GET", "/v1/indexes", None) {
+                    if let IndexFrame::Overview(overview) = self.index.stack.root_mut() {
+                        overview.graphs = None;
+                    }
+                    self.indexes = v
+                        .get("indexes")
+                        .and_then(|f| f.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                }
+                for x in self.indexes.clone() {
+                    let xid = s(&x, "id");
+                    if xid.is_empty() || self.index_search_tags.contains_key(&xid) {
+                        continue;
+                    }
+                    if let Ok(d) = self.call("GET", &format!("/v1/indexes/{xid}"), None) {
+                        if self
+                            .index_covers
+                            .get(&xid)
+                            .map(|c| c.is_empty())
+                            .unwrap_or(true)
+                        {
+                            if let Some(vid) = d
+                                .get("resolved_entries")
+                                .and_then(|r| r.as_array())
+                                .and_then(|a| a.first())
+                                .and_then(|e| e.get("resolved"))
+                                .and_then(|r| r.get("id"))
+                                .and_then(|v| v.as_str())
+                            {
+                                self.index_covers.insert(xid.clone(), vid.to_string());
+                            }
+                        }
+                        self.remember_index_tags(&xid, &d);
+                    }
+                }
+            }
+        }
+        if units {
+            self.prune_wall_selection();
+        }
+    }
+
+    /// Post-folder-delete refresh (delete-freeze round 2,
+    /// 2026-11-25). The delete itself already runs on the
+    /// folder_del worker thread, but the drain used to answer it
+    /// with refresh_all: in local mode that is refresh_local's
+    /// four-list sweep — list_units alone expands U×(1+2R) SQL
+    /// statements for the WHOLE library — plus refresh_org's 14
+    /// sequential REST GETs, all on the UI thread in one frame;
+    /// in REST-fallback mode it is 18+N sequential round trips.
+    /// That drain stall, growing with total library size rather
+    /// than with the deleted subtree, is what users still felt
+    /// as "delete freezes" on the build that already carried the
+    /// worker-thread fix. A folder delete can only change the
+    /// folder tree itself and the units / indexes homed in it
+    /// (lifted one level up, or gone to the trash), plus the
+    /// trash page's rows — so re-read exactly those lists, and
+    /// mark the trash stale (its page and sidebar counts reload
+    /// on entry; the trash page is not visible while a sidebar
+    /// folder delete lands). Org surfaces cannot move.
+    fn refresh_after_folder_delete(&mut self, mode: &str) {
+        self.refresh_work_lists(true, true, true);
+        if mode == "trash" {
+            self.trash.loaded = false;
+        }
+    }
+
     /// Working data from the local library: folders/groups/
     /// units/indexes reads (P0) plus the per-index detail pass
     /// (covers/tags) assembled locally (P1 — write paths go through
@@ -5705,14 +5847,13 @@ impl App {
         }
     }
 
-    /// Organization surfaces over REST: the org-facing half of the
-    /// legacy refresh (same calls, same order) — org tree, showroom,
-    /// assemblies, cache policy, inbox, group spaces, teams, library,
-    /// profile/company/languages/AI status.
-    fn refresh_org(&mut self) {
-        if let Ok(v) = self.call("GET", "/v1/org", None) {
-            self.org = v;
-        }
+    /// The showroom live-wall slice of refresh_org, factored out
+    /// verbatim so a single-item change to the wall (a showroom
+    /// item trashed or restored) can re-read just this slice —
+    /// items, cache-staleness reconciliation, cover re-resolution,
+    /// and the offline cache backfill when the fetch fails —
+    /// instead of the whole org sweep.
+    fn refresh_showroom_live(&mut self) {
         let live_fetched = if let Ok(v) = self.call("GET", "/v1/showroom?state=live", None) {
             self.showroom_live = v
                 .get("items")
@@ -5729,6 +5870,17 @@ impl App {
         if !live_fetched {
             self.backfill_showroom_from_cache();
         }
+    }
+
+    /// Organization surfaces over REST: the org-facing half of the
+    /// legacy refresh (same calls, same order) — org tree, showroom,
+    /// assemblies, cache policy, inbox, group spaces, teams, library,
+    /// profile/company/languages/AI status.
+    fn refresh_org(&mut self) {
+        if let Ok(v) = self.call("GET", "/v1/org", None) {
+            self.org = v;
+        }
+        self.refresh_showroom_live();
         if let Ok(v) = self.call("GET", "/v1/showroom?state=pending", None) {
             self.showroom_pending = v
                 .get("items")
@@ -9133,7 +9285,18 @@ impl App {
             Ok(_) => {
                 self.say("已移入回收站，可随时恢复");
                 self.trash.loaded = false;
-                self.refresh_all();
+                // Only the trashed object's own list can change
+                // (delete-freeze round 2): a unit leaves the
+                // units list, an index the indexes list, a
+                // showroom item the live wall. The old
+                // refresh_all re-read every surface on the UI
+                // thread for each single-item trash.
+                match kind {
+                    "unit" => self.refresh_work_lists(false, true, false),
+                    "index" => self.refresh_work_lists(false, false, true),
+                    "showroom" => self.refresh_showroom_live(),
+                    _ => self.refresh_work_lists(false, true, true),
+                }
                 true
             }
             Err(e) => {
@@ -9152,7 +9315,23 @@ impl App {
             Ok(_) => {
                 self.msg = "已恢复".into();
                 self.trash.loaded = false;
-                self.refresh_all();
+                // The restored object re-enters exactly one list
+                // (delete-freeze round 2; the row's kind is known
+                // from the loaded trash items — unknown kinds
+                // conservatively re-read both working lists).
+                let kind = self
+                    .trash
+                    .items
+                    .iter()
+                    .find(|t| s(t, "id") == trash_id)
+                    .map(|t| s(t, "kind"))
+                    .unwrap_or_default();
+                match kind.as_str() {
+                    "unit" => self.refresh_work_lists(false, true, false),
+                    "index" => self.refresh_work_lists(false, false, true),
+                    "showroom" => self.refresh_showroom_live(),
+                    _ => self.refresh_work_lists(false, true, true),
+                }
             }
             Err(e) => self.msg = format!("恢复失败：{e}"),
         }
@@ -9175,7 +9354,12 @@ impl App {
                 if showing {
                     self.trash.stack.pop();
                 }
-                self.refresh_all();
+                // No refresh: the purged object was already
+                // absent from every wall and list (it sat in the
+                // trash), so nothing visible can change — the
+                // old refresh_all here was pure cost
+                // (delete-freeze round 2). The trash page itself
+                // re-reads via trash.loaded above.
             }
             Err(e) => self.msg = format!("彻底删除失败：{e}"),
         }
@@ -9405,7 +9589,18 @@ impl App {
                     ls.selected.clear();
                 }
                 self.trash.loaded = false;
-                self.refresh_all();
+                // Restored objects re-enter the working lists
+                // (and showroom rows the live wall) — re-read
+                // just those (delete-freeze round 2).
+                self.refresh_work_lists(false, true, true);
+                if ids.iter().any(|id| {
+                    self.trash
+                        .items
+                        .iter()
+                        .any(|t| s(t, "id") == *id && s(t, "kind") == "showroom")
+                }) {
+                    self.refresh_showroom_live();
+                }
             }
             Some("purge") => {
                 let ids: Vec<String> = selected.iter().cloned().collect();
@@ -9875,10 +10070,15 @@ impl eframe::App for App {
                             self.index.overview_folder = None;
                         }
                         // Contents moved (lift) or vanished into
-                        // the trash (trash): the cached unit /
-                        // index / showroom lists are stale either
-                        // way.
-                        self.refresh_all();
+                        // the trash (trash): the folder tree and
+                        // the unit / index lists are stale either
+                        // way — re-read exactly those (plus the
+                        // trash page's freshness in trash mode).
+                        // The old answer here was refresh_all,
+                        // whose org sweep and whole-library cost
+                        // on this UI-thread drain were the
+                        // remaining delete freeze (round 2).
+                        self.refresh_after_folder_delete(&mode);
                     }
                     Err(e) => self.msg = format!("删除失败：{e}"),
                 }
@@ -17490,7 +17690,10 @@ impl App {
                         ls.selected.clear();
                     }
                     self.trash.loaded = false;
-                    self.refresh_all();
+                    // No refresh_all: purged rows were already
+                    // absent from every wall (same reasoning as
+                    // trash_purge, delete-freeze round 2); the
+                    // trash list re-reads via loaded = false.
                 }
                 ConfirmAction::EmptyTrash => {
                     // F6: rows merged from the server (marked
@@ -17527,7 +17730,9 @@ impl App {
                                 selected: Default::default(),
                             }));
                             self.trash.loaded = false;
-                            self.refresh_all();
+                            // No refresh_all: every purged row was
+                            // already absent from the walls
+                            // (delete-freeze round 2).
                         }
                         Err(e) => self.msg = format!("清空失败：{e}"),
                     }
