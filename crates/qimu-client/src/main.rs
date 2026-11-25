@@ -1894,6 +1894,10 @@ struct SettingsState {
     ai_key: String,
     ai_has_key: bool,
     ai_loaded: bool,
+    /// Pending-submission retention days (server setting,
+    /// super-only section 「投稿设置」); loaded on first open.
+    sub_ttl_days: i64,
+    sub_ttl_loaded: bool,
     glossary_text: String,
     profile: BTreeMap<String, String>,
     company: BTreeMap<String, String>,
@@ -3113,6 +3117,105 @@ struct DeckState {
     preview_open: bool,
     /// Set by the detail breadcrumb; the dispatcher pops the frame.
     closed: bool,
+    /// N4 personal reorder (user ruling 2026-11-25): the working
+    /// page order while the user rearranges this deck's pages
+    /// for a personal save-as. `pages` always keeps the item's
+    /// pinned order and is never mutated by reordering — the
+    /// formal faces (presentation engines, exports, the 讲稿视图
+    /// whose saves write into the original versions' scripts)
+    /// keep resolving it. `Some(order)` is a permutation of the
+    /// same pages; the page wall and the single-page preview
+    /// render it, and saving materializes it as a NEW local
+    /// showroom item, after which this returns to None and the
+    /// wall shows the pinned order again.
+    reorder: Option<Vec<ShowroomPage>>,
+    /// The copy saved by the last successful save-as on this
+    /// frame (list_local_showroom shape), kept so the reorder
+    /// bar can offer a jump into it; a fresh adjustment clears
+    /// it (the note belongs to the previous arrangement).
+    saved_copy: Option<Value>,
+    /// Page-card drag state on the thumbnails wall: the display
+    /// index the pointer press started on and where it started.
+    /// Managed from raw pointer input like the sidebar folder
+    /// drag, but WITHOUT the folders' long-press gate — that
+    /// ruling covers the sidebar tree only; a page card arms
+    /// its drag on plain movement past the threshold.
+    page_press: Option<(usize, egui::Pos2)>,
+    /// The display index being dragged once the press arms.
+    page_drag: Option<usize>,
+    /// 「查看我的副本」: the saved copy this frame should be
+    /// replaced by. Set by the reorder bar; consumed by the
+    /// showroom dispatcher after this frame's render (the frame
+    /// is taken out of the stack while it renders, so opening
+    /// the copy's deck must wait until it is put back / popped).
+    jump_to: Option<Value>,
+}
+
+/// The pages the deck detail displays: the working reorder
+/// when one is in progress, else the item's pinned pages.
+fn deck_display_pages(st: &DeckState) -> Vec<ShowroomPage> {
+    st.reorder.clone().unwrap_or_else(|| st.pages.clone())
+}
+
+/// Whether the working order actually differs from the pinned
+/// order (same pages, different sequence).
+fn deck_reorder_changed(st: &DeckState) -> bool {
+    match &st.reorder {
+        Some(order) => {
+            order.len() != st.pages.len()
+                || order
+                    .iter()
+                    .zip(st.pages.iter())
+                    .any(|(a, b)| a.version_id != b.version_id || a.slot != b.slot)
+        }
+        None => false,
+    }
+}
+
+/// Move one page of the working order: `target_insert` is the
+/// insertion index in the pre-move sequence (the drag's drop
+/// seam; the move buttons pass the adjacent seam). Starts the
+/// working order from the pinned pages on the first move;
+/// landing back on the pinned sequence retires the working
+/// order entirely, so an unchanged arrangement never offers a
+/// save. A fresh move also retires the previous save's note.
+fn deck_move_page(st: &mut DeckState, from: usize, target_insert: usize) {
+    let mut order = deck_display_pages(st);
+    if from >= order.len() {
+        return;
+    }
+    let page = order.remove(from);
+    let mut at = target_insert;
+    if at > from {
+        at -= 1;
+    }
+    at = at.min(order.len());
+    order.insert(at, page);
+    st.selected_page = Some(at);
+    st.saved_copy = None;
+    let same = order.len() == st.pages.len()
+        && order
+            .iter()
+            .zip(st.pages.iter())
+            .all(|(a, b)| a.version_id == b.version_id && a.slot == b.slot);
+    st.reorder = if same { None } else { Some(order) };
+}
+
+/// The insertion seam a drag pointer indicates on the
+/// thumbnails wall: the first card whose center the pointer
+/// has not passed in reading order (row by row, left to
+/// right); a pointer above a row aims at that row's first
+/// card, and past the last card the seam is the end.
+fn deck_drag_target(rects: &[(usize, egui::Rect)], pos: egui::Pos2) -> usize {
+    for (idx, r) in rects {
+        if pos.y < r.top() {
+            return *idx;
+        }
+        if pos.y <= r.bottom() && pos.x < r.center().x {
+            return *idx;
+        }
+    }
+    rects.len()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3496,6 +3599,14 @@ struct App {
     /// The folder row currently being pressed (long-press drag
     /// gate); see FolderPress.
     folder_press: Option<FolderPress>,
+    /// Folder sync dialog (user ruling 2026-11-25): open flag,
+    /// the server folder list fetched when the dialog opened,
+    /// and the ids the user has ticked for pulling down. Sync is
+    /// manual picking only — nothing is pulled on connect or
+    /// refresh.
+    folder_sync_open: bool,
+    folder_sync_list: Vec<Value>,
+    folder_sync_checked: std::collections::HashSet<String>,
     page: Page,
     /// Five-features surfaces (2026-11-23): the trash and the
     /// approval queue run on drill-down frame stacks; the home
@@ -4720,6 +4831,9 @@ impl App {
             folder_del_rx,
             folder_del_gen: 0,
             folder_press: None,
+            folder_sync_open: false,
+            folder_sync_list: vec![],
+            folder_sync_checked: std::collections::HashSet::new(),
             page: match std::env::var("QIMU_PAGE").as_deref() {
                 Ok("showroom") => Page::Showroom,
                 Ok("content") => Page::Content,
@@ -4771,6 +4885,8 @@ impl App {
             settings: SettingsState {
                 grant_subject_type: "dept".into(),
                 grant_capability: "view".into(),
+                sub_ttl_days:
+                    qimu_core::store::Store::SUBMISSION_TTL_DEFAULT_DAYS,
                 ..Default::default()
             },
             frames: 0,
@@ -5674,8 +5790,8 @@ impl App {
                 .as_ref()
                 .map(|u| s(u, "role"))
                 .unwrap_or_default();
-            if role != "super" && role != "dept_admin" {
-                self.msg = "关闭服务器需要管理员权限（当前账号不是管理员）".into();
+            if role != "super" {
+                self.msg = "关闭服务器需要超级管理员权限（当前账号不是超级管理员）".into();
                 return;
             }
         }
@@ -5919,6 +6035,7 @@ impl App {
         self.settings.ai_key.clear();
         self.settings.ai_has_key = false;
         self.settings.ai_loaded = false;
+        self.settings.sub_ttl_loaded = false;
         self.settings.dept_name.clear();
         self.settings.user_name.clear();
         self.settings.user_display.clear();
@@ -9337,6 +9454,38 @@ impl App {
         clicked
     }
 
+    /// The folder-tree sidebars' 目录 header: label on the left,
+    /// and at the right end the sync button beside the create
+    /// button (user ruling 2026-11-25: server folders are pulled
+    /// down by hand through the sync dialog — the button opens
+    /// it; it never pulls anything by itself). The create half
+    /// behaves exactly like sr_header_row's button.
+    fn sr_folder_header(&mut self, ui: &mut egui::Ui, scope: &str) {
+        let mut create = false;
+        let mut sync = false;
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("目录")
+                    .size(12.0)
+                    .color(palette_color(TEXT_WEAK)),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.small_icon_button(ui, ChromeIcon::FolderPlus, tr("新建文件夹")) {
+                    create = true;
+                }
+                if self.small_icon_button(ui, ChromeIcon::Download, tr("同步服务器目录")) {
+                    sync = true;
+                }
+            });
+        });
+        if create {
+            self.sr_new_folder(scope);
+        }
+        if sync {
+            self.open_folder_sync();
+        }
+    }
+
     /// Open the shared inline editor for a new root folder (the
     /// editor itself renders under the tree's 全部 row, or under
     /// the zone header where the zone has no folder tree).
@@ -9532,9 +9681,7 @@ impl App {
                 }
             }
             _ => {
-                if self.sr_header_row(ui, "目录", ChromeIcon::FolderPlus, tr("新建文件夹")) {
-                    self.sr_new_folder("showroom");
-                }
+                self.sr_folder_header(ui, "showroom");
                 let mut selected = self.showroom.folder.clone();
                 self.folder_tree(ui, &mut selected, false, "showroom");
                 if selected != self.showroom.folder {
@@ -9565,9 +9712,7 @@ impl App {
         // 目录 header row with the new-folder button at its right
         // end (user ruling 2026-11-24, correcting the same-day
         // removal): the button moved here from the tree's 全部 row.
-        if self.sr_header_row(ui, "目录", ChromeIcon::FolderPlus, tr("新建文件夹")) {
-            self.sr_new_folder("content");
-        }
+        self.sr_folder_header(ui, "content");
         let mut selected = self.content.folder_filter.clone();
         self.folder_tree(ui, &mut selected, false, "content");
         if self.content.folder_filter != selected
@@ -9582,9 +9727,7 @@ impl App {
     fn ix_nav_body(&mut self, ui: &mut egui::Ui) {
         // 目录 header row, same pattern as the other folder-tree
         // sidebars (user ruling 2026-11-24).
-        if self.sr_header_row(ui, "目录", ChromeIcon::FolderPlus, tr("新建文件夹")) {
-            self.sr_new_folder("index");
-        }
+        self.sr_folder_header(ui, "index");
         let (in_detail, mut selected) = match self.index.stack.top() {
             IndexFrame::Detail(detail) => {
                 let folder = self.index_folder_of(&detail.index_id);
@@ -9644,6 +9787,7 @@ impl App {
                     ("组织管理", ChromeIcon::Lineage),
                     ("内容组与授权", ChromeIcon::Directory),
                     ("审批队列", ChromeIcon::Active),
+                    ("投稿设置", ChromeIcon::Clipboard),
                     ("公司公共资料", ChromeIcon::Home),
                     ("内容语言", ChromeIcon::All),
                     ("AI 翻译", ChromeIcon::Split),
@@ -10767,6 +10911,7 @@ impl App {
         if role == "super" {
             sections.extend([
                 "审批队列",
+                "投稿设置",
                 "内容组与授权",
                 "公司公共资料",
                 "内容语言",
@@ -11361,6 +11506,7 @@ impl eframe::App for App {
         self.toast(ui, screen);
         self.login_window(ui);
         self.about_window(ui);
+        self.folder_sync_window(ui);
         self.overlay_stack_ui(ui, screen);
         self.force_change_pw_ui(ui);
     }
@@ -13119,6 +13265,11 @@ impl App {
                 view: DeckView::Thumbnails,
                 preview_open: false,
                 closed: false,
+                reorder: None,
+                saved_copy: None,
+                page_press: None,
+                page_drag: None,
+                jump_to: None,
             }));
         }
     }
@@ -13140,6 +13291,11 @@ impl App {
             view: DeckView::Thumbnails,
             preview_open: false,
             closed: false,
+            reorder: None,
+            saved_copy: None,
+            page_press: None,
+            page_drag: None,
+            jump_to: None,
         }));
         let item_pages = showroom_pages(item);
         if !item_pages.is_empty() {
@@ -14053,6 +14209,10 @@ impl App {
             self.showroom_page_preview(ui, st, item);
             return;
         }
+        // The wall renders the working order while a reorder is
+        // in progress (deck_display_pages); the pinned order in
+        // `st.pages` is never mutated.
+        let pages = deck_display_pages(st);
         ui.horizontal(|ui| {
             if let Some(view) = segmented(
                 ui,
@@ -14067,7 +14227,7 @@ impl App {
                 };
             }
             ui.label(
-                egui::RichText::new(format!("{} 页", st.pages.len()))
+                egui::RichText::new(format!("{} 页", pages.len()))
                     .color(palette_color(TEXT_WEAK)),
             );
             if ui
@@ -14076,15 +14236,74 @@ impl App {
             {
                 st.preview_open = true;
             }
+            if st.view == DeckView::Thumbnails {
+                ui.label(
+                    egui::RichText::new("拖动页卡可调整页序，另存为你的副本")
+                        .size(11.5)
+                        .color(palette_color(TEXT_FAINT)),
+                );
+            }
         });
+        // N4 reorder bar (user ruling 2026-11-25): invisible
+        // until the order actually changes; then the save-as and
+        // restore actions live here. After a save, the bar keeps
+        // the jump into the copy until the next adjustment.
+        let mut bar_act: Option<&'static str> = None;
+        if deck_reorder_changed(st) {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("页序已调整")
+                        .color(palette_color(TEXT_WEAK)),
+                );
+                if btn_primary(ui, "另存为我的演示").clicked() {
+                    bar_act = Some("save");
+                }
+                if btn_default(ui, "恢复原序").clicked() {
+                    bar_act = Some("restore");
+                }
+                ui.label(
+                    egui::RichText::new("原演示不受影响，调整只存入你的副本")
+                        .size(11.5)
+                        .color(palette_color(TEXT_FAINT)),
+                );
+            });
+        } else if st.saved_copy.is_some() {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("已另存为我的演示")
+                        .color(palette_color(TEXT_WEAK)),
+                );
+                if btn_default(ui, "查看我的副本").clicked() {
+                    bar_act = Some("jump");
+                }
+            });
+        }
+        match bar_act {
+            Some("save") => self.save_reordered_copy(st),
+            Some("restore") => {
+                st.reorder = None;
+                st.selected_page = None;
+                st.page_press = None;
+                st.page_drag = None;
+            }
+            Some("jump") => {
+                st.jump_to = st.saved_copy.clone();
+                return;
+            }
+            _ => {}
+        }
         ui.add_space(10.0);
         egui::ScrollArea::vertical()
             .id_salt((item["id"].as_str(), st.view == DeckView::Notes))
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
                 let mut open = false;
+                let mut note_move: Option<(usize, usize)> = None;
                 if st.view == DeckView::Notes {
-                    for (index, page) in st.pages.iter().enumerate() {
+                    let total = pages.len();
+                    for (index, page) in pages.iter().enumerate() {
                         let width = ui.available_width();
                         card_frame().show(ui, |ui| {
                             ui.set_min_width((width - 26.0).max(0.0));
@@ -14100,10 +14319,35 @@ impl App {
                                     open = response.double_clicked();
                                 }
                                 ui.vertical(|ui| {
-                                    ui.label(
-                                        egui::RichText::new(format!("第 {} 页", index + 1))
-                                            .strong(),
-                                    );
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(format!("第 {} 页", index + 1))
+                                                .strong(),
+                                        );
+                                        // N4: the notes rows carry
+                                        // the reorder as direct
+                                        // per-card moves (the drag
+                                        // lives on the thumbnails
+                                        // wall).
+                                        if ui
+                                            .add_enabled(
+                                                index > 0,
+                                                egui::Button::new("前移"),
+                                            )
+                                            .clicked()
+                                        {
+                                            note_move = Some((index, index - 1));
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                index + 1 < total,
+                                                egui::Button::new("后移"),
+                                            )
+                                            .clicked()
+                                        {
+                                            note_move = Some((index, index + 2));
+                                        }
+                                    });
                                     ui.label(if page.note.is_empty() {
                                         "暂无讲稿"
                                     } else {
@@ -14114,8 +14358,17 @@ impl App {
                         });
                     }
                 } else {
+                    // Thumbnails wall + the N4 page drag: card
+                    // rects are collected while rendering, then
+                    // the press/drag resolves against them from
+                    // raw pointer input (the sidebar folder
+                    // drag's pattern, minus its long-press gate —
+                    // that ruling is the sidebar's alone). While
+                    // a drag is armed, card clicks are suppressed:
+                    // the release belongs to the drop.
                     let (columns, width) = showroom_columns(ui, 212.0);
-                    for (row_index, row) in st.pages.chunks(columns).enumerate() {
+                    let mut rects: Vec<(usize, egui::Rect)> = Vec::new();
+                    for (row_index, row) in pages.chunks(columns).enumerate() {
                         ui.horizontal_top(|ui| {
                             for (column, page) in row.iter().enumerate() {
                                 let index = row_index * columns + column;
@@ -14126,7 +14379,8 @@ impl App {
                                         width,
                                         st.selected_page == Some(index),
                                     );
-                                    if response.clicked() {
+                                    rects.push((index, response.rect));
+                                    if response.clicked() && st.page_drag.is_none() {
                                         st.selected_page = Some(index);
                                         open = response.double_clicked();
                                     }
@@ -14139,6 +14393,100 @@ impl App {
                             }
                         });
                     }
+                    let pointer = ui.input(|i| i.pointer.interact_pos());
+                    let primary_down = ui.input(|i| i.pointer.primary_down());
+                    let primary_released = ui.input(|i| i.pointer.primary_released());
+                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        st.page_press = None;
+                        st.page_drag = None;
+                    }
+                    if let Some(pos) = pointer {
+                        if primary_down && st.page_drag.is_none() {
+                            if st.page_press.is_none() {
+                                if let Some((idx, _)) =
+                                    rects.iter().find(|(_, r)| r.contains(pos))
+                                {
+                                    st.page_press = Some((*idx, pos));
+                                }
+                            }
+                            if let Some((from, start)) = st.page_press {
+                                if start.distance(pos) > 8.0 {
+                                    st.page_drag = Some(from);
+                                }
+                            }
+                        }
+                        if let Some(from) = st.page_drag {
+                            let target = deck_drag_target(&rects, pos);
+                            let painter = ui.painter();
+                            // Insertion seam at the target card's
+                            // left edge (or the last card's right).
+                            if let Some((_, r)) = rects.get(target) {
+                                let x = r.left() - 6.0;
+                                painter.line_segment(
+                                    [
+                                        egui::pos2(x, r.top()),
+                                        egui::pos2(x, r.bottom()),
+                                    ],
+                                    egui::Stroke::new(2.5, ACCENT),
+                                );
+                            } else if let Some((_, r)) = rects.last() {
+                                let x = r.right() + 6.0;
+                                painter.line_segment(
+                                    [
+                                        egui::pos2(x, r.top()),
+                                        egui::pos2(x, r.bottom()),
+                                    ],
+                                    egui::Stroke::new(2.5, ACCENT),
+                                );
+                            }
+                            // The dragged card floats with the
+                            // pointer.
+                            if let Some(page) = pages.get(from) {
+                                let ghost = egui::Rect::from_min_size(
+                                    pos - egui::vec2(width / 2.0, 10.0),
+                                    egui::vec2(width, width * 9.0 / 16.0),
+                                );
+                                if let Some(tex) = self.thumb(&page.version_id, page.slot) {
+                                    painter.image(
+                                        tex.id(),
+                                        ghost,
+                                        egui::Rect::from_min_max(
+                                            egui::pos2(0.0, 0.0),
+                                            egui::pos2(1.0, 1.0),
+                                        ),
+                                        egui::Color32::from_rgba_unmultiplied(
+                                            255, 255, 255, 205,
+                                        ),
+                                    );
+                                } else {
+                                    painter.rect_filled(
+                                        ghost,
+                                        0.0,
+                                        palette_color(HOVER_BG),
+                                    );
+                                }
+                                painter.rect_stroke(
+                                    ghost,
+                                    0.0,
+                                    egui::Stroke::new(1.5, ACCENT),
+                                    egui::StrokeKind::Middle,
+                                );
+                            }
+                        }
+                        if primary_released {
+                            if let Some(from) = st.page_drag.take() {
+                                let target = deck_drag_target(&rects, pos);
+                                deck_move_page(st, from, target);
+                            }
+                            st.page_press = None;
+                        }
+                    } else if !primary_down {
+                        st.page_press = None;
+                        st.page_drag = None;
+                    }
+                }
+                if let Some((from, seam)) = note_move {
+                    deck_move_page(st, from, seam);
                 }
                 if open {
                     st.preview_open = true;
@@ -14158,7 +14506,11 @@ impl App {
     }
 
     fn showroom_page_preview(&mut self, ui: &mut egui::Ui, st: &mut DeckState, item: &Value) {
-        let last = st.pages.len() - 1;
+        // The preview pages through the displayed order (the
+        // working reorder while one is in progress), like the
+        // wall it was opened from.
+        let pages = deck_display_pages(st);
+        let last = pages.len() - 1;
         let mut index = st.selected_page.unwrap_or(0).min(last);
         if ui.input(|input| input.key_pressed(egui::Key::ArrowLeft)) {
             index = index.saturating_sub(1);
@@ -14179,13 +14531,13 @@ impl App {
             {
                 index += 1;
             }
-            ui.label(format!("{} / {}", index + 1, st.pages.len()));
+            ui.label(format!("{} / {}", index + 1, pages.len()));
             if ui.small_button("导出本页 PDF").clicked() {
                 self.export_showroom_pdf(item, "slides", Some(index));
             }
         });
         st.selected_page = Some(index);
-        let page = &st.pages[index];
+        let page = &pages[index];
         ui.add_space(10.0);
         let width = ui
             .available_width()
@@ -14209,6 +14561,59 @@ impl App {
             } else {
                 self.showroom.stack.pop();
             }
+        }
+    }
+
+    /// N4 save-as (user ruling 2026-11-25): materialize the
+    /// deck frame's working page order as a NEW item of the
+    /// local library （本地演示） — "调整只动自己": the source
+    /// item is never written, and the moment the working order
+    /// clears, this frame's wall is back on the item's pinned
+    /// order. The composition (personal index + locked entries
+    /// + pins + showroom row, one transaction) lives in the
+    /// local store; a deck whose content the local library does
+    /// not hold (an organization deck whose versions live only
+    /// on its server) fails there with the reason, and the
+    /// working order survives the failure — the arrangement is
+    /// not lost with the error message.
+    fn save_reordered_copy(&mut self, st: &mut DeckState) {
+        let Some(order) = st.reorder.clone() else {
+            return;
+        };
+        let Some(local) = self.local.clone() else {
+            self.msg = "本地库不可用，无法另存为我的演示".into();
+            return;
+        };
+        let title = s(&st.item, "title");
+        let title = if title.is_empty() {
+            "演示稿".to_string()
+        } else {
+            title
+        };
+        let pages: Vec<(String, usize)> = order
+            .iter()
+            .map(|p| (p.version_id.clone(), p.slot))
+            .collect();
+        match local.save_reordered_showroom_copy(
+            &format!("{title}（调序副本）"),
+            &s(&st.item, "intro"),
+            &pages,
+        ) {
+            Ok(copy) => {
+                st.reorder = None;
+                st.selected_page = None;
+                st.page_press = None;
+                st.page_drag = None;
+                st.saved_copy = Some(copy);
+                // The copy's faces — the 本地演示 rows and the
+                // new index's cover/tags — are fed by
+                // refresh_local, the only reader of
+                // local_showroom; organization faces are not
+                // touched (no refresh_all).
+                self.refresh_local();
+                self.msg = "已另存为我的演示，在演示厅「我的」· 本地演示".into();
+            }
+            Err(e) => self.msg = format!("另存失败：{e}"),
         }
     }
 
@@ -15072,18 +15477,22 @@ impl App {
         // represented by their live showroom records above — never
         // counted twice).
         if self.role() == "super" {
-            if let Ok(v) = self.call("GET", "/v1/submissions?state=rejected", None) {
-                if let Some(arr) = v.get("items").and_then(|x| x.as_array()) {
-                    for sub in arr {
-                        all.push(json!({
-                            "id": s(sub, "id"),
-                            "title": s(sub, "title"),
-                            "state": "rejected",
-                            "submitted_by": s(sub, "submitter_name"),
-                            "reviewed_by": s(sub, "reviewed_by"),
-                            "reviewed_ms": i(sub, "reviewed_ms"),
-                            "review_note": s(sub, "review_note"),
-                        }));
+            for sub_state in ["rejected", "expired"] {
+                if let Ok(v) =
+                    self.call("GET", &format!("/v1/submissions?state={sub_state}"), None)
+                {
+                    if let Some(arr) = v.get("items").and_then(|x| x.as_array()) {
+                        for sub in arr {
+                            all.push(json!({
+                                "id": s(sub, "id"),
+                                "title": s(sub, "title"),
+                                "state": sub_state,
+                                "submitted_by": s(sub, "submitter_name"),
+                                "reviewed_by": s(sub, "reviewed_by"),
+                                "reviewed_ms": i(sub, "reviewed_ms"),
+                                "review_note": s(sub, "review_note"),
+                            }));
+                        }
                     }
                 }
             }
@@ -15115,7 +15524,7 @@ impl App {
                 false,
                 None,
                 false,
-                if state == "rejected" {
+                if state == "rejected" || state == "expired" {
                     CardVariant::Rejected
                 } else {
                     CardVariant::Normal
@@ -15130,6 +15539,7 @@ impl App {
                         match state.as_str() {
                             "pending" => badge(ui, tr("待审"), BadgeTone::Warn),
                             "landed" => badge(ui, tr("已落地"), BadgeTone::Ok),
+                            "expired" => badge(ui, tr("已过期"), BadgeTone::Bad),
                             _ => badge(ui, tr("被驳回"), BadgeTone::Bad),
                         }
                     });
@@ -15169,6 +15579,31 @@ impl App {
                         ui.label(
                             egui::RichText::new(tr(
                                 "修改后在索引详情重新提交即可（会自动关联本次驳回）",
+                            ))
+                            .size(11.5)
+                            .color(palette_color(TEXT_FAINT)),
+                        );
+                    }
+                    if state == "expired" {
+                        // The sweep stamps the explanation into
+                        // review_note; show it verbatim, then the
+                        // way back in (a fresh submission from the
+                        // index detail supersedes this row).
+                        let reason = s(sub, "review_note");
+                        if !reason.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{}：{}",
+                                    tr("过期说明"),
+                                    reason
+                                ))
+                                .size(11.5)
+                                .color(palette_color(TEXT_WEAK)),
+                            );
+                        }
+                        ui.label(
+                            egui::RichText::new(tr(
+                                "在索引详情重新提交即可（会自动关联本次过期）",
                             ))
                             .size(11.5)
                             .color(palette_color(TEXT_FAINT)),
@@ -15426,12 +15861,13 @@ impl App {
             let records = self.review.records.clone();
             for item in &records {
                 let rejected = s(item, "state") == "rejected";
+                let expired = s(item, "state") == "expired";
                 standard_card_v(
                     ui,
                     false,
                     None,
                     false,
-                    if rejected {
+                    if rejected || expired {
                         CardVariant::Rejected
                     } else {
                         CardVariant::Normal
@@ -15445,12 +15881,14 @@ impl App {
                             );
                             badge(
                                 ui,
-                                if rejected {
+                                if expired {
+                                    tr("已过期")
+                                } else if rejected {
                                     tr("已驳回")
                                 } else {
                                     tr("已通过")
                                 },
-                                if rejected {
+                                if rejected || expired {
                                     BadgeTone::Bad
                                 } else {
                                     BadgeTone::Ok
@@ -15570,6 +16008,7 @@ impl App {
                         "pending" => badge(ui, tr("待审"), BadgeTone::Warn),
                         "live" => badge(ui, tr("已通过"), BadgeTone::Ok),
                         "rejected" => badge(ui, tr("已驳回"), BadgeTone::Bad),
+                        "expired" => badge(ui, tr("已过期"), BadgeTone::Bad),
                         _ => {}
                     }
                 });
@@ -15813,6 +16252,7 @@ impl App {
                         "pending" => badge(ui, tr("待审"), BadgeTone::Warn),
                         "landed" => badge(ui, tr("已落地"), BadgeTone::Ok),
                         "rejected" => badge(ui, tr("已驳回"), BadgeTone::Bad),
+                        "expired" => badge(ui, tr("已过期"), BadgeTone::Bad),
                         _ => {}
                     }
                     badge(ui, tr("提交包"), BadgeTone::Info);
@@ -16060,7 +16500,13 @@ impl App {
         }
         if let SrFrame::Deck(mut deck) = self.showroom.stack.replace_top(SrFrame::Wall) {
             self.showroom_deck(ui, &mut deck);
-            if deck.closed {
+            if let Some(copy) = deck.jump_to.take() {
+                // N4 「查看我的副本」: the saved reorder copy's
+                // deck replaces this frame — open_showroom_deck
+                // resets the stack to the wall and pushes the
+                // copy's deck in this frame's place.
+                self.open_showroom_deck(&copy);
+            } else if deck.closed {
                 self.showroom.stack.pop();
             } else {
                 self.showroom.stack.replace_top(SrFrame::Deck(deck));
@@ -18460,6 +18906,35 @@ impl App {
                     12.5,
                     egui::Sense::click(),
                 );
+                if s(f, "origin") == "server" {
+                    // Origin badge (user ruling 2026-11-25): a
+                    // small globe right after the name marks a
+                    // folder that was synced down from a server.
+                    // It is a local copy like any other — the
+                    // badge only states where it came from.
+                    let label_x = resp.rect.min.x + 10.0 + d as f32 * 15.0 + 15.0 + 6.0;
+                    let font = egui::FontId::new(12.5, egui::FontFamily::Proportional);
+                    let galley = ui.painter().layout_no_wrap(fname.clone(), font, egui::Color32::WHITE);
+                    let badge_rect = egui::Rect::from_min_size(
+                        egui::pos2(
+                            label_x + galley.size().x + 5.0,
+                            resp.rect.center().y - 5.5,
+                        ),
+                        egui::vec2(11.0, 11.0),
+                    );
+                    let tint = if is_sel {
+                        palette_color(ACCENT)
+                    } else {
+                        palette_color(ICON_TINT)
+                    };
+                    ChromeIcon::Globe.image(11.0, tint).paint_at(ui, badge_rect);
+                    ui.interact(
+                        badge_rect,
+                        egui::Id::new(("folder_origin_badge", fid.as_str())),
+                        egui::Sense::hover(),
+                    )
+                    .on_hover_text("来自服务器");
+                }
                 let is_dragged =
                     matches!(&self.folder_press, Some(p) if p.armed && p.id == fid);
                 if is_dragged {
@@ -20554,6 +21029,250 @@ impl App {
         }
     }
 
+    /// Open the folder sync dialog (user ruling 2026-11-25):
+    /// fetch the ACTIVE server's folder list and let the user
+    /// pick which folders to pull into the local library. This
+    /// is the only way server folders arrive — connecting or
+    /// refreshing never pulls any on its own. In REST-fallback
+    /// mode the working folders already ARE the server's, so
+    /// there is nothing to sync; with no reachable server (or a
+    /// guest session, which the server's folder list refuses)
+    /// the fetch error is surfaced and no dialog opens.
+    fn open_folder_sync(&mut self) {
+        if self.local.is_none() {
+            self.msg = "当前直接使用服务器目录，无需同步".into();
+            return;
+        }
+        match self.call("GET", "/v1/folders", None) {
+            Ok(v) => {
+                self.folder_sync_list = v
+                    .get("folders")
+                    .and_then(|f| f.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                self.folder_sync_checked.clear();
+                self.folder_sync_open = true;
+            }
+            Err(e) => {
+                self.msg = format!("读取服务器目录失败：{e}");
+            }
+        }
+    }
+
+    /// Carry out a sync pick from the dialog: `all` pulls every
+    /// server folder not yet local, otherwise only the ticked
+    /// ones. Reconciliation by id lives in the core store —
+    /// folders already local are skipped and keep their local
+    /// names. Afterwards the working folder list is re-read from
+    /// the local library, like every other local mutation.
+    fn run_folder_sync(&mut self, all: bool) {
+        let Some(local) = self.local.clone() else {
+            self.folder_sync_open = false;
+            return;
+        };
+        let local_ids: std::collections::HashSet<String> =
+            self.folders.iter().map(|f| s(f, "id")).collect();
+        let mut recs: Vec<qimu_core::store::FolderRec> = Vec::new();
+        for v in &self.folder_sync_list {
+            let id = s(v, "id");
+            if id.is_empty() || local_ids.contains(&id) {
+                continue;
+            }
+            if !all && !self.folder_sync_checked.contains(&id) {
+                continue;
+            }
+            if let Ok(rec) = serde_json::from_value::<qimu_core::store::FolderRec>(v.clone()) {
+                recs.push(rec);
+            }
+        }
+        let n = local.sync_server_folders(&recs);
+        self.folders = local.list_folders();
+        self.folder_sync_open = false;
+        self.msg = if n > 0 {
+            format!("已同步 {n} 个服务器目录到本地")
+        } else {
+            "所选目录已全部在本地".into()
+        };
+    }
+
+    /// The sync dialog: the server's folders as per-scope trees
+    /// with checkboxes; folders already in the local library are
+    /// shown ticked and marked 已同步 (unticking is not a delete
+    /// — removing a local copy is the tree's own delete, and it
+    /// can be re-ticked here afterwards). 「全量同步」 pulls
+    /// everything not yet local in one click.
+    fn folder_sync_window(&mut self, ui: &mut egui::Ui) {
+        if !self.folder_sync_open {
+            return;
+        }
+        let mut open = true;
+        let mut act: Option<bool> = None;
+        let mut cancel = false;
+        let mut toggles: Vec<(String, bool)> = Vec::new();
+        let local_ids: std::collections::HashSet<String> =
+            self.folders.iter().map(|f| s(f, "id")).collect();
+        let list = self.folder_sync_list.clone();
+        let checked = self.folder_sync_checked.clone();
+        egui::Window::new("同步服务器目录")
+            .open(&mut open)
+            .title_bar(false)
+            .frame(dlg_frame())
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ui.ctx(), |ui| {
+                ui.set_width(520.0);
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("同步服务器目录")
+                            .strong()
+                            .size(19.0)
+                            .color(palette_color(TEXT_MAIN)),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                        if dlg_close_x(ui) {
+                            cancel = true;
+                        }
+                    });
+                });
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new("勾选要同步到本地的服务器目录。同步后它们会一直保存在本机：可以改名，断开服务器也能用；删除本地副本不影响服务器，需要时可在这里重新勾选同步。")
+                        .size(13.5)
+                        .color(palette_color(TEXT_MAIN)),
+                );
+                ui.add_space(10.0);
+                egui::ScrollArea::vertical()
+                    .max_height(360.0)
+                    .show(ui, |ui| {
+                        if list.is_empty() {
+                            ui.label(
+                                egui::RichText::new("服务器上暂无目录。")
+                                    .size(12.5)
+                                    .color(palette_color(TEXT_WEAK)),
+                            );
+                        }
+                        for (scope, caption) in [
+                            ("showroom", "演示"),
+                            ("content", "页面"),
+                            ("index", "索引"),
+                            ("library", "我的"),
+                            ("inbox", "分享"),
+                        ] {
+                            let mut rows: Vec<Value> = list
+                                .iter()
+                                .filter(|f| s(*f, "scope") == scope)
+                                .cloned()
+                                .collect();
+                            if rows.is_empty() {
+                                continue;
+                            }
+                            rows.sort_by_key(|f| i(f, "sort"));
+                            let mut ordered: Vec<Value> = Vec::new();
+                            fn walk(rows: &[Value], parent: &str, out: &mut Vec<Value>) {
+                                for f in rows {
+                                    if s(f, "parent_id") == parent {
+                                        out.push(f.clone());
+                                        let id = s(f, "id");
+                                        walk(rows, &id, out);
+                                    }
+                                }
+                            }
+                            walk(&rows, "", &mut ordered);
+                            for f in &rows {
+                                if !ordered.iter().any(|x| s(x, "id") == s(f, "id")) {
+                                    ordered.push(f.clone());
+                                }
+                            }
+                            ui.label(
+                                egui::RichText::new(caption)
+                                    .size(12.0)
+                                    .color(palette_color(TEXT_WEAK)),
+                            );
+                            ui.add_space(2.0);
+                            for f in &ordered {
+                                let fid = s(f, "id");
+                                let fname = s(f, "name");
+                                let mut depth = 0usize;
+                                let mut cur = s(f, "parent_id");
+                                while !cur.is_empty() && depth < 8 {
+                                    match rows.iter().find(|x| s(x, "id") == cur) {
+                                        Some(p) => {
+                                            depth += 1;
+                                            cur = s(p, "parent_id");
+                                        }
+                                        None => break,
+                                    }
+                                }
+                                let is_local = local_ids.contains(&fid);
+                                ui.horizontal(|ui| {
+                                    ui.add_space(depth as f32 * 15.0);
+                                    if is_local {
+                                        let mut dummy = true;
+                                        ui.add_enabled(
+                                            false,
+                                            egui::Checkbox::new(&mut dummy, ""),
+                                        );
+                                    } else {
+                                        let mut on = checked.contains(&fid);
+                                        if ui.checkbox(&mut on, "").changed() {
+                                            toggles.push((fid.clone(), on));
+                                        }
+                                    }
+                                    ui.add(ChromeIcon::Folder.image(
+                                        15.0,
+                                        palette_color(ICON_TINT),
+                                    ));
+                                    ui.label(
+                                        egui::RichText::new(&fname)
+                                            .size(12.5)
+                                            .color(palette_color(TEXT_MAIN)),
+                                    );
+                                    if is_local {
+                                        ui.label(
+                                            egui::RichText::new("已同步")
+                                                .size(11.0)
+                                                .color(palette_color(TEXT_WEAK)),
+                                        );
+                                    }
+                                });
+                                ui.add_space(2.0);
+                            }
+                            ui.add_space(8.0);
+                        }
+                    });
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        if btn_default(ui, "同步所选").clicked() {
+                            act = Some(false);
+                        }
+                        if btn_weak(ui, "全量同步").clicked() {
+                            act = Some(true);
+                        }
+                        if btn_weak(ui, "取消").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            });
+        for (id, on) in toggles {
+            if on {
+                self.folder_sync_checked.insert(id);
+            } else {
+                self.folder_sync_checked.remove(&id);
+            }
+        }
+        if let Some(all) = act {
+            self.run_folder_sync(all);
+        }
+        if cancel || !open {
+            self.folder_sync_open = false;
+        }
+    }
+
     fn folder_delete_window(&mut self, ui: &mut egui::Ui) {
         let Some((id, name)) = self.folder_delete_confirm.clone() else {
             return;
@@ -20625,6 +21344,24 @@ impl App {
                         .size(13.5)
                         .color(palette_color(TEXT_MAIN)),
                 );
+                if self
+                    .folders
+                    .iter()
+                    .find(|f| s(f, "id") == id)
+                    .map_or(false, |f| s(f, "origin") == "server")
+                {
+                    // A synced folder deleted here loses only its
+                    // local copy (user ruling 2026-11-25): anyone
+                    // may delete their own copy, the server's
+                    // original stays, and the folder can be pulled
+                    // down again from the sync dialog.
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new("这是从服务器同步到本地的副本：删除只影响你这台电脑，服务器上仍在，需要时可在「同步服务器目录」里重新勾选同步。")
+                            .size(13.5)
+                            .color(palette_color(TEXT_MAIN)),
+                    );
+                }
                 ui.add_space(14.0);
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -20784,6 +21521,14 @@ impl App {
                 ui.label(
                     egui::RichText::new(tr(
                         "只填服务器地址可「匿名进入」：浏览公开内容；发布、审批需实名登录。",
+                    ))
+                    .size(11.5)
+                    .color(palette_color(TEXT_WEAK)),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(tr(
+                        "账号用于访问组织已公开的内容，并使用提交、审批、群组与分享等组织功能；你的素材和文件夹只保存在本机，不会同步到服务器。",
                     ))
                     .size(11.5)
                     .color(palette_color(TEXT_WEAK)),
@@ -22068,6 +22813,22 @@ impl App {
 
     /// 设置 → 服务器：saved connections, add-by-login, LAN discovery.
     fn settings_servers(&mut self, ui: &mut egui::Ui) {
+        // What an account is for (user ruling 2026-11-25): the
+        // account is the ticket into the organization, never a
+        // sync channel for local material.
+        ui.label(
+            egui::RichText::new("关于账号")
+                .strong()
+                .size(14.0)
+                .color(palette_color(TEXT_MAIN)),
+        );
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("登录账号用于访问组织已公开的内容，并使用提交、审批、群组与分享等组织功能。启幕不做云同步：你的素材与文件夹只保存在本机电脑；服务器目录可通过侧边栏的「同步服务器目录」按需同步到本地，同步后断开服务器也能使用。")
+                .size(11.5)
+                .color(palette_color(TEXT_WEAK)),
+        );
+        ui.add_space(14.0);
         ui.label(
             egui::RichText::new("已保存的服务器")
                 .strong()
@@ -22735,6 +23496,65 @@ impl App {
                         }
                         "审批队列" => {
                             self.review_queue_body(ui);
+                        }
+                        "投稿设置" => {
+                            // Server-side retention for pending
+                            // submissions (super only; the section
+                            // itself is super-gated). Loaded once
+                            // per account context, AI-settings
+                            // style; saving takes effect at the
+                            // server's next sweep (hourly at most).
+                            if !self.settings.sub_ttl_loaded {
+                                self.settings.sub_ttl_loaded = true;
+                                if let Ok(v) =
+                                    self.call("GET", "/v1/settings/submissions", None)
+                                {
+                                    if let Some(d) =
+                                        v.get("pending_ttl_days").and_then(|x| x.as_i64())
+                                    {
+                                        self.settings.sub_ttl_days = d;
+                                    }
+                                }
+                            }
+                            ui.label(
+                                egui::RichText::new("待审投稿保留天数")
+                                    .strong()
+                                    .size(16.0)
+                                    .color(palette_color(TEXT_MAIN)),
+                            );
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                ui.label("保留天数");
+                                ui.add(
+                                    egui::DragValue::new(
+                                        &mut self.settings.sub_ttl_days,
+                                    )
+                                    .range(0..=3650),
+                                );
+                                ui.label("天");
+                                if ui.button("保存").clicked()
+                                    && self.require_org_online("保存投稿设置")
+                                {
+                                    match self.call(
+                                        "PUT",
+                                        "/v1/settings/submissions",
+                                        Some(json!({
+                                            "pending_ttl_days": self.settings.sub_ttl_days
+                                        })),
+                                    ) {
+                                        Ok(_) => self.msg = "投稿设置已保存".into(),
+                                        Err(e) => self.msg = e,
+                                    }
+                                }
+                            });
+                            ui.add_space(6.0);
+                            ui.label(
+                                egui::RichText::new(
+                                    "待审投稿超过保留天数仍未审批的，服务器会自动清理其暂存文件，提交记录标记为「已过期」（记录保留，提交人可重新提交）。设为 0 表示永不过期。修改在服务器下一次清扫（每小时一次及每次启动）时生效。",
+                                )
+                                .size(11.5)
+                                .color(palette_color(TEXT_WEAK)),
+                            );
                         }
                         "个人资料" => {
                             // Board: label column + 380×34 fields on a 54

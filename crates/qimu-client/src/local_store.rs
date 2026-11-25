@@ -22,7 +22,7 @@
 
 use qimu_core::manifest::{Binding, Manifest, SourceRef};
 use qimu_core::pptx::{self, Package};
-use qimu_core::store::{FolderDeleteMode, Store, UserRec};
+use qimu_core::store::{FolderDeleteMode, FolderRec, Store, UserRec};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -1130,6 +1130,16 @@ impl LocalStore {
         store.list_folders().map(values_of).unwrap_or_default()
     }
 
+    /// Folder sync (user ruling 2026-11-25): copy the server
+    /// folders the user picked in the sync dialog into the local
+    /// library. Id-based reconciliation lives in the core store
+    /// (existing ids are skipped, never overwritten); returns how
+    /// many folders were newly inserted.
+    pub fn sync_server_folders(&self, folders: &[FolderRec]) -> usize {
+        let store = self.lock_timed("sync_server_folders");
+        store.sync_server_folders(folders).unwrap_or(0)
+    }
+
     /// GET /v1/groups shape: bare group records (the local owner is
     /// the seeded super user, so no visibility filtering applies).
     pub fn list_groups(&self) -> Vec<Value> {
@@ -1192,6 +1202,44 @@ impl LocalStore {
                 value
             })
             .collect()
+    }
+
+    /// N4 personal reorder copy (user ruling 2026-11-25):
+    /// save a reordered page sequence of an open deck as a NEW
+    /// item of THIS library — the composition lives in core
+    /// (`create_reordered_showroom_copy`: personal index +
+    /// locked entries + pins + showroom row, one transaction);
+    /// this wrapper supplies the library's owner/group and
+    /// returns the created row in exactly the shape
+    /// `list_local_showroom` feeds the wall, so the caller can
+    /// offer a jump straight into the copy. A deck whose
+    /// versions this library does not hold (an organization
+    /// deck whose content lives only on its server) fails in
+    /// core's read phase with the reason — the copy is a
+    /// local-library object by design, and nothing is written.
+    pub fn save_reordered_showroom_copy(
+        &self,
+        title: &str,
+        intro: &str,
+        pages: &[(String, usize)],
+    ) -> Result<Value, String> {
+        let item_id = {
+            let store = self.store.lock().unwrap();
+            store
+                .create_reordered_showroom_copy(
+                    title,
+                    intro,
+                    &self.owner.id,
+                    &self.default_group_id,
+                    &self.owner.display_name,
+                    pages,
+                )?
+                .id
+        };
+        self.list_local_showroom()
+            .into_iter()
+            .find(|v| v.get("id").and_then(|x| x.as_str()) == Some(item_id.as_str()))
+            .ok_or_else(|| "副本已保存，但在本地演示列表中未找到".to_string())
     }
 
     /// One-lock snapshot of the four working-data lists

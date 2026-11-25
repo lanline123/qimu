@@ -272,7 +272,8 @@ impl App {
                     body["note"] = json!(note);
                     body["source_index_id"] = json!(id);
                     if let Some(prev) = self.my_submissions.iter().find(|x| {
-                        s(x, "source_index_id") == id && s(x, "state") == "rejected"
+                        s(x, "source_index_id") == id
+                            && matches!(s(x, "state").as_str(), "rejected" | "expired")
                     }) {
                         body["supersedes"] = json!(s(prev, "id"));
                     }

@@ -1493,6 +1493,57 @@ async fn put_cache_policy(
     Ok(Json(json!({ "ok": true })))
 }
 
+/// Pending-submission retention (user ruling 2026-11-25, item
+/// 11): how many days a staged package waits for review before
+/// the sweep expires it. Super-only on both sides, like the AI
+/// settings — the only reader is the super's settings face, and
+/// the value steers a destructive sweep, so it is not a public
+/// policy the way cache-policy is.
+async fn get_submission_settings(
+    State(st): State<St>,
+    headers: HeaderMap,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    if user.role != "super" {
+        return Err(forbidden());
+    }
+    let store = st.store.lock().unwrap();
+    let days = store.submission_pending_ttl_days().map_err(bad)?;
+    Ok(Json(json!({ "pending_ttl_days": days })))
+}
+
+#[derive(Deserialize)]
+struct SubmissionSettingsReq {
+    pending_ttl_days: i64,
+}
+
+async fn put_submission_settings(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Json(req): Json<SubmissionSettingsReq>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    if user.role != "super" {
+        return Err(forbidden());
+    }
+    // Range check (same discipline as cache-policy): 0 is the
+    // deliberate "never expire" escape hatch; the ceiling keeps
+    // a typo from silently disabling the sweep for a century.
+    if !(0..=3650).contains(&req.pending_ttl_days) {
+        return Err(bad(
+            "待审保留天数超出允许范围（0–3650 天，0 表示永不过期）",
+        ));
+    }
+    let store = st.store.lock().unwrap();
+    store
+        .set_setting(
+            Store::SUBMISSION_TTL_KEY,
+            &req.pending_ttl_days.to_string(),
+        )
+        .map_err(bad)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
 // ---------------- folders ----------------
 
 async fn folders(
@@ -1604,6 +1655,13 @@ async fn delete_folder(
     Path(id): Path<String>,
 ) -> Api<Value> {
     let user = auth(&st, &headers)?;
+    // Deleting a folder through the server removes the ORIGINAL
+    // (user ruling 2026-11-25): admins only. Copies already
+    // synced into a client's local library are not affected —
+    // they live and die by the local face, which has no gate.
+    if user.role != "super" && user.role != "dept_admin" {
+        return Err(forbidden());
+    }
     let store = st.store.lock().unwrap();
     store
         .delete_folder(&id, FolderDeleteMode::Lift, &user.id)
@@ -1629,6 +1687,13 @@ async fn delete_folder_mode(
     Json(req): Json<DeleteFolderReq>,
 ) -> Api<Value> {
     let user = auth(&st, &headers)?;
+    // Same original-deletion gate as DELETE /v1/folders/:id
+    // (user ruling 2026-11-25): removing a folder on the server
+    // is an admin act in both modes; the per-object capability
+    // checks below still apply on top for "trash".
+    if user.role != "super" && user.role != "dept_admin" {
+        return Err(forbidden());
+    }
     let mode = match req.mode.as_str() {
         "lift" => FolderDeleteMode::Lift,
         "trash" => FolderDeleteMode::Trash,
@@ -4003,8 +4068,8 @@ async fn create_submission(
         if prev.submitter_id != user.id {
             return Err(bad("重提必须指向自己的提交"));
         }
-        if prev.state != "rejected" {
-            return Err(bad("只有被驳回的提交可以被重提取代"));
+        if prev.state != "rejected" && prev.state != "expired" {
+            return Err(bad("只有被驳回或已过期的提交可以被重提取代"));
         }
     }
     // F9: at most one pending package per (submitter, source
@@ -4137,6 +4202,11 @@ async fn review_submission(
         .get_submission(&id)
         .map_err(bad)?
         .ok_or_else(not_found)?;
+    if sub.state == "expired" {
+        return Err(bad(
+            "该提交已过期（待审超过保留天数，暂存已清理），请让提交人重新提交",
+        ));
+    }
     if sub.state != "pending" {
         return Err(bad("该提交已处理"));
     }
@@ -5681,6 +5751,32 @@ fn discovery_reply(payload: &[u8], http_port: u16) -> Option<String> {
 /// Answer discovery broadcasts with a unicast JSON hello so clients on
 /// the LAN can list this server without knowing its address.
 /// Best-effort: any failure is logged and never affects the HTTP service.
+/// Hourly beat for the pending-submission retention sweep
+/// (the startup pass runs inline in main). One hour is far
+/// below the day-granularity of the retention window, so the
+/// effective expiry lag stays within an hour of the deadline.
+async fn submission_ttl_task(st: St) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+    tick.tick().await; // the immediate first tick stands in for the startup pass
+    loop {
+        tick.tick().await;
+        let swept = {
+            let store = st.store.lock().unwrap();
+            store.sweep_expired_submissions(qimu_core::auth::now_ms())
+        };
+        match swept {
+            Ok(ids) if !ids.is_empty() => {
+                println!(
+                    "投稿过期清扫：{} 份待审投稿已过期，暂存已清理",
+                    ids.len()
+                );
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("投稿过期清扫失败：{e}"),
+        }
+    }
+}
+
 async fn discovery_task(http_port: u16) {
     let sock = match tokio::net::UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT)).await {
         Ok(s) => s,
@@ -6059,7 +6155,9 @@ fn acquire_server_lock(data_dir: &std::path::Path) -> Result<ServerLock, String>
 /// ruling 2026-11-25: the server can be closed from inside the
 /// software). A named-admin door: `auth` refuses guests and
 /// anonymous callers outright, and the role gate below refuses
-/// members — only super / dept_admin may close the server. The
+/// everyone but super — only the super admin may close the
+/// server (user ruling 2026-11-25: narrowed from super +
+/// dept_admin to super only). The
 /// success response returns FIRST; the shutdown flag flips
 /// ~300 ms later on a spawned task, so this request (and anything
 /// else in flight) completes before axum's graceful shutdown
@@ -6072,10 +6170,10 @@ async fn admin_shutdown(
     headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let user = auth(&st, &headers)?;
-    if user.role != "super" && user.role != "dept_admin" {
+    if user.role != "super" {
         return Err(err(
             StatusCode::FORBIDDEN,
-            "关闭服务器需要管理员权限",
+            "关闭服务器需要超级管理员权限",
         ));
     }
     println!(
@@ -6194,6 +6292,10 @@ async fn main() {
             get(get_cache_policy).put(put_cache_policy),
         )
         .route("/v1/settings/ai", get(get_ai_settings).put(put_ai_settings))
+        .route(
+            "/v1/settings/submissions",
+            get(get_submission_settings).put(put_submission_settings),
+        )
         .route("/v1/units/:id/translate", post(translate_unit))
         .route("/v1/units/:id/translate-jobs", post(start_translate_job))
         .route("/v1/translate-jobs/:job_id", get(get_translate_job))
@@ -6341,6 +6443,25 @@ async fn main() {
         "qimu-server listening on http://{addr} (data dir: {})",
         data_dir.display()
     );
+    // Pending-submission retention sweep (user ruling
+    // 2026-11-25, item 11): once at startup, then hourly. The
+    // sweep itself lives in core; this task only supplies the
+    // beat and the store lock (the same Mutex every handler
+    // takes, so a sweep can never interleave with a landing).
+    {
+        let store = state.store.lock().unwrap();
+        match store.sweep_expired_submissions(qimu_core::auth::now_ms()) {
+            Ok(ids) if !ids.is_empty() => {
+                println!(
+                    "投稿过期清扫（启动）：{} 份待审投稿已过期，暂存已清理",
+                    ids.len()
+                );
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("投稿过期清扫（启动）失败：{e}"),
+        }
+    }
+    tokio::spawn(submission_ttl_task(state.clone()));
     tokio::spawn(discovery_task(port));
     // Graceful shutdown has two triggers: the controlled admin
     // shutdown endpoint (watch flag in AppState) and Ctrl-C on the

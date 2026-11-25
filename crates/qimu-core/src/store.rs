@@ -130,6 +130,17 @@ pub struct FolderRec {
     /// Empty when the folder carries no note.
     #[serde(default)]
     pub note: String,
+    /// Where this folder row was born: "" for a folder created in
+    /// this library, "server" for one pulled down from a server
+    /// through the folder sync (user ruling 2026-11-25). A synced
+    /// folder is a local copy from the moment it lands: it keeps
+    /// the server's id (a folder's identity is its id — the name
+    /// is just a detail on the id card and may repeat), it can be
+    /// renamed and deleted locally without touching the server,
+    /// and it survives disconnects and server-side deletions.
+    /// The sidebar marks "server" rows with a small globe badge.
+    #[serde(default)]
+    pub origin: String,
 }
 
 /// How `Store::delete_folder` treats a folder's contents (user
@@ -723,7 +734,7 @@ pub struct SubmissionRec {
     pub intro: String,
     pub submitter_id: String,
     pub submitter_name: String,
-    pub state: String, // pending | landed | rejected
+    pub state: String, // pending | landed | rejected | expired
     /// The submitter's own note riding with the package.
     pub note: String,
     /// Rejection reason, returned to the submitter verbatim.
@@ -846,7 +857,7 @@ CREATE TABLE IF NOT EXISTS departments(id TEXT PRIMARY KEY, name TEXT NOT NULL, 
 CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, display_name TEXT NOT NULL, password_hash TEXT NOT NULL, dept_id TEXT, role TEXT NOT NULL DEFAULT 'member', disabled INTEGER NOT NULL DEFAULT 0, must_change_password INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS user_depts(user_id TEXT NOT NULL, dept_id TEXT NOT NULL, PRIMARY KEY(user_id, dept_id));
 CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, user_id TEXT, created_ms INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'user', client_ip TEXT, last_seen_ms INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE IF NOT EXISTS folders(id TEXT PRIMARY KEY, name TEXT NOT NULL, parent_id TEXT, sort INTEGER NOT NULL DEFAULT 0, main_index_id TEXT, scope TEXT NOT NULL DEFAULT '', color TEXT, note TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS folders(id TEXT PRIMARY KEY, name TEXT NOT NULL, parent_id TEXT, sort INTEGER NOT NULL DEFAULT 0, main_index_id TEXT, scope TEXT NOT NULL DEFAULT '', color TEXT, note TEXT NOT NULL DEFAULT '', origin TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS groups_tbl(id TEXT PRIMARY KEY, name TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS group_grants(id TEXT PRIMARY KEY, group_id TEXT NOT NULL, subject_type TEXT NOT NULL, subject_id TEXT NOT NULL, capability TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS units(id TEXT PRIMARY KEY, name TEXT NOT NULL, folder_id TEXT, group_id TEXT NOT NULL, maintainer TEXT NOT NULL, lead_lang TEXT NOT NULL DEFAULT 'zh', description TEXT NOT NULL DEFAULT '', current_revision INTEGER NOT NULL DEFAULT 1, created_ms INTEGER NOT NULL);
@@ -949,6 +960,7 @@ impl Store {
             ("folders", "scope", "TEXT NOT NULL DEFAULT ''"),
             ("folders", "color", "TEXT"),
             ("folders", "note", "TEXT NOT NULL DEFAULT ''"),
+            ("folders", "origin", "TEXT NOT NULL DEFAULT ''"),
             ("index_branches", "source_index_id", "TEXT"),
             ("index_branches", "source_branch", "TEXT"),
             ("index_branches", "fork_commit_id", "TEXT"),
@@ -2101,6 +2113,7 @@ impl Store {
             scope,
             color: None,
             note: String::new(),
+            origin: String::new(),
         })
     }
 
@@ -2108,7 +2121,7 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, name, parent_id, sort, main_index_id, scope, color, note FROM folders ORDER BY sort, name",
+                "SELECT id, name, parent_id, sort, main_index_id, scope, color, note, origin FROM folders ORDER BY sort, name",
             )
             .map_err(db_err)?;
         let rows = stmt
@@ -2122,6 +2135,7 @@ impl Store {
                     scope: r.get(5)?,
                     color: r.get(6)?,
                     note: r.get(7)?,
+                    origin: r.get(8)?,
                 })
             })
             .map_err(db_err)?
@@ -2142,6 +2156,51 @@ impl Store {
             .into_iter()
             .filter(|f| f.scope == scope)
             .collect())
+    }
+
+    /// Pull server folders down into this library (folder sync,
+    /// user ruling 2026-11-25): the user picks folders on a
+    /// server and they are copied into the local library, where
+    /// they stay for good — mixed into the same trees as local
+    /// folders, marked origin="server".
+    ///
+    /// Reconciliation is by id alone (a folder's identity is its
+    /// id; the name is just a detail on the id card): a row whose
+    /// id already exists locally is skipped untouched, so a
+    /// re-sync never duplicates a folder and never overwrites a
+    /// local rename. A new row adopts the server's id verbatim —
+    /// folder ids are `fld_` + 64 random bits minted by the same
+    /// generator on both sides, so the id space is shared and a
+    /// collision would be the same folder by construction. The
+    /// server parent_id is kept verbatim too: when the parent was
+    /// not picked it dangles for now and the trees surface the
+    /// folder at the root; when the parent is synced later the
+    /// folder re-attaches on its own. `main_index_id` is NOT
+    /// copied — it designates an index on the server, which does
+    /// not exist in this library. Rows with a scope outside the
+    /// five sidebar trees are skipped (they would hang on no
+    /// tree). Returns how many rows were inserted.
+    pub fn sync_server_folders(&self, server_folders: &[FolderRec]) -> SResult<usize> {
+        let existing: HashSet<String> = self
+            .list_folders()?
+            .into_iter()
+            .map(|f| f.id)
+            .collect();
+        let tx = self.conn.unchecked_transaction().map_err(db_err)?;
+        let mut inserted = 0usize;
+        for f in server_folders {
+            if existing.contains(&f.id) || !FOLDER_SCOPES.contains(&f.scope.as_str()) {
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO folders(id, name, parent_id, sort, scope, color, note, origin) VALUES(?1,?2,?3,?4,?5,?6,?7,'server')",
+                params![f.id, f.name, f.parent_id, f.sort, f.scope, f.color, f.note],
+            )
+            .map_err(db_err)?;
+            inserted += 1;
+        }
+        tx.commit().map_err(db_err)?;
+        Ok(inserted)
     }
 
     pub fn rename_folder(&self, id: &str, name: &str) -> SResult<()> {
@@ -4812,6 +4871,124 @@ impl Store {
         Ok(())
     }
 
+    /// Personal reorder copy (N4, user ruling 2026-11-25):
+    /// materialize a reordered page sequence of some deck as a
+    /// NEW showroom item owned by `submitted_by` — the ruling is
+    /// "调整只动自己": the source item and its pins are never
+    /// written; the copy is new rows only. The flattened order
+    /// cannot be expressed by reordering the source item's
+    /// entries (a permutation can cut across blocks), so the
+    /// copy gets its own personal index: one commit whose
+    /// entries are one Locked entry per maximal run of
+    /// consecutive pages of the same version, each entry's
+    /// excerpt slots naming its pages in the new order
+    /// (`excerpt_positions` resolves tokens in the order given,
+    /// so the run's page order is the token order; a page that
+    /// repeats inside one run starts a new entry, because one
+    /// entry's resolution dedups repeated tokens). The item
+    /// points at that commit with the same versions pinned, so
+    /// it publishes exactly the sequence the user arranged —
+    /// the pin model's semantics, reused, not extended.
+    ///
+    /// `pages` is the flattened (version_id, slot) sequence in
+    /// the new order. Every version must live in THIS store:
+    /// callers surface the copy from this store's own showroom
+    /// face, so a version held elsewhere aborts the save in the
+    /// read phase, before anything is written. The write phase
+    /// runs in one transaction (land_submission's shell), so a
+    /// failure midway leaves no half-built copy behind.
+    pub fn create_reordered_showroom_copy(
+        &self,
+        title: &str,
+        intro: &str,
+        submitted_by: &str,
+        group_id: &str,
+        maintainer: &str,
+        pages: &[(String, usize)],
+    ) -> SResult<ShowroomRec> {
+        if pages.is_empty() {
+            return Err("没有可另存的页面".into());
+        }
+        // Resolve + group (reads only): any failure here leaves
+        // the store untouched.
+        let mut entries: Vec<IndexEntry> = Vec::new();
+        let mut pins: Vec<String> = Vec::new();
+        for (version_id, slot) in pages {
+            let ver = self.get_version(version_id).map_err(|_| {
+                "这份演示的内容不在本地库中，副本保存在本地库，本次无法另存".to_string()
+            })?;
+            let page = ver.pages.get(*slot).ok_or_else(|| {
+                "页序与内容不一致，请重新打开演示后再试".to_string()
+            })?;
+            // Page-entity tokens are position-independent; rows
+            // written before page entity-ization may carry an
+            // empty id, where the positional token is the only
+            // name the page has (excerpt_positions reads both).
+            let token = if page.id.is_empty() {
+                slot.to_string()
+            } else {
+                page.id.clone()
+            };
+            let extends_last = entries.last().map_or(false, |e| {
+                matches!(&e.policy, crate::model::EntryPolicy::Locked { version_id: lv } if lv.0 == ver.id)
+                    && !e
+                        .excerpt_slots
+                        .as_ref()
+                        .map(|t| t.contains(&token))
+                        .unwrap_or(true)
+            });
+            if extends_last {
+                entries
+                    .last_mut()
+                    .unwrap()
+                    .excerpt_slots
+                    .as_mut()
+                    .unwrap()
+                    .push(token);
+            } else {
+                let rend = self.get_rendition(&ver.rendition_id)?;
+                entries.push(IndexEntry {
+                    unit_id: crate::model::Id(rend.unit_id.clone()),
+                    rendition_id: crate::model::Id(ver.rendition_id.clone()),
+                    policy: crate::model::EntryPolicy::Locked {
+                        version_id: crate::model::Id(ver.id.clone()),
+                    },
+                    locked_semver: Some(ver.semver.clone()),
+                    excerpt_slots: Some(vec![token]),
+                });
+                pins.push(ver.id.clone());
+            }
+        }
+        self.conn.execute_batch("BEGIN IMMEDIATE").map_err(db_err)?;
+        let attempt = (|| -> SResult<ShowroomRec> {
+            let index =
+                self.create_index(title, None, group_id, maintainer, "company", entries)?;
+            let commit_id = self
+                .branch_head(&index.id, "main")?
+                .ok_or_else(|| "副本索引缺少提交".to_string())?;
+            let rec = self.insert_showroom(
+                title,
+                intro,
+                Some(&index.id),
+                Some(&commit_id),
+                submitted_by,
+                "live",
+            )?;
+            self.set_showroom_pins(&rec.id, &commit_id, &pins)?;
+            Ok(rec)
+        })();
+        match attempt {
+            Ok(rec) => {
+                self.conn.execute_batch("COMMIT").map_err(db_err)?;
+                Ok(rec)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
     // ---------- trash (soft delete, prototype #trashView) ----------
     // Deleting is an overlay: the object row stays in its own table
     // and a trash_items row hides it from the normal lists, so a
@@ -5114,6 +5291,84 @@ impl Store {
         dir_tree_bytes(&self.submission_staging_dir(id))
     }
 
+    /// The settings key holding the pending-submission retention
+    /// window, in days (server settings table; written only
+    /// through the super-gated settings endpoint).
+    pub const SUBMISSION_TTL_KEY: &'static str = "submission_pending_ttl_days";
+
+    /// Retention default (user ruling 2026-11-25, item 11): a
+    /// pending submission's staged package is kept 30 days.
+    pub const SUBMISSION_TTL_DEFAULT_DAYS: i64 = 30;
+
+    /// The effective retention window in days. A stored value of
+    /// 0 (or negative) means "never expire" — an explicit escape
+    /// hatch a super admin can set; a missing or unparsable value
+    /// falls back to the ruled default rather than failing.
+    pub fn submission_pending_ttl_days(&self) -> SResult<i64> {
+        match self.get_setting(Self::SUBMISSION_TTL_KEY)? {
+            Some(v) => Ok(v
+                .trim()
+                .parse::<i64>()
+                .unwrap_or(Self::SUBMISSION_TTL_DEFAULT_DAYS)),
+            None => Ok(Self::SUBMISSION_TTL_DEFAULT_DAYS),
+        }
+    }
+
+    /// Expire every pending submission older than the retention
+    /// window: its staged package is deleted and the row moves
+    /// to the terminal `expired` state (the record itself is
+    /// kept — it stays visible in the submitter's 「我的提交」
+    /// and in the review records, with the expiry explanation in
+    /// review_note). Returns the ids that actually transitioned.
+    ///
+    /// Concurrency: the state flip is a guarded UPDATE
+    /// (`... WHERE state='pending'`, the set_submission_rejected
+    /// pattern) and the staging directory is removed only when
+    /// this call won that flip. Landing re-checks the state
+    /// inside its BEGIN IMMEDIATE transaction, so a submission
+    /// being landed concurrently either commits first (the
+    /// UPDATE then matches 0 rows — nothing is expired and no
+    /// file is touched) or observes `expired` on its in-flight
+    /// re-check and rolls back before reading any staged byte.
+    /// A submission can therefore never lose its files mid-land.
+    pub fn sweep_expired_submissions(&self, now: i64) -> SResult<Vec<String>> {
+        let days = self.submission_pending_ttl_days()?;
+        if days <= 0 {
+            return Ok(Vec::new());
+        }
+        let cutoff = now - days * 86_400_000;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id FROM submissions WHERE state='pending' AND created_ms<?1 ORDER BY created_ms",
+            )
+            .map_err(db_err)?;
+        let ids: Vec<String> = stmt
+            .query_map(params![cutoff], |r| r.get(0))
+            .map_err(db_err)?
+            .collect::<Result<_, _>>()
+            .map_err(db_err)?;
+        drop(stmt);
+        let note = format!(
+            "待审超过保留天数（{days} 天），暂存已自动清理，请重新提交"
+        );
+        let mut expired = Vec::new();
+        for id in ids {
+            let n = self
+                .conn
+                .execute(
+                    "UPDATE submissions SET state='expired', review_note=?2, reviewed_by='', reviewed_ms=?3, land_error='' WHERE id=?1 AND state='pending'",
+                    params![id, note, now],
+                )
+                .map_err(db_err)?;
+            if n == 1 {
+                self.clear_submission_staging(&id);
+                expired.push(id);
+            }
+        }
+        Ok(expired)
+    }
+
     /// (pending count, staged bytes) a submitter currently holds
     /// in the staging zone — the create-submission quota (F5)
     /// reads this. Bytes are measured on disk: the staging
@@ -5259,6 +5514,12 @@ impl Store {
         let sub = self
             .get_submission(id)?
             .ok_or_else(|| "提交不存在".to_string())?;
+        if sub.state == "expired" {
+            return Err(
+                "该提交已过期（待审超过保留天数，暂存已清理），不能落地，请提交人重新提交"
+                    .into(),
+            );
+        }
         if sub.state != "pending" {
             return Err("该提交已处理，不能重复落地".into());
         }
@@ -5397,6 +5658,12 @@ impl Store {
             let fresh = self
                 .get_submission(id)?
                 .ok_or_else(|| "提交不存在".to_string())?;
+            if fresh.state == "expired" {
+                return Err(
+                    "该提交已过期（待审超过保留天数，暂存已清理），不能落地，请提交人重新提交"
+                        .into(),
+                );
+            }
             if fresh.state != "pending" {
                 return Err("该提交已处理，不能重复落地".into());
             }
