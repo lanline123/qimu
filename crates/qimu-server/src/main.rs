@@ -3962,6 +3962,15 @@ async fn submit_showroom(
     if !pins.is_empty() {
         store.set_showroom_pins(&rec.id, &commit_id, &pins).map_err(bad)?;
     }
+    // Message center: a reference-style submission also enters
+    // the approval queue — notify the reviewer set. Best-effort.
+    store.notify_supers(
+        "pending_review",
+        "新的演示待审批",
+        &format!("{} 提交了《{}》，等待审批。", user.display_name, req.title),
+        "showroom",
+        &rec.id,
+    );
     let mut value = serde_json::to_value(&rec).unwrap_or(Value::Null);
     value["submitted_by"] = json!(user.display_name);
     value["submitted_by_id"] = json!(user.id);
@@ -4043,9 +4052,53 @@ async fn review_showroom(
         return Err(bad("驳回必须填写理由（会原样回到提交人）"));
     }
     let store = st.store.lock().unwrap();
+    // The prior state decides what the decision MEANS for the
+    // owner (message center): pending → live is an approval,
+    // pending → rejected a rejection, live → rejected a
+    // takedown （下线）.
+    let prior = store.get_showroom_any(&id).map_err(bad)?;
     store
         .review_showroom(&id, &req.state, note, &user.display_name)
         .map_err(bad)?;
+    if let Some(item) = prior {
+        // Best-effort: the decision already committed. The
+        // row's submitted_by is the owner's user id (the submit
+        // face stores it; only its JSON rendering swaps in the
+        // display name).
+        match (item.state.as_str(), req.state.as_str()) {
+            (_, "live") => {
+                let _ = store.notify_user(
+                    &item.submitted_by,
+                    "approved",
+                    "演示已通过并发布",
+                    &format!("《{}》已通过审批并发布。", item.title),
+                    "showroom",
+                    &id,
+                );
+            }
+            ("live", "rejected") => {
+                let _ = store.notify_user(
+                    &item.submitted_by,
+                    "offline",
+                    "演示已被下线",
+                    &format!("《{}》已被下线。下线理由：{note}", item.title),
+                    "showroom",
+                    &id,
+                );
+            }
+            (_, "rejected") => {
+                let _ = store.notify_user(
+                    &item.submitted_by,
+                    "rejected",
+                    "演示申请被驳回",
+                    &format!("《{}》未通过审批。驳回理由：{note}", item.title),
+                    "showroom",
+                    &id,
+                );
+            }
+            _ => {}
+        }
+    }
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -4246,7 +4299,40 @@ async fn create_submission(
         store.clear_submission_staging(&id);
         return Err(e);
     }
+    // Message center: every super admin (the reviewer set) gets
+    // a "有新待审批" notification. Best-effort — the submission
+    // itself already committed.
+    store.notify_supers(
+        "pending_review",
+        "新的投稿待审批",
+        &format!("{} 提交了《{}》，等待审批。", user.display_name, req.title),
+        "submission",
+        &id,
+    );
     Ok(Json(json!(rec)))
+}
+
+/// Message center pull face (full version, 2026-11-25): the
+/// caller's own notification rows, newest first. `since` is an
+/// incremental created_ms cursor; clients merge by id into
+/// their local mirror, so overlaps are harmless. There is
+/// deliberately NO delete face here: deletion is a local-copy
+/// right (ruling C2) and the server row stays as the record.
+/// Guests never reach this handler — `auth` requires a named
+/// identity, and guests hold no user id to notify.
+async fn list_notifications(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let since: i64 = q
+        .get("since")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let store = st.store.lock().unwrap();
+    let items = store.list_notifications(&user.id, since).map_err(bad)?;
+    Ok(Json(json!({ "items": items })))
 }
 
 async fn list_submissions(
@@ -4310,6 +4396,17 @@ async fn review_submission(
                     // (Before this fix, landed staging was kept
                     // forever.)
                     store.clear_submission_staging(&id);
+                    // Message center: the submitter is notified
+                    // of the approval + landing. Best-effort —
+                    // the landing already committed.
+                    let _ = store.notify_user(
+                        &sub.submitter_id,
+                        "approved",
+                        "投稿已通过并落地",
+                        &format!("《{}》已通过审批并落地发布。", sub.title),
+                        "submission",
+                        &id,
+                    );
                     Ok(Json(json!({
                         "ok": true,
                         "landed_index_id": index_id,
@@ -4336,6 +4433,17 @@ async fn review_submission(
             // manifest stays on the submission row for the
             // record (and for the review preview's structure).
             store.clear_submission_staging(&id);
+            // Message center: the rejection reason travels back
+            // to the submitter as a notification, verbatim like
+            // the review_note itself. Best-effort.
+            let _ = store.notify_user(
+                &sub.submitter_id,
+                "rejected",
+                "投稿被驳回",
+                &format!("《{}》未通过审批。驳回理由：{note}", sub.title),
+                "submission",
+                &id,
+            );
             Ok(Json(json!({ "ok": true })))
         }
         _ => Err(bad("未知审批结果")),
@@ -6474,6 +6582,7 @@ async fn main() {
         .route("/v1/attachments/:id/download", get(download_attachment))
         .route("/v1/showroom", get(list_showroom).post(submit_showroom))
         .route("/v1/showroom/:id/review", post(review_showroom))
+        .route("/v1/notifications", get(list_notifications))
         .route("/v1/submissions", get(list_submissions).post(create_submission))
         .route("/v1/submissions/:id/review", post(review_submission))
         .route("/v1/submissions/:id/manifest", get(submission_manifest_view))

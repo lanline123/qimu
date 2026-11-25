@@ -512,7 +512,10 @@ impl App {
             })
             .clicked()
         {
-            self.workspace_controls.unread = 0;
+            // The badge is the mirror's real unread count now:
+            // opening the page no longer marks anything read —
+            // read state flips per card, on the card's own
+            // click (user ruling 2026-11-25).
             self.navigate_to(Page::Messages);
         }
 
@@ -833,7 +836,29 @@ impl App {
         }
     }
 
+    /// The message center (full version, user ruling
+    /// 2026-11-25): renders the LOCAL MIRROR list (App.messages)
+    /// filtered by the sidebar directory's kind selection. An
+    /// unread card wears its kind's frame color over the kind's
+    /// soft fill; clicking the card marks it read in the mirror
+    /// and the frame disappears (per-card read — opening the
+    /// page marks nothing). The per-card 删除 button removes
+    /// the local row (server-origin rows are tombstoned in
+    /// core, so a later pull cannot resurrect them). Actions
+    /// are collected during the render and applied after it,
+    /// the dialog pattern.
     pub(super) fn page_messages(&mut self, ui: &mut egui::Ui) {
+        let list: Vec<Value> = self
+            .messages
+            .iter()
+            .filter(|m| match &self.msg_filter {
+                None => true,
+                Some(k) => s(m, "kind") == *k,
+            })
+            .cloned()
+            .collect();
+        let mut read_id: Option<String> = None;
+        let mut delete_id: Option<String> = None;
         egui::Frame::NONE
             .inner_margin(egui::Margin::symmetric(22, 20))
             .show(ui, |ui| {
@@ -845,25 +870,41 @@ impl App {
                         .color(palette_color(TEXT_MAIN)),
                 );
                 ui.add_space(12.0);
-                if self.workspace_controls.messages.is_empty() {
+                if list.is_empty() {
                     return;
                 }
-                let now = ui.input(|input| input.time);
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        for message in &self.workspace_controls.messages {
-                            egui::Frame::NONE
-                                .fill(palette_color(CARD_BG))
-                                .stroke(egui::Stroke::new(1.0, palette_color(CARD_BORDER)))
+                        for message in &list {
+                            let id = s(message, "id");
+                            let kind = s(message, "kind");
+                            let unread = i(message, "read") == 0;
+                            let (fill, stroke) = if unread {
+                                (
+                                    palette_color(msg_kind_soft(&kind)),
+                                    egui::Stroke::new(
+                                        1.5,
+                                        palette_color(msg_kind_color(&kind)),
+                                    ),
+                                )
+                            } else {
+                                (
+                                    palette_color(CARD_BG),
+                                    egui::Stroke::new(1.0, palette_color(CARD_BORDER)),
+                                )
+                            };
+                            let frame = egui::Frame::NONE
+                                .fill(fill)
+                                .stroke(stroke)
                                 .corner_radius(6)
                                 .inner_margin(egui::Margin::symmetric(16, 12))
                                 .show(ui, |ui| {
                                     ui.set_width(ui.available_width());
                                     ui.horizontal(|ui| {
                                         ui.label(
-                                            egui::RichText::new(tr("会话消息"))
+                                            egui::RichText::new(s(message, "title"))
                                                 .size(14.0)
                                                 .strong()
                                                 .color(palette_color(TEXT_MAIN)),
@@ -871,35 +912,97 @@ impl App {
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
+                                                if ui
+                                                    .add(
+                                                        egui::Button::new(
+                                                            egui::RichText::new(tr("删除"))
+                                                                .size(11.5)
+                                                                .color(palette_color(
+                                                                    TEXT_WEAK,
+                                                                )),
+                                                        )
+                                                        .frame(false),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    delete_id = Some(id.clone());
+                                                }
                                                 ui.label(
-                                                    egui::RichText::new(message_age(
-                                                        message.at, now,
-                                                    ))
+                                                    egui::RichText::new(msg_age(i(
+                                                        message,
+                                                        "created_ms",
+                                                    )))
                                                     .size(11.5)
                                                     .color(palette_color(TEXT_WEAK)),
+                                                );
+                                                ui.label(
+                                                    egui::RichText::new(msg_kind_label(&kind))
+                                                        .size(11.5)
+                                                        .color(palette_color(msg_kind_color(
+                                                            &kind,
+                                                        ))),
                                                 );
                                             },
                                         );
                                     });
-                                    ui.add_space(6.0);
-                                    ui.label(
-                                        egui::RichText::new(&message.body)
-                                            .size(12.5)
-                                            .color(palette_color(TEXT_WEAK)),
-                                    );
+                                    let body = s(message, "body");
+                                    if !body.is_empty() {
+                                        ui.add_space(6.0);
+                                        ui.label(
+                                            egui::RichText::new(body)
+                                                .size(12.5)
+                                                .color(palette_color(TEXT_WEAK)),
+                                        );
+                                    }
                                 });
+                            if unread
+                                && frame
+                                    .response
+                                    .interact(egui::Sense::click())
+                                    .clicked()
+                            {
+                                read_id = Some(id.clone());
+                            }
                             ui.add_space(14.0);
                         }
                     });
             });
+        if let Some(id) = delete_id {
+            self.msg_delete(&id);
+        } else if let Some(id) = read_id {
+            self.msg_mark_read(&id);
+        }
     }
 }
 
-fn message_age(at: f64, now: f64) -> String {
-    let seconds = (now - at).max(0.0) as u64;
+/// Wall-clock age for a message row (created_ms): the mirror
+/// stores real epoch milliseconds, unlike the old in-memory
+/// history's egui-runtime seconds. Older than a day, the date
+/// itself is shown (YYYY-MM-DD, UTC+8 — the product's locale).
+fn msg_age(created_ms: i64) -> String {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(created_ms);
+    let seconds = ((now_ms - created_ms) / 1000).max(0);
     match seconds {
         0..=59 => tr("刚刚").to_string(),
         60..=3599 => format!("{} {}", seconds / 60, tr("分钟前")),
-        _ => format!("{} {}", seconds / 3600, tr("小时前")),
+        3600..=86399 => format!("{} {}", seconds / 3600, tr("小时前")),
+        _ => {
+            // Days-from-epoch → civil date (Howard Hinnant's
+            // algorithm), shifted to UTC+8.
+            let days = ((created_ms + 8 * 3600_000) / 86_400_000) + 719_468;
+            let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+            let doe = days - era * 146_097;
+            let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+            let y = yoe + era * 400;
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+            let mp = (5 * doy + 2) / 153;
+            let d = doy - (153 * mp + 2) / 5 + 1;
+            let m = if mp < 10 { mp + 3 } else { mp - 9 };
+            let y = if m <= 2 { y + 1 } else { y };
+            format!("{y:04}-{m:02}-{d:02}")
+        }
     }
 }

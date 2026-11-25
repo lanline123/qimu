@@ -3010,6 +3010,80 @@ impl LocalStore {
                         "graphs": serde_json::to_value(&graphs).unwrap_or_default()
                     }))
                 }
+                // ---- message center (full version, 2026-11-25):
+                // the local mirror's faces. Local-only paths —
+                // the server has no /v1/local-messages; when no
+                // local library is open these calls fall through
+                // and fail there, which the App treats as "no
+                // local messages" (declared degradation).
+                ("GET", ["v1", "local-messages"]) => {
+                    let user = query_param(q, "user").unwrap_or_default();
+                    let store = self.store.lock().unwrap();
+                    let items = store.list_local_messages(&user)?;
+                    Ok(json!({ "items": serde_json::to_value(&items).unwrap_or_default() }))
+                }
+                ("GET", ["v1", "local-messages", "unread"]) => {
+                    let user = query_param(q, "user").unwrap_or_default();
+                    let store = self.store.lock().unwrap();
+                    let count = store.count_local_unread(&user)?;
+                    Ok(json!({ "count": count }))
+                }
+                // One of this machine's own operation-feedback
+                // messages (kind `system`), recorded by the
+                // toast path.
+                ("POST", ["v1", "local-messages", "system"]) => {
+                    let store = self.store.lock().unwrap();
+                    let rec = store.insert_local_system_message(
+                        &str_field(&body, "title").unwrap_or_default(),
+                        &str_field(&body, "body").unwrap_or_default(),
+                        &str_field(&body, "user_id").unwrap_or_default(),
+                    )?;
+                    Ok(serde_json::to_value(&rec).unwrap_or_default())
+                }
+                // Merge a pulled page of server notifications
+                // into the mirror (tombstones + existing ids are
+                // skipped inside core).
+                ("POST", ["v1", "local-messages", "merge"]) => {
+                    let items: Vec<qimu_core::store::NotificationRec> =
+                        serde_json::from_value(
+                            body.get("items").cloned().unwrap_or_default(),
+                        )
+                        .map_err(|e| format!("通知数据无效：{e}"))?;
+                    let store = self.store.lock().unwrap();
+                    let inserted = store.merge_server_notifications(&items)?;
+                    Ok(json!({ "inserted": inserted }))
+                }
+                ("POST", ["v1", "local-messages", "read"]) => {
+                    let store = self.store.lock().unwrap();
+                    store.mark_local_message_read(
+                        &str_field(&body, "id").unwrap_or_default(),
+                    )?;
+                    Ok(json!({ "ok": true }))
+                }
+                ("POST", ["v1", "local-messages", "delete"]) => {
+                    let store = self.store.lock().unwrap();
+                    store.delete_local_message(
+                        &str_field(&body, "id").unwrap_or_default(),
+                    )?;
+                    Ok(json!({ "ok": true }))
+                }
+                // The clear dialog's three modes; core computes
+                // the day cutoff itself. Returns the removed
+                // count for the result toast.
+                ("POST", ["v1", "local-messages", "clear"]) => {
+                    let days = body
+                        .get("days")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(7);
+                    let store = self.store.lock().unwrap();
+                    let removed = store.clear_local_messages(
+                        &str_field(&body, "user_id").unwrap_or_default(),
+                        &str_field(&body, "mode").unwrap_or_else(|| "all".into()),
+                        &str_field(&body, "kind").unwrap_or_default(),
+                        days,
+                    )?;
+                    Ok(json!({ "removed": removed }))
+                }
                 _ => Err(UNHANDLED.to_string()),
             }
         })();

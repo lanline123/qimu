@@ -874,6 +874,43 @@ pub struct SubmissionRec {
     pub land_error: String,
 }
 
+/// One message-center row (full version, user ruling 2026-11-25).
+/// The same table shape serves both stores: on the SERVER it is
+/// the notification stream written at workflow transition points
+/// (`source = 'server'`, `read` unused — always 0); in a client's
+/// LOCAL library it is the mirror the message center renders —
+/// pulled server rows copied in with their server ids, plus
+/// `source = 'local'` rows for this machine's own operation
+/// feedback (kind `system`). `read` is managed only on the local
+/// side (C3: read state never leaves the machine).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationRec {
+    pub id: String,
+    /// Recipient user id (server rows). Local system rows carry
+    /// the signed-in user id at creation time, or "" when the
+    /// action ran logged-out; the local list face shows local
+    /// rows regardless of this field.
+    pub user_id: String,
+    /// rejected | approved | pending_review | expired | offline
+    /// | system
+    pub kind: String,
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
+    /// The business object the message is about ("" when none):
+    /// ref_kind is "submission" | "showroom" | "".
+    #[serde(default)]
+    pub ref_kind: String,
+    #[serde(default)]
+    pub ref_id: String,
+    pub created_ms: i64,
+    #[serde(default)]
+    pub read: i64,
+    /// server | local
+    #[serde(default)]
+    pub source: String,
+}
+
 /// The content manifest of a submission package (design §6.3):
 /// one local index pinned at one commit, with every referenced
 /// unit / rendition / version's metadata. Fragment bytes travel
@@ -998,6 +1035,8 @@ CREATE TABLE IF NOT EXISTS profile_fields(user_id TEXT NOT NULL, field TEXT NOT 
 CREATE TABLE IF NOT EXISTS company_profile(field TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS pending_imports(id TEXT PRIMARY KEY, filename TEXT NOT NULL, stem TEXT NOT NULL DEFAULT '', deck_hash TEXT NOT NULL, folder_id TEXT, group_id TEXT NOT NULL DEFAULT '', author TEXT NOT NULL DEFAULT '', slide_count INTEGER NOT NULL DEFAULT 0, sections_json TEXT NOT NULL DEFAULT '', pages_json TEXT NOT NULL DEFAULT '[]', blocks_json TEXT NOT NULL DEFAULT '', grouped_json TEXT NOT NULL DEFAULT '[]', verified INTEGER, state TEXT NOT NULL DEFAULT 'splitting', error TEXT NOT NULL DEFAULT '', created_ms INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS notifications(id TEXT PRIMARY KEY, user_id TEXT NOT NULL, kind TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '', ref_kind TEXT NOT NULL DEFAULT '', ref_id TEXT NOT NULL DEFAULT '', created_ms INTEGER NOT NULL, read INTEGER NOT NULL DEFAULT 0, source TEXT NOT NULL DEFAULT 'server');
+CREATE TABLE IF NOT EXISTS notification_tombstones(server_id TEXT PRIMARY KEY, deleted_ms INTEGER NOT NULL DEFAULT 0);
 ";
 
 pub struct Store {
@@ -5703,11 +5742,13 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id FROM submissions WHERE state='pending' AND created_ms<?1 ORDER BY created_ms",
+                "SELECT id, submitter_id, title FROM submissions WHERE state='pending' AND created_ms<?1 ORDER BY created_ms",
             )
             .map_err(db_err)?;
-        let ids: Vec<String> = stmt
-            .query_map(params![cutoff], |r| r.get(0))
+        let rows: Vec<(String, String, String)> = stmt
+            .query_map(params![cutoff], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
             .map_err(db_err)?
             .collect::<Result<_, _>>()
             .map_err(db_err)?;
@@ -5716,20 +5757,387 @@ impl Store {
             "待审超过保留天数（{days} 天），暂存已自动清理，请重新提交"
         );
         let mut expired = Vec::new();
-        for id in ids {
+        for (id, submitter_id, title) in &rows {
             let n = self
                 .conn
                 .execute(
                     "UPDATE submissions SET state='expired', review_note=?2, reviewed_by='', reviewed_ms=?3, land_error='' WHERE id=?1 AND state='pending'",
-                    params![id, note, now],
+                    params![id.as_str(), note, now],
                 )
                 .map_err(db_err)?;
             if n == 1 {
-                self.clear_submission_staging(&id);
-                expired.push(id);
+                self.clear_submission_staging(id);
+                // Message center (full version): the submitter
+                // learns of the expiry from the notification
+                // stream, not only by re-checking 我的提交. The
+                // flip already committed above; a failed message
+                // write must never fail the sweep, so the result
+                // is deliberately dropped.
+                let _ = self.notify_user(
+                    submitter_id,
+                    "expired",
+                    "投稿已过期",
+                    &format!("《{title}》{note}"),
+                    "submission",
+                    id,
+                );
+                expired.push(id.clone());
             }
         }
         Ok(expired)
+    }
+
+    // ---------------- notifications (message center, full
+    // version — user ruling 2026-11-25) ----------------
+    //
+    // One table, two stores (see NotificationRec): the server
+    // writes rows at workflow transition points and serves them
+    // through GET /v1/notifications; a client library mirrors
+    // those rows (same ids) next to its own local `system` rows
+    // and owns the read flags and the deletion tombstones.
+
+    /// Write one server-side notification row. Callers at
+    /// transition points deliberately drop the Result: a failed
+    /// message write must never roll back the workflow action
+    /// that produced it.
+    pub fn notify_user(
+        &self,
+        user_id: &str,
+        kind: &str,
+        title: &str,
+        body: &str,
+        ref_kind: &str,
+        ref_id: &str,
+    ) -> SResult<String> {
+        if user_id.is_empty() {
+            return Err("通知缺少接收人".into());
+        }
+        let id = new_id("ntf");
+        self.conn
+            .execute(
+                "INSERT INTO notifications(id, user_id, kind, title, body, ref_kind, ref_id, created_ms, read, source) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,0,'server')",
+                params![id, user_id, kind, title, body, ref_kind, ref_id, now_ms()],
+            )
+            .map_err(db_err)?;
+        Ok(id)
+    }
+
+    /// Every enabled super-admin's user id — the reviewer set
+    /// that "有新待审批" notifications fan out to (submission and
+    /// showroom review are both super-gated).
+    pub fn super_user_ids(&self) -> SResult<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM users WHERE role='super' AND disabled=0 ORDER BY rowid")
+            .map_err(db_err)?;
+        let ids = stmt
+            .query_map([], |r| r.get(0))
+            .map_err(db_err)?
+            .collect::<Result<Vec<String>, _>>()
+            .map_err(db_err)?;
+        Ok(ids)
+    }
+
+    /// Fan one notification out to every super admin. Fully
+    /// best-effort: per-recipient failures are swallowed here so
+    /// a caller at a transition point has nothing to handle.
+    pub fn notify_supers(
+        &self,
+        kind: &str,
+        title: &str,
+        body: &str,
+        ref_kind: &str,
+        ref_id: &str,
+    ) {
+        if let Ok(ids) = self.super_user_ids() {
+            for uid in ids {
+                let _ = self.notify_user(&uid, kind, title, body, ref_kind, ref_id);
+            }
+        }
+    }
+
+    /// The server pull face: one user's notifications, newest
+    /// first. `since_ms` is an incremental cursor (strictly
+    /// greater); clients merge by id, so an overlapping window
+    /// is harmless.
+    pub fn list_notifications(
+        &self,
+        user_id: &str,
+        since_ms: i64,
+    ) -> SResult<Vec<NotificationRec>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, user_id, kind, title, body, ref_kind, ref_id, created_ms, read, source FROM notifications WHERE user_id=?1 AND created_ms>?2 ORDER BY created_ms DESC, rowid DESC LIMIT 500",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![user_id, since_ms], |r| {
+                Ok(NotificationRec {
+                    id: r.get(0)?,
+                    user_id: r.get(1)?,
+                    kind: r.get(2)?,
+                    title: r.get(3)?,
+                    body: r.get(4)?,
+                    ref_kind: r.get(5)?,
+                    ref_id: r.get(6)?,
+                    created_ms: r.get(7)?,
+                    read: r.get(8)?,
+                    source: r.get(9)?,
+                })
+            })
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(rows)
+    }
+
+    /// Record one of this machine's own operation-feedback
+    /// messages in the local library (kind `system`). `user_id`
+    /// is the signed-in user at the time, or "" — the local list
+    /// face shows local rows regardless (they are this machine's
+    /// feedback, not an account's data).
+    pub fn insert_local_system_message(
+        &self,
+        title: &str,
+        body: &str,
+        user_id: &str,
+    ) -> SResult<NotificationRec> {
+        let rec = NotificationRec {
+            id: new_id("loc"),
+            user_id: user_id.to_string(),
+            kind: "system".into(),
+            title: title.to_string(),
+            body: body.to_string(),
+            ref_kind: String::new(),
+            ref_id: String::new(),
+            created_ms: now_ms(),
+            read: 0,
+            source: "local".into(),
+        };
+        self.conn
+            .execute(
+                "INSERT INTO notifications(id, user_id, kind, title, body, ref_kind, ref_id, created_ms, read, source) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,0,'local')",
+                params![
+                    rec.id,
+                    rec.user_id,
+                    rec.kind,
+                    rec.title,
+                    rec.body,
+                    rec.ref_kind,
+                    rec.ref_id,
+                    rec.created_ms
+                ],
+            )
+            .map_err(db_err)?;
+        Ok(rec)
+    }
+
+    /// Merge pulled server rows into the local mirror. Rules:
+    /// a tombstoned id is skipped (locally deleted — never
+    /// resurrects, ruling C2); an id already present is left
+    /// untouched, so its local read flag survives; a new id
+    /// lands unread with source='server'. Returns how many rows
+    /// were actually inserted.
+    pub fn merge_server_notifications(
+        &self,
+        items: &[NotificationRec],
+    ) -> SResult<usize> {
+        let mut inserted = 0usize;
+        for it in items {
+            let tombstoned: bool = self
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM notification_tombstones WHERE server_id=?1",
+                    params![it.id],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map_err(db_err)?
+                > 0;
+            if tombstoned {
+                continue;
+            }
+            let n = self
+                .conn
+                .execute(
+                    "INSERT OR IGNORE INTO notifications(id, user_id, kind, title, body, ref_kind, ref_id, created_ms, read, source) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,0,'server')",
+                    params![
+                        it.id,
+                        it.user_id,
+                        it.kind,
+                        it.title,
+                        it.body,
+                        it.ref_kind,
+                        it.ref_id,
+                        it.created_ms
+                    ],
+                )
+                .map_err(db_err)?;
+            inserted += n;
+        }
+        Ok(inserted)
+    }
+
+    /// The local list face: this machine's own rows plus the
+    /// signed-in user's mirrored server rows, newest first.
+    /// Logged out (user_id ""), only local rows show — server
+    /// rows wait for their owner.
+    pub fn list_local_messages(&self, user_id: &str) -> SResult<Vec<NotificationRec>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, user_id, kind, title, body, ref_kind, ref_id, created_ms, read, source FROM notifications WHERE source='local' OR user_id=?1 ORDER BY created_ms DESC, rowid DESC LIMIT 500",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![user_id], |r| {
+                Ok(NotificationRec {
+                    id: r.get(0)?,
+                    user_id: r.get(1)?,
+                    kind: r.get(2)?,
+                    title: r.get(3)?,
+                    body: r.get(4)?,
+                    ref_kind: r.get(5)?,
+                    ref_id: r.get(6)?,
+                    created_ms: r.get(7)?,
+                    read: r.get(8)?,
+                    source: r.get(9)?,
+                })
+            })
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(rows)
+    }
+
+    /// Unread count over the same visible set as
+    /// `list_local_messages` — the toolbar bell's real number.
+    pub fn count_local_unread(&self, user_id: &str) -> SResult<i64> {
+        let n = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM notifications WHERE read=0 AND (source='local' OR user_id=?1)",
+                params![user_id],
+                |r| r.get(0),
+            )
+            .map_err(db_err)?;
+        Ok(n)
+    }
+
+    /// Mark one local message read (the per-card click). A
+    /// missing id is a no-op, not an error — the list may have
+    /// been cleared between render and click.
+    pub fn mark_local_message_read(&self, id: &str) -> SResult<()> {
+        self.conn
+            .execute(
+                "UPDATE notifications SET read=1 WHERE id=?1",
+                params![id],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    fn tombstone_server_message(&self, server_id: &str) -> SResult<()> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO notification_tombstones(server_id, deleted_ms) VALUES(?1,?2)",
+                params![server_id, now_ms()],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Delete one local message. A server-origin row also drops
+    /// a tombstone, so the next pull does not resurrect it; the
+    /// server's own row is never touched (ruling C2).
+    pub fn delete_local_message(&self, id: &str) -> SResult<()> {
+        let source: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT source FROM notifications WHERE id=?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_err)?;
+        let Some(source) = source else {
+            return Ok(());
+        };
+        if source == "server" {
+            self.tombstone_server_message(id)?;
+        }
+        self.conn
+            .execute("DELETE FROM notifications WHERE id=?1", params![id])
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// The clear dialog's three modes over the visible set:
+    /// `mode` is "all" | "kind" | "older" (older uses
+    /// `older_days`, the dialog's default 7). Read and unread
+    /// alike — the condition is the only filter. Server-origin
+    /// rows in the deleted set are tombstoned first. Returns the
+    /// number of rows removed.
+    pub fn clear_local_messages(
+        &self,
+        user_id: &str,
+        mode: &str,
+        kind: &str,
+        older_days: i64,
+    ) -> SResult<usize> {
+        let cond = match mode {
+            "all" => "",
+            "kind" => " AND kind=?2",
+            "older" => " AND created_ms<?2",
+            _ => return Err(format!("未知的清理方式：{mode}")),
+        };
+        let cutoff = now_ms() - older_days.max(0) * 86_400_000;
+        let select = format!(
+            "SELECT id, source FROM notifications WHERE (source='local' OR user_id=?1){cond}"
+        );
+        let mut stmt = self.conn.prepare(&select).map_err(db_err)?;
+        let map_row = |r: &rusqlite::Row<'_>| Ok((r.get(0)?, r.get(1)?));
+        let victims: Vec<(String, String)> = match mode {
+            "kind" => stmt
+                .query_map(params![user_id, kind], map_row)
+                .map_err(db_err)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(db_err)?,
+            "older" => stmt
+                .query_map(params![user_id, cutoff], map_row)
+                .map_err(db_err)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(db_err)?,
+            _ => stmt
+                .query_map(params![user_id], map_row)
+                .map_err(db_err)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(db_err)?,
+        };
+        drop(stmt);
+        for (id, source) in &victims {
+            if source == "server" {
+                self.tombstone_server_message(id)?;
+            }
+        }
+        let delete = format!(
+            "DELETE FROM notifications WHERE (source='local' OR user_id=?1){cond}"
+        );
+        let n = match mode {
+            "kind" => self
+                .conn
+                .execute(&delete, params![user_id, kind])
+                .map_err(db_err)?,
+            "older" => self
+                .conn
+                .execute(&delete, params![user_id, cutoff])
+                .map_err(db_err)?,
+            _ => self
+                .conn
+                .execute(&delete, params![user_id])
+                .map_err(db_err)?,
+        };
+        Ok(n)
     }
 
     /// (pending count, staged bytes) a submitter currently holds

@@ -131,7 +131,11 @@ impl App {
                     Page::Index => 52.0,
                     Page::Content => 52.0,
                     Page::Showroom | Page::Trash => 52.0,
-                    Page::Messages | Page::Settings => 0.0,
+                    // Message center: the 清除消息 button takes
+                    // the same single-button sizing as the other
+                    // one-button pages.
+                    Page::Messages => 52.0,
+                    Page::Settings => 0.0,
                 };
                 if action_height > 0.0 {
                     egui::Panel::bottom("sidebar_actions")
@@ -163,7 +167,7 @@ impl App {
                                 Page::Index => self.ix_nav_body(ui),
                                 Page::Trash => self.trash_nav_body(ui),
                                 Page::Settings => self.st_nav_body(ui),
-                                Page::Messages => {}
+                                Page::Messages => self.msg_nav_body(ui),
                             }
                         });
                 });
@@ -299,6 +303,26 @@ impl App {
                 .inner;
             if resp.clicked() {
                 self.confirm_empty_trash();
+            }
+        }
+        if page == Page::Messages {
+            // 清除消息 (user ruling 2026-11-25): the same
+            // accent-filled sidebar action form as 清空回收站
+            // above; it opens the three-mode clear dialog
+            // (App::msg_clear_window). Greyed when there is
+            // nothing to clear, by the same add_enabled_ui gate.
+            let button = egui::Button::new(
+                egui::RichText::new(tr("清除消息")).color(egui::Color32::WHITE),
+            )
+            .fill(ACCENT)
+            .corner_radius(6);
+            let resp = ui
+                .add_enabled_ui(!self.messages.is_empty(), |ui| {
+                    ui.add_sized([ui.available_width(), 32.0], button)
+                })
+                .inner;
+            if resp.clicked() {
+                self.msg_clear_open = true;
             }
         }
     }
@@ -1793,6 +1817,7 @@ impl App {
             || self.login_open
             || self.about_open
             || self.folder_sync_open
+            || self.msg_clear_open
             || self.must_change_pw
             || self.folder_delete_confirm.is_some()
             || self.share_dialog.is_some()

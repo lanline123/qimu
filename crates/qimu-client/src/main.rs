@@ -494,6 +494,64 @@ pub const BADGE_BAD_BG: egui::Color32 =
 /// Solid danger button fill with white text.
 pub const DANGER_BG: egui::Color32 = egui::Color32::from_rgb(0xB9, 0x1C, 0x1C);
 
+/// Message-center kinds (full version, user ruling 2026-11-25):
+/// the sidebar directory rows and the clear dialog's type list
+/// both iterate this table, in this order. Kinds are stamped at
+/// the producing transition point (server workflow events) or
+/// locally (`system` — this machine's operation feedback); they
+/// are never guessed from message text (the prototype's
+/// keyword-based msgKind was a prototype shortcut).
+pub const MSG_KINDS: [(&str, &str); 6] = [
+    ("pending_review", "待审批"),
+    ("approved", "已通过"),
+    ("rejected", "被驳回"),
+    ("expired", "已过期"),
+    ("offline", "已下线"),
+    ("system", "系统"),
+];
+
+/// Display label for a kind; unknown kinds (a newer server's
+/// vocabulary) fall back to the raw kind string rather than
+/// hiding the message.
+fn msg_kind_label(kind: &str) -> &str {
+    MSG_KINDS
+        .iter()
+        .find(|(k, _)| *k == kind)
+        .map(|(_, label)| *label)
+        .unwrap_or(kind)
+}
+
+/// The kind's frame color — the single mapping the sidebar
+/// dots, the unread card frames and the clear dialog share.
+/// Sources are existing palette constants: rejected = ROSE
+/// (the prototype's --rose), approved = the chip green,
+/// pending_review = the chip amber, offline = ACCENT,
+/// expired = the folder palette's gray family (TEXT_FAINT),
+/// system = neutral (TEXT_WEAK).
+fn msg_kind_color(kind: &str) -> egui::Color32 {
+    match kind {
+        "rejected" => ROSE,
+        "approved" => CHIP_GREEN_FG,
+        "pending_review" => CHIP_ORANGE_FG,
+        "offline" => ACCENT,
+        "expired" => TEXT_FAINT,
+        _ => TEXT_WEAK,
+    }
+}
+
+/// The kind's soft fill, shown under an UNREAD card (the
+/// prototype's .unread soft pairing); read cards sit on the
+/// plain CARD_BG.
+fn msg_kind_soft(kind: &str) -> egui::Color32 {
+    match kind {
+        "rejected" => ROSE_SOFT_BG,
+        "approved" => CHIP_GREEN_BG,
+        "pending_review" => CHIP_ORANGE_BG,
+        "offline" => ACCENT_SOFT,
+        _ => CHIP_GRAY_BG,
+    }
+}
+
 /// Ghost text action — the boards draw secondary actions as plain text
 /// (no box): 开始演示 in accent, the rest in main/weak text color.
 fn text_action(ui: &mut egui::Ui, label: &str, color: egui::Color32, size: f32) -> bool {
@@ -3820,6 +3878,21 @@ struct App {
     folder_sync_open: bool,
     folder_sync_list: Vec<Value>,
     folder_sync_checked: std::collections::HashSet<String>,
+    /// Message center (full version, 2026-11-25): `messages` is
+    /// the local mirror list page_messages renders (newest
+    /// first, already visibility-filtered by the local face);
+    /// `msg_filter` is the sidebar directory's selected kind
+    /// (None = 全部). The clear dialog carries its own mode
+    /// state; `msg_pull_since` is the incremental pull cursor
+    /// (max server created_ms merged, pulled with an overlap —
+    /// the merge dedupes by id).
+    messages: Vec<Value>,
+    msg_filter: Option<String>,
+    msg_pull_since: i64,
+    msg_clear_open: bool,
+    msg_clear_mode: usize, // 0 = 全部, 1 = 按类型, 2 = 按天数
+    msg_clear_kind: String,
+    msg_clear_days: String,
     page: Page,
     /// Five-features surfaces (2026-11-23): the trash and the
     /// approval queue run on drill-down frame stacks; the home
@@ -5184,6 +5257,13 @@ impl App {
             folder_sync_open: false,
             folder_sync_list: vec![],
             folder_sync_checked: std::collections::HashSet::new(),
+            messages: vec![],
+            msg_filter: None,
+            msg_pull_since: 0,
+            msg_clear_open: false,
+            msg_clear_mode: 0,
+            msg_clear_kind: "system".to_string(),
+            msg_clear_days: "7".to_string(),
             page: match std::env::var("QIMU_PAGE").as_deref() {
                 Ok("showroom") => Page::Showroom,
                 Ok("content") => Page::Content,
@@ -6450,6 +6530,17 @@ impl App {
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.folder_del_undo = None;
+        // Message center: the mirror list is visibility-filtered
+        // by owner, so the previous identity's list must not
+        // linger; the pull cursor belongs to that identity too
+        // (reusing it could skip the new user's older
+        // notifications). The stored mirror rows themselves stay
+        // — they are filtered by owner at read time.
+        self.messages.clear();
+        self.msg_filter = None;
+        self.msg_pull_since = 0;
+        self.msg_clear_open = false;
+        self.workspace_controls.unread = 0;
         // In-flight translation belongs to the previous account:
         // its worker polls the old server with the old token.
         // Clear the busy state and bump the generation so the
@@ -6764,11 +6855,371 @@ impl App {
         }
         self.indexes = local.list_indexes();
         self.local_showroom = local.list_local_showroom();
+        // Message center: the local mirror list + real unread
+        // badge ride the local refresh, so they are current
+        // offline and at first paint.
+        self.refresh_messages();
         // Per-index detail pass (P1): covers and search tags for
         // local indexes are assembled from the local store,
         // mirroring the REST loop in refresh_all_rest (which skips
         // indexes whose tags are already remembered).
         self.reread_index_meta_local(None);
+    }
+
+    /// The signed-in user's id ("" when logged out or a guest —
+    /// guests hold no id and receive no messages).
+    fn user_id(&self) -> String {
+        self.user.as_ref().map(|u| s(u, "id")).unwrap_or_default()
+    }
+
+    /// Message center (full version, 2026-11-25): re-read the
+    /// local mirror list and re-derive the bell badge from it —
+    /// the badge is the real unread count now, not the old
+    /// "visits since page open" memory counter. Runs on the
+    /// local refresh path, so the center works fully offline.
+    fn refresh_messages(&mut self) {
+        let uid = self.user_id();
+        if let Ok(v) = self.call_work(
+            "GET",
+            &format!("/v1/local-messages?user={uid}"),
+            None,
+        ) {
+            self.messages = v
+                .get("items")
+                .and_then(|f| f.as_array())
+                .cloned()
+                .unwrap_or_default();
+            self.msg_sync_unread();
+        }
+    }
+
+    fn msg_sync_unread(&mut self) {
+        self.workspace_controls.unread = self
+            .messages
+            .iter()
+            .filter(|m| i(m, "read") == 0)
+            .count();
+    }
+
+    /// Pull the server's notification stream into the local
+    /// mirror (the org refresh path calls this). The cursor
+    /// rewinds a minute behind the newest merged row — clock
+    /// skew and same-millisecond rows can never slip past it,
+    /// and the merge dedupes the overlap by id and honors the
+    /// local tombstones. Logged out, there is nothing to pull;
+    /// the local list still refreshes.
+    fn pull_notifications(&mut self) {
+        if self.user.is_some() {
+            let since = (self.msg_pull_since - 60_000).max(0);
+            if let Ok(v) =
+                self.call("GET", &format!("/v1/notifications?since={since}"), None)
+            {
+                let items = v.get("items").cloned().unwrap_or(json!([]));
+                if let Some(arr) = items.as_array() {
+                    let max_ms = arr.iter().map(|m| i(m, "created_ms")).max().unwrap_or(0);
+                    if max_ms > self.msg_pull_since {
+                        self.msg_pull_since = max_ms;
+                    }
+                }
+                let _ = self.call_work(
+                    "POST",
+                    "/v1/local-messages/merge",
+                    Some(json!({ "items": items })),
+                );
+            }
+        }
+        self.refresh_messages();
+    }
+
+    /// Record one operation-feedback message in the local
+    /// mirror (kind `system`, titled by the feedback text
+    /// itself — the old fixed 「会话消息」 title is gone). Called
+    /// from the toast path, once per message change. Without a
+    /// local library this is a no-op (the in-memory toast
+    /// history remains the fallback face).
+    fn persist_system_message(&mut self, text: &str) {
+        if self.local.is_none() || text.is_empty() {
+            return;
+        }
+        let _ = self.call_work(
+            "POST",
+            "/v1/local-messages/system",
+            Some(json!({
+                "title": text,
+                "body": "",
+                "user_id": self.user_id(),
+            })),
+        );
+        self.refresh_messages();
+    }
+
+    /// Per-card click: mark read in the mirror and drop the
+    /// kind frame at once (the in-memory row flips with the
+    /// stored one; the badge re-derives from the list).
+    fn msg_mark_read(&mut self, id: &str) {
+        let _ = self.call_work(
+            "POST",
+            "/v1/local-messages/read",
+            Some(json!({ "id": id })),
+        );
+        if let Some(m) = self.messages.iter_mut().find(|m| s(m, "id") == id) {
+            m["read"] = json!(1);
+        }
+        self.msg_sync_unread();
+    }
+
+    /// Per-card delete: removes the local row (core tombstones
+    /// server-origin rows so a later pull cannot resurrect
+    /// them; the server's own row is never touched).
+    fn msg_delete(&mut self, id: &str) {
+        let _ = self.call_work(
+            "POST",
+            "/v1/local-messages/delete",
+            Some(json!({ "id": id })),
+        );
+        self.messages.retain(|m| s(m, "id") != id);
+        self.msg_sync_unread();
+    }
+
+    /// The clear dialog's confirm: one conditional delete in
+    /// the local mirror (read and unread alike — the chosen
+    /// condition is the only filter), then the result is
+    /// reported through the normal feedback channel.
+    fn run_msg_clear(&mut self) {
+        let mode = match self.msg_clear_mode {
+            1 => "kind",
+            2 => "older",
+            _ => "all",
+        };
+        let days: i64 = self.msg_clear_days.trim().parse().unwrap_or(7);
+        let r = self.call_work(
+            "POST",
+            "/v1/local-messages/clear",
+            Some(json!({
+                "user_id": self.user_id(),
+                "mode": mode,
+                "kind": self.msg_clear_kind,
+                "days": days,
+            })),
+        );
+        self.msg_clear_open = false;
+        match r {
+            Ok(v) => {
+                let n = i(&v, "removed");
+                self.refresh_messages();
+                self.say(format!("已清理 {n} 条消息"));
+            }
+            Err(e) => self.say(format!("清理消息失败：{e}")),
+        }
+    }
+
+    /// The 清除消息 dialog (sidebar bottom button): three
+    /// mutually exclusive modes — everything, one kind, or
+    /// older than N days (default 7). Mode state is edited on
+    /// locals and written back after the window closes its
+    /// frame, the folder-sync dialog's pattern.
+    fn msg_clear_window(&mut self, ui: &mut egui::Ui) {
+        if !self.msg_clear_open {
+            return;
+        }
+        let mut open = true;
+        let mut act = false;
+        let mut cancel = false;
+        let mut mode = self.msg_clear_mode;
+        let mut kind = self.msg_clear_kind.clone();
+        let mut days = self.msg_clear_days.clone();
+        egui::Window::new("清除消息")
+            .open(&mut open)
+            .title_bar(false)
+            .frame(dlg_frame())
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ui.ctx(), |ui| {
+                ui.set_width(420.0);
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("清除消息")
+                            .strong()
+                            .size(19.0)
+                            .color(palette_color(TEXT_MAIN)),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                        if dlg_close_x(ui) {
+                            cancel = true;
+                        }
+                    });
+                });
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new("清理只删除本机保存的这一份，服务器上的记录保留；已读和未读一并清理。")
+                        .size(13.5)
+                        .color(palette_color(TEXT_MAIN)),
+                );
+                ui.add_space(12.0);
+                ui.radio_value(&mut mode, 0, "清理全部消息");
+                ui.add_space(6.0);
+                ui.radio_value(&mut mode, 1, "只清理某个类型");
+                if mode == 1 {
+                    ui.add_space(4.0);
+                    for (k, label) in MSG_KINDS {
+                        ui.horizontal(|ui| {
+                            ui.add_space(22.0);
+                            ui.radio_value(&mut kind, k.to_string(), "");
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(10.0, 10.0),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().circle_filled(
+                                rect.center(),
+                                4.0,
+                                palette_color(msg_kind_color(k)),
+                            );
+                            ui.label(
+                                egui::RichText::new(label)
+                                    .size(12.5)
+                                    .color(palette_color(TEXT_MAIN)),
+                            );
+                        });
+                        ui.add_space(2.0);
+                    }
+                }
+                ui.add_space(6.0);
+                ui.radio_value(&mut mode, 2, "清理多少天之前的消息");
+                if mode == 2 {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(22.0);
+                        ui.label(
+                            egui::RichText::new("清理")
+                                .size(12.5)
+                                .color(palette_color(TEXT_MAIN)),
+                        );
+                        let edit = egui::TextEdit::singleline(&mut days)
+                            .desired_width(56.0)
+                            .horizontal_align(egui::Align::Center);
+                        ui.add(edit);
+                        ui.label(
+                            egui::RichText::new("天之前的消息")
+                                .size(12.5)
+                                .color(palette_color(TEXT_MAIN)),
+                        );
+                    });
+                }
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        if btn_danger(ui, "清除").clicked() {
+                            act = true;
+                        }
+                        if btn_weak(ui, "取消").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            });
+        self.msg_clear_mode = mode;
+        self.msg_clear_kind = kind;
+        self.msg_clear_days = days;
+        if act {
+            self.run_msg_clear();
+        }
+        if cancel || !open {
+            self.msg_clear_open = false;
+        }
+    }
+
+    /// Message-center sidebar directory (user ruling
+    /// 2026-11-25): a 「目录」 header over virtual rows — 全部
+    /// on top, then one row per kind. The rows are NOT folder
+    /// entities: they cannot be renamed, reordered or deleted,
+    /// they only filter the list. Each row carries its unread
+    /// count; a kind row's dot wears the kind color the card
+    /// frames use.
+    fn msg_nav_body(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            egui::RichText::new("目录")
+                .size(12.0)
+                .color(palette_color(TEXT_WEAK)),
+        );
+        ui.add_space(2.0);
+        let total_unread = self
+            .messages
+            .iter()
+            .filter(|m| i(m, "read") == 0)
+            .count();
+        let mut rows: Vec<(Option<String>, String, usize)> =
+            vec![(None, "全部".to_string(), total_unread)];
+        for (k, label) in MSG_KINDS {
+            let n = self
+                .messages
+                .iter()
+                .filter(|m| s(m, "kind") == k && i(m, "read") == 0)
+                .count();
+            rows.push((Some(k.to_string()), label.to_string(), n));
+        }
+        let mut clicked: Option<Option<String>> = None;
+        for (kind, label, unread) in &rows {
+            let selected = self.msg_filter == *kind;
+            let (rect, resp) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), 28.0),
+                egui::Sense::click(),
+            );
+            if selected {
+                ui.painter()
+                    .rect_filled(rect, 6.0, palette_color(SEL_BG));
+            } else if resp.hovered() {
+                ui.painter()
+                    .rect_filled(rect, 6.0, palette_color(HOVER_BG));
+            }
+            let cy = rect.center().y;
+            match kind {
+                Some(k) => {
+                    ui.painter().circle_filled(
+                        egui::pos2(rect.min.x + 9.0, cy),
+                        4.0,
+                        palette_color(msg_kind_color(k)),
+                    );
+                }
+                None => {
+                    ui.painter().circle_filled(
+                        egui::pos2(rect.min.x + 9.0, cy),
+                        4.0,
+                        palette_color(TEXT_WEAK),
+                    );
+                }
+            }
+            let text_color = if selected {
+                ACCENT
+            } else {
+                palette_color(TEXT_MAIN)
+            };
+            ui.painter().text(
+                egui::pos2(rect.min.x + 22.0, cy),
+                egui::Align2::LEFT_CENTER,
+                tr(label),
+                egui::FontId::proportional(12.5),
+                text_color,
+            );
+            if *unread > 0 {
+                ui.painter().text(
+                    egui::pos2(rect.max.x - 6.0, cy),
+                    egui::Align2::RIGHT_CENTER,
+                    unread.to_string(),
+                    egui::FontId::proportional(11.5),
+                    palette_color(ROSE),
+                );
+            }
+            if resp.clicked() {
+                clicked = Some(kind.clone());
+            }
+            let _ = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+        }
+        if let Some(kind) = clicked {
+            self.msg_filter = kind;
+        }
     }
 
     /// The L5 slice (design §1.1): per-index cover + search-tag
@@ -6856,6 +7307,10 @@ impl App {
         self.reread_cache_index();
         self.reread_profile_tail();
         self.default_import_group();
+        // Message center: pull the notification stream into
+        // the local mirror on the same sweep as the other org
+        // faces, then re-read the mirror.
+        self.pull_notifications();
     }
 
     /// The O11 slice (design §1.1): cache policy + profile /
@@ -12326,6 +12781,14 @@ impl App {
             self.toast_since = now;
             self.workspace_controls
                 .record_message(&self.msg, now, self.page != Page::Messages);
+            // Message center (full version): the same feedback
+            // also lands in the local mirror as a `system`
+            // message, so it survives restarts and reinstalls
+            // and takes part in the directory / read / clear
+            // machinery. The in-memory deque above stays as the
+            // toast path's own history.
+            let text = self.msg.clone();
+            self.persist_system_message(&text);
         }
         if self.toast_msg.is_empty() || now - self.toast_since > 3.4 {
             return;
@@ -12828,6 +13291,7 @@ impl eframe::App for App {
         self.login_window(ui);
         self.about_window(ui);
         self.folder_sync_window(ui);
+        self.msg_clear_window(ui);
         self.overlay_stack_ui(ui, screen);
         self.force_change_pw_ui(ui);
     }
