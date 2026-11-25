@@ -1378,6 +1378,56 @@ impl LocalStore {
         store.folder_has_contents(id).unwrap_or(true)
     }
 
+    // ---------- redo captures & restores (client Ctrl+Y) ----------
+    //
+    // The symmetric faces of the undo support above: an undo
+    // captures the CURRENT (post-operation) state through these
+    // before it restores the pre-image, and a redo hands its
+    // entry to the matching restore — which is direction-free,
+    // so several undo faces serve both ways and only the
+    // genuinely forward restores are new in core.
+
+    pub fn redo_snapshot_folder_row(&self, id: &str) -> Option<FolderRec> {
+        let store = self.store.lock().unwrap();
+        store.snapshot_folder_row(id).ok().flatten()
+    }
+
+    pub fn redo_restore_folder_row(&self, f: &FolderRec) -> Result<(), String> {
+        let store = self.store.lock().unwrap();
+        store.restore_folder_row(f)
+    }
+
+    pub fn redo_snapshot_version_page_ids(&self, version_id: &str) -> Option<Vec<String>> {
+        let store = self.store.lock().unwrap();
+        store.snapshot_version_page_ids(version_id).ok()
+    }
+
+    pub fn redo_merge(
+        &self,
+        source: &UnitSnapshot,
+        pre: &VersionRowSnap,
+        post: &VersionRowSnap,
+    ) -> Result<(), String> {
+        let store = self.store.lock().unwrap();
+        store.redo_merge(source, pre, post)
+    }
+
+    pub fn redo_trash_apply(&self, rows: &[TrashRec]) -> Result<Vec<TrashRec>, String> {
+        let store = self.store.lock().unwrap();
+        store.redo_trash_apply(rows)
+    }
+
+    /// Re-run a folder delete the undo reversed; `deleted_by`
+    /// follows the local dispatch's own delete arm (the library
+    /// owner's display name).
+    pub fn redo_folder_delete(
+        &self,
+        snap: &FolderDeleteSnapshot,
+    ) -> Result<FolderDeleteSnapshot, String> {
+        let store = self.store.lock().unwrap();
+        store.redo_folder_delete(snap, &self.owner.display_name)
+    }
+
     /// The version's fragment PPTX bytes from the local store
     /// (the same read the server's thumb and edit-preview handlers
     /// perform). None when the version is not in this library.

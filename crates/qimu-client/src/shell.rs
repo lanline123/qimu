@@ -1665,8 +1665,8 @@ impl App {
     /// - a plain Ctrl+Z press, first press only (key repeats
     ///   are ignored: holding the chord down must not burn
     ///   through the whole stack in one press), no Shift (that
-    ///   chord is redo's spelling — deliberately unclaimed this
-    ///   round), no Alt/Cmd;
+    ///   chord is redo's spelling — `redo_key` below claims it,
+    ///   and this handler must never fire for it), no Alt/Cmd;
     /// - no widget holds focus — a focused TextEdit keeps
     ///   Ctrl+Z for its own text buffer, and the page editor's
     ///   own undo keeps working the same way (its overlay also
@@ -1711,6 +1711,71 @@ impl App {
         }
         ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Z));
         self.do_undo();
+    }
+
+    /// Keyboard Ctrl+Y (and its alias Ctrl+Shift+Z) → the
+    /// session redo stack (user ruling 2026-11-25). The gates
+    /// are `undo_key`'s three, verbatim and for the same
+    /// reasons: first press only with repeats ignored, no
+    /// widget focus (a focused TextEdit keeps both chords for
+    /// its own text buffer — egui's TextEdit handles Ctrl+Y /
+    /// Ctrl+Shift+Z as text redo itself), and no overlay or
+    /// dialog open. The chord set is disjoint from undo's:
+    /// Ctrl+Y differs by key, Ctrl+Shift+Z by the Shift that
+    /// `undo_key` excludes, so neither handler can fire for
+    /// the other's press (regression-checked: plain Ctrl+Z
+    /// still undoes, Ctrl+Shift+Z never undoes). An empty
+    /// redo stack is a silent no-op; on a hit the press is
+    /// consumed with the exact modifiers it arrived with.
+    pub(super) fn redo_key(&mut self, ctx: &egui::Context) {
+        let chord: Option<(egui::Modifiers, egui::Key)> = ctx.input(|i| {
+            let mut hit = None;
+            for e in &i.events {
+                let egui::Event::Key {
+                    key,
+                    pressed,
+                    repeat,
+                    modifiers,
+                    ..
+                } = e
+                else {
+                    continue;
+                };
+                if !*pressed || *repeat || modifiers.alt || modifiers.command {
+                    continue;
+                }
+                if *key == egui::Key::Y && modifiers.ctrl && !modifiers.shift {
+                    hit = Some((egui::Modifiers::CTRL, egui::Key::Y));
+                    break;
+                }
+                if *key == egui::Key::Z && modifiers.ctrl && modifiers.shift {
+                    hit = Some((
+                        egui::Modifiers {
+                            ctrl: true,
+                            shift: true,
+                            ..Default::default()
+                        },
+                        egui::Key::Z,
+                    ));
+                    break;
+                }
+            }
+            hit
+        });
+        let Some((mods, key)) = chord else {
+            return;
+        };
+        if ctx.memory(|m| m.focused().is_some()) {
+            return;
+        }
+        if self.delete_key_dialog_open() {
+            return;
+        }
+        if self.redo_stack.is_empty() {
+            return;
+        }
+        ctx.input_mut(|i| i.consume_key(mods, key));
+        self.do_redo();
     }
 
     /// Any overlay or standalone dialog that must shield the

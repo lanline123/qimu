@@ -6970,6 +6970,17 @@ impl Store {
         Ok(Some(self.snapshot_version_row(&ver.id)?))
     }
 
+    /// One version's page-id sequence, in order (redo
+    /// support): the capture a draft-reorder undo takes of the
+    /// CURRENT sequence before re-running the reorder with the
+    /// old one, so the redo entry can name the post-drag order
+    /// it must restore. Read through `get_version`, the same
+    /// parse the reorder itself validates against.
+    pub fn snapshot_version_page_ids(&self, version_id: &str) -> SResult<Vec<String>> {
+        let ver = self.get_version(version_id)?;
+        Ok(ver.pages.iter().map(|p| p.id.clone()).collect())
+    }
+
     /// The full pre-image of one unit (see UnitSnapshot).
     /// Versions are read raw per rendition — NOT through
     /// list_versions, whose trash-overlay filter would drop a
@@ -7251,6 +7262,184 @@ impl Store {
         Ok(())
     }
 
+    /// Whether the unit `snap` was taken of still matches the
+    /// snapshot on every field a dissolve would destroy (redo
+    /// support): the unit row's columns, the rendition set, each
+    /// version's mutable payload (the `version_snap_same`
+    /// basis), and the tag / binding / attachment / trash-row
+    /// identity sets. A hand edit that only rewrites a tag's
+    /// value in place (same id, same count) is below this
+    /// comparison's resolution — declared; every edit path the
+    /// client exposes replaces rows or changes a version
+    /// payload, both of which register.
+    pub fn unit_snapshot_intact(&self, snap: &UnitSnapshot) -> SResult<bool> {
+        let cur = match self.snapshot_unit(&snap.unit.id) {
+            Ok(c) => c,
+            Err(_) => return Ok(false),
+        };
+        let a = &snap.unit;
+        let b = &cur.unit;
+        if a.name != b.name
+            || a.folder_id != b.folder_id
+            || a.group_id != b.group_id
+            || a.maintainer != b.maintainer
+            || a.lead_lang != b.lead_lang
+            || a.description != b.description
+            || a.current_revision != b.current_revision
+            || a.created_ms != b.created_ms
+            || a.sort != b.sort
+        {
+            return Ok(false);
+        }
+        if cur.renditions.len() != snap.renditions.len()
+            || snap.renditions.iter().any(|r| {
+                !cur.renditions
+                    .iter()
+                    .any(|c| c.id == r.id && c.form == r.form && c.lang == r.lang)
+            })
+        {
+            return Ok(false);
+        }
+        if cur.versions.len() != snap.versions.len()
+            || snap.versions.iter().any(|v| {
+                !cur.versions
+                    .iter()
+                    .any(|c| c.id == v.id && Self::version_snap_same(c, v))
+            })
+        {
+            return Ok(false);
+        }
+        let ids_same = |a: &[String], b: &[String]| {
+            a.len() == b.len() && a.iter().all(|x| b.contains(x))
+        };
+        if !ids_same(
+            &snap.version_tags.iter().map(|t| t.id.clone()).collect::<Vec<_>>(),
+            &cur.version_tags.iter().map(|t| t.id.clone()).collect::<Vec<_>>(),
+        ) || !ids_same(
+            &snap.bindings.iter().map(|t| t.id.clone()).collect::<Vec<_>>(),
+            &cur.bindings.iter().map(|t| t.id.clone()).collect::<Vec<_>>(),
+        ) || !ids_same(
+            &snap.attachments.iter().map(|t| t.id.clone()).collect::<Vec<_>>(),
+            &cur.attachments.iter().map(|t| t.id.clone()).collect::<Vec<_>>(),
+        ) || !ids_same(
+            &snap.trash_rows.iter().map(|t| t.id.clone()).collect::<Vec<_>>(),
+            &cur.trash_rows.iter().map(|t| t.id.clone()).collect::<Vec<_>>(),
+        ) {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// Redo a `merge_unit_page_into` that `undo_merge` reversed
+    /// (Ctrl+Y): write the merge's product back — the target
+    /// draft row returns to its `post` image (in place when the
+    /// merge extended a draft, re-inserted verbatim when the
+    /// merge born it) — and dissolve the source unit again.
+    /// Guards, all before any write: the target must still sit
+    /// at its `pre` image (a draft edited after the undo
+    /// refuses — re-applying would silently discard that edit);
+    /// a born draft's id must still be free; the resurrected
+    /// source must still match its snapshot (an edit to it
+    /// after the undo refuses — dissolving would destroy it);
+    /// and the publish-pin guard the forward merge carries is
+    /// re-checked, since a version could have been pinned while
+    /// the source lived again.
+    pub fn redo_merge(
+        &self,
+        source: &UnitSnapshot,
+        pre: &VersionRowSnap,
+        post: &VersionRowSnap,
+    ) -> SResult<()> {
+        if pre.id == post.id {
+            let cur = Self::version_snap_on(&self.conn, &pre.id)?
+                .ok_or("目标草稿已不存在，无法重做并入".to_string())?;
+            if !Self::version_snap_same(&cur, pre) {
+                return Err(
+                    "目标草稿在撤回并入后又被修改，无法重做并入；请先处理草稿的后续修改"
+                        .into(),
+                );
+            }
+        } else {
+            let cur_pre = Self::version_snap_on(&self.conn, &pre.id)?
+                .ok_or("目标内容块的工作版本已不存在，无法重做并入".to_string())?;
+            if !Self::version_snap_same(&cur_pre, pre) {
+                return Err(
+                    "目标内容块的工作版本在撤回并入后已变化，无法重做并入".into(),
+                );
+            }
+            if Self::version_snap_on(&self.conn, &post.id)?.is_some() {
+                return Err("并入生成的草稿已重新存在，无法重做并入".into());
+            }
+        }
+        if !Self::object_exists_on(&self.conn, "unit", &source.unit.id)? {
+            return Err("源内容块已不存在，无法重做并入".into());
+        }
+        if !self.unit_snapshot_intact(source)? {
+            return Err(
+                "源内容块在撤回并入后已被修改，无法重做并入；重做会丢失这些修改".into(),
+            );
+        }
+        let pinned_live: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM showroom_pins p JOIN showroom s ON s.id = p.showroom_id JOIN versions v ON v.id = p.version_id JOIN renditions r ON r.id = v.rendition_id WHERE r.unit_id = ?1 AND s.state = 'live'",
+                params![source.unit.id],
+                |r| r.get(0),
+            )
+            .map_err(db_err)?;
+        if pinned_live > 0 {
+            return Err(
+                "该内容块的版本正被演示厅条目钉为正式版，不能重做并入；请先更新该条目的演示推送或将其下架"
+                    .into(),
+            );
+        }
+        let tx = self.conn.unchecked_transaction().map_err(db_err)?;
+        if pre.id == post.id {
+            let n = tx
+                .execute(
+                    "UPDATE versions SET fragment_hash=?2, page_count=?3, pages_json=?4, text_all=?5, scripts_json=?6 WHERE id=?1 AND status='draft'",
+                    params![
+                        post.id,
+                        post.fragment_hash,
+                        post.page_count,
+                        post.pages_json,
+                        post.text_all,
+                        post.scripts_json
+                    ],
+                )
+                .map_err(db_err)?;
+            if n == 0 {
+                return Err("目标草稿状态已变化，无法重做并入".into());
+            }
+        } else {
+            tx.execute(
+                "INSERT INTO versions(id, rendition_id, semver, major, minor, patch, basis_revision, author, note, created_ms, fragment_hash, page_count, pages_json, text_all, status, scripts_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                params![
+                    post.id,
+                    post.rendition_id,
+                    post.semver,
+                    post.major,
+                    post.minor,
+                    post.patch,
+                    post.basis_revision,
+                    post.author,
+                    post.note,
+                    post.created_ms,
+                    post.fragment_hash,
+                    post.page_count,
+                    post.pages_json,
+                    post.text_all,
+                    post.status,
+                    post.scripts_json
+                ],
+            )
+            .map_err(db_err)?;
+        }
+        Self::delete_unit_rows(&tx, &source.unit.id)?;
+        tx.commit().map_err(db_err)?;
+        Ok(())
+    }
+
     /// Undo a batch of trash operations: drop the overlay rows
     /// the operations created, so the objects reappear exactly
     /// as they were. A row already gone with its object visible
@@ -7309,6 +7498,88 @@ impl Store {
         Ok(())
     }
 
+    /// Redo a batch of trash operations `undo_trash_restore`
+    /// reversed (Ctrl+Y): re-apply the overlay rows for the
+    /// recorded (kind, object) pairs — fresh row ids and a
+    /// fresh deletion time, title / origin / deleted_by carried
+    /// from the rows the undo dropped — and return the new rows
+    /// (the redo's own counter-entry on the undo stack names
+    /// exactly them). Guards, all before any write, mirroring
+    /// `trash_add` and the undo's whole-batch discipline: every
+    /// object must still exist (a purged object refuses the
+    /// whole batch rather than re-trashing a subset), no object
+    /// may already sit behind the overlay (a later delete owns
+    /// its state now), and a version a live showroom item pins
+    /// refuses with `trash_add`'s own wording.
+    pub fn redo_trash_apply(&self, rows: &[TrashRec]) -> SResult<Vec<TrashRec>> {
+        let tx = self.conn.unchecked_transaction().map_err(db_err)?;
+        for row in rows {
+            let title = if row.title.is_empty() {
+                row.object_id.clone()
+            } else {
+                row.title.clone()
+            };
+            if !Self::object_exists_on(&tx, &row.kind, &row.object_id)? {
+                return Err(format!("「{title}」已被彻底删除，无法重做删除"));
+            }
+            let existing: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM trash_items WHERE kind=?1 AND object_id=?2",
+                    params![row.kind, row.object_id],
+                    |r| r.get(0),
+                )
+                .map_err(db_err)?;
+            if existing > 0 {
+                return Err(format!(
+                    "「{title}」已被再次移入回收站，无法重做此前的删除"
+                ));
+            }
+            if row.kind == "version" {
+                let pinned_live: i64 = tx
+                    .query_row(
+                        "SELECT COUNT(*) FROM showroom_pins p JOIN showroom s ON s.id = p.showroom_id WHERE p.version_id = ?1 AND s.state = 'live'",
+                        params![row.object_id],
+                        |r| r.get(0),
+                    )
+                    .map_err(db_err)?;
+                if pinned_live > 0 {
+                    return Err(
+                        "该版本正被演示厅条目钉为正式版，不能删除；请先更新该条目的演示推送或将其下架"
+                            .into(),
+                    );
+                }
+            }
+        }
+        let mut fresh: Vec<TrashRec> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let rec = TrashRec {
+                id: new_id("trs"),
+                kind: row.kind.clone(),
+                object_id: row.object_id.clone(),
+                title: row.title.clone(),
+                origin: row.origin.clone(),
+                deleted_by: row.deleted_by.clone(),
+                deleted_ms: now_ms(),
+            };
+            tx.execute(
+                "INSERT INTO trash_items(id, kind, object_id, title, origin, deleted_by, deleted_ms) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    rec.id,
+                    rec.kind,
+                    rec.object_id,
+                    rec.title,
+                    rec.origin,
+                    rec.deleted_by,
+                    rec.deleted_ms
+                ],
+            )
+            .map_err(db_err)?;
+            fresh.push(rec);
+        }
+        tx.commit().map_err(db_err)?;
+        Ok(fresh)
+    }
+
     /// Every folder's tree position within one sidebar scope
     /// (see FolderPosition).
     pub fn snapshot_folder_positions(&self, scope: &str) -> SResult<Vec<FolderPosition>> {
@@ -7357,6 +7628,65 @@ impl Store {
             )
             .map_err(db_err)?;
         Ok(n > 0)
+    }
+
+    /// One folder row, verbatim (redo support): the capture a
+    /// folder-creation undo takes before the create is reversed,
+    /// so the redo can re-insert the folder with its recorded
+    /// identity and fields instead of minting a look-alike.
+    /// None when the folder is already gone.
+    pub fn snapshot_folder_row(&self, id: &str) -> SResult<Option<FolderRec>> {
+        Ok(self.list_folders()?.into_iter().find(|f| f.id == id))
+    }
+
+    /// Re-insert one folder row (the redo of a folder creation
+    /// the undo deleted): the recorded id must still be free
+    /// and the recorded parent must still exist — a collision
+    /// or a dangling parent refuses rather than resurrecting
+    /// the folder into a different tree than the one it was
+    /// created in.
+    pub fn restore_folder_row(&self, f: &FolderRec) -> SResult<()> {
+        let exists: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM folders WHERE id=?1",
+                params![f.id],
+                |r| r.get(0),
+            )
+            .map_err(db_err)?;
+        if exists > 0 {
+            return Err("该文件夹已被重新创建，无法重做新建".into());
+        }
+        if let Some(p) = &f.parent_id {
+            let parent_exists: i64 = self
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM folders WHERE id=?1",
+                    params![p],
+                    |r| r.get(0),
+                )
+                .map_err(db_err)?;
+            if parent_exists == 0 {
+                return Err("父文件夹已不存在，无法重做新建".into());
+            }
+        }
+        self.conn
+            .execute(
+                "INSERT INTO folders(id, name, parent_id, sort, main_index_id, scope, color, note, origin) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![
+                    f.id,
+                    f.name,
+                    f.parent_id,
+                    f.sort,
+                    f.main_index_id,
+                    f.scope,
+                    f.color,
+                    f.note,
+                    f.origin
+                ],
+            )
+            .map_err(db_err)?;
+        Ok(())
     }
 
     /// The pre-image of a folder delete (see
@@ -7612,6 +7942,37 @@ impl Store {
         }
         tx.commit().map_err(db_err)?;
         Ok(())
+    }
+
+    /// Redo a folder delete `restore_folder_delete` reversed
+    /// (Ctrl+Y): re-run the delete the snapshot describes —
+    /// same root, same mode — against the CURRENT tree, and
+    /// return the fresh pre-image the delete actually consumed
+    /// (the redo's counter-entry on the undo stack names that
+    /// one, so an undo of the redo restores what the redo
+    /// really took, including anything homed into the folder
+    /// after the original undo). The snapshot is re-taken with
+    /// `snapshot_folder_delete`'s own walk and the delete runs
+    /// through `delete_folder` itself, so the redo can never
+    /// diverge from the forward operation's semantics. The
+    /// root must still exist; a root deleted again by hand in
+    /// the meantime refuses.
+    pub fn redo_folder_delete(
+        &self,
+        snap: &FolderDeleteSnapshot,
+        deleted_by: &str,
+    ) -> SResult<FolderDeleteSnapshot> {
+        if self.snapshot_folder_row(&snap.root.id)?.is_none() {
+            return Err("文件夹已不存在，无法重做删除".into());
+        }
+        let mode = if snap.trash_mode {
+            FolderDeleteMode::Trash
+        } else {
+            FolderDeleteMode::Lift
+        };
+        let fresh = self.snapshot_folder_delete(&snap.root.id, mode)?;
+        self.delete_folder(&snap.root.id, mode, deleted_by)?;
+        Ok(fresh)
     }
 
     pub fn save_assembly(

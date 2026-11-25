@@ -2132,8 +2132,11 @@ struct DelTarget {
 /// except that a delete batch's locally-held rows still record
 /// while its server-held rows do not). The stack is
 /// session-only: it starts empty at launch and is cleared on
-/// account reset. There is deliberately no redo variant —
-/// undoing is one-way this round.
+/// account reset. Redo (Ctrl+Y) lives in `RedoAction` below:
+/// executing an undo first captures the current state as a
+/// redo entry, and executing a redo captures its counter-entry
+/// back — the two stacks are mirror images over the same core
+/// snapshot/restore faces.
 enum UndoAction {
     /// Card drag (move_units): restore every unit's recorded
     /// home + seat (the move renumbers the whole library).
@@ -2194,6 +2197,85 @@ enum UndoAction {
 struct UndoEntry {
     label: String,
     action: UndoAction,
+}
+
+/// One redoable operation on the session redo stack (Ctrl+Y,
+/// user ruling 2026-11-25): the mirror image of `UndoAction`.
+/// An undo creates one entry here by capturing the CURRENT
+/// (post-operation) state before it restores the pre-image;
+/// executing the entry restores that post-operation state and
+/// captures its own counter-entry back onto the undo stack,
+/// so undo/redo can walk the same operation back and forth.
+/// Payloads therefore name post-operation state, in whatever
+/// shape the matching restore consumes — where a restore is
+/// direction-free (positions, trash overlays) the payload is
+/// the same shape as the undo's; where the forward effect is
+/// its own operation (merge, folder delete) the payload is
+/// what that operation needs to re-run under its guards.
+/// Recording a NEW undoable operation clears the whole stack
+/// (standard semantics: the future it described is gone), and
+/// the account reset clears it with the undo stack. Depth is
+/// bounded by the same `undo_limit` setting as the undo stack.
+enum RedoAction {
+    /// Card drag: restore every unit's post-move home + seat
+    /// (the same whole-library restore as the undo, fed the
+    /// positions captured while the move was in effect).
+    MoveUnits { positions: Vec<UnitPosition> },
+    /// Single-page merge: re-apply the merge — the target
+    /// draft returns to the `post` row and the source unit
+    /// (resurrected by the undo, verified unchanged against
+    /// its snapshot) dissolves again.
+    MergePage {
+        target_id: String,
+        source: UnitSnapshot,
+        pre: VersionRowSnap,
+        post: VersionRowSnap,
+    },
+    /// Soft deletes: re-apply the trash overlay rows the undo
+    /// dropped (core re-mints the rows and returns them for
+    /// the counter-entry).
+    TrashBatch { rows: Vec<TrashRec> },
+    /// Creations the undo soft-deleted: restore exactly the
+    /// trash rows that undo created for them.
+    CreatedUnits { rows: Vec<TrashRec> },
+    /// 组合为索引： same, for the index's trash row.
+    CreatedIndex { rows: Vec<TrashRec> },
+    /// 解除组合： re-trash the original and restore the split
+    /// blocks from the trash rows the undo created for them.
+    Ungroup {
+        created_rows: Vec<TrashRec>,
+        original_id: String,
+    },
+    /// #101 draft page reorder: re-run the reorder with the
+    /// post-drag page sequence the undo captured.
+    ReorderDraft {
+        version_id: String,
+        unit_id: String,
+        new_page_ids: Vec<String>,
+    },
+    /// Folder creation: re-insert the folder row the undo
+    /// deleted, verbatim (identity and fields preserved).
+    FolderCreated { folder: qimu_core::store::FolderRec },
+    /// Folder rename: rename to the post-rename name.
+    FolderRenamed { id: String, new_name: String },
+    /// Folder note edit: write the post-edit note back.
+    FolderNote { id: String, new_note: String },
+    /// Sidebar folder drag: restore the scope's post-move
+    /// tree positions.
+    FolderMoved { positions: Vec<FolderPosition> },
+    /// Folder delete: re-run the delete the snapshot
+    /// describes (same root, same mode) against the current
+    /// tree; core returns the fresh pre-image it consumed for
+    /// the counter-entry.
+    FolderDeleted { snap: FolderDeleteSnapshot },
+}
+
+/// One redo stack entry: the label of the operation it
+/// re-applies (the redo toast names it «已重做：{label}») plus
+/// the forward payload.
+struct RedoEntry {
+    label: String,
+    action: RedoAction,
 }
 
 /// Whether a trash row belongs to a positional trash filter
@@ -3940,6 +4022,12 @@ struct App {
     /// by `undo_limit`; pushing past the limit drops the oldest
     /// entries. Session-only — never persisted (see UndoAction).
     undo_stack: Vec<UndoEntry>,
+    /// Session redo stack (Ctrl+Y): newest entry last, bounded
+    /// by the same `undo_limit`. Filled only by `do_undo`'s
+    /// symmetric captures; cleared whenever a new undoable
+    /// operation records (and on account reset, with the undo
+    /// stack). Session-only — never persisted (see RedoAction).
+    redo_stack: Vec<RedoEntry>,
     /// The stack's depth limit (设置 → 演示偏好「撤回步数」,
     /// client-settings.json `undo_limit`, default 30; 0 = off).
     undo_limit: i64,
@@ -5205,6 +5293,7 @@ impl App {
             dc_auto_quit: load_dc_auto_quit(),
             present_engine: load_present_engine(),
             undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             undo_limit: load_undo_limit(),
             undo_suspend: 0,
             folder_del_undo: None,
@@ -6359,6 +6448,7 @@ impl App {
         // a pending folder-delete snapshot belongs to the old
         // context too.
         self.undo_stack.clear();
+        self.redo_stack.clear();
         self.folder_del_undo = None;
         // In-flight translation belongs to the previous account:
         // its worker polls the old server with the old token.
@@ -8384,6 +8474,14 @@ impl App {
                 });
             });
         });
+        // Same re-assertion as the empty-folder placeholder:
+        // the scope above ends by assigning the parent cursor
+        // from the child's min_rect, which is shorter than this
+        // card — without this the flow would resume inside the
+        // card's frame. (This function currently has no call
+        // sites; the guard stays so the trap does not revive
+        // with it.)
+        ui.advance_cursor_after_rect(rect);
         if paste {
             self.create_unit_from_paste();
         } else if blank {
@@ -10681,6 +10779,42 @@ impl App {
         if self.local.is_none() || self.undo_limit <= 0 {
             return;
         }
+        // A new operation forks the timeline: the redo stack's
+        // captured futures no longer describe reachable states.
+        self.redo_stack.clear();
+        self.undo_stack.push(UndoEntry { label, action });
+        let limit = self.undo_limit as usize;
+        while self.undo_stack.len() > limit {
+            self.undo_stack.remove(0);
+        }
+    }
+
+    /// Record the redo entry an undo just captured (see
+    /// RedoAction). Internal counterpart of `push_undo` with
+    /// the opposite stack discipline: it never touches the
+    /// undo stack, and it is gated on the same conditions (a
+    /// local library, undo not switched off), so a redo entry
+    /// can never outlive the world it was captured from.
+    fn push_redo(&mut self, entry: RedoEntry) {
+        if self.local.is_none() || self.undo_limit <= 0 {
+            return;
+        }
+        self.redo_stack.push(entry);
+        let limit = self.undo_limit as usize;
+        while self.redo_stack.len() > limit {
+            self.redo_stack.remove(0);
+        }
+    }
+
+    /// Record the counter-entry a redo just captured back onto
+    /// the undo stack. Like `push_redo`, an internal push: it
+    /// must NOT clear the redo stack (the entries below the
+    /// one being redone stay reachable), which is exactly what
+    /// distinguishes it from `push_undo`.
+    fn push_undo_counter(&mut self, label: String, action: UndoAction) {
+        if self.local.is_none() || self.undo_limit <= 0 {
+            return;
+        }
         self.undo_stack.push(UndoEntry { label, action });
         let limit = self.undo_limit as usize;
         while self.undo_stack.len() > limit {
@@ -10747,16 +10881,34 @@ impl App {
     /// behind it). Refresh rides the phase-1 change events,
     /// scoped to the slices the inverse touched; the folder
     /// arms reuse the folder operations' own re-reads.
+    ///
+    /// Each arm ALSO captures the operation's post-image from
+    /// the current state before the inverse runs and returns
+    /// it as a redo entry; only a successful undo pushes it
+    /// (a refused undo changed nothing, so there is nothing to
+    /// redo). A capture that comes back empty (the state it
+    /// needed is already gone) skips the redo entry rather
+    /// than blocking the undo.
     fn do_undo(&mut self) {
         let Some(entry) = self.undo_stack.pop() else {
             return;
         };
         let label = entry.label.clone();
-        let result: Result<Vec<Change>, String> = match entry.action {
+        let result: Result<(Vec<Change>, Option<RedoEntry>), String> = match entry.action {
             UndoAction::MoveUnits { positions } => match &self.local {
-                Some(local) => local
-                    .undo_restore_unit_positions(&positions)
-                    .map(|_| vec![Change::Units]),
+                Some(local) => {
+                    // Redo capture: the whole library's CURRENT
+                    // positions are the move's post-image.
+                    let redo = RedoEntry {
+                        label: label.clone(),
+                        action: RedoAction::MoveUnits {
+                            positions: local.undo_snapshot_unit_positions(),
+                        },
+                    };
+                    local
+                        .undo_restore_unit_positions(&positions)
+                        .map(|_| (vec![Change::Units], Some(redo)))
+                }
                 None => Err("本地库不可用".into()),
             },
             UndoAction::MergePage {
@@ -10765,53 +10917,136 @@ impl App {
                 pre,
                 post,
             } => match &self.local {
-                Some(local) => match local.undo_merge(&source, &pre, &post) {
-                    Ok(()) => {
-                        let open_target = match self.content.stack.top() {
-                            ContentFrame::Unit(st) => st.unit_id == target_id,
-                            _ => false,
-                        };
-                        if open_target {
-                            self.reload_unit_detail(&target_id);
+                Some(local) => {
+                    // Redo capture: the undo entry itself names
+                    // the merge's post-image (the pre/post rows
+                    // and the source snapshot are exactly what
+                    // re-applying needs), so no fresh grab is
+                    // taken — the redo re-applies the recorded
+                    // merge under redo_merge's own guards.
+                    let redo = RedoEntry {
+                        label: label.clone(),
+                        action: RedoAction::MergePage {
+                            target_id: target_id.clone(),
+                            source: source.clone(),
+                            pre: pre.clone(),
+                            post: post.clone(),
+                        },
+                    };
+                    match local.undo_merge(&source, &pre, &post) {
+                        Ok(()) => {
+                            let open_target = match self.content.stack.top() {
+                                ContentFrame::Unit(st) => st.unit_id == target_id,
+                                _ => false,
+                            };
+                            if open_target {
+                                self.reload_unit_detail(&target_id);
+                            }
+                            Ok((vec![Change::Units], Some(redo)))
                         }
-                        Ok(vec![Change::Units])
+                        Err(e) => Err(e),
                     }
-                    Err(e) => Err(e),
-                },
+                }
                 None => Err("本地库不可用".into()),
             },
             UndoAction::TrashBatch { rows } => match &self.local {
-                Some(local) => match local.undo_trash_restore(&rows) {
-                    Ok(()) => {
-                        self.trash.loaded = false;
-                        let mut changes = vec![Change::Trash];
-                        if rows.iter().any(|r| r.kind == "unit" || r.kind == "version") {
-                            changes.push(Change::Units);
+                Some(local) => {
+                    // Redo capture: the rows themselves are the
+                    // redo's template (kind / object / title are
+                    // all it re-applies).
+                    let redo = RedoEntry {
+                        label: label.clone(),
+                        action: RedoAction::TrashBatch { rows: rows.clone() },
+                    };
+                    match local.undo_trash_restore(&rows) {
+                        Ok(()) => {
+                            self.trash.loaded = false;
+                            let mut changes = vec![Change::Trash];
+                            if rows.iter().any(|r| r.kind == "unit" || r.kind == "version") {
+                                changes.push(Change::Units);
+                            }
+                            if rows.iter().any(|r| r.kind == "index") {
+                                changes.push(Change::Indexes);
+                            }
+                            if rows.iter().any(|r| r.kind == "showroom") {
+                                changes.push(Change::ShowroomLive);
+                            }
+                            Ok((changes, Some(redo)))
                         }
-                        if rows.iter().any(|r| r.kind == "index") {
-                            changes.push(Change::Indexes);
-                        }
-                        if rows.iter().any(|r| r.kind == "showroom") {
-                            changes.push(Change::ShowroomLive);
-                        }
-                        Ok(changes)
+                        Err(e) => Err(e),
                     }
-                    Err(e) => Err(e),
-                },
+                }
                 None => Err("本地库不可用".into()),
             },
-            UndoAction::CreatedUnits { ids } => self
-                .undo_trash_created("unit", &ids)
-                .map(|_| vec![Change::Units, Change::Trash]),
-            UndoAction::CreatedIndex { id } => self
-                .undo_trash_created("index", std::slice::from_ref(&id))
-                .map(|_| vec![Change::Indexes, Change::Trash]),
+            UndoAction::CreatedUnits { ids } => {
+                match self.undo_trash_created("unit", &ids) {
+                    Ok(()) => {
+                        // Redo capture: the trash rows this undo
+                        // just created are the redo's restore
+                        // image. All-or-nothing — a partial set
+                        // would let the redo restore a subset and
+                        // misreport it, so a missing row skips
+                        // the redo entry instead.
+                        let redo = self.local.as_ref().and_then(|local| {
+                            let rows: Vec<TrashRec> = ids
+                                .iter()
+                                .filter_map(|id| local.undo_trash_find("unit", id))
+                                .collect();
+                            (rows.len() == ids.len()).then(|| RedoEntry {
+                                label: label.clone(),
+                                action: RedoAction::CreatedUnits { rows },
+                            })
+                        });
+                        Ok((vec![Change::Units, Change::Trash], redo))
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            UndoAction::CreatedIndex { id } => {
+                match self.undo_trash_created("index", std::slice::from_ref(&id)) {
+                    Ok(()) => {
+                        // Redo capture: as CreatedUnits, the one
+                        // trash row this undo just created.
+                        let redo = self.local.as_ref().and_then(|local| {
+                            local.undo_trash_find("index", &id).map(|row| RedoEntry {
+                                label: label.clone(),
+                                action: RedoAction::CreatedIndex { rows: vec![row] },
+                            })
+                        });
+                        Ok((vec![Change::Indexes, Change::Trash], redo))
+                    }
+                    Err(e) => Err(e),
+                }
+            }
             UndoAction::Ungroup { created, original } => {
                 match self.undo_trash_created("unit", &created) {
                     Ok(()) => match &self.local {
-                        Some(local) => local
+                        Some(local) => match local
                             .undo_trash_restore(std::slice::from_ref(&original))
-                            .map(|_| vec![Change::Units, Change::Trash]),
+                        {
+                            Ok(()) => {
+                                // Redo capture: the split blocks'
+                                // new trash rows are the redo's
+                                // restore image; the original is
+                                // named by id (the redo re-trashes
+                                // it and captures its fresh row).
+                                let rows: Vec<TrashRec> = created
+                                    .iter()
+                                    .filter_map(|id| local.undo_trash_find("unit", id))
+                                    .collect();
+                                let redo = (rows.len() == created.len()).then(|| {
+                                    RedoEntry {
+                                        label: label.clone(),
+                                        action: RedoAction::Ungroup {
+                                            created_rows: rows,
+                                            original_id: original.object_id.clone(),
+                                        },
+                                    }
+                                });
+                                Ok((vec![Change::Units, Change::Trash], redo))
+                            }
+                            Err(e) => Err(e),
+                        },
                         None => Err("本地库不可用".into()),
                     },
                     Err(e) => Err(e),
@@ -10821,24 +11056,51 @@ impl App {
                 version_id,
                 unit_id,
                 old_page_ids,
-            } => match self.call_work(
-                "POST",
-                &format!("/v1/versions/{version_id}/reorder-pages"),
-                Some(json!({ "page_ids": old_page_ids })),
-            ) {
-                Ok(_) => {
-                    let open_unit = match self.content.stack.top() {
-                        ContentFrame::Unit(st) => st.unit_id == unit_id,
-                        _ => false,
-                    };
-                    if open_unit {
-                        self.reload_unit_detail(&unit_id);
+            } => {
+                // Redo capture: the draft's CURRENT page
+                // sequence is the post-drag order the redo must
+                // restore (the core grab parses it the same way
+                // the reorder itself validates).
+                let redo = self.local.as_ref().and_then(|local| {
+                    local
+                        .redo_snapshot_version_page_ids(&version_id)
+                        .map(|new_page_ids| RedoEntry {
+                            label: label.clone(),
+                            action: RedoAction::ReorderDraft {
+                                version_id: version_id.clone(),
+                                unit_id: unit_id.clone(),
+                                new_page_ids,
+                            },
+                        })
+                });
+                match self.call_work(
+                    "POST",
+                    &format!("/v1/versions/{version_id}/reorder-pages"),
+                    Some(json!({ "page_ids": old_page_ids })),
+                ) {
+                    Ok(_) => {
+                        let open_unit = match self.content.stack.top() {
+                            ContentFrame::Unit(st) => st.unit_id == unit_id,
+                            _ => false,
+                        };
+                        if open_unit {
+                            self.reload_unit_detail(&unit_id);
+                        }
+                        Ok((vec![Change::Units], redo))
                     }
-                    Ok(vec![Change::Units])
+                    Err(e) => Err(e),
                 }
-                Err(e) => Err(e),
-            },
+            }
             UndoAction::FolderCreated { id } => {
+                // Redo capture: the folder's full row, taken
+                // before the delete below removes it — the redo
+                // re-inserts the row verbatim.
+                let redo = self.local.as_ref().and_then(|local| {
+                    local.redo_snapshot_folder_row(&id).map(|folder| RedoEntry {
+                        label: label.clone(),
+                        action: RedoAction::FolderCreated { folder },
+                    })
+                });
                 let has_contents = self
                     .local
                     .as_ref()
@@ -10854,53 +11116,410 @@ impl App {
                     ) {
                         Ok(_) => {
                             self.reload_folders();
-                            Ok(vec![Change::Folders])
+                            Ok((vec![Change::Folders], redo))
                         }
                         Err(e) => Err(e),
                     }
                 }
             }
-            UndoAction::FolderRenamed { id, old_name } => match self.call_work(
-                "POST",
-                &format!("/v1/folders/{id}/rename"),
-                Some(json!({ "name": old_name })),
-            ) {
-                Ok(_) => {
-                    self.reload_folders();
-                    Ok(vec![Change::Folders])
-                }
-                Err(e) => Err(e),
-            },
-            UndoAction::FolderNote { id, old_note } => match self.call_work(
-                "POST",
-                &format!("/v1/folders/{id}/note"),
-                Some(json!({ "note": old_note })),
-            ) {
-                Ok(_) => {
-                    self.reload_folders();
-                    Ok(vec![Change::Folders])
-                }
-                Err(e) => Err(e),
-            },
-            UndoAction::FolderMoved { positions } => match &self.local {
-                Some(local) => match local.undo_restore_folder_positions(&positions) {
-                    Ok(()) => {
+            UndoAction::FolderRenamed { id, old_name } => {
+                // Redo capture: the folder's CURRENT name is
+                // the post-rename name the redo writes back.
+                let redo = self.local.as_ref().and_then(|local| {
+                    local.redo_snapshot_folder_row(&id).map(|row| RedoEntry {
+                        label: label.clone(),
+                        action: RedoAction::FolderRenamed {
+                            id: id.clone(),
+                            new_name: row.name,
+                        },
+                    })
+                });
+                match self.call_work(
+                    "POST",
+                    &format!("/v1/folders/{id}/rename"),
+                    Some(json!({ "name": old_name })),
+                ) {
+                    Ok(_) => {
                         self.reload_folders();
-                        Ok(vec![Change::Folders])
+                        Ok((vec![Change::Folders], redo))
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            UndoAction::FolderNote { id, old_note } => {
+                // Redo capture: the folder's CURRENT note is
+                // the post-edit note the redo writes back.
+                let redo = self.local.as_ref().and_then(|local| {
+                    local.redo_snapshot_folder_row(&id).map(|row| RedoEntry {
+                        label: label.clone(),
+                        action: RedoAction::FolderNote {
+                            id: id.clone(),
+                            new_note: row.note,
+                        },
+                    })
+                });
+                match self.call_work(
+                    "POST",
+                    &format!("/v1/folders/{id}/note"),
+                    Some(json!({ "note": old_note })),
+                ) {
+                    Ok(_) => {
+                        self.reload_folders();
+                        Ok((vec![Change::Folders], redo))
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            UndoAction::FolderMoved { positions } => match &self.local {
+                Some(local) => {
+                    // Redo capture: the scope's CURRENT tree
+                    // positions are the move's post-image. The
+                    // positions don't name their scope, so it is
+                    // read off any moved folder's row first.
+                    let redo = positions.first().and_then(|first| {
+                        local.redo_snapshot_folder_row(&first.id).map(|row| {
+                            RedoEntry {
+                                label: label.clone(),
+                                action: RedoAction::FolderMoved {
+                                    positions: local
+                                        .undo_snapshot_folder_positions(&row.scope),
+                                },
+                            }
+                        })
+                    });
+                    match local.undo_restore_folder_positions(&positions) {
+                        Ok(()) => {
+                            self.reload_folders();
+                            Ok((vec![Change::Folders], redo))
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                None => Err("本地库不可用".into()),
+            },
+            UndoAction::FolderDeleted { snap } => match &self.local {
+                Some(local) => {
+                    // Redo capture: the delete's own pre-image
+                    // IS the redo's payload — re-running the
+                    // delete needs only its root and mode, and
+                    // core re-derives the rest from the tree it
+                    // finds at redo time.
+                    let redo = RedoEntry {
+                        label: label.clone(),
+                        action: RedoAction::FolderDeleted { snap: snap.clone() },
+                    };
+                    match local.undo_restore_folder_delete(&snap) {
+                        Ok(()) => {
+                            // The delete drain's own refresh, mirrored:
+                            // folder tree + homed lists (+ trash
+                            // staleness in trash mode).
+                            let mode = if snap.trash_mode { "trash" } else { "lift" };
+                            self.refresh_after_folder_delete(mode);
+                            Ok((vec![Change::Folders], Some(redo)))
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                None => Err("本地库不可用".into()),
+            },
+        };
+        match result {
+            Ok((changes, redo)) => {
+                if let Some(redo) = redo {
+                    self.push_redo(redo);
+                }
+                for c in changes {
+                    self.changed(c);
+                }
+                self.say(format!("已撤回：{label}"));
+            }
+            Err(e) => self.say(format!("无法撤回「{label}」：{e}")),
+        }
+    }
+
+    /// Ctrl+Y / Ctrl+Shift+Z: re-apply the newest redo entry.
+    /// The mirror of `do_undo` in every discipline: the entry
+    /// is consumed either way (a guard refusal reports why and
+    /// does not wall off the entries below it), refresh rides
+    /// the same phase-1 change events the matching undo arm
+    /// used, and each arm first captures the CURRENT state as
+    /// the counter-entry the undo stack gets back — pushed
+    /// through `push_undo_counter`, never `push_undo`, so
+    /// redoing does not clear the redo entries still below.
+    /// Where a counter-capture comes back empty the redo still
+    /// runs; only its walk-back is skipped.
+    fn do_redo(&mut self) {
+        let Some(entry) = self.redo_stack.pop() else {
+            return;
+        };
+        let label = entry.label.clone();
+        let result: Result<(Vec<Change>, Option<UndoEntry>), String> = match entry.action {
+            RedoAction::MoveUnits { positions } => match &self.local {
+                Some(local) => {
+                    // Counter-capture: the library's CURRENT
+                    // positions — the state this redo replaces,
+                    // which is what an undo of the redo restores.
+                    let counter = UndoAction::MoveUnits {
+                        positions: local.undo_snapshot_unit_positions(),
+                    };
+                    local
+                        .undo_restore_unit_positions(&positions)
+                        .map(|_| (vec![Change::Units], Some(counter)))
+                }
+                None => Err("本地库不可用".into()),
+            },
+            RedoAction::MergePage {
+                target_id,
+                source,
+                pre,
+                post,
+            } => match &self.local {
+                Some(local) => {
+                    // Counter-capture: the resurrected source's
+                    // snapshot and the target's current (pre)
+                    // row, grabbed before the redo dissolves
+                    // and rewrites — exactly the undo entry's
+                    // payload, re-read so it names the state the
+                    // redo actually found.
+                    let counter = local.undo_snapshot_unit(&source.unit.id).and_then(|src| {
+                        local
+                            .undo_snapshot_version(&pre.id)
+                            .map(|pre_now| UndoAction::MergePage {
+                                target_id: target_id.clone(),
+                                source: src,
+                                pre: pre_now,
+                                post: post.clone(),
+                            })
+                    });
+                    match local.redo_merge(&source, &pre, &post) {
+                        Ok(()) => {
+                            let open_target = match self.content.stack.top() {
+                                ContentFrame::Unit(st) => st.unit_id == target_id,
+                                _ => false,
+                            };
+                            if open_target {
+                                self.reload_unit_detail(&target_id);
+                            }
+                            Ok((vec![Change::Units], counter))
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                None => Err("本地库不可用".into()),
+            },
+            RedoAction::TrashBatch { rows } => match &self.local {
+                Some(local) => match local.redo_trash_apply(&rows) {
+                    Ok(fresh) => {
+                        self.trash.loaded = false;
+                        let mut changes = vec![Change::Trash];
+                        if rows.iter().any(|r| r.kind == "unit" || r.kind == "version") {
+                            changes.push(Change::Units);
+                        }
+                        if rows.iter().any(|r| r.kind == "index") {
+                            changes.push(Change::Indexes);
+                        }
+                        if rows.iter().any(|r| r.kind == "showroom") {
+                            changes.push(Change::ShowroomLive);
+                        }
+                        // Counter-entry: the fresh rows core
+                        // just minted are the ones an undo of
+                        // this redo must drop.
+                        Ok((changes, Some(UndoAction::TrashBatch { rows: fresh })))
                     }
                     Err(e) => Err(e),
                 },
                 None => Err("本地库不可用".into()),
             },
-            UndoAction::FolderDeleted { snap } => match &self.local {
-                Some(local) => match local.undo_restore_folder_delete(&snap) {
+            RedoAction::CreatedUnits { rows } => match &self.local {
+                Some(local) => match local.undo_trash_restore(&rows) {
                     Ok(()) => {
-                        // The delete drain's own refresh, mirrored:
-                        // folder tree + homed lists (+ trash
-                        // staleness in trash mode).
+                        self.trash.loaded = false;
+                        let counter = UndoAction::CreatedUnits {
+                            ids: rows.iter().map(|r| r.object_id.clone()).collect(),
+                        };
+                        Ok((vec![Change::Units, Change::Trash], Some(counter)))
+                    }
+                    Err(e) => Err(e),
+                },
+                None => Err("本地库不可用".into()),
+            },
+            RedoAction::CreatedIndex { rows } => match &self.local {
+                Some(local) => match local.undo_trash_restore(&rows) {
+                    Ok(()) => {
+                        self.trash.loaded = false;
+                        let counter = UndoAction::CreatedIndex {
+                            id: rows
+                                .first()
+                                .map(|r| r.object_id.clone())
+                                .unwrap_or_default(),
+                        };
+                        Ok((vec![Change::Indexes, Change::Trash], Some(counter)))
+                    }
+                    Err(e) => Err(e),
+                },
+                None => Err("本地库不可用".into()),
+            },
+            RedoAction::Ungroup {
+                created_rows,
+                original_id,
+            } => {
+                // Two steps, mirroring the undo's own shape
+                // (trash one side, restore the other): re-trash
+                // the original, then restore the split blocks.
+                match self.undo_trash_created("unit", std::slice::from_ref(&original_id)) {
+                    Ok(()) => match &self.local {
+                        Some(local) => {
+                            // Counter-capture: the original's
+                            // fresh trash row, minted by the
+                            // re-trash just above.
+                            let counter = local
+                                .undo_trash_find("unit", &original_id)
+                                .map(|row| UndoAction::Ungroup {
+                                    created: created_rows
+                                        .iter()
+                                        .map(|r| r.object_id.clone())
+                                        .collect(),
+                                    original: row,
+                                });
+                            match local.undo_trash_restore(&created_rows) {
+                                Ok(()) => {
+                                    Ok((vec![Change::Units, Change::Trash], counter))
+                                }
+                                Err(e) => Err(e),
+                            }
+                        }
+                        None => Err("本地库不可用".into()),
+                    },
+                    Err(e) => Err(e),
+                }
+            }
+            RedoAction::ReorderDraft {
+                version_id,
+                unit_id,
+                new_page_ids,
+            } => {
+                // Counter-capture: the draft's CURRENT page
+                // sequence (the post-undo order) is what an
+                // undo of this redo restores.
+                let counter = self.local.as_ref().and_then(|local| {
+                    local
+                        .redo_snapshot_version_page_ids(&version_id)
+                        .map(|old_page_ids| UndoAction::ReorderDraft {
+                            version_id: version_id.clone(),
+                            unit_id: unit_id.clone(),
+                            old_page_ids,
+                        })
+                });
+                match self.call_work(
+                    "POST",
+                    &format!("/v1/versions/{version_id}/reorder-pages"),
+                    Some(json!({ "page_ids": new_page_ids })),
+                ) {
+                    Ok(_) => {
+                        let open_unit = match self.content.stack.top() {
+                            ContentFrame::Unit(st) => st.unit_id == unit_id,
+                            _ => false,
+                        };
+                        if open_unit {
+                            self.reload_unit_detail(&unit_id);
+                        }
+                        Ok((vec![Change::Units], counter))
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            RedoAction::FolderCreated { folder } => match &self.local {
+                Some(local) => match local.redo_restore_folder_row(&folder) {
+                    Ok(()) => {
+                        self.reload_folders();
+                        let counter = UndoAction::FolderCreated { id: folder.id.clone() };
+                        Ok((vec![Change::Folders], Some(counter)))
+                    }
+                    Err(e) => Err(e),
+                },
+                None => Err("本地库不可用".into()),
+            },
+            RedoAction::FolderRenamed { id, new_name } => {
+                // Counter-capture: the folder's CURRENT name
+                // (the post-undo name) is the undo's write-back.
+                let counter = self.local.as_ref().and_then(|local| {
+                    local.redo_snapshot_folder_row(&id).map(|row| {
+                        UndoAction::FolderRenamed {
+                            id: id.clone(),
+                            old_name: row.name,
+                        }
+                    })
+                });
+                match self.call_work(
+                    "POST",
+                    &format!("/v1/folders/{id}/rename"),
+                    Some(json!({ "name": new_name })),
+                ) {
+                    Ok(_) => {
+                        self.reload_folders();
+                        Ok((vec![Change::Folders], counter))
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            RedoAction::FolderNote { id, new_note } => {
+                // Counter-capture: the folder's CURRENT note.
+                let counter = self.local.as_ref().and_then(|local| {
+                    local.redo_snapshot_folder_row(&id).map(|row| {
+                        UndoAction::FolderNote {
+                            id: id.clone(),
+                            old_note: row.note,
+                        }
+                    })
+                });
+                match self.call_work(
+                    "POST",
+                    &format!("/v1/folders/{id}/note"),
+                    Some(json!({ "note": new_note })),
+                ) {
+                    Ok(_) => {
+                        self.reload_folders();
+                        Ok((vec![Change::Folders], counter))
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            RedoAction::FolderMoved { positions } => match &self.local {
+                Some(local) => {
+                    // Counter-capture: the scope's CURRENT tree
+                    // positions (scope read off a moved folder's
+                    // row, as in the undo arm).
+                    let counter = positions.first().and_then(|first| {
+                        local.redo_snapshot_folder_row(&first.id).map(|row| {
+                            UndoAction::FolderMoved {
+                                positions: local
+                                    .undo_snapshot_folder_positions(&row.scope),
+                            }
+                        })
+                    });
+                    match local.undo_restore_folder_positions(&positions) {
+                        Ok(()) => {
+                            self.reload_folders();
+                            Ok((vec![Change::Folders], counter))
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                None => Err("本地库不可用".into()),
+            },
+            RedoAction::FolderDeleted { snap } => match &self.local {
+                Some(local) => match local.redo_folder_delete(&snap) {
+                    Ok(fresh) => {
+                        // The delete drain's own refresh,
+                        // mirrored (as in the undo arm).
                         let mode = if snap.trash_mode { "trash" } else { "lift" };
                         self.refresh_after_folder_delete(mode);
-                        Ok(vec![Change::Folders])
+                        // Counter-entry: the fresh pre-image
+                        // core captured for THIS delete.
+                        Ok((
+                            vec![Change::Folders],
+                            Some(UndoAction::FolderDeleted { snap: fresh }),
+                        ))
                     }
                     Err(e) => Err(e),
                 },
@@ -10908,13 +11527,16 @@ impl App {
             },
         };
         match result {
-            Ok(changes) => {
+            Ok((changes, counter)) => {
+                if let Some(counter) = counter {
+                    self.push_undo_counter(label.clone(), counter);
+                }
                 for c in changes {
                     self.changed(c);
                 }
-                self.say(format!("已撤回：{label}"));
+                self.say(format!("已重做：{label}"));
             }
-            Err(e) => self.say(format!("无法撤回「{label}」：{e}")),
+            Err(e) => self.say(format!("无法重做「{label}」：{e}")),
         }
     }
 
@@ -12193,6 +12815,12 @@ impl eframe::App for App {
         // execution live in shell.rs::undo_key). Same placement
         // as the Delete key, for the same reason.
         self.undo_key(ui.ctx());
+
+        // Keyboard Ctrl+Y / Ctrl+Shift+Z → the session redo
+        // stack (shell.rs::redo_key). The chords are disjoint
+        // from Ctrl+Z's (undo_key excludes Shift and never sees
+        // Y), so the two handlers can run back to back.
+        self.redo_key(ui.ctx());
 
         let screen = ui.max_rect();
         self.workspace_ui(ui);
@@ -18269,11 +18897,13 @@ impl App {
                             // folder (act_import_ppt_into), and 智能
                             // 分块导入 renders in the greyed
                             // placeholder form until the AI proposer
-                            // lands. The frame's allocation is the
-                            // bare placeholder's, unchanged — the
-                            // buttons live inside it, so the flow's
-                            // geometry (and FlowMetrics, which never
-                            // measured this frame) is untouched. The
+                            // lands. The buttons live inside the
+                            // frame's allocation; the flow's geometry
+                            // (and FlowMetrics, which never measured
+                            // this frame) keys off that allocation
+                            // alone — which is why the cursor is
+                            // re-asserted past the frame right after
+                            // the button scope below (see there). The
                             // placeholder shows exactly while the
                             // folder holds no unit rows: lazy-open
                             // wrapper units are unit rows, so it
@@ -18373,6 +19003,24 @@ impl App {
                                     });
                                 },
                             );
+                            // The button scope above must not size
+                            // this block: scope_builder closes by
+                            // advancing the parent cursor past the
+                            // child Ui's min_rect, and the placer's
+                            // advance ASSIGNS the cursor
+                            // (Layout::advance_after_rects), so the
+                            // centred button row — whose min_rect is
+                            // only about half the frame — pulls the
+                            // cursor back up into the frame just
+                            // allocated, and the next folder's header
+                            // renders inside the placeholder (the
+                            // collapsed-placeholder bug, user report
+                            // 2026-11-25). Re-assert the frame's own
+                            // advance so the placeholder occupies
+                            // exactly one card height in the flow, on
+                            // the plain and virtualized paths alike
+                            // (this branch always builds for real).
+                            ui.advance_cursor_after_rect(rect);
                             if do_import {
                                 self.act_import_ppt_into(Some(fid.clone()));
                             }
@@ -25255,7 +25903,7 @@ impl App {
                             );
                             ui.add_space(4.0);
                             ui.horizontal(|ui| {
-                                ui.label("Ctrl+Z 可撤回的操作步数");
+                                ui.label("Ctrl+Z 撤回 / Ctrl+Y 重做的操作步数");
                                 let resp = ui.add(
                                     egui::DragValue::new(&mut self.undo_limit)
                                         .range(0..=200),
@@ -25269,6 +25917,9 @@ impl App {
                                     while self.undo_stack.len() > limit {
                                         self.undo_stack.remove(0);
                                     }
+                                    while self.redo_stack.len() > limit {
+                                        self.redo_stack.remove(0);
+                                    }
                                     self.msg = if self.undo_limit <= 0 {
                                         "撤回已关闭".into()
                                     } else {
@@ -25279,7 +25930,7 @@ impl App {
                             ui.add_space(4.0);
                             ui.label(
                                 egui::RichText::new(
-                                    "移动、并入、删除、组合、粘贴与文件夹操作等可按 Ctrl+Z 逐步撤回（仅限本机库内的操作，本次运行内有效）。设为 0 关闭撤回；调小步数会立即丢弃最早的撤回记录。",
+                                    "移动、并入、删除、组合、粘贴与文件夹操作等可按 Ctrl+Z 逐步撤回，按 Ctrl+Y（或 Ctrl+Shift+Z）重做刚撤回的操作（仅限本机库内的操作，本次运行内有效）。重做步数与撤回共用此设置；设为 0 关闭撤回与重做；调小步数会立即丢弃最早的记录。",
                                 )
                                 .size(11.5)
                                 .color(palette_color(TEXT_WEAK)),
