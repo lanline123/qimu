@@ -7502,7 +7502,9 @@ impl App {
         match resp {
             Ok(v) => match v.get("data_base64").and_then(|x| x.as_str()) {
                 Some(data) => match b64d(data) {
-                    Ok(bytes) => self.clip_store(&bytes, &s(item, "title"), true),
+                    Ok(bytes) => {
+                        self.clip_store(&bytes, &s(item, "title"), true);
+                    }
                     Err(_) => self.msg = "复制失败：演示稿数据损坏".into(),
                 },
                 None => self.msg = "复制失败：服务器未返回演示稿".into(),
@@ -7515,7 +7517,9 @@ impl App {
     fn clip_copy_pages(&mut self, version_id: &str, pages: &[usize], source: &str) {
         match self.version_fragment_bytes(version_id) {
             Ok(frag) => match self.clip_pick_pages(&frag, pages) {
-                Ok(picked) => self.clip_store(&picked, source, true),
+                Ok(picked) => {
+                    self.clip_store(&picked, source, true);
+                }
                 Err(e) => self.msg = format!("复制失败：{e}"),
             },
             Err(e) => self.msg = format!("复制失败：{e}"),
