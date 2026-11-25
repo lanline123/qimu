@@ -258,6 +258,46 @@ impl Store {
         None
     }
 
+    /// A wrapper unit in the given home whose matching rendition
+    /// carries NO version at all — the residue of an open that
+    /// died between creating the unit and inserting the version
+    /// (the N8 failure at `lazy_open` left exactly one per
+    /// affected library, for its first not-yet-known page). It
+    /// can be told apart from another flow's interrupted wrapper
+    /// only by home + name + rendition shape — exactly the
+    /// identity `find_page_wrapper` keys on, minus the version.
+    /// Returns (unit_id, rendition_id).
+    fn find_versionless_wrapper(
+        &self,
+        folder_id: Option<&str>,
+        group_id: &str,
+        name: &str,
+        form: &str,
+        lang: &str,
+    ) -> Option<(String, String)> {
+        let units = self.list_units(None).ok()?;
+        for u in units {
+            if u.folder_id.as_deref() != folder_id || u.group_id != group_id || u.name != name {
+                continue;
+            }
+            let Ok(rends) = self.list_renditions(&u.id) else {
+                continue;
+            };
+            for r in rends {
+                if r.form != form || r.lang != lang {
+                    continue;
+                }
+                match self.list_versions(&r.id) {
+                    Ok(vers) if vers.is_empty() => {
+                        return Some((u.id.clone(), r.id.clone()));
+                    }
+                    _ => continue,
+                }
+            }
+        }
+        None
+    }
+
     /// A block unit in the given home whose 1.0.0 version's
     /// page-reference sequence is exactly `page_ids`, if one
     /// exists — the block an earlier `import_group` call with
@@ -1035,6 +1075,19 @@ impl Store {
     /// path, same as `import_open`). If EVERY page is already
     /// known, grouping and the deck-level gate run inline and no
     /// pending row survives the call.
+    ///
+    /// A not-yet-known page's wrapper version is born pending
+    /// (`insert_pending_version_from_pages`, empty fragment):
+    /// routing it through `insert_version_from_pages` with a
+    /// None fragment trips the audit-N8 birth guard and kills
+    /// the open at the first new page — the failure this flow
+    /// originally shipped with, since the guard and the lazy
+    /// open were written on parallel baselines. Re-opening the
+    /// same deck adopts the wrappers an earlier open landed
+    /// (completed or still-pending) and the versionless unit an
+    /// interrupted open left behind, and a failed open rolls
+    /// back the wrappers it created itself (audit N4), so a
+    /// retry converges instead of duplicating.
     pub fn lazy_open(
         &self,
         filename: &str,
@@ -1075,60 +1128,160 @@ impl Store {
             }
         };
         let pending_id = new_id("lzi");
-        let mut pages: Vec<PendingPage> = Vec::with_capacity(slide_refs.len());
-        for (i, s) in slide_refs.iter().enumerate() {
-            let (name, form, lang) = match blocks
-                .and_then(|bs| bs.iter().find(|b| b.pages.contains(&i)))
-            {
-                Some(spec) if spec.pages.len() == 1 => {
-                    (spec.name.clone(), spec.form.clone(), spec.lang.clone())
+        // The page loop runs as one attempt (audit N4, mirrored
+        // from import_open): a failure midway rolls back the
+        // wrappers THIS call created, so a retry starts from the
+        // pre-open state instead of duplicating every page
+        // already landed. Wrappers adopted from an earlier open
+        // are not rolled back — they were not created here, and
+        // the retry will adopt them again.
+        let mut created_units: Vec<String> = Vec::new();
+        let mut attempt = || -> Result<Vec<PendingPage>, String> {
+            let mut pages = Vec::with_capacity(slide_refs.len());
+            for (i, s) in slide_refs.iter().enumerate() {
+                let (name, form, lang) = match blocks
+                    .and_then(|bs| bs.iter().find(|b| b.pages.contains(&i)))
+                {
+                    Some(spec) if spec.pages.len() == 1 => {
+                        (spec.name.clone(), spec.form.clone(), spec.lang.clone())
+                    }
+                    _ => (slide_name(i), None, None),
+                };
+                let lang = lang.as_deref().unwrap_or("zh");
+                let form = form.as_deref().unwrap_or("标准");
+                let page_id = crate::store::page_id_for_fp(&s.fingerprint);
+                let info = crate::store::PageInfo {
+                    id: page_id.clone(),
+                    fp: s.fingerprint.clone(),
+                    title: titles[i].clone(),
+                };
+                let known = self.get_page(&page_id)?;
+                // Adopt a wrapper an earlier open of this deck
+                // already landed for this page (audit N4): a
+                // completed wrapper (its version carries the
+                // fragment) counts as split; a still-pending one
+                // (empty fragment, from an interrupted lazy open)
+                // is re-tracked by THIS record, and its split
+                // fills the SAME version in when it lands.
+                if let Some((uid, rid, vid, semver)) = self.find_page_wrapper(
+                    folder_id,
+                    group_id,
+                    &name,
+                    form,
+                    lang,
+                    &page_id,
+                ) {
+                    let ver = self.get_version(&vid)?;
+                    pages.push(PendingPage {
+                        index: i,
+                        fp: s.fingerprint.clone(),
+                        title: titles[i].clone(),
+                        text: texts[i].clone(),
+                        script: scripts[i].clone(),
+                        unit_id: uid,
+                        rendition_id: rid,
+                        version_id: vid,
+                        semver,
+                        split: !ver.fragment_hash.is_empty(),
+                        gone: false,
+                    });
+                    continue;
                 }
-                _ => (slide_name(i), None, None),
-            };
-            let lang = lang.as_deref().unwrap_or("zh");
-            let unit = self.create_unit(&name, folder_id, group_id, author, lang, "")?;
-            let rend = self.get_or_create_rendition(
-                &unit.id,
-                form.as_deref().unwrap_or("标准"),
-                lang,
-            )?;
-            let page_id = crate::store::page_id_for_fp(&s.fingerprint);
-            let info = crate::store::PageInfo {
-                id: page_id,
-                fp: s.fingerprint.clone(),
-                title: titles[i].clone(),
-            };
-            let known = self.get_page(&info.id)?;
-            let (frag, split) = match &known {
-                Some(rec) => (Some(self.file_get(&rec.hash)?), true),
-                None => (None, false),
-            };
-            let ver = self.insert_version_from_pages(
-                &rend.id,
-                SemVer::new(1, 0, 0),
-                unit.current_revision,
-                author,
-                "导入",
-                "normal",
-                &[info],
-                &texts[i..i + 1],
-                &scripts[i..i + 1],
-                frag.as_deref(),
-            )?;
-            pages.push(PendingPage {
-                index: i,
-                fp: s.fingerprint.clone(),
-                title: titles[i].clone(),
-                text: texts[i].clone(),
-                script: scripts[i].clone(),
-                unit_id: unit.id.clone(),
-                rendition_id: rend.id.clone(),
-                version_id: ver.id.clone(),
-                semver: ver.semver.clone(),
-                split,
-                gone: false,
-            });
-        }
+                // Adopt the residue of an open that died between
+                // creating the wrapper unit and inserting its
+                // version — the N8 failure at this very call left
+                // exactly one such unit (for the first
+                // not-yet-known page) in every affected library.
+                // The unit and rendition are reused and the
+                // version is born on them below, so re-importing
+                // the same deck heals the residue instead of
+                // piling a duplicate wrapper beside it.
+                let (unit, rend) = match self.find_versionless_wrapper(
+                    folder_id,
+                    group_id,
+                    &name,
+                    form,
+                    lang,
+                ) {
+                    Some((uid, rid)) => {
+                        (self.get_unit(&uid)?, self.get_rendition(&rid)?)
+                    }
+                    None => {
+                        let unit =
+                            self.create_unit(&name, folder_id, group_id, author, lang, "")?;
+                        created_units.push(unit.id.clone());
+                        let rend = self.get_or_create_rendition(&unit.id, form, lang)?;
+                        (unit, rend)
+                    }
+                };
+                // A page the library already holds as an entity
+                // is split by definition: its wrapper version
+                // adopts the entity's stored package at once. Any
+                // other page's wrapper is born pending
+                // (`insert_pending_version_from_pages`): passing
+                // its (nonexistent) fragment to
+                // `insert_version_from_pages` instead is what
+                // tripped the N8 guard and killed the open at the
+                // first new page — the split owes this version
+                // the entity's package, paid by `lazy_split_page`
+                // via `set_version_fragment_hash`.
+                let (ver, split) = match &known {
+                    Some(rec) => {
+                        let frag_bytes = self.file_get(&rec.hash)?;
+                        let ver = self.insert_version_from_pages(
+                            &rend.id,
+                            SemVer::new(1, 0, 0),
+                            unit.current_revision,
+                            author,
+                            "导入",
+                            "normal",
+                            &[info],
+                            &texts[i..i + 1],
+                            &scripts[i..i + 1],
+                            Some(&frag_bytes),
+                        )?;
+                        (ver, true)
+                    }
+                    None => {
+                        let ver = self.insert_pending_version_from_pages(
+                            &rend.id,
+                            SemVer::new(1, 0, 0),
+                            unit.current_revision,
+                            author,
+                            "导入",
+                            "normal",
+                            &[info],
+                            &texts[i..i + 1],
+                            &scripts[i..i + 1],
+                        )?;
+                        (ver, false)
+                    }
+                };
+                pages.push(PendingPage {
+                    index: i,
+                    fp: s.fingerprint.clone(),
+                    title: titles[i].clone(),
+                    text: texts[i].clone(),
+                    script: scripts[i].clone(),
+                    unit_id: unit.id.clone(),
+                    rendition_id: rend.id.clone(),
+                    version_id: ver.id.clone(),
+                    semver: ver.semver.clone(),
+                    split,
+                    gone: false,
+                });
+            }
+            Ok(pages)
+        };
+        let pages = match attempt() {
+            Ok(pages) => pages,
+            Err(e) => {
+                for uid in &created_units {
+                    let _ = self.delete_unit_permanent(uid);
+                }
+                return Err(e);
+            }
+        };
         let rec = PendingImportRec {
             id: pending_id.clone(),
             filename: filename.to_string(),

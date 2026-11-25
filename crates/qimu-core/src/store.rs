@@ -1176,6 +1176,14 @@ impl Store {
     }
 
     fn version_page_packages_legacy(&self, version: &VersionRec) -> SResult<Vec<Package>> {
+        // A lazy-import wrapper whose page has not been split
+        // yet carries no fragment (see
+        // `insert_pending_version_from_pages`): name that cause
+        // here instead of surfacing a missing-file error for the
+        // empty hash (audit N8's intent, enforced at the door).
+        if version.fragment_hash.is_empty() {
+            return Err("版本尚无片段字节（页面未拆分完成），无法组包".into());
+        }
         let bytes = self.file_get(&version.fragment_hash)?;
         let pkg = Package::load(&bytes)?;
         crate::pptx::split(&pkg)
@@ -1188,6 +1196,13 @@ impl Store {
     /// reference sequence); consumers that need pages rather than
     /// the whole fragment should prefer `version_page_packages`.
     pub fn version_fragment_bytes(&self, version: &VersionRec) -> SResult<Vec<u8>> {
+        // The submission byte chain's door (audit N8): a
+        // not-yet-split lazy wrapper has no fragment to ship —
+        // refuse here with the cause named rather than letting
+        // an empty hash fail far away as a missing file.
+        if version.fragment_hash.is_empty() {
+            return Err("版本尚无片段字节（页面未拆分完成），无法组包".into());
+        }
         self.file_get(&version.fragment_hash)
     }
 
@@ -2952,8 +2967,11 @@ impl Store {
     /// page's own single-page package; for a grouped version, the
     /// one assembly of the member singles) — the byte-exact chains
     /// downstream (submission staging verifies SHA-256 against
-    /// `fragment_hash`) require it to exist, so only a caller with
-    /// nothing byte-facing may pass None.
+    /// `fragment_hash`) require it to exist, so a caller must
+    /// supply it: `None` is refused at birth (audit N8, below).
+    /// The one legitimate byte-less birth — a lazy-import wrapper
+    /// whose page has not been split yet — goes through
+    /// `insert_pending_version_from_pages`, never through here.
     #[allow(clippy::too_many_arguments)]
     pub fn insert_version_from_pages(
         &self,
@@ -2967,6 +2985,103 @@ impl Store {
         texts: &[String],
         scripts: &[String],
         fragment: Option<&[u8]>,
+    ) -> SResult<VersionRec> {
+        // N8 (chain line): a None fragment used to land as
+        // fragment_hash = "" and only failed much later, far
+        // from the cause — at submission-package build, where
+        // the byte chain reads the hash back and finds nothing.
+        // Fail here, at the version's birth, with the cause
+        // named: every caller of THIS entry has the bytes, and a
+        // caller with nothing byte-facing must not create
+        // byte-chained versions.
+        let hash = match fragment {
+            Some(bytes) => self.file_put(bytes)?,
+            None => {
+                return Err(
+                    "建版本缺少片段字节：无字节的版本会让投稿组包在远处失败，请传入片段"
+                        .into(),
+                )
+            }
+        };
+        self.insert_version_from_pages_hashed(
+            rendition_id,
+            semver,
+            basis_revision,
+            author,
+            note,
+            status,
+            pages,
+            texts,
+            scripts,
+            hash,
+        )
+    }
+
+    /// Insert a NOT-YET-MATERIALIZED version from a page-reference
+    /// sequence: the lazy import's wrapper birth. The page has
+    /// not been split at open time — splitting it eagerly would
+    /// defeat the lazy open — so the version is born with an
+    /// empty `fragment_hash` and is owed exactly one future
+    /// write: when the page's split lands, `lazy_split_page`
+    /// registers the page entity and points this version at the
+    /// entity's stored package via `set_version_fragment_hash`,
+    /// after which the wrapper is indistinguishable from a
+    /// staged import's stage-1 version.
+    ///
+    /// This does NOT reopen the hole audit N8 closed. The N8
+    /// guard on `insert_version_from_pages` stands untouched for
+    /// every byte-facing caller; this entry is reachable only
+    /// from `lazy_open`, and the version it creates lives inside
+    /// a durable `pending_imports` record that tracks the debt
+    /// until the split pays it. The byte chains are guarded at
+    /// their own doors in the meantime: `version_fragment_bytes`
+    /// and `version_page_packages_legacy` refuse an empty-hash
+    /// version with the cause named, at the point of use, instead
+    /// of failing far away on a missing content-addressed file.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_pending_version_from_pages(
+        &self,
+        rendition_id: &str,
+        semver: SemVer,
+        basis_revision: i64,
+        author: &str,
+        note: &str,
+        status: &str,
+        pages: &[PageInfo],
+        texts: &[String],
+        scripts: &[String],
+    ) -> SResult<VersionRec> {
+        self.insert_version_from_pages_hashed(
+            rendition_id,
+            semver,
+            basis_revision,
+            author,
+            note,
+            status,
+            pages,
+            texts,
+            scripts,
+            String::new(),
+        )
+    }
+
+    /// The shared insert body behind `insert_version_from_pages`
+    /// and `insert_pending_version_from_pages`: the reference
+    /// sequence checks and the row write, with the fragment hash
+    /// already decided by the entry point.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_version_from_pages_hashed(
+        &self,
+        rendition_id: &str,
+        semver: SemVer,
+        basis_revision: i64,
+        author: &str,
+        note: &str,
+        status: &str,
+        pages: &[PageInfo],
+        texts: &[String],
+        scripts: &[String],
+        hash: String,
     ) -> SResult<VersionRec> {
         if scripts.len() != pages.len() {
             return Err("讲稿数量与页面数量不匹配".into());
@@ -2982,23 +3097,6 @@ impl Store {
             return Err("页引用缺少实体 id，版本未写入".into());
         }
         self.check_semver_free(rendition_id, semver, None)?;
-        // N8 (chain line): a None fragment used to land as
-        // fragment_hash = "" and only failed much later, far
-        // from the cause — at submission-package build, where
-        // the byte chain reads the hash back and finds nothing.
-        // Fail here, at the version's birth, with the cause
-        // named: every current caller has the bytes, and a
-        // caller with nothing byte-facing must not create
-        // byte-chained versions.
-        let hash = match fragment {
-            Some(bytes) => self.file_put(bytes)?,
-            None => {
-                return Err(
-                    "建版本缺少片段字节：无字节的版本会让投稿组包在远处失败，请传入片段"
-                        .into(),
-                )
-            }
-        };
         let id = new_id("ver");
         self.conn
             .execute(
