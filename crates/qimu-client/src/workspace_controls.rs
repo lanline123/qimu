@@ -885,7 +885,7 @@ impl App {
                                 (
                                     palette_color(msg_kind_soft(&kind)),
                                     egui::Stroke::new(
-                                        1.5,
+                                        1.0,
                                         palette_color(msg_kind_color(&kind)),
                                     ),
                                 )

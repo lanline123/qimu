@@ -764,9 +764,13 @@ impl App {
         let copy_deck: Option<Value> = item.clone().or(plaza_item);
         // sdClose — the global back button. It keeps its own
         // availability and never follows the group's grey state.
+        // Its glyph is the redrawn back arrow in the theme
+        // accent (user ruling 2026-11-26, this button only —
+        // tool_accent); availability, label and action are the
+        // plain tool button's.
         let back_label = self.deckbar_back_label();
         if ChromeIcons
-            .tool(
+            .tool_accent(
                 ui,
                 ChromeIcon::Back,
                 back_label.unwrap_or("返回上一层"),
@@ -1800,6 +1804,108 @@ impl App {
         }
         ctx.input_mut(|i| i.consume_key(mods, key));
         self.do_redo();
+    }
+
+    /// Whether an in-progress pointer/keyboard interaction owns
+    /// Escape this frame: a press or armed drag on a wall or in a
+    /// detail wall, or a page-binding pick in flight. Each of
+    /// these has its own Esc consumer in the render pass (the
+    /// drag-arming code clears its press/drag state, the detail
+    /// clears its pick) — the app-level back key must stand down
+    /// while any of them is live, or one Esc would both cancel
+    /// the interaction AND pop the frame behind it.
+    fn esc_interaction_active(&self) -> bool {
+        if self.card_press.is_some() || self.folder_press.is_some() {
+            return true;
+        }
+        if let ContentFrame::Unit(st) = self.content.stack.top() {
+            if st.page_press.is_some()
+                || st.page_drag.is_some()
+                || st.vh_press.is_some()
+                || st.vh_drag.is_some()
+                || st.bind_pick.is_some()
+            {
+                return true;
+            }
+        }
+        if let SrFrame::Deck(st) = self.showroom.stack.top() {
+            if st.page_press.is_some() || st.page_drag.is_some() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Keyboard Escape → the deckbar sdClose path (user ruling
+    /// 2026-11-26: Esc and the bottom bar's back button are one
+    /// action). On a hit it runs `deckbar_back()` verbatim — the
+    /// button's own per-page back path — so the key inherits the
+    /// button's whole semantics, and its availability is the
+    /// button's: `deckbar_back_label()` returning None (the Home
+    /// root) makes the key a silent no-op, exactly the button's
+    /// grey state. The return standard's other half — Esc closes
+    /// an open overlay first — is NOT duplicated here: the
+    /// overlay stack already owns Esc in that scene
+    /// (`overlay_stack_ui`, with the page editor's unsaved
+    /// guard and the presenter's end_present), so the dialog
+    /// gate below stands this handler down whenever any overlay
+    /// or modal window is up, and the two paths can never fire
+    /// on the same press. Gates, all must pass:
+    /// - a plain Escape press, first press only, no modifiers
+    ///   (repeats ignored: holding Esc must not walk the whole
+    ///   drill stack in one hold);
+    /// - no widget holds focus — the established idiom of the
+    ///   Delete/undo keys: a focused TextEdit keeps Escape for
+    ///   its own cancel (folder rename, the detail's meta and
+    ///   renumber edits all cancel in place), and egui's blur
+    ///   on Escape must not be misread as anything else;
+    /// - no overlay or dialog is open (`delete_key_dialog_open`,
+    ///   shared verbatim: the overlay stack, the login window —
+    ///   whose own Esc closes it — the delete confirm, the
+    ///   share dialogs, the toolbar menus);
+    /// - no drag/press/pick interaction is live
+    ///   (`esc_interaction_active`): those cancel themselves
+    ///   with this same press in the render pass.
+    /// On a hit the press is consumed, so no later reader in
+    /// the frame can re-interpret it.
+    pub(super) fn deckbar_back_key(&mut self, ctx: &egui::Context) {
+        let pressed = ctx.input(|i| {
+            i.events.iter().any(|e| match e {
+                egui::Event::Key {
+                    key,
+                    pressed,
+                    repeat,
+                    modifiers,
+                    ..
+                } => {
+                    *key == egui::Key::Escape
+                        && *pressed
+                        && !*repeat
+                        && !modifiers.ctrl
+                        && !modifiers.alt
+                        && !modifiers.command
+                        && !modifiers.shift
+                }
+                _ => false,
+            })
+        });
+        if !pressed {
+            return;
+        }
+        if ctx.memory(|m| m.focused().is_some()) {
+            return;
+        }
+        if self.delete_key_dialog_open() {
+            return;
+        }
+        if self.esc_interaction_active() {
+            return;
+        }
+        if self.deckbar_back_label().is_none() {
+            return;
+        }
+        ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        self.deckbar_back();
     }
 
     /// Any overlay or standalone dialog that must shield the

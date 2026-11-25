@@ -2140,16 +2140,6 @@ impl App {
                                     });
                             });
                         });
-                    if selected {
-                        // .std-card.selected: the 1px outer ring
-                        // around the accent border.
-                        ui.painter().rect_stroke(
-                            frame_resp.response.rect.expand(1.0),
-                            6.0,
-                            egui::Stroke::new(1.0, ACCENT),
-                            egui::StrokeKind::Outside,
-                        );
-                    }
                 }
             });
             ui.add_space(12.0);
@@ -2476,14 +2466,6 @@ impl App {
                         .color(palette_color(TEXT_FAINT)),
                 );
             });
-        if selected {
-            ui.painter().rect_stroke(
-                frame_resp.response.rect.expand(1.0),
-                6.0,
-                egui::Stroke::new(1.0, ACCENT),
-                egui::StrokeKind::Outside,
-            );
-        }
         (frame_resp.response.rect, hots)
     }
 
@@ -2756,14 +2738,6 @@ impl App {
                     );
                 }
             });
-        if selected {
-            ui.painter().rect_stroke(
-                frame_resp.response.rect.expand(1.0),
-                6.0,
-                egui::Stroke::new(1.0, ACCENT),
-                egui::StrokeKind::Outside,
-            );
-        }
         (frame_resp.response.rect, hots)
     }
 

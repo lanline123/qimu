@@ -255,11 +255,43 @@ impl ChromeIcons {
         selected: bool,
         editor: bool,
     ) -> egui::Response {
+        self.tool_tinted(ui, icon, label, enabled, selected, editor, None)
+    }
+
+    /// `tool` with the icon in the theme accent — used ONLY by
+    /// the deckbar's sdClose back button (user ruling
+    /// 2026-11-26: the back glyph was redrawn and its colour is
+    /// the theme colour, a named single-button exception like
+    /// the selected folder's accent dye). Every other tool
+    /// button keeps the standard icon tint; the button's fill,
+    /// stroke and state behaviour are `tool`'s, unchanged.
+    pub(super) fn tool_accent(
+        self,
+        ui: &mut egui::Ui,
+        icon: ChromeIcon,
+        label: &str,
+        enabled: bool,
+        selected: bool,
+        editor: bool,
+    ) -> egui::Response {
+        self.tool_tinted(ui, icon, label, enabled, selected, editor, Some(ACCENT))
+    }
+
+    fn tool_tinted(
+        self,
+        ui: &mut egui::Ui,
+        icon: ChromeIcon,
+        label: &str,
+        enabled: bool,
+        selected: bool,
+        editor: bool,
+        icon_tint: Option<egui::Color32>,
+    ) -> egui::Response {
         use craft_ui::buttons::{ButtonVisuals, IconButton, IconButtonStyle};
         let normal = ButtonVisuals {
             fill: palette_color(FIELD_BG),
             stroke: egui::Stroke::new(1.0, palette_color(FIELD_BORDER)),
-            icon: palette_color(ICON_TINT),
+            icon: icon_tint.unwrap_or_else(|| palette_color(ICON_TINT)),
         };
         let style = IconButtonStyle {
             normal,

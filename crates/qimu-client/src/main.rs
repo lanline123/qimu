@@ -10204,9 +10204,13 @@ fn standard_card<R>(
 }
 
 /// Card variants (the prototype's .std-card modifiers): `Mine`
-/// is the 「我维护」 fill (--mine-bg); `Rejected` is the rose 2px
+/// is the 「我维护」 fill (--mine-bg); `Rejected` is the rose
 /// frame a rejected card wears until it is opened. Stroke
-/// priority: selected > rejected > scope colour.
+/// priority: selected > rejected > scope colour. Every state
+/// stroke is 1.0 wide (user ruling 2026-11-26): state shows in
+/// the stroke COLOUR only, never the width — egui Frame
+/// geometry counts the stroke, so a wider selected stroke
+/// shifted every neighbouring card by the difference.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CardVariant {
     Normal,
@@ -10230,9 +10234,9 @@ fn standard_card_v<R>(
         frame = frame.inner_margin(0);
     }
     if selected {
-        frame = frame.stroke(egui::Stroke::new(1.5, ACCENT));
+        frame = frame.stroke(egui::Stroke::new(1.0, ACCENT));
     } else if variant == CardVariant::Rejected {
-        frame = frame.stroke(egui::Stroke::new(2.0, palette_color(ROSE)));
+        frame = frame.stroke(egui::Stroke::new(1.0, palette_color(ROSE)));
     } else if let Some(color) = scope {
         frame = frame.stroke(egui::Stroke::new(1.0, color));
     }
@@ -13322,6 +13326,14 @@ impl eframe::App for App {
         // Y), so the two handlers can run back to back.
         self.redo_key(ui.ctx());
 
+        // Keyboard Escape → the deckbar sdClose path (gates and
+        // execution live in shell.rs::deckbar_back_key). Same
+        // placement as the other app-level keys: the hosted show
+        // above has already claimed the keyboard while a show is
+        // live, and the press is answered before the workspace
+        // draws.
+        self.deckbar_back_key(ui.ctx());
+
         let screen = ui.max_rect();
         self.workspace_ui(ui);
         self.toast(ui, screen);
@@ -13568,7 +13580,7 @@ impl App {
             ui.painter().rect_stroke(
                 rect,
                 0.0,
-                egui::Stroke::new(1.5, ACCENT),
+                egui::Stroke::new(1.0, ACCENT),
                 egui::StrokeKind::Middle,
             );
         } else if resp.hovered() {
