@@ -555,6 +555,7 @@ impl App {
             [width, 26.0],
             egui::TextEdit::singleline(&mut self.workspace_controls.search_text)
                 .desired_width(width)
+                .align(egui::Align2::LEFT_CENTER)
                 .hint_text(tr("搜索页面、标签、维护人…")),
         );
         if std::mem::take(&mut self.workspace_controls.focus_search) {

@@ -11046,12 +11046,18 @@ impl App {
     }
 
     /// The status surface: no status bar — a floating toast where
-    /// the prototype puts it: top-right, 14px below the 100px
-    /// chrome (top = --chrome-h + 14 = 114), --panel3 fill with a
-    /// --line2 outline, 8px radius, 13px text, gone after 3.4
-    /// seconds. `msg` remains the client's only message channel;
-    /// the toast stamps it when it changes.
-    fn toast(&mut self, ui: &mut egui::Ui, _screen: egui::Rect) {
+    /// the prototype puts it (component C33 / prototype `.toast`,
+    /// final cascaded values): top-right, 14px below the chrome
+    /// (68px here, so top = 82), right 16px, --panel3 fill with a
+    /// 1px --line2 outline, 8px radius, the shared --shadow,
+    /// 13px/600 text, 12px × 16px padding, max width
+    /// min(420px, screen − 32px), gone after 3.4 seconds, no
+    /// fade, a new message replaces the old one. The prototype's
+    /// 600 weight rides egui's strong() — the same approximation
+    /// the dialog titles use for their 600/700 text. `msg`
+    /// remains the client's only message channel; the toast
+    /// stamps it when it changes.
+    fn toast(&mut self, ui: &mut egui::Ui, screen: egui::Rect) {
         let now = ui.ctx().input(|i| i.time);
         if self.msg != self.toast_msg || self.toast_nonce != self.toast_seen_nonce {
             self.toast_msg = self.msg.clone();
@@ -11063,6 +11069,18 @@ impl App {
         if self.toast_msg.is_empty() || now - self.toast_since > 3.4 {
             return;
         }
+        // --shadow, theme-aware exactly as apply_modern_style
+        // sets it for windows/popups: deep black at 50% on the
+        // dark theme, a faint slate at ~10% on the light theme.
+        let shadow_color = if LIGHT_THEME.get() {
+            egui::Color32::from_rgba_unmultiplied(20, 25, 40, 26)
+        } else {
+            egui::Color32::from_black_alpha(128)
+        };
+        // Prototype max-width: min(420px, 100% − 32px); the cap
+        // covers the whole toast, so the text column inside the
+        // 16px side margins gets what remains.
+        let text_max = 420.0f32.min((screen.width() - 32.0).max(80.0)) - 32.0;
         egui::Area::new(egui::Id::new("qimu_toast"))
             .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 82.0))
             .order(egui::Order::Foreground)
@@ -11075,18 +11093,20 @@ impl App {
                         offset: [0, 14],
                         blur: 34,
                         spread: 0,
-                        color: egui::Color32::from_black_alpha(128),
+                        color: shadow_color,
                     })
                     .inner_margin(egui::Margin {
-                        left: 12,
-                        right: 12,
-                        top: 7,
-                        bottom: 7,
+                        left: 16,
+                        right: 16,
+                        top: 12,
+                        bottom: 12,
                     })
                     .show(ui, |ui| {
+                        ui.set_max_width(text_max);
                         ui.label(
                             egui::RichText::new(&self.toast_msg)
                                 .size(13.0)
+                                .strong()
                                 .color(palette_color(TEXT_MAIN)),
                         );
                     });
@@ -19321,8 +19341,19 @@ impl App {
             ui.add_space(6.0);
             if let Some(edit) = &mut self.folder_edit {
                 let w = ui.available_width().min(190.0).max(60.0);
-                let resp =
-                    ui.add_sized([w, 30.0], egui::TextEdit::singleline(&mut edit.text));
+                // Vertical centering (user report 2026-11-25):
+                // this fork's TextEdit places its galley by its
+                // `align`, whose default resolves to LEFT_TOP,
+                // so in a box taller than one line the glyphs
+                // hug the top and read as shifted up. Pin the
+                // align to LEFT_CENTER and give the box the
+                // tree row's exact 28px height, so the editor
+                // row is indistinguishable in height from the
+                // rows around it and the text sits centered.
+                let resp = ui.add_sized(
+                    [w, 28.0],
+                    egui::TextEdit::singleline(&mut edit.text).align(egui::Align2::LEFT_CENTER),
+                );
                 if self.folder_edit_focus {
                     resp.request_focus();
                     self.folder_edit_focus = false;
