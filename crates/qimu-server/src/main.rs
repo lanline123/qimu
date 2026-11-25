@@ -1894,20 +1894,60 @@ fn unit_json(st: &St, unit: &UnitRec, with_versions: bool) -> Value {
     let mut rends = Vec::new();
     if let Ok(list) = store.list_renditions(&unit.id) {
         for r in list {
-            let versions = if with_versions {
-                store.list_versions(&r.id).unwrap_or_default()
+            let (working, versions, line_order) = if with_versions {
+                let all = store.list_versions(&r.id).unwrap_or_default();
+                // The unnumbered working draft leaves the
+                // version list and rides its own field: the
+                // history line is numbered versions only.
+                let working = all.iter().find(|v| v.status == "working").cloned();
+                let line_order: Vec<String> = store
+                    .version_line_order(&r.id)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|v| v.id.clone())
+                    .collect();
+                let versions: Vec<_> =
+                    all.into_iter().filter(|v| v.status != "working").collect();
+                (working, versions, line_order)
             } else {
-                vec![]
+                (None, vec![], vec![])
             };
             let latest = store.latest_version(&r.id).ok().flatten();
+            let use_sel = store.get_use_sel(&unit.id, &r.id).ok().flatten();
             rends.push(json!({
                 "rendition": r,
                 "latest": latest,
                 "versions": versions,
+                "working": working,
+                "line_order": line_order,
+                "use_sel": use_sel,
             }));
         }
     }
-    json!({ "unit": unit, "renditions": rends })
+    // Badges and mounts are detail-page data: computing them
+    // per row would tax every list surface, so list rows
+    // (with_versions = false) carry empty arrays.
+    let status_badges: Vec<Value> = if with_versions {
+        store
+            .unit_status_badges(&unit.id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(kind, text)| json!({ "kind": kind, "text": text }))
+            .collect()
+    } else {
+        vec![]
+    };
+    let lang_mounts = if with_versions {
+        store.list_lang_mounts(&unit.id).unwrap_or_default()
+    } else {
+        vec![]
+    };
+    json!({
+        "unit": unit,
+        "renditions": rends,
+        "status_badges": status_badges,
+        "lang_mounts": lang_mounts,
+    })
 }
 
 async fn list_units(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
@@ -2235,13 +2275,21 @@ async fn recall_version(
     Ok(Json(json!({ "ok": true })))
 }
 
+#[derive(Deserialize)]
+struct PublishDraftReq {
+    note: Option<String>,
+}
+
 /// POST /v1/versions/:id/publish-draft — the #101 history card's
 /// 「发布为最新版本」: flip a draft version to normal. Only drafts
 /// qualify; anything else is a client error, not a silent no-op.
+/// The card's inline publish input may carry a note, which then
+/// replaces the draft's stored one.
 async fn publish_draft_version(
     State(st): State<St>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    body: Option<Json<PublishDraftReq>>,
 ) -> Api<Value> {
     let user = auth(&st, &headers)?;
     let store = st.store.lock().unwrap();
@@ -2253,8 +2301,254 @@ async fn publish_draft_version(
     let unit = store.get_unit(&rend.unit_id).map_err(bad)?;
     drop(store);
     need_cap(&st, &user, &unit.group_id, "publish")?;
+    let note = body
+        .and_then(|Json(req)| req.note)
+        .filter(|n| !n.trim().is_empty());
     let store = st.store.lock().unwrap();
-    store.set_version_status(&id, "normal").map_err(bad)?;
+    let ver = store.publish_draft(&id, note.as_deref()).map_err(bad)?;
+    Ok(Json(json!({ "version": ver })))
+}
+
+/// Resolve a version's owning unit (for capability checks).
+fn version_unit(
+    store: &qimu_core::store::Store,
+    version_id: &str,
+) -> Result<qimu_core::store::UnitRec, (StatusCode, Json<Value>)> {
+    let ver = store.get_version(version_id).map_err(|_| not_found())?;
+    let rend = store.get_rendition(&ver.rendition_id).map_err(bad)?;
+    store.get_unit(&rend.unit_id).map_err(bad)
+}
+
+#[derive(Deserialize)]
+struct NoteReq {
+    note: Option<String>,
+}
+
+/// POST /v1/renditions/:id/seed-working — birth (or fetch) the
+/// rendition's unnumbered working draft (publish governance).
+async fn seed_working(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let unit = {
+        let store = st.store.lock().unwrap();
+        let rend = store.get_rendition(&id).map_err(|_| not_found())?;
+        store.get_unit(&rend.unit_id).map_err(bad)?
+    };
+    need_cap(&st, &user, &unit.group_id, "publish")?;
+    let store = st.store.lock().unwrap();
+    let ver = store
+        .seed_working_draft(&id, &user.display_name)
+        .map_err(bad)?;
+    Ok(Json(json!({ "version": ver })))
+}
+
+/// POST /v1/versions/:id/publish-working — publish the
+/// unnumbered working draft: its own row takes the next minor
+/// number and turns normal.
+async fn publish_working(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Option<Json<NoteReq>>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let unit = {
+        let store = st.store.lock().unwrap();
+        version_unit(&store, &id)?
+    };
+    need_cap(&st, &user, &unit.group_id, "publish")?;
+    let note = body
+        .and_then(|Json(req)| req.note)
+        .unwrap_or_default();
+    let store = st.store.lock().unwrap();
+    let ver = store
+        .publish_working_draft(&id, &note, &user.display_name)
+        .map_err(bad)?;
+    Ok(Json(json!({ "version": ver })))
+}
+
+#[derive(Deserialize)]
+struct InsertAtReq {
+    base_version_id: String,
+}
+
+/// POST /v1/versions/:id/insert-at — 定号插入： number the
+/// working draft into the line right after the base version,
+/// cascade-shifting newer numbers (each shift is ledgered).
+async fn insert_working_at(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<InsertAtReq>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let unit = {
+        let store = st.store.lock().unwrap();
+        version_unit(&store, &id)?
+    };
+    need_cap(&st, &user, &unit.group_id, "publish")?;
+    let store = st.store.lock().unwrap();
+    let (ver, shifts) = store
+        .insert_working_at(&id, &req.base_version_id, &user.display_name)
+        .map_err(bad)?;
+    let shifts: Vec<Value> = shifts
+        .iter()
+        .map(|(from, to)| json!({ "from": from, "to": to }))
+        .collect();
+    Ok(Json(json!({ "version": ver, "shifts": shifts })))
+}
+
+#[derive(Deserialize)]
+struct RenumberReq {
+    semver: String,
+}
+
+/// POST /v1/versions/:id/renumber — super-admin manual
+/// renumber, ledgered （版本身份不变，编号变更留痕）.
+async fn renumber_version_h(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<RenumberReq>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    if user.role != "super" {
+        return Err(forbidden());
+    }
+    let semver = SemVer::parse(&req.semver).map_err(bad)?;
+    let store = st.store.lock().unwrap();
+    store
+        .renumber_version_recorded(&id, semver, &user.display_name, "超级管理员手动改号")
+        .map_err(bad)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct RejectReq {
+    reason: String,
+}
+
+/// POST /v1/versions/:id/reject — mark a version not-passed
+/// （未通过） with its reason. The state is written by the
+/// review flow; #101 only renders it.
+async fn reject_version_h(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<RejectReq>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let unit = {
+        let store = st.store.lock().unwrap();
+        version_unit(&store, &id)?
+    };
+    need_cap(&st, &user, &unit.group_id, "publish")?;
+    let store = st.store.lock().unwrap();
+    store
+        .reject_version(&id, &req.reason, &user.display_name)
+        .map_err(bad)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// POST /v1/versions/:id/restore — undo a not-passed mark.
+async fn restore_version_h(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let unit = {
+        let store = st.store.lock().unwrap();
+        version_unit(&store, &id)?
+    };
+    need_cap(&st, &user, &unit.group_id, "publish")?;
+    let store = st.store.lock().unwrap();
+    store.restore_version(&id).map_err(bad)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct UseSelReq {
+    rendition_id: String,
+    version_id: Option<String>,
+}
+
+/// POST /v1/units/:id/use-sel — set (or clear, with no
+/// version_id) the rendition line's version-use marker.
+async fn set_use_sel(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<UseSelReq>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let unit = {
+        let store = st.store.lock().unwrap();
+        store.get_unit(&id).map_err(|_| not_found())?
+    };
+    need_cap(&st, &user, &unit.group_id, "publish")?;
+    let store = st.store.lock().unwrap();
+    store
+        .set_use_sel(&id, &req.rendition_id, req.version_id.as_deref())
+        .map_err(bad)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct LangMountReq {
+    version_id: String,
+    lang: String,
+    state: String,
+}
+
+/// POST /v1/units/:id/lang-mount — record an explicit history
+/// language mount state for one version.
+async fn set_lang_mount(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<LangMountReq>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let unit = {
+        let store = st.store.lock().unwrap();
+        store.get_unit(&id).map_err(|_| not_found())?
+    };
+    need_cap(&st, &user, &unit.group_id, "publish")?;
+    let store = st.store.lock().unwrap();
+    store
+        .set_lang_mount(&id, &req.version_id, &req.lang, &req.state)
+        .map_err(bad)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct LineOrderReq {
+    rendition_id: String,
+    version_ids: Vec<String>,
+}
+
+/// POST /v1/units/:id/line-order — write the rendition line's
+/// user-arranged display order (history-card drag).
+async fn set_line_order(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<LineOrderReq>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let unit = {
+        let store = st.store.lock().unwrap();
+        store.get_unit(&id).map_err(|_| not_found())?
+    };
+    need_cap(&st, &user, &unit.group_id, "publish")?;
+    let store = st.store.lock().unwrap();
+    store
+        .set_version_line_order(&req.rendition_id, &req.version_ids)
+        .map_err(bad)?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -2263,12 +2557,14 @@ struct ReorderPagesReq {
     page_ids: Vec<String>,
 }
 
-/// POST /v1/versions/:id/reorder-pages — the #101 draft wall's
-/// drag reorder: rewrite a DRAFT version's page order in place
-/// (core `Store::reorder_draft_pages`). Drafts only — core
-/// refuses a published version, whose page sequence is immutable
-/// history. Same capability shape as publish-draft / scripts:
-/// an in-place working-copy edit on the version's own group.
+/// POST /v1/versions/:id/reorder-pages — the #101 wall's drag
+/// reorder, governed (core `Store::reorder_version_pages`):
+/// drafts and the unnumbered working draft reorder in place;
+/// a PUBLISHED version's drag seeds the working draft and
+/// lands the order there — published history is never
+/// rewritten, the drag's result is a new (unnumbered) version.
+/// The response's version is the one that now holds the order.
+/// Same capability shape as publish-draft / scripts.
 async fn reorder_version_pages(
     State(st): State<St>,
     headers: HeaderMap,
@@ -2278,14 +2574,12 @@ async fn reorder_version_pages(
     let user = auth(&st, &headers)?;
     let unit = {
         let store = st.store.lock().unwrap();
-        let ver = store.get_version(&id).map_err(|_| not_found())?;
-        let rend = store.get_rendition(&ver.rendition_id).map_err(bad)?;
-        store.get_unit(&rend.unit_id).map_err(bad)?
+        version_unit(&store, &id)?
     };
     need_cap(&st, &user, &unit.group_id, "publish")?;
     let store = st.store.lock().unwrap();
     let ver = store
-        .reorder_draft_pages(&id, &req.page_ids)
+        .reorder_version_pages(&id, &req.page_ids, &user.display_name)
         .map_err(bad)?;
     Ok(Json(json!({ "version": ver })))
 }
@@ -6530,6 +6824,21 @@ async fn main() {
             "/v1/versions/:id/publish-draft",
             post(publish_draft_version),
         )
+        .route(
+            "/v1/versions/:id/publish-working",
+            post(publish_working),
+        )
+        .route("/v1/versions/:id/insert-at", post(insert_working_at))
+        .route("/v1/versions/:id/renumber", post(renumber_version_h))
+        .route("/v1/versions/:id/reject", post(reject_version_h))
+        .route("/v1/versions/:id/restore", post(restore_version_h))
+        .route(
+            "/v1/renditions/:id/seed-working",
+            post(seed_working),
+        )
+        .route("/v1/units/:id/use-sel", post(set_use_sel))
+        .route("/v1/units/:id/lang-mount", post(set_lang_mount))
+        .route("/v1/units/:id/line-order", post(set_line_order))
         .route(
             "/v1/versions/:id/reorder-pages",
             post(reorder_version_pages),

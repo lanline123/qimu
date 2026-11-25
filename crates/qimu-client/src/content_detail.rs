@@ -1,19 +1,25 @@
 use super::*;
 
 // ----------------------------------------------------------------
-// #101 内容块详情页 — full rebuild (user order 2026-11-25: 不要基于
-// 现有的页面做，要完全重构，1:1 对齐原型). The rendering below is
-// written from the extracted spec (~/workspace/qimu-101-rebuild/
-// SPEC.md; prototype 启幕原型-内容索引页.html, renderDetail @2589)
-// rather than evolved from the previous page: header → thumbnails
-// wall (with the per-page language bind bar) → bind panel →
-// embedded blocks → history versions. The old "语言绑定（逐页）"
-// workbench section does not exist in the prototype and is gone;
-// binding lives in exactly the prototype's two places — the thumb
-// bar's chips (single-click direct toggle) and the panel below
-// the wall. Data assembly, the drill stack and the bottom-bar
-// contract stay with the caller (main.rs unit_detail keeps only
-// the crumb, the pick-pages mode and the client-only sections).
+// #101 内容块详情页 — rebuild2 (user order 2026-11-25 21:09/21:22:
+// 推倒重构 + 发布治理数据模型一起建). Written field-by-field
+// from the extracted spec (~/workspace/qimu-101-spec2/SPEC.md;
+// prototype 启幕原型-内容索引页.html, renderDetail @2589) with
+// DIFFERENCES.md as the acceptance list; the previous page's
+// code served only as the data-wiring reference.
+//
+// Page skeleton (SPEC §1): header (title + intro + hint +
+// status badges) → thumbnails wall (rendition segctl, bind bar,
+// bind panel directly after) → embedded blocks → history (the
+// unnumbered working-draft card, then ONE line of version
+// cards for the shown rendition). The wall always shows the
+// rendition's working head (the unnumbered draft when one
+// exists, else the latest version); history cards only SELECT
+// — the bottom-bar views open the selection (user rulings
+// 2026-11-25). The three client-only sections the old page
+// carried below the body (AI 翻译 / 逐页讲稿编辑 / 发布新版本）
+// are not part of this page; their whereabouts are recorded
+// in the rebuild2 REPORT §四.
 // ----------------------------------------------------------------
 
 #[derive(Clone)]
@@ -73,34 +79,135 @@ pub(super) struct LightState {
     pub target_index: usize,
 }
 
-pub(super) fn unit_versions(detail: &Value) -> Vec<UnitVersion> {
+/// One rendition of the detail payload, governance fields
+/// included: the numbered versions in payload (semver) order,
+/// the unnumbered working draft riding its own field, the
+/// user-arranged line order, and the version-use marker.
+#[derive(Clone)]
+struct RendRow {
+    rendition_id: String,
+    form: String,
+    lang: String,
+    versions: Vec<Value>,
+    working: Option<Value>,
+    latest: Option<Value>,
+    line_order: Vec<String>,
+    use_sel: Option<String>,
+}
+
+fn rendition_rows(detail: &Value) -> Vec<RendRow> {
     detail
         .get("renditions")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .flat_map(|row| {
+        .map(|row| {
             let rendition = row.get("rendition").cloned().unwrap_or(Value::Null);
-            row.get("versions")
-                .and_then(Value::as_array)
+            RendRow {
+                rendition_id: s(&rendition, "id"),
+                form: s(&rendition, "form"),
+                lang: s(&rendition, "lang"),
+                versions: row
+                    .get("versions")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
+                working: row
+                    .get("working")
+                    .filter(|w| w.is_object())
+                    .cloned(),
+                latest: row
+                    .get("latest")
+                    .filter(|w| w.is_object())
+                    .cloned(),
+                line_order: row
+                    .get("line_order")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|x| x.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                use_sel: row
+                    .get("use_sel")
+                    .and_then(Value::as_str)
+                    .filter(|x| !x.is_empty())
+                    .map(str::to_string),
+            }
+        })
+        .collect()
+}
+
+/// The history line's display order for one rendition. When
+/// the user has arranged the line (any version carries a
+/// line_pos), the payload's `line_order` rules as-is. Otherwise
+/// the standing ruling applies: drafts first (stable), then
+/// the payload's semver order.
+fn display_versions(row: &RendRow) -> Vec<Value> {
+    let arranged = row
+        .versions
+        .iter()
+        .any(|v| v.get("line_pos").is_some_and(|x| !x.is_null()));
+    if arranged {
+        let mut out: Vec<Value> = row
+            .line_order
+            .iter()
+            .filter_map(|id| row.versions.iter().find(|v| s(v, "id") == *id).cloned())
+            .collect();
+        for v in &row.versions {
+            if !out.iter().any(|o| s(o, "id") == s(v, "id")) {
+                out.push(v.clone());
+            }
+        }
+        out
+    } else {
+        let mut out: Vec<Value> = row
+            .versions
+            .iter()
+            .filter(|v| s(v, "status") == "draft")
+            .cloned()
+            .collect();
+        out.extend(
+            row.versions
+                .iter()
+                .filter(|v| s(v, "status") != "draft")
+                .cloned(),
+        );
+        out
+    }
+}
+
+pub(super) fn unit_versions(detail: &Value) -> Vec<UnitVersion> {
+    rendition_rows(detail)
+        .into_iter()
+        .flat_map(|row| {
+            row.versions
                 .into_iter()
-                .flatten()
                 .map(|version| UnitVersion {
-                    rendition_id: s(&rendition, "id"),
-                    form: s(&rendition, "form"),
-                    lang: s(&rendition, "lang"),
-                    version: version.clone(),
+                    rendition_id: row.rendition_id.clone(),
+                    form: row.form.clone(),
+                    lang: row.lang.clone(),
+                    version,
                 })
                 .collect::<Vec<_>>()
         })
         .collect()
 }
 
+/// The rendition's working head as the payload assembly
+/// resolved it (core latest_version): the first version that
+/// is neither recalled, rejected nor the working draft.
 fn latest_version(row: &Value) -> Option<Value> {
     row.get("versions")
         .and_then(Value::as_array)?
         .iter()
-        .find(|version| s(version, "status") != "recalled")
+        .find(|version| {
+            !matches!(
+                s(version, "status").as_str(),
+                "recalled" | "rejected" | "working"
+            )
+        })
         .or_else(|| row.get("versions").and_then(Value::as_array)?.first())
         .cloned()
 }
@@ -192,7 +299,7 @@ fn desc_line(desc: &str, max_chars: usize) -> String {
 }
 
 /// The light view's bind head names the target language
-/// (prototype .lb-bind-head: 英语), not its code.
+/// (prototype .lb-bind-head: 英语）, not its code.
 fn lang_display_name(code: &str) -> String {
     match code {
         "en" => "英语".to_string(),
@@ -249,23 +356,70 @@ fn page_bind_state(
     }
 }
 
+/// Pages of `version` whose entity ids do not occur in
+/// `head` — the prototype's 新增 count for a draft publish.
+fn added_pages(version: &Value, head: Option<&Value>) -> usize {
+    let Some(head) = head else {
+        return i(version, "page_count").max(0) as usize;
+    };
+    let head_ids: Vec<String> = head
+        .get("pages")
+        .and_then(Value::as_array)
+        .map(|pages| pages.iter().map(|p| s(p, "id")).collect())
+        .unwrap_or_default();
+    version
+        .get("pages")
+        .and_then(Value::as_array)
+        .map(|pages| {
+            pages
+                .iter()
+                .filter(|p| !head_ids.contains(&s(p, "id")))
+                .count()
+        })
+        .unwrap_or_else(|| i(version, "page_count").max(0) as usize)
+}
+
 /// Deferred outcomes of one frame's wall/panel/history drawing.
 /// The draw closures borrow the thumbnail cache through `self`,
 /// so every store-touching follow-up is collected and executed
-/// after the section has been drawn (the pattern the previous
-/// page used for its binding requests).
+/// after the section has been drawn.
 enum DetailAct {
     Bind(PageBindingRequest),
     Unbind {
         binding_id: String,
-        ok_msg: &'static str,
+        ok_msg: String,
     },
     MarkMissing {
         from_version_id: String,
         from_slot: i64,
         to_version_id: String,
     },
-    PublishDraft(String),
+    /// A numbered draft's publish (its card's inline input).
+    PublishDraft {
+        version_id: String,
+        note: String,
+        added: usize,
+        semver: String,
+    },
+    /// The unnumbered working card's publish. `working_id` is
+    /// the live working row when one exists; without one the
+    /// run side resolves the mirror state (head draft → its
+    /// publish path; published head → seed, then publish).
+    PublishWorking {
+        working_id: Option<String>,
+        rendition_id: String,
+        head_id: String,
+        head_is_draft: bool,
+        note: String,
+        added: usize,
+    },
+    /// 定号插入： the working draft dropped onto a version card.
+    InsertWorkingAt {
+        working_id: Option<String>,
+        rendition_id: String,
+        base_version_id: String,
+        base_semver: String,
+    },
     DropVersion(String),
     ReorderPages {
         version_id: String,
@@ -274,6 +428,32 @@ enum DetailAct {
         /// the reorder's inverse is the same core call with
         /// this sequence, so the act carries it along.
         old_page_ids: Vec<String>,
+    },
+    /// Super-admin renumber of a history card's bigver.
+    RenumberVersion {
+        version_id: String,
+        from: String,
+        to: String,
+    },
+    /// Version-use marker set / clear (USE_SEL).
+    UseSel {
+        rendition_id: String,
+        version_id: Option<String>,
+        semver: String,
+    },
+    /// One history language chip's cycle (explicit mount).
+    LangMount {
+        version_id: String,
+        lang: String,
+        state: &'static str,
+        toast: String,
+    },
+    /// History-card drag: write the line's display order.
+    ReorderLine {
+        rendition_id: String,
+        version_ids: Vec<String>,
+        moved_semver: String,
+        moved_to: usize,
     },
 }
 
@@ -331,13 +511,59 @@ impl App {
         codes
     }
 
+    /// The display name of the language a binding addresses,
+    /// resolved through the open frame's own detail (the
+    /// prototype's bind copy names languages, never codes).
+    fn target_lang_name(
+        &self,
+        unit_id: &str,
+        from_version_id: &str,
+        to_version_id: &str,
+    ) -> String {
+        if let ContentFrame::Unit(st) = self.content.stack.top() {
+            if st.unit_id == unit_id {
+                if let Some(t) = binding_targets(&st.detail, from_version_id)
+                    .iter()
+                    .find(|t| s(&t.version, "id") == to_version_id)
+                {
+                    return lang_display_name(&t.lang);
+                }
+            }
+        }
+        "目标语言".to_string()
+    }
+
+    /// Open #406 (the light view) at one page of one version.
+    pub(super) fn open_light(&mut self, st: &mut UnitState, version: &Value, slot: usize) {
+        let page_count = i(version, "page_count").max(0) as usize;
+        if page_count == 0 || slot >= page_count {
+            return;
+        }
+        let unit_id = st.unit_id.clone();
+        let version_id = s(version, "id");
+        let bindings = st.bindings.clone();
+        let targets = binding_targets(&st.detail, &version_id);
+        st.selected_page = Some(slot);
+        st.bind_pick = None;
+        self.overlays
+            .retain(|overlay| !matches!(overlay, Overlay::Light(_)));
+        self.overlays.push(Overlay::Light(LightState {
+            unit_id,
+            version: version.clone(),
+            slot,
+            bindings,
+            targets,
+            target_index: 0,
+        }));
+    }
+
     fn run_detail_act(&mut self, unit_id: &str, bindings: &[Value], act: DetailAct) {
         match act {
             DetailAct::Bind(request) => {
                 self.request_page_binding(request, bindings);
             }
             DetailAct::Unbind { binding_id, ok_msg } => {
-                self.delete_page_binding_msg(unit_id, &binding_id, ok_msg);
+                self.delete_page_binding_msg(unit_id, &binding_id, &ok_msg);
             }
             DetailAct::MarkMissing {
                 from_version_id,
@@ -346,20 +572,184 @@ impl App {
             } => {
                 self.apply_missing_mark(unit_id, &from_version_id, from_slot, &to_version_id);
             }
-            DetailAct::PublishDraft(version_id) => {
+            DetailAct::PublishDraft {
+                version_id,
+                note,
+                added,
+                semver,
+            } => {
                 match self.call_work(
                     "POST",
                     &format!("/v1/versions/{version_id}/publish-draft"),
-                    None,
+                    Some(json!({ "note": note })),
                 ) {
-                    Ok(_) => {
-                        self.msg = "草稿已发布为最新版本".into();
+                    Ok(resp) => {
+                        // The numbered draft's own handler toast
+                        // (prototype @3901): the published
+                        // version and its total page count.
+                        let pages = resp
+                            .get("version")
+                            .map(|v| i(v, "page_count"))
+                            .unwrap_or(0);
+                        self.msg = format!(
+                            "草稿已发布为正式最新版本 {}（{} 页）。",
+                            semver, pages
+                        );
+                        let _ = added;
                         self.reload_unit_detail(unit_id);
-                        // The wall card's latest version / page
-                        // count changed with the publish.
                         self.changed(Change::Units);
                     }
                     Err(e) => self.msg = format!("发布草稿失败：{e}"),
+                }
+            }
+            DetailAct::PublishWorking {
+                working_id,
+                rendition_id,
+                head_id,
+                head_is_draft,
+                note,
+                added,
+            } => {
+                // Resolve the mirror state first: no working
+                // row + a draft head publishes through the
+                // draft's own path; no working row + a published
+                // head seeds the draft, then publishes it.
+                let live_id = match working_id {
+                    Some(id) => Some(id),
+                    None if head_is_draft => {
+                        match self.call_work(
+                            "POST",
+                            &format!("/v1/versions/{head_id}/publish-draft"),
+                            Some(json!({ "note": note })),
+                        ) {
+                            Ok(resp) => {
+                                // Mirror state: the published thing
+                                // IS the numbered draft, so its own
+                                // handler toast applies (@3901).
+                                let semver = resp
+                                    .get("version")
+                                    .map(|v| s(v, "semver"))
+                                    .unwrap_or_default();
+                                let pages = resp
+                                    .get("version")
+                                    .map(|v| i(v, "page_count"))
+                                    .unwrap_or(0);
+                                self.msg = format!(
+                                    "草稿已发布为正式最新版本 {}（{} 页）。",
+                                    semver, pages
+                                );
+                                let _ = added;
+                                self.reload_unit_detail(unit_id);
+                                self.changed(Change::Units);
+                                return;
+                            }
+                            Err(e) => {
+                                self.msg = format!("发布草稿失败：{e}");
+                                return;
+                            }
+                        }
+                    }
+                    None => match self.call_work(
+                        "POST",
+                        &format!("/v1/renditions/{rendition_id}/seed-working"),
+                        Some(json!({})),
+                    ) {
+                        Ok(resp) => resp
+                            .get("version")
+                            .map(|v| s(v, "id"))
+                            .filter(|x| !x.is_empty()),
+                        Err(e) => {
+                            self.msg = format!("建立未定号草稿失败：{e}");
+                            return;
+                        }
+                    },
+                };
+                let Some(wid) = live_id else {
+                    self.msg = "建立未定号草稿失败".into();
+                    return;
+                };
+                match self.call_work(
+                    "POST",
+                    &format!("/v1/versions/{wid}/publish-working"),
+                    Some(json!({ "note": note })),
+                ) {
+                    Ok(resp) => {
+                        let semver = resp
+                            .get("version")
+                            .map(|v| s(v, "semver"))
+                            .unwrap_or_default();
+                        self.msg = format!("已发布 {}（新增 {} 页）。", semver, added);
+                        self.reload_unit_detail(unit_id);
+                        self.changed(Change::Units);
+                    }
+                    Err(e) => self.msg = format!("发布草稿失败：{e}"),
+                }
+            }
+            DetailAct::InsertWorkingAt {
+                working_id,
+                rendition_id,
+                base_version_id,
+                base_semver,
+            } => {
+                let live_id = match working_id {
+                    Some(id) => Some(id),
+                    None => match self.call_work(
+                        "POST",
+                        &format!("/v1/renditions/{rendition_id}/seed-working"),
+                        Some(json!({})),
+                    ) {
+                        Ok(resp) => resp
+                            .get("version")
+                            .map(|v| s(v, "id"))
+                            .filter(|x| !x.is_empty()),
+                        Err(e) => {
+                            self.msg = format!("建立未定号草稿失败：{e}");
+                            return;
+                        }
+                    },
+                };
+                let Some(wid) = live_id else {
+                    self.msg = "建立未定号草稿失败".into();
+                    return;
+                };
+                match self.call_work(
+                    "POST",
+                    &format!("/v1/versions/{wid}/insert-at"),
+                    Some(json!({ "base_version_id": base_version_id })),
+                ) {
+                    Ok(resp) => {
+                        let new_semver = resp
+                            .get("version")
+                            .map(|v| s(v, "semver"))
+                            .unwrap_or_default();
+                        let shifts: Vec<String> = resp
+                            .get("shifts")
+                            .and_then(Value::as_array)
+                            .map(|arr| {
+                                arr.iter()
+                                    .map(|sh| {
+                                        format!("{} → {}", s(sh, "from"), s(sh, "to"))
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        self.msg = if shifts.is_empty() {
+                            format!(
+                                "已插入归位：新版定号 {}（以 {} 为基 · 小版本定号）· 落在首位，成为最新版",
+                                new_semver, base_semver
+                            )
+                        } else {
+                            format!(
+                                "已插入归位：新版定号 {}（以 {} 为基 · 小版本定号）· 级联顺移：{}",
+                                new_semver,
+                                base_semver,
+                                shifts.join("、")
+                            )
+                        };
+                        self.reload_unit_detail(unit_id);
+                        self.changed(Change::Units);
+                    }
+                    Err(e) => self.msg = format!("定号插入失败：{e}"),
                 }
             }
             DetailAct::DropVersion(version_id) => {
@@ -369,7 +759,7 @@ impl App {
                     None,
                 ) {
                     Ok(_) => {
-                        self.msg = "已放弃该草稿".into();
+                        self.msg = "草稿已放弃。".into();
                         self.reload_unit_detail(unit_id);
                         self.changed(Change::Units);
                     }
@@ -386,51 +776,141 @@ impl App {
                     &format!("/v1/versions/{version_id}/reorder-pages"),
                     Some(json!({ "page_ids": page_ids })),
                 ) {
-                    Ok(_) => {
-                        self.msg = "草稿页序已更新".into();
-                        // Undo (Ctrl+Z): re-running the reorder
-                        // with the pre-drag sequence restores the
-                        // old order (bindings re-permute with it).
+                    Ok(resp) => {
+                        // The governed entry may have landed the
+                        // order on a freshly seeded working
+                        // draft; the undo entry and the toast
+                        // address the version that holds it now.
+                        let held_id = resp
+                            .get("version")
+                            .map(|v| s(v, "id"))
+                            .filter(|x| !x.is_empty())
+                            .unwrap_or_else(|| version_id.clone());
+                        self.msg = if held_id != version_id {
+                            "页序已调整 · 已存入未定号草稿，发布时定号".into()
+                        } else {
+                            "草稿页序已更新".into()
+                        };
                         self.push_undo(
                             "调整草稿页序".to_string(),
                             UndoAction::ReorderDraft {
-                                version_id,
+                                version_id: held_id,
                                 unit_id: unit_id.to_string(),
                                 old_page_ids,
                             },
                         );
                         self.reload_unit_detail(unit_id);
-                        // The wall card's cover follows the
-                        // draft's first page.
                         self.changed(Change::Units);
                     }
                     Err(e) => self.msg = format!("调整页序失败：{e}"),
                 }
             }
+            DetailAct::RenumberVersion { version_id, from, to } => {
+                match self.call_work(
+                    "POST",
+                    &format!("/v1/versions/{version_id}/renumber"),
+                    Some(json!({ "semver": to })),
+                ) {
+                    Ok(_) => {
+                        self.msg = format!(
+                            "版本号已从 {} 改为 {}（编号变更记录已留存，版本身份不变）。",
+                            from, to
+                        );
+                        self.reload_unit_detail(unit_id);
+                        self.changed(Change::Units);
+                    }
+                    Err(e) => self.msg = format!("改号失败：{e}"),
+                }
+            }
+            DetailAct::UseSel {
+                rendition_id,
+                version_id,
+                semver,
+            } => {
+                let body = match &version_id {
+                    Some(vid) => json!({ "rendition_id": rendition_id, "version_id": vid }),
+                    None => json!({ "rendition_id": rendition_id }),
+                };
+                match self.call_work(
+                    "POST",
+                    &format!("/v1/units/{unit_id}/use-sel"),
+                    Some(body),
+                ) {
+                    Ok(_) => {
+                        self.msg = if version_id.is_none() {
+                            "已恢复默认使用版。".into()
+                        } else {
+                            format!("已选用 {}。", semver)
+                        };
+                        self.reload_unit_detail(unit_id);
+                    }
+                    Err(e) => self.msg = format!("选用失败：{e}"),
+                }
+            }
+            DetailAct::LangMount {
+                version_id,
+                lang,
+                state,
+                toast,
+            } => {
+                match self.call_work(
+                    "POST",
+                    &format!("/v1/units/{unit_id}/lang-mount"),
+                    Some(json!({
+                        "version_id": version_id,
+                        "lang": lang,
+                        "state": state,
+                    })),
+                ) {
+                    Ok(_) => {
+                        self.msg = toast;
+                        self.reload_unit_detail(unit_id);
+                    }
+                    Err(e) => self.msg = format!("更新语言挂载失败：{e}"),
+                }
+            }
+            DetailAct::ReorderLine {
+                rendition_id,
+                version_ids,
+                moved_semver,
+                moved_to,
+            } => {
+                match self.call_work(
+                    "POST",
+                    &format!("/v1/units/{unit_id}/line-order"),
+                    Some(json!({
+                        "rendition_id": rendition_id,
+                        "version_ids": version_ids,
+                    })),
+                ) {
+                    Ok(_) => {
+                        self.msg = format!(
+                            "版本「{}」已移到第 {} 位。",
+                            moved_semver,
+                            moved_to + 1
+                        );
+                        self.reload_unit_detail(unit_id);
+                    }
+                    Err(e) => self.msg = format!("版本排序失败：{e}"),
+                }
+            }
         }
     }
+}
 
+impl App {
     // ------------------------------------------------------------
-    // Header (SPEC 一): one baseline row — h2 title (double-click
-    // inline edit), the intro + 「当前 v…」 hint, the kind tag in
-    // the badges slot. The prototype's third hint segment is the
-    // version POLICY (锁定版本 / 跟随最新): entry-level data,
-    // plumbed into the frame by the index entry path that opened
-    // it (audit R1, EntryPolicyView on UnitState) — it is NOT
-    // replaced by the maintainer here. Opened through no entry
-    // (content wall, search, home…), the segment renders the
-    // prototype's default form: a block's policy defaults to
-    // follow, so it reads 跟随最新. The header delete button the
-    // old page had does not exist in the prototype and is gone
-    // (D1, report); deletion stays on the shell bottom bar.
+    // Header (SPEC §2): one row that wraps — h2 title (double-
+    // click inline edit), the intro + version + policy hint,
+    // then the status badges from the payload (governance data,
+    // SPEC §15.1). The prototype's header carries NO kind tag
+    // and NO delete button (D1); the kind tag lives on the wall
+    // cards. The hint's third segment is the version POLICY of
+    // the entry this detail was opened through (audit R1,
+    // EntryPolicyView); opened through no entry it renders the
+    // prototype's default form, 跟随最新.
     // ------------------------------------------------------------
-    pub(super) fn unit_header_ui(
-        &mut self,
-        ui: &mut egui::Ui,
-        st: &mut UnitState,
-        unit: &Value,
-        kind_tag: Option<&'static str>,
-    ) {
+    pub(super) fn unit_header_ui(&mut self, ui: &mut egui::Ui, st: &mut UnitState, unit: &Value) {
         let head_latest = st
             .detail
             .get("renditions")
@@ -439,7 +919,7 @@ impl App {
             .and_then(|r| r.get("latest"))
             .cloned()
             .unwrap_or(Value::Null);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if matches!(&st.meta_edit, Some((MetaField::Name, _))) {
                 self.meta_edit_ui(ui, st, MetaField::Name);
             } else {
@@ -454,10 +934,6 @@ impl App {
                     st.meta_edit_focus = true;
                 }
             }
-            if let Some(tag) = kind_tag {
-                chip(ui, tag, palette_color(CHIP_GRAY_FG), CHIP_GRAY_BG);
-            }
-            // .hint: 13px, --muted, on the title's baseline row.
             let mut hint_has_intro = false;
             if matches!(&st.meta_edit, Some((MetaField::Description, _))) {
                 hint_has_intro = true;
@@ -477,13 +953,6 @@ impl App {
                     st.meta_edit_focus = true;
                 }
             }
-            // The prototype's hint version segment is always
-            // the plain version string straight from the data
-            // (prototype @2600: intro, then the version, then
-            // the policy); it has no fallback form, so when the
-            // shown rendition carries no semver the segment is
-            // simply absent. The earlier revision-counter text
-            // here was a client invention and is gone.
             let head_semver = s(&head_latest, "semver");
             if !head_semver.is_empty() {
                 ui.label(
@@ -496,11 +965,6 @@ impl App {
                     .color(palette_color(TEXT_FAINT)),
                 );
             }
-            // Third hint segment: the version policy of the
-            // entry this detail was opened through (prototype:
-            // 锁定版本 / 跟随最新; a locked entry names its
-            // version). No entry context → the prototype's
-            // default form, 跟随最新 (see the header note).
             let policy_text = match &st.entry_policy {
                 Some(EntryPolicyView::Locked { semver }) if !semver.is_empty() => {
                     format!("锁定版本 v{semver}")
@@ -520,43 +984,70 @@ impl App {
                 .size(13.0)
                 .color(palette_color(TEXT_FAINT)),
             );
+            // Status badges (prototype .h-badges, right after the
+            // hint): derived server/core-side from the unit's
+            // rendition state and shipped on the payload — ok
+            // badges take the info form, warn badges the warn
+            // form. The 编辑中 badge has no state source in the
+            // client and is not fabricated (REPORT).
+            if let Some(badges) = st
+                .detail
+                .get("status_badges")
+                .and_then(Value::as_array)
+            {
+                for badge in badges {
+                    let text = s(badge, "text");
+                    if text.is_empty() {
+                        continue;
+                    }
+                    if s(badge, "kind") == "warn" {
+                        chip(ui, &text, palette_color(CHIP_ORANGE_FG), CHIP_ORANGE_BG);
+                    } else {
+                        chip(ui, &text, palette_color(ACCENT_DEEP), CHIP_BLUE_BG);
+                    }
+                }
+            }
         });
     }
 
     // ------------------------------------------------------------
     // The #101 body, in the prototype's block order: thumbnails
     // (+ bind panel directly after), embedded blocks, history.
+    // The wall shows the selected rendition's working head —
+    // the unnumbered draft when one exists, else its latest
+    // version. A history selection never moves the wall.
     // ------------------------------------------------------------
     pub(super) fn unit_101_body(&mut self, ui: &mut egui::Ui, st: &mut UnitState) {
-        let versions = unit_versions(&st.detail);
-        let Some(first) = versions.first() else {
+        let rows = rendition_rows(&st.detail);
+        let Some(first) = rows.first() else {
             return;
         };
         if st
             .selected_rendition
             .as_ref()
-            .is_none_or(|id| versions.iter().all(|item| &item.rendition_id != id))
+            .is_none_or(|id| rows.iter().all(|r| &r.rendition_id != id))
         {
             st.selected_rendition = Some(first.rendition_id.clone());
         }
         let selected_id = st.selected_rendition.clone().unwrap_or_default();
-        // The shown version: a history version the user clicked
-        // wins over the rendition's latest (views unification,
-        // user ruling 2026-11-25) — the wall, and with it the
-        // bottom-bar views, address that frozen page sequence.
-        let Some(shown) = versions
-            .iter()
-            .find(|item| {
-                item.rendition_id == selected_id
-                    && st.selected_version.as_deref() == Some(s(&item.version, "id").as_str())
-            })
-            .or_else(|| versions.iter().find(|item| item.rendition_id == selected_id))
-            .cloned()
-        else {
+        let Some(row) = rows.iter().find(|r| r.rendition_id == selected_id) else {
             return;
         };
+        let shown_version = row.working.clone().or_else(|| row.latest.clone());
+        let Some(shown_version) = shown_version else {
+            return;
+        };
+        let shown = UnitVersion {
+            rendition_id: row.rendition_id.clone(),
+            form: row.form.clone(),
+            lang: row.lang.clone(),
+            version: shown_version,
+        };
         let mut acts: Vec<DetailAct> = Vec::new();
-        self.unit_thumbs_ui(ui, st, &versions, &shown, &mut acts);
+        // .dsec margin-top 20: the gap between the header and
+        // the first section (DIFFERENCES 差 25).
+        ui.add_space(20.0);
+        self.unit_thumbs_ui(ui, st, &rows, &shown, &mut acts);
         self.unit_kids_ui(ui, st);
         self.unit_history_ui(ui, st, &mut acts);
         let unit_id = st.unit_id.clone();
@@ -568,37 +1059,21 @@ impl App {
         }
     }
 
-    /// Renditions of the detail, deduplicated in payload order —
-    /// the wall switches renditions, not versions.
-    fn rendition_rows(versions: &[UnitVersion]) -> Vec<(String, String, String)> {
-        let mut rows: Vec<(String, String, String)> = Vec::new();
-        for item in versions {
-            if !rows.iter().any(|(id, _, _)| *id == item.rendition_id) {
-                rows.push((
-                    item.rendition_id.clone(),
-                    item.form.clone(),
-                    item.lang.clone(),
-                ));
-            }
-        }
-        rows
-    }
-
     // ------------------------------------------------------------
-    // Thumbnails section (SPEC 三): h3 + the rendition segctl,
+    // Thumbnails section (SPEC §4): h3 + the rendition segctl,
     // then the framed cells — real page thumbnails over the
     // prototype's frame geometry (2px --line, radius 6, --panel),
     // the toolbar strip (8/10/10) holding the bind bar and the
-    // caption. The CSS grid's minmax(230px, 1fr) columns are
-    // reproduced by measuring the available width and dividing
-    // it into equal columns (declared approximation: egui has
-    // no grid; the count follows the width, cells stay equal).
+    // caption. Rows are chunked explicitly (the Frame-in-
+    // horizontal_wrapped construction cannot wrap — the trio2
+    // finding), with the CSS grid's minmax(230px, 1fr) column
+    // math: equal columns, no width floor.
     // ------------------------------------------------------------
     fn unit_thumbs_ui(
         &mut self,
         ui: &mut egui::Ui,
         st: &mut UnitState,
-        versions: &[UnitVersion],
+        rows: &[RendRow],
         shown: &UnitVersion,
         acts: &mut Vec<DetailAct>,
     ) {
@@ -606,19 +1081,8 @@ impl App {
         let page_count = i(&shown.version, "page_count").max(0) as usize;
         let targets = binding_targets(&st.detail, &version_id);
         let lang_codes = self.bind_lang_codes(&shown.lang, &targets);
-        let picked = st.selected_version.is_some();
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("页面缩略图").strong().size(16.0));
-            if picked {
-                // The wall is showing a frozen history version,
-                // not the rendition's latest — the prototype's
-                // title suffix slot (its EN-mode version tag).
-                ui.label(
-                    egui::RichText::new(format!(" · v{}", s(&shown.version, "semver")))
-                        .size(16.0)
-                        .color(palette_color(TEXT_FAINT)),
-                );
-            }
             if let Some(pick) = &st.bind_pick {
                 ui.label(
                     egui::RichText::new(format!(
@@ -635,20 +1099,19 @@ impl App {
             // Rendition switch: the prototype's segctl form,
             // right-aligned on the section title row. Only shown
             // when the block actually has several renditions.
-            let rows = Self::rendition_rows(versions);
             if rows.len() > 1 {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let labels: Vec<String> = rows
                         .iter()
-                        .map(|(_, form, lang)| format!("{form} · {lang}"))
+                        .map(|r| format!("{} · {}", r.form, r.lang))
                         .collect();
                     let active = rows
                         .iter()
-                        .position(|(id, _, _)| *id == shown.rendition_id)
+                        .position(|r| r.rendition_id == shown.rendition_id)
                         .unwrap_or(0);
                     let label_refs: Vec<&str> = labels.iter().map(|l| l.as_str()).collect();
                     if let Some(next) = segmented(ui, &label_refs, active, SegStyle::Soft) {
-                        st.selected_rendition = Some(rows[next].0.clone());
+                        st.selected_rendition = Some(rows[next].rendition_id.clone());
                         st.selected_version = None;
                         st.selected_page = None;
                         st.bind_pick = None;
@@ -657,18 +1120,18 @@ impl App {
                 });
             }
         });
-        ui.add_space(6.0);
+        ui.add_space(4.0);
         let picking = st.bind_pick.is_some();
-        // Draft page drag (user ruling 2026-11-25): only a shown
-        // DRAFT's wall is draggable — a published version's page
-        // sequence is frozen — and only when every page carries
-        // its entity id, since the reorder write addresses pages
-        // by id (core refuses an id-less draft by name). The
-        // per-slot rects are collected during the wall's draw
-        // below and resolved afterwards, the N4 showroom wall's
-        // pattern.
+        // Wall page drag (user ruling 2026-11-25 21:22): EVERY
+        // shown version's wall is draggable — drafts and the
+        // working draft reorder in place, a published version's
+        // drop lands in the unnumbered working draft through
+        // the governed core entry. Only id-less pages (stock
+        // that never entity-ized) cannot be addressed, so the
+        // drag stays off there. The per-slot rects are collected
+        // during the wall's draw and resolved afterwards, the
+        // N4 showroom wall's pattern.
         let draggable = !picking
-            && s(&shown.version, "status") == "draft"
             && page_count >= 2
             && shown
                 .version
@@ -681,115 +1144,125 @@ impl App {
         let mut thumb_rects: Vec<(usize, egui::Rect)> = Vec::new();
         let mut cell_rects: Vec<(usize, egui::Rect)> = Vec::new();
         if draggable {
-            ui.label(
-                egui::RichText::new("草稿 · 拖动页卡可调整页序")
-                    .size(11.5)
-                    .color(palette_color(TEXT_FAINT)),
-            );
-            ui.add_space(2.0);
+            let hint = match s(&shown.version, "status").as_str() {
+                "draft" => Some("草稿 · 拖动页卡可调整页序"),
+                "working" => Some("未定号草稿 · 拖动页卡可调整页序"),
+                _ => None,
+            };
+            if let Some(hint) = hint {
+                ui.label(
+                    egui::RichText::new(hint)
+                        .size(11.5)
+                        .color(palette_color(TEXT_FAINT)),
+                );
+                ui.add_space(2.0);
+            }
         }
-        let saved_spacing = ui.spacing().item_spacing;
-        ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
         let avail = ui.available_width();
         let cols = (((avail + 12.0) / (230.0 + 12.0)).floor() as usize).max(1);
-        let cell_w = ((avail - 12.0 * (cols as f32 - 1.0)) / cols as f32).max(170.0);
+        let cell_w = (avail - 12.0 * (cols as f32 - 1.0)) / cols as f32;
         let inner_w = (cell_w - 4.0).max(120.0);
-        ui.horizontal_wrapped(|ui| {
-            for slot in 0..page_count {
-                let frame_resp = egui::Frame::NONE
-                    .fill(palette_color(PANEL_BG))
-                    .stroke(egui::Stroke::new(2.0, palette_color(LINE_34)))
-                    .corner_radius(6)
-                    .inner_margin(egui::Margin::same(0))
-                    .show(ui, |ui| {
-                        ui.vertical(|ui| {
-                            ui.set_width(inner_w);
-                            let response = self.thumb_response(
-                                ui,
-                                &version_id,
-                                slot,
-                                inner_w,
-                                st.selected_page == Some(slot),
-                            );
-                            thumb_rects.push((slot, response.rect));
-                            if picking {
-                                if response.clicked() {
-                                    if let Some(pick) = st.bind_pick.clone() {
-                                        acts.push(DetailAct::Bind(PageBindingRequest {
-                                            unit_id: st.unit_id.clone(),
-                                            from_version_id: pick.from_version_id,
-                                            from_slot: pick.from_slot,
-                                            to_version_id: pick.to_version_id,
-                                            to_slot: slot as i64,
-                                        }));
-                                        st.bind_pick = None;
+        for row_start in (0..page_count).step_by(cols) {
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 12.0;
+                for slot in row_start..(row_start + cols).min(page_count) {
+                    let frame_resp = egui::Frame::NONE
+                        .fill(palette_color(PANEL_BG))
+                        .stroke(egui::Stroke::new(2.0, palette_color(LINE_34)))
+                        .corner_radius(6)
+                        .inner_margin(egui::Margin::same(0))
+                        .show(ui, |ui| {
+                            ui.vertical(|ui| {
+                                ui.set_width(inner_w);
+                                let response = self.thumb_response(
+                                    ui,
+                                    &version_id,
+                                    slot,
+                                    inner_w,
+                                    st.selected_page == Some(slot),
+                                );
+                                thumb_rects.push((slot, response.rect));
+                                if picking {
+                                    if response.clicked() {
+                                        if let Some(pick) = st.bind_pick.clone() {
+                                            acts.push(DetailAct::Bind(PageBindingRequest {
+                                                unit_id: st.unit_id.clone(),
+                                                from_version_id: pick.from_version_id,
+                                                from_slot: pick.from_slot,
+                                                to_version_id: pick.to_version_id,
+                                                to_slot: slot as i64,
+                                            }));
+                                            st.bind_pick = None;
+                                        }
+                                    }
+                                } else {
+                                    // While a page drag is armed the
+                                    // release belongs to the drop, not
+                                    // to the click (N4's rule).
+                                    if response.clicked() && st.page_drag.is_none() {
+                                        st.selected_page = Some(slot);
+                                    }
+                                    if response.double_clicked() && st.page_drag.is_none() {
+                                        self.open_light(st, &shown.version, slot);
                                     }
                                 }
-                            } else {
-                                // While a page drag is armed the
-                                // release belongs to the drop, not
-                                // to the click (N4's rule).
-                                if response.clicked() && st.page_drag.is_none() {
-                                    st.selected_page = Some(slot);
-                                }
-                                if response.double_clicked() && st.page_drag.is_none() {
-                                    self.open_light(st, &shown.version, slot);
-                                }
-                            }
-                            // .tb: 8 top / 10 sides / 10 bottom.
-                            ui.add_space(8.0);
-                            ui.horizontal(|ui| {
-                                ui.add_space(10.0);
-                                if !picking {
+                                // .tb: 8 top / 10 sides / 10 bottom.
+                                // The bind bar stays rendered while
+                                // picking (SPEC §4); its chips are
+                                // inert then.
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    ui.add_space(10.0);
                                     self.bind_bar_ui(
                                         ui, st, shown, slot, &targets, &lang_codes, acts,
+                                        picking,
                                     );
-                                }
-                            });
-                            ui.horizontal(|ui| {
-                                ui.add_space(10.0);
+                                });
                                 // .tb-desc: the page's 说明 (d),
                                 // carried on the version's page
-                                // rows since the R3 data line. A
-                                // page without one (stock imported
-                                // before the field) renders the
-                                // prototype's empty state — an
-                                // empty line, no stand-in text.
-                                ui.label(
-                                    egui::RichText::new(page_desc(&shown.version, slot))
-                                        .size(12.0)
-                                        .color(palette_color(TEXT_FAINT)),
-                                );
+                                // rows since the R3 data line. An
+                                // empty 说明 renders NOTHING — the
+                                // prototype's empty inline element
+                                // adds no height (DIFFERENCES
+                                // 差 40).
+                                let desc = page_desc(&shown.version, slot);
+                                if !desc.is_empty() {
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(10.0);
+                                        ui.label(
+                                            egui::RichText::new(desc)
+                                                .size(12.0)
+                                                .color(palette_color(TEXT_FAINT)),
+                                        );
+                                    });
+                                }
+                                ui.add_space(10.0);
                             });
-                            ui.add_space(10.0);
                         });
-                    });
-                cell_rects.push((slot, frame_resp.response.rect));
-                if picking {
-                    // .thumb-grid.picking: a 2px dashed accent
-                    // outline per cell — egui strokes have no
-                    // dash, so the outline is solid (declared).
-                    let rect = frame_resp.response.rect.expand(2.0);
-                    ui.painter().rect_stroke(
-                        rect,
-                        8.0,
-                        egui::Stroke::new(2.0, ACCENT),
-                        egui::StrokeKind::Outside,
-                    );
+                    cell_rects.push((slot, frame_resp.response.rect));
+                    if picking {
+                        // .thumb-grid.picking: a 2px dashed accent
+                        // outline per cell — egui strokes have no
+                        // dash, so the outline is solid (declared).
+                        let rect = frame_resp.response.rect.expand(2.0);
+                        ui.painter().rect_stroke(
+                            rect,
+                            8.0,
+                            egui::Stroke::new(2.0, ACCENT),
+                            egui::StrokeKind::Outside,
+                        );
+                    }
                 }
-            }
-        });
-        ui.spacing_mut().item_spacing = saved_spacing;
-        // Draft page drag resolution (the N4 showroom wall's
+            });
+            ui.add_space(12.0);
+        }
+        // Page drag resolution (the N4 showroom wall's
         // raw-pointer pattern): the press is tracked against the
         // THUMB rects — a press on the bind bar below a thumb
         // never arms a drag — movement past the threshold arms
         // it, the seam paints at the target CELL, the dragged
         // page's thumb floats with the pointer, and the drop
-        // persists straight into the draft via DetailAct (there
-        // is no working-order state to save later; the reload
-        // after the write is what proves the stored order).
-        // Escape cancels. Non-draft walls never enter this block.
+        // persists through the governed DetailAct. Escape cancels.
         if draggable {
             let pointer = ui.input(|i| i.pointer.interact_pos());
             let primary_down = ui.input(|i| i.pointer.primary_down());
@@ -910,26 +1383,27 @@ impl App {
             }
         }
         // The bind panel renders directly after the wall
-        // (prototype @2603 concatenation order).
-        if !picking && st.bind_panel.is_some() {
+        // (prototype @2603 concatenation order) — also while a
+        // pick is running (SPEC §4: picking never hides it).
+        if st.bind_panel.is_some() {
             self.unit_bind_panel_ui(ui, st, shown, &targets, &lang_codes, acts);
         }
     }
 
-    /// The per-page bind bar (SPEC 三, bindBarHtml @2744): one
+    /// The per-page bind bar (SPEC §4, bindBarHtml @2744): one
     /// chip per language of the full content-language set, in
     /// the .lang-chip form enlarged for the thumb bar (min-width
     /// 32, height 24), then the panel-open pill (.bind-open
     /// @683 — its CSS and handler exist in the prototype build
     /// but no element emits it there; the pill is restored here
-    /// to its CSS spec so the panel is reachable, see report).
-    /// Chip click is the prototype's DIRECT TOGGLE (@5026):
-    /// bound → unbind, missing → unmark, unbound → bind to the
-    /// same-index page (an occupied target goes through the
-    /// existing move-confirm overlay, the prototype's
-    /// bindConfirmDlg). When the same-index bind is impossible
-    /// (no version in that language, or the page has no
-    /// counterpart), the click opens the panel instead.
+    /// to its CSS spec so the panel is reachable, and the user
+    /// ruled it kept). Chip click is the prototype's DIRECT
+    /// TOGGLE (@5026): bound → unbind, missing → unmark, unbound
+    /// → bind to the same-index page (an occupied target goes
+    /// through the move-confirm overlay). When the same-index
+    /// bind is impossible (no version in that language, or the
+    /// page has no counterpart), the click opens the panel
+    /// instead. While a pick runs the bar renders but is inert.
     #[allow(clippy::too_many_arguments)]
     fn bind_bar_ui(
         &mut self,
@@ -940,6 +1414,7 @@ impl App {
         targets: &[UnitVersion],
         lang_codes: &[String],
         acts: &mut Vec<DetailAct>,
+        picking: bool,
     ) {
         let version_id = s(&shown.version, "id");
         for lang in lang_codes {
@@ -984,18 +1459,22 @@ impl App {
             .stroke(stroke)
             .corner_radius(6)
             .min_size(egui::vec2(32.0, 24.0));
-            if ui.add(chip).on_hover_text(tip).clicked() {
+            if ui.add(chip).on_hover_text(tip).clicked() && !picking {
                 match (target, state) {
                     (Some(_), Some(PageBindState::Bound(b))) => {
                         acts.push(DetailAct::Unbind {
                             binding_id: s(&b, "id"),
-                            ok_msg: "已解除页面绑定",
+                            ok_msg: format!(
+                                "已解绑：第 {} 页 · {}",
+                                slot + 1,
+                                lang_display_name(lang)
+                            ),
                         });
                     }
                     (Some(_), Some(PageBindState::Missing(b))) => {
                         acts.push(DetailAct::Unbind {
                             binding_id: s(&b, "id"),
-                            ok_msg: "已取消缺译标记",
+                            ok_msg: format!("已取消缺译标记（第 {} 页）。", slot + 1),
                         });
                     }
                     (Some(t), _) if slot < i(&t.version, "page_count").max(0) as usize => {
@@ -1044,7 +1523,7 @@ impl App {
         })
         .corner_radius(6)
         .min_size(egui::vec2(0.0, 28.0));
-        if ui.add(pill).clicked() {
+        if ui.add(pill).clicked() && !picking {
             if panel_here {
                 st.bind_panel = None;
             } else {
@@ -1078,19 +1557,27 @@ impl App {
             }
         }
     }
+}
 
+impl App {
     // ------------------------------------------------------------
-    // Bind panel (SPEC 四, bindPanelHtml @2751): --panel fill,
+    // Bind panel (SPEC §5, bindPanelHtml @2751): --panel fill,
     // 1px --line border, radius 6, 14px padding, directly below
     // the wall. Title, a segctl language switch whose labels
     // carry the bind status, the candidate grid (targetPagesFor
     // = the target rendition's latest version's pages), and the
     // action row. Candidate click follows tryPageBind: the
-    // already-bound candidate only reports; an occupied one goes
-    // through the move-confirm overlay; otherwise it binds and
-    // the panel closes (applyPageBind @2761). When the page is
-    // marked missing for the language, the candidate area is
-    // replaced by the missing banner.
+    // already-bound candidate only reports; an occupied one
+    // goes through the move-confirm overlay; otherwise it binds
+    // — and the panel stays OPEN until the bind actually lands
+    // (it closes inside apply_page_binding, SPEC §5). When the
+    // page is marked missing for the language, the candidate
+    // area is replaced by the missing banner. When the target
+    // language has NO version yet, the candidates are generated
+    // from the source pages in the prototype's own form
+    // (targetPagesFor's no-target branch) — but a client
+    // binding must address a real target version, so clicking
+    // one only reports that; see the REPORT （差 15).
     // ------------------------------------------------------------
     #[allow(clippy::too_many_arguments)]
     fn unit_bind_panel_ui(
@@ -1215,142 +1702,123 @@ impl App {
                                     .strong(),
                             );
                         });
-                } else if let Some(t) = &target {
-                    let target_id = s(&t.version, "id");
-                    let cand_pages = i(&t.version, "page_count").max(0) as usize;
-                    ui.add_space(10.0);
+                } else {
+                    // Candidate grid: .bind-cands (prototype
+                    // @687), repeat(auto-fill, minmax(170px, 1fr)),
+                    // gap 8 — column count derived from the width
+                    // with the same minmax semantics, rows laid
+                    // out explicitly, card height following
+                    // the wrapped text （差 28).
                     let saved_spacing = ui.spacing().item_spacing;
                     ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
                     let avail_w = ui.available_width();
-                    // .bind-cands (prototype @687): CSS grid,
-                    // repeat(auto-fill, minmax(170px, 1fr)),
-                    // gap 8 -- the candidate cards stretch
-                    // with the panel width. egui has no CSS
-                    // grid, so the column count is derived
-                    // from the available width with the same
-                    // minmax semantics and the rows are laid
-                    // out explicitly; the card height stays
-                    // fixed at 58, approximating the
-                    // prototype's two-line content height
-                    // (9px vertical padding around a 13px
-                    // line and an 11.5px line).
                     let cols = (((avail_w + 8.0) / (170.0 + 8.0)).floor() as usize).max(1);
                     let card_w = (avail_w - (cols - 1) as f32 * 8.0) / cols as f32;
-                    for row_start in (0..cand_pages).step_by(cols) {
-                        ui.horizontal(|ui| {
-                            for ci in row_start..(row_start + cols).min(cand_pages) {
-                                let cand = PageBindingRequest {
-                                    unit_id: st.unit_id.clone(),
-                                    from_version_id: version_id.clone(),
-                                    from_slot: pi as i64,
-                                    to_version_id: target_id.clone(),
-                                    to_slot: ci as i64,
-                                };
-                                let is_cur = exact_binding(&st.bindings, &cand).is_some();
-                                let owner = occupied_binding(&st.bindings, &cand)
-                                    .map(|b| i(&b, "from_slot"));
-                                // .bind-cand: 2px --line border (the
-                                // current one accent on accent-soft),
-                                // radius 6, 9/10 padding, two lines.
-                                let (rect, resp) = ui.allocate_exact_size(
-                                    egui::vec2(card_w, 58.0),
-                                    egui::Sense::click(),
-                                );
-                                let painter = ui.painter();
-                                let hovered = resp.hovered();
-                                let (fill, stroke) = if is_cur {
-                                    (SEL_BG, egui::Stroke::new(2.0, ACCENT))
-                                } else if hovered {
-                                    (
-                                        palette_color(PANEL_BG),
-                                        egui::Stroke::new(2.0, ACCENT),
-                                    )
-                                } else {
-                                    (
-                                        palette_color(PANEL_BG),
-                                        egui::Stroke::new(2.0, palette_color(LINE_34)),
-                                    )
-                                };
-                                painter.rect_filled(rect, 6.0, fill);
-                                painter.rect_stroke(
-                                    rect,
-                                    6.0,
-                                    stroke,
-                                    egui::StrokeKind::Inside,
-                                );
-                                let line1 = format!(
-                                    "第 {} 页 · {}",
-                                    ci + 1,
-                                    page_title(&t.version, ci)
-                                );
-                                let g1 = painter.layout_no_wrap(
-                                    line1,
-                                    egui::FontId::new(13.0, egui::FontFamily::Proportional),
-                                    palette_color(TEXT_MAIN),
-                                );
-                                painter.galley(
-                                    egui::pos2(rect.min.x + 10.0, rect.min.y + 9.0),
-                                    g1,
-                                    palette_color(TEXT_MAIN),
-                                );
-                                // Line 2 is the candidate page's own
-                                // 说明 (prototype: cp.d) plus the state
-                                // suffix. A page without a desc (stock)
-                                // falls back to the target rendition's
-                                // label — real data about the target,
-                                // not an invented page summary.
-                                let cand_desc = page_desc(&t.version, ci);
-                                let mut line2 = if cand_desc.is_empty() {
-                                    t.label()
-                                } else {
-                                    desc_line(&cand_desc, 30)
-                                };
-                                if is_cur {
-                                    line2.push_str(" · 当前绑定");
-                                } else if let Some(owner_slot) = owner {
-                                    line2.push_str(&format!(
-                                        " · 已绑在中文第 {} 页，点选将移动绑定",
-                                        owner_slot + 1
-                                    ));
-                                }
-                                let g2 = painter.layout_no_wrap(
-                                    line2,
-                                    egui::FontId::new(11.5, egui::FontFamily::Proportional),
-                                    palette_color(TEXT_FAINT),
-                                );
-                                painter.galley(
-                                    egui::pos2(rect.min.x + 10.0, rect.min.y + 32.0),
-                                    g2,
-                                    palette_color(TEXT_FAINT),
-                                );
-                                if resp.clicked() {
-                                    if is_cur {
-                                        self.msg = format!(
-                                            "第 {} 页已经绑在{}第 {} 页上了。",
-                                            pi + 1,
-                                            lang_display_name(&lang),
-                                            ci + 1
+                    ui.add_space(10.0);
+                    match &target {
+                        Some(t) => {
+                            let target_id = s(&t.version, "id");
+                            let cand_pages = i(&t.version, "page_count").max(0) as usize;
+                            for row_start in (0..cand_pages).step_by(cols) {
+                                ui.horizontal(|ui| {
+                                    for ci in row_start..(row_start + cols).min(cand_pages) {
+                                        self.bind_candidate_ui(
+                                            ui, st, shown, t, &target_id, pi, ci, card_w,
+                                            acts,
                                         );
-                                    } else {
-                                        st.bind_panel = None;
-                                        acts.push(DetailAct::Bind(cand));
                                     }
-                                }
+                                });
                             }
-                        });
+                        }
+                        None => {
+                            // No version in this language yet:
+                            // the prototype generates candidates
+                            // from the SOURCE pages. They render
+                            // in the same form; a click reports
+                            // the honest state, because a client
+                            // binding must address a real target
+                            // version （差 15, REPORT).
+                            for row_start in (0..page_count).step_by(cols) {
+                                ui.horizontal(|ui| {
+                                    for ci in row_start..(row_start + cols).min(page_count) {
+                                        // Same .bind-cand form as the
+                                        // real candidates, height
+                                        // following the wrapped text
+                                        // （差 28).
+                                        let painter = ui.painter();
+                                        let wrap_w = (card_w - 20.0).max(40.0);
+                                        let g1 = painter.layout(
+                                            format!(
+                                                "第 {} 页 · {}",
+                                                ci + 1,
+                                                page_title(&shown.version, ci)
+                                            ),
+                                            egui::FontId::new(
+                                                13.0,
+                                                egui::FontFamily::Proportional,
+                                            ),
+                                            palette_color(TEXT_MAIN),
+                                            wrap_w,
+                                        );
+                                        let g2 = painter.layout(
+                                            page_desc(&shown.version, ci),
+                                            egui::FontId::new(
+                                                11.5,
+                                                egui::FontFamily::Proportional,
+                                            ),
+                                            palette_color(TEXT_FAINT),
+                                            wrap_w,
+                                        );
+                                        let card_h =
+                                            9.0 + g1.size().y + 3.0 + g2.size().y + 9.0;
+                                        let (rect, resp) = ui.allocate_exact_size(
+                                            egui::vec2(card_w, card_h),
+                                            egui::Sense::click(),
+                                        );
+                                        let (fill, stroke) = if resp.hovered() {
+                                            (
+                                                palette_color(PANEL_BG),
+                                                egui::Stroke::new(2.0, ACCENT),
+                                            )
+                                        } else {
+                                            (
+                                                palette_color(PANEL_BG),
+                                                egui::Stroke::new(2.0, palette_color(LINE_34)),
+                                            )
+                                        };
+                                        painter.rect_filled(rect, 6.0, fill);
+                                        painter.rect_stroke(
+                                            rect,
+                                            6.0,
+                                            stroke,
+                                            egui::StrokeKind::Inside,
+                                        );
+                                        let g1_h = g1.size().y;
+                                        painter.galley(
+                                            egui::pos2(rect.min.x + 10.0, rect.min.y + 9.0),
+                                            g1,
+                                            palette_color(TEXT_MAIN),
+                                        );
+                                        painter.galley(
+                                            egui::pos2(
+                                                rect.min.x + 10.0,
+                                                rect.min.y + 9.0 + g1_h + 3.0,
+                                            ),
+                                            g2,
+                                            palette_color(TEXT_FAINT),
+                                        );
+                                        if resp.clicked() {
+                                            self.msg = format!(
+                                                "尚无{}版本，暂时没有可绑定的对应页。",
+                                                lang_display_name(&lang)
+                                            );
+                                        }
+                                    }
+                                });
+                            }
+                        }
                     }
                     ui.spacing_mut().item_spacing = saved_spacing;
-                } else {
-                    ui.add_space(10.0);
-
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "尚无{}版本，暂时没有可绑定的对应页。",
-                            lang_display_name(&lang)
-                        ))
-                        .size(13.0)
-                        .color(palette_color(TEXT_FAINT)),
-                    );
                 }
                 // .bind-acts: the row under the candidates.
                 ui.add_space(12.0);
@@ -1361,7 +1829,11 @@ impl App {
                         {
                             acts.push(DetailAct::Unbind {
                                 binding_id: s(b, "id"),
-                                ok_msg: "已解除页面绑定",
+                                ok_msg: format!(
+                                    "已解绑：第 {} 页 · {}",
+                                    pi + 1,
+                                    lang_display_name(&lang)
+                                ),
                             });
                         }
                     }
@@ -1370,7 +1842,10 @@ impl App {
                             if let Some(PageBindState::Missing(b)) = &cur_state {
                                 acts.push(DetailAct::Unbind {
                                     binding_id: s(b, "id"),
-                                    ok_msg: "已取消缺译标记",
+                                    ok_msg: format!(
+                                        "已取消缺译标记（第 {} 页）。",
+                                        pi + 1
+                                    ),
                                 });
                             }
                         }
@@ -1390,15 +1865,127 @@ impl App {
             });
     }
 
+    /// One real candidate card of the bind panel (the target
+    /// rendition's latest version's pages): current binding in
+    /// accent on accent-soft, occupation noted on the second
+    /// line — whose text is the candidate page's own 说明，
+    /// falling back to the SOURCE page's 说明 when the target
+    /// page has none (prototype targetPagesFor: cp.d || p.d).
+    #[allow(clippy::too_many_arguments)]
+    fn bind_candidate_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        st: &UnitState,
+        shown: &UnitVersion,
+        target: &UnitVersion,
+        target_id: &str,
+        pi: usize,
+        ci: usize,
+        card_w: f32,
+        acts: &mut Vec<DetailAct>,
+    ) {
+        let cand = PageBindingRequest {
+            unit_id: st.unit_id.clone(),
+            from_version_id: s(&shown.version, "id"),
+            from_slot: pi as i64,
+            to_version_id: target_id.to_string(),
+            to_slot: ci as i64,
+        };
+        let is_cur = exact_binding(&st.bindings, &cand).is_some();
+        let owner = occupied_binding(&st.bindings, &cand).map(|b| i(&b, "from_slot"));
+        // .bind-cand: 2px --line border (the current one accent
+        // on accent-soft), radius 6, 9/10 padding, two lines —
+        // and the card's height FOLLOWS the wrapped text
+        // (DIFFERENCES 差 28): both lines are laid out with
+        // wrapping at the inner width and the card is as tall
+        // as they need, never a fixed 58 with overflow.
+        let painter = ui.painter();
+        let wrap_w = (card_w - 20.0).max(40.0);
+        let line1 = format!("第 {} 页 · {}", ci + 1, page_title(&target.version, ci));
+        let g1 = painter.layout(
+            line1,
+            egui::FontId::new(13.0, egui::FontFamily::Proportional),
+            palette_color(TEXT_MAIN),
+            wrap_w,
+        );
+        let cand_desc = page_desc(&target.version, ci);
+        let mut line2 = if cand_desc.is_empty() {
+            page_desc(&shown.version, ci)
+        } else {
+            cand_desc
+        };
+        if is_cur {
+            line2.push_str(" · 当前绑定");
+        } else if let Some(owner_slot) = owner {
+            line2.push_str(&format!(
+                " · 已绑在中文第 {} 页，点选将移动绑定",
+                owner_slot + 1
+            ));
+        }
+        let g2 = painter.layout(
+            line2,
+            egui::FontId::new(11.5, egui::FontFamily::Proportional),
+            palette_color(TEXT_FAINT),
+            wrap_w,
+        );
+        let card_h = 9.0 + g1.size().y + 3.0 + g2.size().y + 9.0;
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(card_w, card_h), egui::Sense::click());
+        let hovered = resp.hovered();
+        let (fill, stroke) = if is_cur {
+            (SEL_BG, egui::Stroke::new(2.0, ACCENT))
+        } else if hovered {
+            (palette_color(PANEL_BG), egui::Stroke::new(2.0, ACCENT))
+        } else {
+            (
+                palette_color(PANEL_BG),
+                egui::Stroke::new(2.0, palette_color(LINE_34)),
+            )
+        };
+        painter.rect_filled(rect, 6.0, fill);
+        painter.rect_stroke(rect, 6.0, stroke, egui::StrokeKind::Inside);
+        let g1_h = g1.size().y;
+        painter.galley(
+            egui::pos2(rect.min.x + 10.0, rect.min.y + 9.0),
+            g1,
+            palette_color(TEXT_MAIN),
+        );
+        painter.galley(
+            egui::pos2(rect.min.x + 10.0, rect.min.y + 9.0 + g1_h + 3.0),
+            g2,
+            palette_color(TEXT_FAINT),
+        );
+        if resp.clicked() {
+            if is_cur {
+                self.msg = format!(
+                    "第 {} 页已经绑在{}第 {} 页上了。",
+                    pi + 1,
+                    lang_display_name(&target.lang),
+                    ci + 1
+                );
+            } else {
+                // The panel is NOT closed here: it closes when
+                // the bind lands (apply_page_binding) or when
+                // the user 收起s it — an occupied candidate's
+                // confirm overlay must find it still open
+                // underneath (SPEC §5).
+                acts.push(DetailAct::Bind(cand));
+            }
+        }
+    }
+}
+
+impl App {
     // ------------------------------------------------------------
-    // Embedded blocks (SPEC 五, kidsHtml @2597): rendered only
-    // when the detail payload carries a `children` array — the
-    // current payload does not (data gap, see report: the
-    // minimal fix is for the unit detail assembly to attach
-    // children shaped like list rows: {unit, renditions[].latest,
-    // children?}). When present, each child is a standard card:
-    // cover, title, a sub-page strip, and the accent main action
-    // that drills into the child.
+    // Embedded blocks (SPEC §6, kidsHtml @2597): rendered only
+    // when the detail payload carries children. Each child is a
+    // standard card: cover, title, the 内含 badge in the badges
+    // row, a sub-page strip with ALL pages at equal flexible
+    // widths, and the accent main action. Selection semantics
+    // are the prototype's (SPEC §10.10's sibling rule): a single
+    // click on the cover or the card body only SELECTS (accent
+    // border + outer ring); the drill is the main button or a
+    // cover double-click. Rows are chunked explicitly (the
+    // Frame wrap finding).
     // ------------------------------------------------------------
     fn unit_kids_ui(&mut self, ui: &mut egui::Ui, st: &mut UnitState) {
         let Some(children) = st
@@ -1412,181 +1999,265 @@ impl App {
         };
         ui.add_space(20.0);
         ui.label(egui::RichText::new("内嵌内容块").strong().size(16.0));
-        ui.add_space(6.0);
-        let saved_spacing = ui.spacing().item_spacing;
-        ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
+        ui.add_space(4.0);
         let avail = ui.available_width();
         let cols = (((avail + 12.0) / (230.0 + 12.0)).floor() as usize).max(1);
         let cell_w = ((avail - 12.0 * (cols as f32 - 1.0)) / cols as f32).max(170.0);
         let inner_w = (cell_w - 2.0).max(120.0);
         let mut drill: Option<String> = None;
-        ui.horizontal_wrapped(|ui| {
-            for child in &children {
-                let cunit = child.get("unit").cloned().unwrap_or(Value::Null);
-                let latest = child
-                    .get("renditions")
-                    .and_then(Value::as_array)
-                    .and_then(|arr| arr.first())
-                    .and_then(|r| r.get("latest"))
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                let latest_id = s(&latest, "id");
-                let nested = child
-                    .get("children")
-                    .and_then(Value::as_array)
-                    .map(|a| a.len())
-                    .unwrap_or(0);
-                egui::Frame::NONE
-                    .fill(palette_color(PANEL_BG))
-                    .stroke(egui::Stroke::new(1.0, palette_color(LINE_34)))
-                    .corner_radius(6)
-                    .inner_margin(egui::Margin::same(0))
-                    .show(ui, |ui| {
-                        ui.vertical(|ui| {
-                            ui.set_width(inner_w);
-                            if !latest_id.is_empty() {
-                                let resp =
-                                    self.thumb_response(ui, &latest_id, 0, inner_w, false);
-                                if resp.clicked() {
-                                    drill = Some(s(&cunit, "id"));
-                                }
-                            }
-                            egui::Frame::NONE
-                                .inner_margin(egui::Margin {
-                                    left: 12,
-                                    right: 12,
-                                    top: 10,
-                                    bottom: 11,
-                                })
-                                .show(ui, |ui| {
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(s(&cunit, "name"))
-                                                .size(13.0)
-                                                .strong(),
-                                        )
-                                        .truncate(),
+        for row_start in (0..children.len()).step_by(cols) {
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 12.0;
+                for child in &children[row_start..(row_start + cols).min(children.len())] {
+                    let cunit = child.get("unit").cloned().unwrap_or(Value::Null);
+                    let child_id = s(&cunit, "id");
+                    let latest = child
+                        .get("renditions")
+                        .and_then(Value::as_array)
+                        .and_then(|arr| arr.first())
+                        .and_then(|r| r.get("latest"))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    let latest_id = s(&latest, "id");
+                    let nested = child
+                        .get("children")
+                        .and_then(Value::as_array)
+                        .map(|a| a.len())
+                        .unwrap_or(0);
+                    let selected = st.kid_sel.as_deref() == Some(child_id.as_str());
+                    let frame_resp = egui::Frame::NONE
+                        .fill(palette_color(PANEL_BG))
+                        .stroke(egui::Stroke::new(
+                            1.0,
+                            if selected {
+                                ACCENT
+                            } else {
+                                palette_color(LINE_34)
+                            },
+                        ))
+                        .corner_radius(6)
+                        .inner_margin(egui::Margin::same(0))
+                        .show(ui, |ui| {
+                            ui.vertical(|ui| {
+                                ui.set_width(inner_w);
+                                if !latest_id.is_empty() {
+                                    let resp = self.thumb_response(
+                                        ui,
+                                        &latest_id,
+                                        0,
+                                        inner_w,
+                                        false,
                                     );
-                                    if nested > 0 {
-                                        ui.add_space(4.0);
-                                        chip(
-                                            ui,
-                                            &format!("内含 {nested} 个子块"),
-                                            palette_color(ACCENT_DEEP),
-                                            SEL_BG,
-                                        );
+                                    if resp.clicked() {
+                                        st.kid_sel = Some(child_id.clone());
                                     }
-                                    // .std-sub: the child's pages
-                                    // as a strip of mini bars
-                                    // under a dashed rule.
-                                    let pages = latest
-                                        .get("pages")
-                                        .and_then(Value::as_array)
-                                        .cloned()
-                                        .unwrap_or_default();
-                                    if !pages.is_empty() {
-                                        ui.add_space(8.0);
-                                        dashed_rule(ui);
-                                        ui.add_space(8.0);
-                                        ui.horizontal(|ui| {
-                                            ui.spacing_mut().item_spacing.x = 5.0;
-                                            let shown_pages = pages.len().min(8);
-                                            let bar_w = ((inner_w - 24.0
-                                                - 5.0 * (shown_pages as f32 - 1.0))
-                                                / shown_pages as f32)
-                                                .max(28.0);
-                                            for (idx, page) in
-                                                pages.iter().take(shown_pages).enumerate()
-                                            {
-                                                egui::Frame::NONE
-                                                    .fill(palette_color(HOVER_BG))
-                                                    .stroke(egui::Stroke::new(
-                                                        1.0,
-                                                        palette_color(LINE_34),
-                                                    ))
-                                                    .corner_radius(8)
-                                                    .inner_margin(egui::Margin {
-                                                        left: 7,
-                                                        right: 7,
-                                                        top: 5,
-                                                        bottom: 5,
-                                                    })
-                                                    .show(ui, |ui| {
-                                                        ui.set_width(bar_w - 14.0);
-                                                        ui.add(
-                                                            egui::Label::new(
-                                                                egui::RichText::new(format!(
-                                                                    "{}. {}",
-                                                                    idx + 1,
-                                                                    s(page, "title")
-                                                                ))
-                                                                .size(11.0)
-                                                                .strong(),
-                                                            )
-                                                            .truncate(),
-                                                        );
-                                                    });
-                                            }
-                                            if pages.len() > shown_pages {
-                                                ui.label(
-                                                    egui::RichText::new("…")
-                                                        .size(11.0)
-                                                        .color(palette_color(TEXT_FAINT)),
-                                                );
-                                            }
-                                        });
+                                    if resp.double_clicked() {
+                                        drill = Some(child_id.clone());
                                     }
-                                    ui.add_space(8.0);
-                                    // .show-actions .main: the
-                                    // accent drill action.
-                                    if ui
-                                        .add_sized(
-                                            egui::vec2(inner_w - 24.0, 30.0),
-                                            egui::Button::new(
-                                                egui::RichText::new("打开维护 · 点开下钻 →")
-                                                    .size(12.0)
-                                                    .color(egui::Color32::WHITE),
+                                }
+                                egui::Frame::NONE
+                                    .inner_margin(egui::Margin {
+                                        left: 12,
+                                        right: 12,
+                                        top: 10,
+                                        bottom: 11,
+                                    })
+                                    .show(ui, |ui| {
+                                        let title = ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(s(&cunit, "name"))
+                                                    .size(13.0)
+                                                    .strong(),
                                             )
-                                            .fill(ACCENT)
-                                            .corner_radius(6),
-                                        )
-                                        .clicked()
-                                    {
-                                        drill = Some(s(&cunit, "id"));
-                                    }
-                                });
+                                            .truncate()
+                                            .sense(egui::Sense::click()),
+                                        );
+                                        if title.clicked() {
+                                            st.kid_sel = Some(child_id.clone());
+                                        }
+                                        // .badges row: the 内含
+                                        // chip rides directly
+                                        // under the title.
+                                        if nested > 0 {
+                                            ui.horizontal_wrapped(|ui| {
+                                                chip(
+                                                    ui,
+                                                    &format!("内含 {nested} 个子块"),
+                                                    palette_color(ACCENT_DEEP),
+                                                    SEL_BG,
+                                                );
+                                            });
+                                        }
+                                        // .std-sub: ALL of the
+                                        // child's pages as a strip
+                                        // of mini bars under a
+                                        // dashed rule, at equal
+                                        // flexible widths.
+                                        let pages = latest
+                                            .get("pages")
+                                            .and_then(Value::as_array)
+                                            .cloned()
+                                            .unwrap_or_default();
+                                        if !pages.is_empty() {
+                                            ui.add_space(8.0);
+                                            dashed_rule(ui);
+                                            ui.add_space(8.0);
+                                            ui.horizontal(|ui| {
+                                                ui.spacing_mut().item_spacing.x = 5.0;
+                                                let bar_w = (inner_w - 24.0
+                                                    - 5.0 * (pages.len() as f32 - 1.0))
+                                                    / pages.len() as f32;
+                                                for (idx, page) in pages.iter().enumerate() {
+                                                    egui::Frame::NONE
+                                                        .fill(palette_color(HOVER_BG))
+                                                        .stroke(egui::Stroke::new(
+                                                            1.0,
+                                                            palette_color(LINE_34),
+                                                        ))
+                                                        .corner_radius(8)
+                                                        .inner_margin(egui::Margin {
+                                                            left: 7,
+                                                            right: 7,
+                                                            top: 5,
+                                                            bottom: 5,
+                                                        })
+                                                        .show(ui, |ui| {
+                                                            ui.set_width((bar_w - 14.0).max(0.0));
+                                                            ui.add(
+                                                                egui::Label::new(
+                                                                    egui::RichText::new(
+                                                                        format!(
+                                                                            "{}. {}",
+                                                                            idx + 1,
+                                                                            s(page, "title")
+                                                                        ),
+                                                                    )
+                                                                    .size(11.0)
+                                                                    .strong(),
+                                                                )
+                                                                .truncate(),
+                                                            );
+                                                        });
+                                                }
+                                            });
+                                        }
+                                        ui.add_space(8.0);
+                                        // .show-actions .main: the
+                                        // accent drill action.
+                                        if ui
+                                            .add_sized(
+                                                egui::vec2(inner_w - 24.0, 30.0),
+                                                egui::Button::new(
+                                                    egui::RichText::new("打开维护 · 点开下钻 →")
+                                                        .size(12.0)
+                                                        .color(egui::Color32::WHITE),
+                                                )
+                                                .fill(ACCENT)
+                                                .corner_radius(6),
+                                            )
+                                            .clicked()
+                                        {
+                                            drill = Some(child_id.clone());
+                                        }
+                                    });
+                            });
                         });
-                    });
-            }
-        });
-        ui.spacing_mut().item_spacing = saved_spacing;
+                    if selected {
+                        // .std-card.selected: the 1px outer ring
+                        // around the accent border.
+                        ui.painter().rect_stroke(
+                            frame_resp.response.rect.expand(1.0),
+                            6.0,
+                            egui::Stroke::new(1.0, ACCENT),
+                            egui::StrokeKind::Outside,
+                        );
+                    }
+                }
+            });
+            ui.add_space(12.0);
+        }
         if let Some(child_id) = drill {
             if !child_id.is_empty() {
                 self.open_unit_detail(&child_id);
             }
         }
     }
+}
 
+/// Shared context for one history line's rendering.
+struct HistCtx {
+    row: RendRow,
+    /// The version the line is using (USE_SEL ?? the current
+    /// published head).
+    using_id: Option<String>,
+    /// The current published head version (first normal in
+    /// payload order), for 新增 counts and derivations.
+    head_normal: Option<Value>,
+    /// Enabled history languages: en first, then the other
+    /// renditions' languages.
+    langs: Vec<String>,
+    mounts: Vec<Value>,
+    is_super: bool,
+    my_name: String,
+}
+
+/// One history language's resolved state for one version:
+/// an explicit mount wins; otherwise the derivation of
+/// SPEC §10.7 (target rendition basis vs this version).
+fn hist_lang_state(ctx: &HistCtx, detail: &Value, version: &Value, lang: &str) -> &'static str {
+    let vid = s(version, "id");
+    for m in &ctx.mounts {
+        if s(m, "version_id") == vid && s(m, "lang") == lang {
+            return match s(m, "state").as_str() {
+                "synced" => "synced",
+                "stale" => "stale",
+                _ => "missing",
+            };
+        }
+    }
+    let target = detail
+        .get("renditions")
+        .and_then(Value::as_array)
+        .and_then(|arr| {
+            arr.iter().find(|r| {
+                s(&r["rendition"], "lang") == lang
+                    && s(&r["rendition"], "id") != ctx.row.rendition_id
+            })
+        });
+    let Some(target) = target else {
+        return "missing";
+    };
+    let is_current = ctx
+        .head_normal
+        .as_ref()
+        .is_some_and(|h| s(h, "id") == vid);
+    if !is_current {
+        return "missing";
+    }
+    let target_latest = target.get("latest").cloned().unwrap_or(Value::Null);
+    if target_latest.is_object()
+        && i(&target_latest, "basis_revision") >= i(version, "basis_revision")
+    {
+        "synced"
+    } else {
+        "stale"
+    }
+}
+
+impl App {
     // ------------------------------------------------------------
-    // History (SPEC 六, histHtmlForBlk @2555): one section; the
-    // client's versions arrive grouped per rendition, so each
-    // rendition's line rides under a small subhead (declared
-    // grouping difference — the prototype's single line is the
-    // block's own semver line, the client's semvers are per
-    // rendition). Cards follow the final cascade: --panel fill,
-    // 1px --line border, radius 6, 10px padding. The in-use
-    // version (the clicked history version, else the rendition's
-    // latest — views unification ruling) takes the accent
-    // border and the accent bigver; a draft takes the amber
-    // border (the prototype's dashed .draftv — egui strokes
-    // have no dash, declared). The prototype's separate blue
-    // .selected state has no client counterpart: selecting a
-    // version IS putting it in use here. Its language chips
-    // (which translation hangs on which version) have no data
-    // behind them in the client model — not rendered (report).
-    // Card selection hot zones: the bigver chip, the thumbs and
-    // the caption (egui has no whole-card background click
-    // layer that leaves the head buttons live — declared).
+    // History (SPEC §7, histHtmlForBlk @2555): ONE line for the
+    // shown rendition — the unnumbered working-draft card
+    // always first, then the numbered cards in display order.
+    // Card anatomy follows the final cascade (SPEC §10.2);
+    // interactions follow §10.10 as amended by the user's
+    // rulings: a card click only SELECTS (accent border + ring;
+    // the wall never follows — the bottom bar opens the
+    // selection), a thumbnail click selects the thumbnail, a
+    // thumbnail double-click opens #406 at that page, a card
+    // drag reorders the line (the working card's drag is the
+    // 定号插入）. Head segments hide under width pressure in
+    // the prototype's order (languages first, then badges).
     // ------------------------------------------------------------
     fn unit_history_ui(
         &mut self,
@@ -1596,283 +2267,903 @@ impl App {
     ) {
         ui.add_space(20.0);
         ui.label(egui::RichText::new("历史版本").strong().size(16.0));
-        ui.add_space(6.0);
-        let Some(rends) = st
-            .detail
-            .get("renditions")
-            .and_then(|r| r.as_array())
+        ui.add_space(4.0);
+        let rows = rendition_rows(&st.detail);
+        let Some(row) = rows
+            .iter()
+            .find(|r| Some(&r.rendition_id) == st.selected_rendition.as_ref())
+            .or_else(|| rows.first())
             .cloned()
         else {
             return;
         };
-        let unit = st.detail.get("unit").cloned().unwrap_or(json!({}));
-        for row in &rends {
-            let rend = row.get("rendition").cloned().unwrap_or(json!({}));
-            let rend_id = s(&rend, "id");
-            ui.label(
-                egui::RichText::new(format!("{} · {}", s(&rend, "form"), s(&rend, "lang")))
-                    .size(13.0)
-                    .color(palette_color(TEXT_WEAK)),
-            );
-            ui.add_space(4.0);
-            // The in-use version of this rendition: the user's
-            // history pick while it belongs here, else the
-            // rendition's latest (first non-recalled).
-            let cur_id = st
-                .selected_version
-                .clone()
-                .filter(|vid| {
-                    row.get("versions")
-                        .and_then(Value::as_array)
-                        .is_some_and(|vs| vs.iter().any(|v| s(v, "id") == *vid))
-                })
-                .or_else(|| latest_version(row).map(|v| s(&v, "id")))
-                .unwrap_or_default();
-            let Some(versions) = row.get("versions").and_then(|v| v.as_array()) else {
-                continue;
-            };
-            // Presentation order (user ruling 2026-11-25): the
-            // draft rides FIRST, ahead of every numbered version;
-            // numbered versions keep the payload order, which
-            // core's list_versions already sorts newest-first
-            // (semver DESC, then created_ms DESC). The partition
-            // is stable — several drafts keep their relative
-            // order, and recalled versions keep their semver
-            // place among the numbered. (The payload order alone
-            // could not promise this: a draft sits wherever its
-            // stored semver sorts, e.g. a translation draft's
-            // 1.0.0 under a rendition's 2.x line.)
-            let mut ordered: Vec<&Value> = Vec::with_capacity(versions.len());
-            ordered.extend(versions.iter().filter(|v| s(v, "status") == "draft"));
-            ordered.extend(versions.iter().filter(|v| s(v, "status") != "draft"));
-            let saved_spacing = ui.spacing().item_spacing;
-            ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
-            ui.horizontal_wrapped(|ui| {
-                for v in ordered {
-                    let vid = s(v, "id");
-                    let is_draft = s(v, "status") == "draft";
-                    let is_recalled = s(v, "status") == "recalled";
-                    let is_cur = vid == cur_id;
-                    let stroke = if is_draft {
-                        egui::Stroke::new(1.0, palette_color(CHIP_ORANGE_FG))
-                    } else if is_cur {
-                        egui::Stroke::new(1.0, ACCENT)
+        let head_normal = row
+            .versions
+            .iter()
+            .find(|v| s(v, "status") == "normal")
+            .cloned();
+        let using_id = row
+            .use_sel
+            .clone()
+            .or_else(|| head_normal.as_ref().map(|v| s(v, "id")));
+        let mut langs: Vec<String> = vec!["en".to_string()];
+        for r in &rows {
+            if r.rendition_id != row.rendition_id
+                && r.lang != row.lang
+                && !langs.contains(&r.lang)
+            {
+                langs.push(r.lang.clone());
+            }
+        }
+        let ctx = HistCtx {
+            using_id,
+            head_normal,
+            langs,
+            mounts: st
+                .detail
+                .get("lang_mounts")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            is_super: self.role() == "super",
+            my_name: self
+                .user
+                .as_ref()
+                .and_then(|u| u.get("display_name"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            row,
+        };
+        let versions = display_versions(&ctx.row);
+        // Card list: the working card always leads.
+        let mut keys: Vec<String> = vec!["working".to_string()];
+        keys.extend(versions.iter().map(|v| s(v, "id")));
+        // Geometry: repeat(auto-fill, minmax(248px, 1fr)) with
+        // a 300px cap; at most 640px wide the cards go full
+        // width, one per row.
+        let avail = ui.available_width();
+        let (cols, card_w) = if avail <= 640.0 {
+            (1, avail)
+        } else {
+            let c = (((avail + 12.0) / (248.0 + 12.0)).floor() as usize).max(1);
+            let w = ((avail - 12.0 * (c as f32 - 1.0)) / c as f32).min(300.0);
+            (c, w)
+        };
+        let mut card_rects: Vec<(String, egui::Rect)> = Vec::new();
+        let mut hot_rects: Vec<egui::Rect> = Vec::new();
+        for row_start in (0..keys.len()).step_by(cols) {
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 12.0;
+                for key in &keys[row_start..(row_start + cols).min(keys.len())] {
+                    let (rect, hots) = if key == "working" {
+                        self.hist_working_card_ui(ui, st, &ctx, card_w, acts)
                     } else {
-                        egui::Stroke::new(1.0, palette_color(LINE_34))
+                        let version = versions
+                            .iter()
+                            .find(|v| s(v, "id") == *key)
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        self.hist_version_card_ui(ui, st, &ctx, &version, card_w, acts)
                     };
-                    egui::Frame::NONE
-                        .fill(palette_color(PANEL_BG))
-                        .stroke(stroke)
-                        .corner_radius(6)
-                        .inner_margin(egui::Margin::same(10))
-                        .show(ui, |ui| {
-                            ui.set_width(264.0);
-                            // .vh-card-head: bigver chip, status
-                            // badges, then the head actions.
-                            ui.horizontal_wrapped(|ui| {
-                                let ver_text = format!("v{}", s(v, "semver"));
-                                let ver_font = egui::FontId::new(
-                                    12.0,
-                                    egui::FontFamily::Proportional,
-                                );
-                                let ver_fg = if is_cur {
-                                    egui::Color32::WHITE
-                                } else {
-                                    palette_color(TEXT_MAIN)
-                                };
-                                let ver_bg = if is_cur {
-                                    ACCENT
-                                } else {
-                                    palette_color(PRESSED_BG)
-                                };
-                                let galley = ui
-                                    .painter()
-                                    .layout_no_wrap(ver_text, ver_font, ver_fg);
-                                let (rect, ver_resp) = ui.allocate_exact_size(
-                                    egui::vec2(galley.size().x + 16.0, 24.0),
-                                    egui::Sense::click(),
-                                );
-                                ui.painter().rect_filled(rect, 6.0, ver_bg);
-                                ui.painter().galley(
-                                    egui::pos2(
-                                        rect.min.x + 8.0,
-                                        rect.center().y - galley.size().y / 2.0,
-                                    ),
-                                    galley,
-                                    ver_fg,
-                                );
-                                if ver_resp.clicked() {
-                                    st.selected_version = Some(vid.clone());
-                                    st.selected_rendition = Some(rend_id.clone());
-                                    st.selected_page = None;
-                                    st.bind_pick = None;
-                                }
-                                if ver_resp.double_clicked() {
-                                    self.open_light(st, v, 0);
-                                }
-                                if is_draft {
-                                    chip(
-                                        ui,
-                                        "草稿",
-                                        palette_color(CHIP_ORANGE_FG),
-                                        CHIP_ORANGE_BG,
-                                    );
-                                }
-                                if is_recalled {
-                                    chip(ui, "已撤回", palette_color(ROSE), ROSE_SOFT_BG);
-                                }
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if vh_btn(ui, "下载片段").clicked() {
-                                            if let Ok(resp) = self.call_work(
-                                                "GET",
-                                                &format!("/v1/versions/{vid}/fragment"),
-                                                None,
-                                            ) {
-                                                if let Some(data) = resp
-                                                    .get("data_base64")
-                                                    .and_then(|x| x.as_str())
-                                                {
-                                                    if let (Ok(bytes), Some(path)) = (
-                                                        b64d(data),
-                                                        rfd::FileDialog::new()
-                                                            .set_file_name("fragment.pptx")
-                                                            .save_file(),
-                                                    ) {
-                                                        // Audit2 E-M10: the write result decides the message.
-                                                        self.msg = match std::fs::write(
-                                                            path, bytes,
-                                                        ) {
-                                                            Ok(()) => "已保存".into(),
-                                                            Err(e) => {
-                                                                format!("保存失败：{e}")
-                                                            }
-                                                        };
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        if vh_btn(ui, "讲稿").clicked() {
-                                            let mut scripts: Vec<String> = v
-                                                .get("scripts")
-                                                .and_then(|x| x.as_array())
-                                                .map(|arr| {
-                                                    arr.iter()
-                                                        .map(|t| {
-                                                            t.as_str().unwrap_or("").to_string()
-                                                        })
-                                                        .collect()
-                                                })
-                                                .unwrap_or_default();
-                                            let pages = i(v, "page_count") as usize;
-                                            while scripts.len() < pages {
-                                                scripts.push(String::new());
-                                            }
-                                            st.scripts_edit = scripts;
-                                            st.scripts_for = Some(vid.clone());
-                                        }
-                                        if !is_recalled && vh_btn(ui, "撤回").clicked() {
-                                            let _ = self.call_work(
-                                                "POST",
-                                                &format!("/v1/versions/{vid}/recall"),
-                                                None,
-                                            );
-                                            self.reload_unit_detail(&st.unit_id.clone());
-                                        }
-                                        if !is_recalled && vh_btn(ui, "编辑页面").clicked() {
-                                            self.open_page_editor(&unit, v, 0);
-                                        }
-                                        if is_draft {
-                                            // The prototype puts
-                                            // ALL card-head actions
-                                            // after the flex spacer,
-                                            // in the one right-hand
-                                            // group (prototype
-                                            // @2564); the draft
-                                            // pair leads that group.
-                                            // This right-to-left
-                                            // layout stacks later
-                                            // widgets further left,
-                                            // so adding 放弃 then
-                                            // 发布为最新版本 here
-                                            // renders them at the
-                                            // group's left edge in
-                                            // the prototype's
-                                            // order.
-                                            if vh_btn(ui, "放弃").clicked() {
-                                                acts.push(DetailAct::DropVersion(
-                                                    vid.clone(),
-                                                ));
-                                            }
-                                            if vh_btn_primary(ui, "发布为最新版本").clicked() {
-                                                acts.push(DetailAct::PublishDraft(
-                                                    vid.clone(),
-                                                ));
-                                            }
-                                        }
-                                    },
-                                );
-                            });
-                            ui.add_space(9.0);
-                            // .vh-thumbs: click selects the
-                            // version (views unification ruling:
-                            // the wall above and the bottom-bar
-                            // views follow the pick); double-click
-                            // opens the light view at that page.
-                            ui.horizontal_wrapped(|ui| {
-                                let page_count = i(v, "page_count").max(0) as usize;
-                                for p in 0..page_count {
-                                    let thumb =
-                                        self.thumb_response(ui, &vid, p, 120.0, false);
-                                    if thumb.clicked() {
-                                        st.selected_version = Some(vid.clone());
-                                        st.selected_rendition = Some(rend_id.clone());
-                                        st.selected_page = None;
-                                        st.bind_pick = None;
-                                    }
-                                    if thumb.double_clicked() {
-                                        self.open_light(st, v, p);
-                                    }
-                                }
-                            });
-                            ui.add_space(8.0);
-                            // .vh-caption: meta line, then the
-                            // revision note. The .vh-cap-meta
-                            // order is the prototype's: date
-                            // first, then author (prototype
-                            // @2564: (h.date||h.time), then
-                            // h.author, joined by " · ").
-                            let meta = ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(format!(
-                                        "{} · {}",
-                                        fmt_time(i(v, "created_ms")),
-                                        s(v, "author")
-                                    ))
-                                    .size(11.5)
-                                    .color(palette_color(TEXT_FAINT)),
-                                )
-                                .sense(egui::Sense::click()),
-                            );
-                            if meta.clicked() {
-                                st.selected_version = Some(vid.clone());
-                                st.selected_rendition = Some(rend_id.clone());
-                                st.selected_page = None;
-                                st.bind_pick = None;
-                            }
-                            if !s(v, "note").is_empty() {
-                                ui.label(
-                                    egui::RichText::new(s(v, "note"))
-                                        .size(11.5)
-                                        .color(palette_color(TEXT_FAINT)),
-                                );
-                            }
-                        });
+                    card_rects.push((key.clone(), rect));
+                    hot_rects.extend(hots);
                 }
             });
-            ui.spacing_mut().item_spacing = saved_spacing;
-            ui.add_space(8.0);
+            ui.add_space(12.0);
+        }
+        self.hist_drag_resolve(ui, st, &ctx, &versions, &card_rects, &hot_rects, acts);
+    }
+
+    /// The unnumbered working-draft card (SPEC §10.8): always
+    /// present at the line's head. Its pages are the working
+    /// row's when one exists, else the working head's (the
+    /// mirror state). Publish goes through the inline input;
+    /// the card is draggable onto a version card （定号插入）.
+    fn hist_working_card_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        st: &mut UnitState,
+        ctx: &HistCtx,
+        card_w: f32,
+        acts: &mut Vec<DetailAct>,
+    ) -> (egui::Rect, Vec<egui::Rect>) {
+        let mut hots: Vec<egui::Rect> = Vec::new();
+        let src = ctx
+            .row
+            .working
+            .clone()
+            .or_else(|| ctx.row.latest.clone());
+        let effective_id = ctx
+            .row
+            .working
+            .as_ref()
+            .map(|w| s(w, "id"))
+            .or_else(|| ctx.row.latest.as_ref().map(|v| s(v, "id")))
+            .unwrap_or_default();
+        let selected = st.selected_version.as_deref() == Some(effective_id.as_str())
+            && !effective_id.is_empty();
+        let inner_w = card_w - 20.0;
+        let frame_resp = egui::Frame::NONE
+            .fill(palette_color(PANEL_BG))
+            .stroke(egui::Stroke::new(
+                1.0,
+                if selected {
+                    ACCENT
+                } else {
+                    palette_color(CHIP_ORANGE_FG)
+                },
+            ))
+            .corner_radius(6)
+            .inner_margin(egui::Margin::same(10))
+            .show(ui, |ui| {
+                ui.set_width(inner_w);
+                // Head: bigver 未定号， warn 草稿 badge, spacer,
+                // then the publish action (or its input state).
+                ui.horizontal(|ui| {
+                    self.bigver_chip(ui, "未定号", false);
+                    chip(ui, "草稿", palette_color(CHIP_ORANGE_FG), CHIP_ORANGE_BG);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if st.draft_pub.as_ref().is_some_and(|(k, _, _)| k == "working") {
+                            if vh_btn(ui, "取消").clicked() {
+                                st.draft_pub = None;
+                            }
+                            let pub_resp = vh_btn_primary(ui, "发布");
+                            hots.push(pub_resp.rect);
+                            if pub_resp.clicked() {
+                                let note = st
+                                    .draft_pub
+                                    .as_ref()
+                                    .map(|(_, n, _)| n.trim().to_string())
+                                    .unwrap_or_default();
+                                let added = src
+                                    .as_ref()
+                                    .map(|v| {
+                                        added_pages(v, ctx.head_normal.as_ref())
+                                    })
+                                    .unwrap_or(0);
+                                let note = if note.is_empty() {
+                                    format!("草稿发布为正式最新版本（新增 {} 页）", added)
+                                } else {
+                                    note
+                                };
+                                acts.push(DetailAct::PublishWorking {
+                                    working_id: ctx.row.working.as_ref().map(|w| s(w, "id")),
+                                    rendition_id: ctx.row.rendition_id.clone(),
+                                    head_id: ctx
+                                        .row
+                                        .latest
+                                        .as_ref()
+                                        .map(|v| s(v, "id"))
+                                        .unwrap_or_default(),
+                                    head_is_draft: ctx
+                                        .row
+                                        .latest
+                                        .as_ref()
+                                        .is_some_and(|v| s(v, "status") == "draft"),
+                                    note,
+                                    added,
+                                });
+                                st.draft_pub = None;
+                            }
+                            if let Some((_, text, focus)) = &mut st.draft_pub {
+                                let resp = ui.add(
+                                    egui::TextEdit::singleline(text)
+                                        .hint_text("修订说明（可留空）")
+                                        .desired_width(150.0),
+                                );
+                                hots.push(resp.rect);
+                                if *focus {
+                                    resp.request_focus();
+                                    *focus = false;
+                                }
+                            }
+                        } else {
+                            let pub_resp = vh_btn_primary(ui, "发布");
+                            hots.push(pub_resp.rect);
+                            if pub_resp.clicked() {
+                                st.draft_pub =
+                                    Some(("working".to_string(), String::new(), true));
+                            }
+                        }
+                    });
+                });
+                // Thumbs: the working page set; foot is 草稿 only.
+                if let Some(srcv) = &src {
+                    self.hist_thumbs_ui(
+                        ui,
+                        st,
+                        "working",
+                        srcv,
+                        &s(srcv, "id"),
+                        inner_w,
+                        true,
+                        &mut hots,
+                    );
+                }
+                ui.add_space(8.0);
+                let meta = if ctx.my_name.is_empty() {
+                    "刚刚 · 我".to_string()
+                } else {
+                    format!("刚刚 · 我（{}）", ctx.my_name)
+                };
+                ui.label(
+                    egui::RichText::new(meta)
+                        .size(11.5)
+                        .color(palette_color(TEXT_FAINT)),
+                );
+                ui.label(
+                    egui::RichText::new("未定号草稿")
+                        .size(11.5)
+                        .color(palette_color(TEXT_FAINT)),
+                );
+            });
+        if selected {
+            ui.painter().rect_stroke(
+                frame_resp.response.rect.expand(1.0),
+                6.0,
+                egui::Stroke::new(1.0, ACCENT),
+                egui::StrokeKind::Outside,
+            );
+        }
+        (frame_resp.response.rect, hots)
+    }
+
+    /// One numbered history card (SPEC §10.2/§10.9).
+    fn hist_version_card_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        st: &mut UnitState,
+        ctx: &HistCtx,
+        version: &Value,
+        card_w: f32,
+        acts: &mut Vec<DetailAct>,
+    ) -> (egui::Rect, Vec<egui::Rect>) {
+        let mut hots: Vec<egui::Rect> = Vec::new();
+        let vid = s(version, "id");
+        let status = s(version, "status");
+        let is_draft = status == "draft";
+        let is_rejected = status == "rejected";
+        let is_recalled = status == "recalled";
+        let is_using = ctx.using_id.as_deref() == Some(vid.as_str());
+        let selected = st.selected_version.as_deref() == Some(vid.as_str());
+        let inner_w = card_w - 20.0;
+        let stroke = if is_rejected {
+            egui::Stroke::new(1.0, palette_color(ROSE))
+        } else if is_draft {
+            egui::Stroke::new(1.0, palette_color(CHIP_ORANGE_FG))
+        } else if is_using || selected {
+            egui::Stroke::new(1.0, ACCENT)
+        } else {
+            egui::Stroke::new(1.0, palette_color(LINE_34))
+        };
+        let frame_resp = egui::Frame::NONE
+            .fill(palette_color(PANEL_BG))
+            .stroke(stroke)
+            .corner_radius(6)
+            .inner_margin(egui::Margin::same(10))
+            .show(ui, |ui| {
+                ui.set_width(inner_w);
+                // ---- head (one line, segments hide under
+                // pressure: languages first, then badges) ----
+                let editing_renum = st
+                    .renum_edit
+                    .as_ref()
+                    .is_some_and(|(id, _)| *id == vid);
+                ui.horizontal(|ui| {
+                    if editing_renum {
+                        if let Some((_, text)) = &mut st.renum_edit {
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(text).desired_width(92.0),
+                            );
+                            hots.push(resp.rect);
+                            if st.renum_focus {
+                                resp.request_focus();
+                                st.renum_focus = false;
+                            }
+                            let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                            if esc {
+                                st.renum_edit = None;
+                            } else if resp.lost_focus() {
+                                if let Some((_, t)) = st.renum_edit.take() {
+                                    let to = t.trim().trim_start_matches('v').to_string();
+                                    let from = s(version, "semver");
+                                    if !to.is_empty() && to != from {
+                                        acts.push(DetailAct::RenumberVersion {
+                                            version_id: vid.clone(),
+                                            from,
+                                            to,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        self.bigver_chip(ui, &format!("v{}", s(version, "semver")), is_using);
+                    }
+                    // Width budget for the hide ladder.
+                    let badges: Vec<(&str, egui::Color32, egui::Color32)> = {
+                        let mut v = Vec::new();
+                        if is_draft {
+                            v.push(("草稿", palette_color(CHIP_ORANGE_FG), CHIP_ORANGE_BG));
+                        }
+                        if is_rejected {
+                            v.push(("未通过", palette_color(ROSE), ROSE_SOFT_BG));
+                        }
+                        if is_recalled {
+                            v.push(("已撤回", palette_color(ROSE), ROSE_SOFT_BG));
+                        }
+                        v
+                    };
+                    let show_langs = !is_draft && !ctx.langs.is_empty();
+                    let head_used = 92.0
+                        + badges.len() as f32 * 52.0
+                        + if show_langs {
+                            ctx.langs.len() as f32 * 86.0
+                        } else {
+                            0.0
+                        }
+                        + 130.0;
+                    let hide_langs = head_used > inner_w;
+                    let hide_badges = hide_langs && (92.0 + 130.0 + badges.len() as f32 * 52.0 > inner_w);
+                    if !hide_badges {
+                        for (text, fg, bg) in &badges {
+                            chip(ui, text, *fg, *bg);
+                        }
+                    }
+                    if show_langs && !hide_langs {
+                        for lang in &ctx.langs {
+                            let state = hist_lang_state(ctx, &st.detail, version, lang);
+                            let (label, fg, bg) = match state {
+                                "synced" => (
+                                    format!("{} · 已同步", lang_display_name(lang)),
+                                    palette_color(ACCENT_DEEP),
+                                    SEL_BG,
+                                ),
+                                "stale" => (
+                                    format!("{} · 待更新", lang_display_name(lang)),
+                                    palette_color(CHIP_ORANGE_FG),
+                                    CHIP_ORANGE_BG,
+                                ),
+                                _ => (
+                                    format!("{} · 缺译", lang_display_name(lang)),
+                                    palette_color(TEXT_FAINT),
+                                    palette_color(HOVER_BG),
+                                ),
+                            };
+                            let btn = egui::Button::new(
+                                egui::RichText::new(label).size(11.0).color(fg),
+                            )
+                            .fill(bg)
+                            .stroke(egui::Stroke::NONE)
+                            .corner_radius(6)
+                            .min_size(egui::vec2(0.0, 22.0));
+                            let resp = ui.add(btn);
+                            hots.push(resp.rect);
+                            if resp.clicked() {
+                                let (next, toast) = match state {
+                                    "missing" => (
+                                        "synced",
+                                        format!(
+                                            "{}译文已挂到 {}。",
+                                            lang_display_name(lang),
+                                            s(version, "semver")
+                                        ),
+                                    ),
+                                    "stale" => (
+                                        "synced",
+                                        format!(
+                                            "{}译文已更新到 {}。",
+                                            lang_display_name(lang),
+                                            s(version, "semver")
+                                        ),
+                                    ),
+                                    _ => (
+                                        "missing",
+                                        format!(
+                                            "已解除 {} 的{}绑定。",
+                                            s(version, "semver"),
+                                            lang_display_name(lang)
+                                        ),
+                                    ),
+                                };
+                                acts.push(DetailAct::LangMount {
+                                    version_id: vid.clone(),
+                                    lang: lang.clone(),
+                                    state: next,
+                                    toast,
+                                });
+                            }
+                        }
+                    }
+                    // Right group: [primary/default actions]
+                    // then 改号 at the right edge (added first
+                    // in right-to-left order).
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ctx.is_super && !is_draft && !is_recalled {
+                            let resp = vh_btn(ui, "改号");
+                            hots.push(resp.rect);
+                            if resp.clicked() {
+                                st.renum_edit =
+                                    Some((vid.clone(), s(version, "semver")));
+                                st.renum_focus = true;
+                            }
+                        }
+                        if is_draft {
+                            let drop_resp = vh_btn(ui, "放弃");
+                            hots.push(drop_resp.rect);
+                            if drop_resp.clicked() {
+                                acts.push(DetailAct::DropVersion(vid.clone()));
+                            }
+                            let pub_resp = vh_btn_primary(ui, "发布为最新版本");
+                            hots.push(pub_resp.rect);
+                            if pub_resp.clicked() {
+                                let added =
+                                    added_pages(version, ctx.head_normal.as_ref());
+                                let note = format!(
+                                    "草稿发布为正式最新版本（新增 {} 页）",
+                                    added
+                                );
+                                acts.push(DetailAct::PublishDraft {
+                                    version_id: vid.clone(),
+                                    note,
+                                    added,
+                                    semver: s(version, "semver"),
+                                });
+                            }
+                        } else if !is_recalled && !is_rejected {
+                            if is_using {
+                                let resp = vh_btn_primary(ui, "使用");
+                                hots.push(resp.rect);
+                                if resp.clicked() {
+                                    acts.push(DetailAct::UseSel {
+                                        rendition_id: ctx.row.rendition_id.clone(),
+                                        version_id: None,
+                                        semver: String::new(),
+                                    });
+                                }
+                            } else {
+                                let resp = vh_btn(ui, "选用");
+                                hots.push(resp.rect);
+                                if resp.clicked() {
+                                    acts.push(DetailAct::UseSel {
+                                        rendition_id: ctx.row.rendition_id.clone(),
+                                        version_id: Some(vid.clone()),
+                                        semver: s(version, "semver"),
+                                    });
+                                }
+                            }
+                        }
+                    });
+                });
+                // ---- thumbs ----
+                self.hist_thumbs_ui(
+                    ui,
+                    st,
+                    &vid,
+                    version,
+                    &vid,
+                    inner_w,
+                    false,
+                    &mut hots,
+                );
+                // ---- caption ----
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} · {}",
+                        fmt_time(i(version, "created_ms")),
+                        s(version, "author")
+                    ))
+                    .size(11.5)
+                    .color(palette_color(TEXT_FAINT)),
+                );
+                if !s(version, "note").is_empty() {
+                    ui.label(
+                        egui::RichText::new(s(version, "note"))
+                            .size(11.5)
+                            .color(palette_color(TEXT_FAINT)),
+                    );
+                }
+                if is_rejected && !s(version, "pub_reason").is_empty() {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "未通过理由：{}（{} · {}）",
+                            s(version, "pub_reason"),
+                            s(version, "pub_by"),
+                            fmt_time(i(version, "pub_at"))
+                        ))
+                        .size(11.5)
+                        .color(palette_color(ROSE)),
+                    );
+                }
+            });
+        if selected {
+            ui.painter().rect_stroke(
+                frame_resp.response.rect.expand(1.0),
+                6.0,
+                egui::Stroke::new(1.0, ACCENT),
+                egui::StrokeKind::Outside,
+            );
+        }
+        (frame_resp.response.rect, hots)
+    }
+
+    /// The .vh-bigver chip: --panel3 fill, radius 6, 12px
+    /// medium; the in-use version's chip is accent-filled.
+    fn bigver_chip(&self, ui: &mut egui::Ui, text: &str, accent_fill: bool) {
+        // The prototype's bigver uses a monospace numeric stack
+        // with tabular figures （差 35): the client's closest
+        // face is egui's Monospace family.
+        let font = egui::FontId::new(12.0, egui::FontFamily::Monospace);
+        let fg = if accent_fill {
+            egui::Color32::WHITE
+        } else {
+            palette_color(TEXT_MAIN)
+        };
+        let galley = ui.painter().layout_no_wrap(text.to_string(), font, fg);
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(galley.size().x + 16.0, 24.0),
+            egui::Sense::hover(),
+        );
+        ui.painter().rect_filled(
+            rect,
+            6.0,
+            if accent_fill {
+                ACCENT
+            } else {
+                palette_color(PRESSED_BG)
+            },
+        );
+        ui.painter().galley(
+            egui::pos2(rect.min.x + 8.0, rect.center().y - galley.size().y / 2.0),
+            galley,
+            fg,
+        );
+    }
+
+    /// A history card's thumbnail strip (.vh-thumbs): every
+    /// page at an equal flexible width, a {i} / {n} chip over
+    /// the slide's top-left, and a foot line (desc left, version
+    /// right — the working card's foot is 草稿 alone). A single
+    /// click selects the thumbnail and its card; a double-click
+    /// opens #406 at that page.
+    #[allow(clippy::too_many_arguments)]
+    fn hist_thumbs_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        st: &mut UnitState,
+        card_key: &str,
+        version: &Value,
+        thumb_version_id: &str,
+        inner_w: f32,
+        working_card: bool,
+        hots: &mut Vec<egui::Rect>,
+    ) {
+        let page_count = i(version, "page_count").max(0) as usize;
+        if page_count == 0 {
+            return;
+        }
+        ui.add_space(9.0);
+        let n = page_count as f32;
+        let thumb_w = (inner_w - 6.0 * (n - 1.0)) / n;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            for p in 0..page_count {
+                ui.vertical(|ui| {
+                    ui.set_width(thumb_w);
+                    let thumb_sel = st.hist_thumb_sel.as_ref().is_some_and(|(k, idx)| {
+                        k == card_key && *idx == p
+                    });
+                    let resp =
+                        self.thumb_response(ui, thumb_version_id, p, thumb_w, thumb_sel);
+                    hots.push(resp.rect);
+                    // .k chip over the slide's top-left.
+                    let k_text = format!("{} / {}", p + 1, page_count);
+                    let galley = ui.painter().layout_no_wrap(
+                        k_text,
+                        egui::FontId::new(10.0, egui::FontFamily::Proportional),
+                        egui::Color32::WHITE,
+                    );
+                    let k_rect = egui::Rect::from_min_size(
+                        resp.rect.min + egui::vec2(5.0, 5.0),
+                        galley.size() + egui::vec2(8.0, 3.0),
+                    );
+                    ui.painter()
+                        .rect_filled(k_rect, 4.0, egui::Color32::from_black_alpha(140));
+                    ui.painter().galley(
+                        k_rect.min + egui::vec2(4.0, 1.5),
+                        galley,
+                        egui::Color32::WHITE,
+                    );
+                    if resp.clicked() {
+                        st.hist_thumb_sel = Some((card_key.to_string(), p));
+                        st.selected_version = Some(thumb_version_id.to_string());
+                        st.selected_page = None;
+                        st.bind_pick = None;
+                    }
+                    if resp.double_clicked() {
+                        let v = version.clone();
+                        self.open_light(st, &v, p);
+                    }
+                    // .foot: desc left (truncated), version
+                    // right; the working card's foot is 草稿.
+                    ui.horizontal(|ui| {
+                        if working_card {
+                            ui.label(
+                                egui::RichText::new("草稿")
+                                    .size(10.5)
+                                    .color(palette_color(TEXT_FAINT)),
+                            );
+                        } else {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(page_desc(version, p))
+                                        .size(10.5)
+                                        .color(palette_color(TEXT_FAINT)),
+                                )
+                                .truncate(),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "v{}",
+                                            s(version, "semver")
+                                        ))
+                                        .size(10.5)
+                                        .color(palette_color(TEXT_FAINT)),
+                                    );
+                                },
+                            );
+                        }
+                    });
+                });
+            }
+        });
+    }
+
+    /// History card pointer resolution: background clicks
+    /// select, background double-clicks open #406 at page 0,
+    /// and drags reorder the line (numbered cards) or number
+    /// the working draft in (working card dropped on a version
+    /// card). Presses that start on a card's interactive
+    /// children (its hot rects) never arm anything here.
+    #[allow(clippy::too_many_arguments)]
+    fn hist_drag_resolve(
+        &mut self,
+        ui: &mut egui::Ui,
+        st: &mut UnitState,
+        ctx: &HistCtx,
+        versions: &[Value],
+        card_rects: &[(String, egui::Rect)],
+        hot_rects: &[egui::Rect],
+        acts: &mut Vec<DetailAct>,
+    ) {
+        let pointer = ui.input(|i| i.pointer.interact_pos());
+        let primary_down = ui.input(|i| i.pointer.primary_down());
+        let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
+        let primary_released = ui.input(|i| i.pointer.primary_released());
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            st.vh_press = None;
+            st.vh_drag = None;
+        }
+        let Some(pos) = pointer else {
+            if !primary_down {
+                st.vh_press = None;
+                st.vh_drag = None;
+            }
+            return;
+        };
+        let in_hot = |p: egui::Pos2| hot_rects.iter().any(|r| r.contains(p));
+        if primary_pressed && st.vh_drag.is_none() && !in_hot(pos) {
+            if let Some((key, _)) = card_rects.iter().find(|(_, r)| r.contains(pos)) {
+                st.vh_press = Some((key.clone(), pos));
+            }
+        }
+        if primary_down {
+            if let Some((key, start)) = st.vh_press.clone() {
+                if start.distance(pos) > 8.0 {
+                    st.vh_drag = Some(key);
+                }
+            }
+        }
+        // Drag visuals: a seam at the target card's edge for a
+        // line reorder; a highlight over the target card for a
+        // 定号插入 (the prototype's .dragover form).
+        if let Some(drag_key) = st.vh_drag.clone() {
+            let target = card_rects
+                .iter()
+                .find(|(k, r)| *k != drag_key && r.contains(pos));
+            if let Some((tkey, trect)) = target {
+                if drag_key == "working" {
+                    ui.painter().rect_stroke(
+                        *trect,
+                        6.0,
+                        egui::Stroke::new(1.5, ACCENT),
+                        egui::StrokeKind::Inside,
+                    );
+                    ui.painter().rect_filled(
+                        *trect,
+                        6.0,
+                        egui::Color32::from_rgba_unmultiplied(0x2F, 0x6B, 0xF5, 18),
+                    );
+                    let _ = tkey;
+                } else {
+                    let before = pos.x < trect.center().x;
+                    let x = if before { trect.left() - 6.0 } else { trect.right() + 6.0 };
+                    ui.painter().line_segment(
+                        [egui::pos2(x, trect.top()), egui::pos2(x, trect.bottom())],
+                        egui::Stroke::new(2.5, ACCENT),
+                    );
+                }
+            }
+            // The dragged card's ghost follows the pointer.
+            if let Some((_, drect)) = card_rects.iter().find(|(k, _)| *k == drag_key) {
+                let ghost = egui::Rect::from_min_size(
+                    pos - egui::vec2(30.0, 14.0),
+                    egui::vec2(drect.width().min(220.0), 28.0),
+                );
+                ui.painter()
+                    .rect_filled(ghost, 6.0, palette_color(PRESSED_BG));
+                ui.painter().rect_stroke(
+                    ghost,
+                    6.0,
+                    egui::Stroke::new(1.0, ACCENT),
+                    egui::StrokeKind::Middle,
+                );
+                let label = if drag_key == "working" {
+                    "未定号草稿".to_string()
+                } else {
+                    versions
+                        .iter()
+                        .find(|v| s(v, "id") == drag_key)
+                        .map(|v| format!("v{}", s(v, "semver")))
+                        .unwrap_or_default()
+                };
+                let galley = ui.painter().layout_no_wrap(
+                    label,
+                    egui::FontId::new(12.0, egui::FontFamily::Proportional),
+                    palette_color(TEXT_MAIN),
+                );
+                ui.painter().galley(
+                    ghost.min + egui::vec2(10.0, 7.0),
+                    galley,
+                    palette_color(TEXT_MAIN),
+                );
+            }
+        }
+        if primary_released {
+            if let Some(drag_key) = st.vh_drag.take() {
+                let target = card_rects
+                    .iter()
+                    .find(|(k, r)| *k != drag_key && r.contains(pos))
+                    .cloned();
+                if let Some((tkey, trect)) = target {
+                    if drag_key == "working" {
+                        if tkey != "working" {
+                            let base = versions
+                                .iter()
+                                .find(|v| s(v, "id") == tkey);
+                            if let Some(base) = base {
+                                acts.push(DetailAct::InsertWorkingAt {
+                                    working_id: ctx
+                                        .row
+                                        .working
+                                        .as_ref()
+                                        .map(|w| s(w, "id")),
+                                    rendition_id: ctx.row.rendition_id.clone(),
+                                    base_version_id: tkey.clone(),
+                                    base_semver: s(base, "semver"),
+                                });
+                            }
+                        }
+                    } else {
+                        // Line reorder over the display order
+                        // (numbered cards only).
+                        let mut order: Vec<String> =
+                            versions.iter().map(|v| s(v, "id")).collect();
+                        if let (Some(from), Some(tpos)) = (
+                            order.iter().position(|id| *id == drag_key),
+                            order.iter().position(|id| *id == tkey),
+                        ) {
+                            let moved = order.remove(from);
+                            let after = pos.x >= trect.center().x;
+                            let mut at = tpos;
+                            if from < tpos {
+                                at = tpos - 1 + if after { 1 } else { 0 };
+                            } else if after {
+                                at = tpos + 1;
+                            }
+                            at = at.min(order.len());
+                            order.insert(at, moved);
+                            let changed = order
+                                .iter()
+                                .enumerate()
+                                .any(|(n, id)| versions.get(n).is_none_or(|v| s(v, "id") != *id));
+                            if changed {
+                                let moved_semver = versions
+                                    .iter()
+                                    .find(|v| s(v, "id") == drag_key)
+                                    .map(|v| s(v, "semver"))
+                                    .unwrap_or_default();
+                                acts.push(DetailAct::ReorderLine {
+                                    rendition_id: ctx.row.rendition_id.clone(),
+                                    version_ids: order,
+                                    moved_semver,
+                                    moved_to: at,
+                                });
+                            }
+                        }
+                    }
+                }
+                st.vh_press = None;
+                return;
+            }
+            if let Some((key, start)) = st.vh_press.take() {
+                if start.distance(pos) <= 8.0 {
+                    if let Some((_, rect)) =
+                        card_rects.iter().find(|(k, _)| *k == key)
+                    {
+                        if rect.contains(pos) && !in_hot(pos) {
+                            // Select: the version this card
+                            // stands for (the working card
+                            // selects its effective version).
+                            let effective = if key == "working" {
+                                ctx.row
+                                    .working
+                                    .as_ref()
+                                    .map(|w| s(w, "id"))
+                                    .or_else(|| {
+                                        ctx.row.latest.as_ref().map(|v| s(v, "id"))
+                                    })
+                                    .unwrap_or_default()
+                            } else {
+                                key.clone()
+                            };
+                            if !effective.is_empty() {
+                                st.selected_version = Some(effective);
+                            }
+                            st.selected_page = None;
+                            st.bind_pick = None;
+                            // Double-click opens #406 at page 0
+                            // with the card's own version.
+                            let now = ui.input(|i| i.time);
+                            let dbl = st
+                                .vh_last_click
+                                .as_ref()
+                                .is_some_and(|(k, t)| *k == key && now - *t < 0.4);
+                            if dbl {
+                                let version = if key == "working" {
+                                    ctx.row
+                                        .working
+                                        .clone()
+                                        .or_else(|| ctx.row.latest.clone())
+                                } else {
+                                    versions
+                                        .iter()
+                                        .find(|v| s(v, "id") == key)
+                                        .cloned()
+                                };
+                                if let Some(v) = version {
+                                    self.open_light(st, &v, 0);
+                                }
+                                st.vh_last_click = None;
+                            } else {
+                                st.vh_last_click = Some((key.clone(), now));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !primary_down && st.vh_drag.is_none() {
+            // A press that never armed and never released inside
+            // (scroll, window loss) dies quietly.
+            if pointer.is_none() {
+                st.vh_press = None;
+            }
         }
     }
 }
@@ -1907,17 +3198,60 @@ fn vh_btn_primary(ui: &mut egui::Ui, label: &str) -> egui::Response {
 }
 
 impl App {
+    /// Prototype confirm copy (SPEC §10.5): moving a binding
+    /// asks first, naming the language, the target page, the
+    /// source page it is bound from, and the destination.
     fn request_page_binding(&mut self, request: PageBindingRequest, bindings: &[Value]) {
         if exact_binding(bindings, &request).is_some() {
             self.msg = "页面已经绑定".into();
             return;
         }
         if let Some(owner) = occupied_binding(bindings, &request) {
+            let lang = self.target_lang_name(
+                &request.unit_id,
+                &request.from_version_id,
+                &request.to_version_id,
+            );
+            // The prototype's full confirm copy (DIFFERENCES
+            // 差 41, verified against the HTML): it names the
+            // language, the candidate page and its title, the
+            // source page it is bound from, and the destination,
+            // and says plainly this is not a silent steal. The
+            // source language is the shown rendition's own (the
+            // prototype hardcodes 中文 as its source).
+            let (cand_title, src_lang) =
+                if let ContentFrame::Unit(st) = self.content.stack.top() {
+                    let cand = binding_targets(&st.detail, &request.from_version_id)
+                        .iter()
+                        .find(|t| s(&t.version, "id") == request.to_version_id)
+                        .map(|t| page_title(&t.version, request.to_slot.max(0) as usize))
+                        .unwrap_or_default();
+                    let src = rendition_rows(&st.detail)
+                        .iter()
+                        .find(|r| {
+                            r.versions.iter().any(|v| s(v, "id") == request.from_version_id)
+                                || r.working
+                                    .as_ref()
+                                    .is_some_and(|w| s(w, "id") == request.from_version_id)
+                        })
+                        .map(|r| lang_display_name(&r.lang))
+                        .unwrap_or_else(|| "中文".to_string());
+                    (cand, src)
+                } else {
+                    (String::new(), "中文".to_string())
+                };
             self.overlays.push(Overlay::Confirm(ConfirmState {
-                title: "移动页面绑定？".into(),
+                title: "移动绑定？".into(),
                 body: format!(
-                    "目标页已绑定在第 {} 页。继续会解除原绑定，并改绑到第 {} 页。",
+                    "{}第 {} 页「{}」已经绑在{}第 {} 页上。继续会把它从{}第 {} 页解开、改绑到{}第 {} 页——不是静默抢绑，请你确认。",
+                    lang,
+                    request.to_slot + 1,
+                    cand_title,
+                    src_lang,
                     i(&owner, "from_slot") + 1,
+                    src_lang,
+                    i(&owner, "from_slot") + 1,
+                    src_lang,
                     request.from_slot + 1
                 ),
                 confirm_label: "移动绑定".into(),
@@ -1984,7 +3318,25 @@ impl App {
             self.msg = format!("绑定失败：{error}");
             return;
         }
-        self.msg = "页面绑定已更新".into();
+        // Prototype success toast + the panel closes (the
+        // pick-mode flow ends here; the bind bar returns).
+        let lang = self.target_lang_name(
+            &request.unit_id,
+            &request.from_version_id,
+            &request.to_version_id,
+        );
+        self.msg = format!(
+            "已绑定：第 {} 页 · {} ↔ 第 {} 页。",
+            request.from_slot + 1,
+            lang,
+            request.to_slot + 1
+        );
+        if let ContentFrame::Unit(st) = self.content.stack.top_mut() {
+            if st.unit_id == request.unit_id {
+                st.bind_panel = None;
+                st.bind_pick = None;
+            }
+        }
         self.reload_unit_detail(&request.unit_id);
         // Bindings reshape the resolved page sequence, so the
         // wall card's page count can move with them.
@@ -2071,7 +3423,9 @@ impl App {
             })),
         ) {
             Ok(_) => {
-                self.msg = "已标缺译".into();
+                let lang =
+                    self.target_lang_name(unit_id, from_version_id, to_version_id);
+                self.msg = format!("已标注缺译：第 {} 页 · {}", from_slot + 1, lang);
                 self.reload_unit_detail(unit_id);
                 self.changed(Change::Units);
             }
@@ -2109,12 +3463,17 @@ impl App {
                         // detail shell pads 22px at the sides and
                         // 16px at the top, the two columns sit
                         // 14px apart, and the sidebar is a fixed
-                        // 300px (.lb-side). The stage takes the
-                        // remaining width and its height follows
-                        // the slide's own aspect — no height cap.
+                        // 300px (.lb-side — the prototype's final
+                        // effective value, SPEC 差 35 corrected).
+                        // The stage takes the remaining width,
+                        // capped so the slide never outgrows the
+                        // viewport height (SPEC 差 34): the stage
+                        // column is at most (screen height − 240)
+                        // tall at 16:9.
                         let side_width = 300.0;
-                        let left_width =
-                            (screen.width() - 22.0 - 14.0 - side_width - 22.0).max(260.0);
+                        let left_width = (screen.width() - 22.0 - 14.0 - side_width - 22.0)
+                            .max(260.0)
+                            .min(((screen.height() - 240.0).max(200.0)) * 16.0 / 9.0);
                         ui.horizontal_top(|ui| {
                             ui.add_space(22.0);
                             ui.vertical(|ui| {

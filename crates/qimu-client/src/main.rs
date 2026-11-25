@@ -1798,18 +1798,23 @@ struct UnitState {
     publish_file: Option<std::path::PathBuf>,
     bindings: Vec<Value>,
     selected_rendition: Option<String>,
-    /// The history version the user clicked in the version list
-    /// (views unification, user ruling 2026-11-25): while set, the
-    /// pages wall shows THIS version and the bottom-bar views open
-    /// it — a frozen page sequence — instead of the rendition's
-    /// latest. Cleared by the rendition chips; survives detail
-    /// reloads (reload mutates the frame in place).
+    /// The history version the user clicked in the version list:
+    /// the card selection, and the version the bottom-bar views
+    /// open (views unification, user ruling 2026-11-25). Since
+    /// the rebuild2 page the WALL no longer follows the pick —
+    /// the prototype's history cards only select (user ruling
+    /// 2026-11-25 21:22, DIFFERENCES 差 4) — the wall always
+    /// shows the rendition's working head. Cleared by the
+    /// rendition chips; survives detail reloads (reload mutates
+    /// the frame in place).
     selected_version: Option<String>,
     selected_page: Option<usize>,
-    /// #101 draft wall page drag (mirrors DeckState's N4 fields):
+    /// #101 wall page drag (mirrors DeckState's N4 fields):
     /// the slot the pointer press started on and where it
     /// started, and the slot being dragged once the press arms.
-    /// Only ever set while the shown version is a draft.
+    /// The governed reorder entry decides where a drop lands
+    /// (draft/working in place, published via the working
+    /// draft) — the wall itself is always draggable.
     page_press: Option<(usize, egui::Pos2)>,
     page_drag: Option<usize>,
     bind_pick: Option<PageBindingPick>,
@@ -1821,6 +1826,30 @@ struct UnitState {
     /// title or the intro is being edited in place.
     meta_edit: Option<(MetaField, String)>,
     meta_edit_focus: bool,
+    /// Kids zone selection (prototype: a child card's single
+    /// click only selects it; the drill is the main button or
+    /// a cover double-click).
+    kid_sel: Option<String>,
+    /// History publish inline input (prototype .vh-msg-in):
+    /// (card key, note text, wants focus) while a draft card's
+    /// publish input is open. The card key is the version id
+    /// for a numbered draft, or the working card's key.
+    draft_pub: Option<(String, String, bool)>,
+    /// History renumber inline edit (super admin): (version
+    /// id, text) while a card's bigver is being edited.
+    renum_edit: Option<(String, String)>,
+    renum_focus: bool,
+    /// History card drag (line reorder / draft insert): the
+    /// card the press started on (its key: a version id, or
+    /// the working card's key) and where, and the card being
+    /// dragged once the press arms.
+    vh_press: Option<(String, egui::Pos2)>,
+    vh_drag: Option<String>,
+    /// Last history-card background click (card key, time) for
+    /// the double-click → open #406 rule.
+    vh_last_click: Option<(String, f64)>,
+    /// The selected history thumbnail: (version key, page).
+    hist_thumb_sel: Option<(String, usize)>,
     scripts_for: Option<String>, // version id whose 讲稿 is being edited
     scripts_edit: Vec<String>,
     translate_to: String,
@@ -1850,6 +1879,14 @@ impl UnitState {
             bind_panel: None,
             meta_edit: None,
             meta_edit_focus: false,
+            kid_sel: None,
+            draft_pub: None,
+            renum_edit: None,
+            renum_focus: false,
+            vh_press: None,
+            vh_drag: None,
+            vh_last_click: None,
+            hist_thumb_sel: None,
             scripts_for: None,
             scripts_edit: Vec::new(),
             translate_to: String::new(),
@@ -20895,7 +20932,19 @@ impl App {
         let mut cancel = false;
         if let Some((f, text)) = &mut st.meta_edit {
             if *f == field {
-                let resp = ui.add(egui::TextEdit::singleline(text).desired_width(360.0));
+                // SPEC 差 33: the prototype sizes the inline
+                // editor to the text (name ~min(560, max(160,
+                // len×12.4+32)); description the same family at
+                // a smaller per-char advance). egui has no
+                // content-sized singleline input, so the width
+                // is computed from the current text — declared
+                // approximation.
+                let chars = text.chars().count() as f32;
+                let width = match field {
+                    MetaField::Name => (chars * 12.4 + 32.0).clamp(160.0, 560.0),
+                    MetaField::Description => (chars * 8.0 + 32.0).clamp(120.0, 560.0),
+                };
+                let resp = ui.add(egui::TextEdit::singleline(text).desired_width(width));
                 if st.meta_edit_focus {
                     resp.request_focus();
                     st.meta_edit_focus = false;
@@ -21014,23 +21063,8 @@ impl App {
             st.closed = true;
             return;
         }
-        // Type tag (unified content model, user ruling
-        // 2026-11-25): the head rendition's latest version
-        // decides — one page reads 单页, more read 内容块.
-        let head_latest = detail
-            .get("renditions")
-            .and_then(|r| r.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|r| r.get("latest"))
-            .cloned()
-            .unwrap_or(Value::Null);
-        let kind_tag = if head_latest.is_object() {
-            unit_kind_tag(i(&head_latest, "page_count"))
-        } else {
-            None
-        };
         ui.add_space(6.0);
-        self.unit_header_ui(ui, st, &unit, kind_tag);
+        self.unit_header_ui(ui, st, &unit);
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             // pick-pages mode: the entry's currently resolved version,
@@ -21097,254 +21131,13 @@ impl App {
                 ui.add_space(6.0);
             }
             self.unit_101_body(ui, st);
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("AI 翻译（生成草稿）").strong().size(16.0));
-                // Configuration state from /v1/ai/status: a stub draft
-                // must never look like a real translation.
-                if let Some(st) = &self.ai_status {
-                    if s(st, "provider") == "stub" {
-                        ui.label(
-                            egui::RichText::new("当前为 stub 占位（未配置真实 AI）")
-                                .small()
-                                .color(palette_color(TEXT_WEAK)),
-                        );
-                    } else if st
-                        .get("configured")
-                        .and_then(|x| x.as_bool())
-                        .unwrap_or(false)
-                    {
-                        ui.label(
-                            egui::RichText::new(format!("AI 已配置：{}", s(st, "model")))
-                                .small()
-                                .color(palette_color(TEXT_WEAK)),
-                        );
-                    }
-                }
-                let cur_to = if st.translate_to.is_empty() {
-                    "zh".to_string()
-                } else {
-                    st.translate_to.clone()
-                };
-                let cur_label = self
-                    .lang_options
-                    .iter()
-                    .find(|(code, _)| *code == cur_to)
-                    .map(|(_, label)| label.clone())
-                    .unwrap_or_else(|| match cur_to.as_str() {
-                        "en" => "英语".to_string(),
-                        "ja" => "日语".to_string(),
-                        _ => "中文".to_string(),
-                    });
-                egui::ComboBox::from_id_salt("translate_to")
-                    .selected_text(cur_label)
-                    .show_ui(ui, |ui| {
-                        if self.lang_options.is_empty() {
-                            ui.selectable_value(&mut st.translate_to, "zh".into(), "中文");
-                            ui.selectable_value(&mut st.translate_to, "en".into(), "英语");
-                            ui.selectable_value(&mut st.translate_to, "ja".into(), "日语");
-                        } else {
-                            for (code, label) in self.lang_options.clone() {
-                                ui.selectable_value(&mut st.translate_to, code, label);
-                            }
-                        }
-                    });
-                let busy = self.translating.is_some();
-                let translate_ready = st
-                    .detail
-                    .get("renditions")
-                    .and_then(|r| r.as_array())
-                    .and_then(|arr| arr.first())
-                    .and_then(|r| r.get("versions"))
-                    .and_then(|v| v.as_array())
-                    .map(|arr| !arr.is_empty())
-                    .unwrap_or(false);
-                let btn_text = match &self.translating {
-                    Some((_, d, t)) if *t > 0 => format!("翻译中… {d}/{t}"),
-                    Some(_) => "翻译中…".to_string(),
-                    None => "翻译最新版本".to_string(),
-                };
-                if ui
-                    .add_enabled(!busy && translate_ready, egui::Button::new(btn_text))
-                    .clicked()
-                {
-                    // latest version of the first rendition in the detail
-                    let first_version = st
-                        .detail
-                        .get("renditions")
-                        .and_then(|r| r.as_array())
-                        .and_then(|arr| arr.first())
-                        .and_then(|r| r.get("versions"))
-                        .and_then(|v| v.as_array())
-                        .and_then(|arr| arr.first())
-                        .map(|v| s(v, "id"));
-                    match first_version {
-                        Some(vid) => {
-                            let uid = st.unit_id.clone();
-                            let to = if st.translate_to.is_empty() {
-                                "zh".to_string()
-                            } else {
-                                st.translate_to.clone()
-                            };
-                            match self.call(
-                                "POST",
-                                &format!("/v1/units/{uid}/translate-jobs"),
-                                Some(json!({ "version_id": vid, "target_lang": to })),
-                            ) {
-                                Ok(v) => {
-                                    let job_id = s(&v, "job_id");
-                                    self.translating = Some((uid, 0, 0));
-                                    let server = self.server.clone();
-                                    let token = self.token.clone();
-                                    let tx = self.translate_tx.clone();
-                                    let gen = self.translate_gen;
-                                    std::thread::spawn(move || loop {
-                                        match raw_call(
-                                            &server,
-                                            token.as_deref(),
-                                            "GET",
-                                            &format!("/v1/translate-jobs/{job_id}"),
-                                            None,
-                                            false,
-                                        ) {
-                                            Ok(p) => {
-                                                let _ = tx.send(TranslateEvent::Progress(
-                                                    gen,
-                                                    i(&p, "done") as usize,
-                                                    i(&p, "total") as usize,
-                                                ));
-                                                match s(&p, "state").as_str() {
-                                                    "succeeded" => {
-                                                        let _ = tx.send(TranslateEvent::Done(
-                                                            gen,
-                                                            Ok(p.get("result")
-                                                                .cloned()
-                                                                .unwrap_or(Value::Null)),
-                                                        ));
-                                                        break;
-                                                    }
-                                                    "failed" => {
-                                                        let _ = tx.send(TranslateEvent::Done(
-                                                            gen,
-                                                            Err(s(&p, "error")),
-                                                        ));
-                                                        break;
-                                                    }
-                                                    _ => std::thread::sleep(
-                                                        std::time::Duration::from_millis(700),
-                                                    ),
-                                                }
-                                            }
-                                            Err(e) => {
-                                                let _ =
-                                                    tx.send(TranslateEvent::Done(gen, Err(e)));
-                                                break;
-                                            }
-                                        }
-                                    });
-                                }
-                                Err(e) => self.msg = format!("翻译失败：{e}"),
-                            }
-                        }
-                        _ => self.msg = "暂无可翻译的版本".into(),
-                    }
-                }
-            });
-            if let Some(vid) = st.scripts_for.clone() {
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("逐页讲稿（保存不升版本）").strong());
-                    if ui.button("保存讲稿").clicked() {
-                        let scripts = st.scripts_edit.clone();
-                        match self.call_work(
-                            "PUT",
-                            &format!("/v1/versions/{vid}/scripts"),
-                            Some(json!({ "scripts": scripts })),
-                        ) {
-                            Ok(_) => {
-                                self.msg = "讲稿已保存".into();
-                                self.reload_unit_detail(&st.unit_id.clone());
-                            }
-                            Err(e) => self.msg = format!("保存讲稿失败：{e}"),
-                        }
-                    }
-                    if ui.button("关闭").clicked() {
-                        st.scripts_for = None;
-                    }
-                });
-                let n = st.scripts_edit.len();
-                for idx in 0..n {
-                    ui.horizontal(|ui| {
-                        ui.label(format!("第 {} 页", idx + 1));
-                        ui.add(
-                            egui::TextEdit::multiline(&mut st.scripts_edit[idx])
-                                .desired_width(560.0)
-                                .desired_rows(2),
-                        );
-                    });
-                }
-            }
-            ui.add_space(20.0);
-            ui.label(egui::RichText::new("发布新版本").strong().size(16.0));
-            ui.horizontal(|ui| {
-                if ui.button("选择片段文件").clicked() {
-                    st.publish_file = rfd::FileDialog::new()
-                        .add_filter("PowerPoint", &["pptx"])
-                        .pick_file();
-                }
-                if let Some(p) = &st.publish_file {
-                    ui.label(
-                        p.file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_default(),
-                    );
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("形态");
-                ui.add(egui::TextEdit::singleline(&mut st.publish_form).desired_width(80.0));
-                ui.label("语言");
-                ui.add(egui::TextEdit::singleline(&mut st.publish_lang).desired_width(60.0));
-                ui.label("升版方式");
-                for (idx, label) in [(0usize, "大版本"), (1, "小版本"), (2, "文字调整")] {
-                    ui.radio_value(&mut st.publish_bump, idx, label);
-                }
-                ui.label("备注");
-                ui.text_edit_singleline(&mut st.publish_note);
-            });
-            if ui
-                .add_enabled(st.publish_file.is_some(), egui::Button::new("发布"))
-                .clicked()
-            {
-                if let Some(path) = st.publish_file.clone() {
-                    let uid = st.unit_id.clone();
-                    if let Ok(bytes) = std::fs::read(&path) {
-                        let bump = ["major", "minor", "patch"][st.publish_bump];
-                        let r = self.call_work(
-                            "POST",
-                            &format!("/v1/units/{uid}/publish"),
-                            Some(json!({
-                                "data_base64": b64e(&bytes),
-                                "form": st.publish_form,
-                                "lang": st.publish_lang,
-                                "bump": bump,
-                                "note": st.publish_note,
-                            })),
-                        );
-                        match r {
-                            Ok(v) => {
-                                self.msg = format!("已发布 v{}", s(&v, "semver"));
-                                self.reload_unit_detail(&uid);
-                                // A new latest version changes the
-                                // wall card (version / page count).
-                                self.changed(Change::Units);
-                            }
-                            Err(e) => self.msg = format!("发布失败：{e}"),
-                        }
-                    }
-                } else {
-                    self.msg = "先选择片段文件".into();
-                }
-            }
+            // The prototype's #101 body ends with the history
+            // zone: the AI-translation section, the per-page
+            // script editor and the file-publish section that
+            // used to render below it are not part of this page
+            // (rebuild2, see the line's REPORT §四 for where
+            // each lives now). Attachments stay: they are not
+            // one of the three moved-out sections.
         });
         self.attachments_ui(ui, "unit", &st.unit_id.clone());
     }

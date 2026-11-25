@@ -327,11 +327,70 @@ pub struct VersionRec {
     pub fragment_hash: String,
     pub page_count: i64,
     pub pages: Vec<PageInfo>,
-    pub status: String, // normal | recalled | draft
+    /// normal | recalled | draft | working | rejected. `working`
+    /// is the publish-governance UNNUMBERED draft (user ruling
+    /// 2026-11-25): semver '' with major/minor/patch = -1, at most
+    /// one per rendition, converted in place to a numbered normal
+    /// version when published or insert-numbered. `rejected` is
+    /// the governance not-passed state; its reason rides the
+    /// pub_* fields below.
+    pub status: String,
     /// Per-page speaker scripts (讲稿), aligned with `pages`. Imported
     /// from the fragment's notes; editable without bumping the version.
     #[serde(default)]
     pub scripts: Vec<String>,
+    /// Position in the rendition's version line when the user
+    /// has arranged the line by dragging history cards (display
+    /// order only — resolution never reads it). None while the
+    /// line has never been arranged.
+    #[serde(default)]
+    pub line_pos: Option<i64>,
+    /// Not-passed (未通过) record for status = "rejected": the
+    /// reason, who rejected, and when (ms). Empty/0 otherwise.
+    #[serde(default)]
+    pub pub_reason: String,
+    #[serde(default)]
+    pub pub_by: String,
+    #[serde(default)]
+    pub pub_at: i64,
+}
+
+/// One entry of the renumber ledger (`version_renumbers`):
+/// every governance renumber — a super admin's manual renumber,
+/// a 定号插入 and each cascade shift it causes — leaves one of
+/// these, so a version's number history is auditable even
+/// though its identity (the row id) never changes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenumberRec {
+    pub id: String,
+    pub version_id: String,
+    pub from_semver: String,
+    pub to_semver: String,
+    pub reason: String,
+    pub by: String,
+    pub at_ms: i64,
+}
+
+/// One explicit history language mount (`version_lang_mounts`):
+/// the state a user cycled a history card's language chip to.
+/// Absence of a row means the state is derived at render time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LangMountRec {
+    pub unit_id: String,
+    pub version_id: String,
+    pub lang: String,
+    pub state: String, // synced | stale | missing
+}
+
+/// Display name of a language for the header status badges.
+fn badge_lang_name(code: &str) -> String {
+    match code {
+        "en" => "英语".to_string(),
+        "ja" => "日语".to_string(),
+        "zh" => "中文".to_string(),
+        "ko" => "韩语".to_string(),
+        other => other.to_uppercase(),
+    }
 }
 
 /// One unit embedded in another (see `Store::embedded_children`):
@@ -1012,7 +1071,10 @@ CREATE TABLE IF NOT EXISTS groups_tbl(id TEXT PRIMARY KEY, name TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS group_grants(id TEXT PRIMARY KEY, group_id TEXT NOT NULL, subject_type TEXT NOT NULL, subject_id TEXT NOT NULL, capability TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS units(id TEXT PRIMARY KEY, name TEXT NOT NULL, folder_id TEXT, group_id TEXT NOT NULL, maintainer TEXT NOT NULL, lead_lang TEXT NOT NULL DEFAULT 'zh', description TEXT NOT NULL DEFAULT '', current_revision INTEGER NOT NULL DEFAULT 1, created_ms INTEGER NOT NULL, sort INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS renditions(id TEXT PRIMARY KEY, unit_id TEXT NOT NULL, form TEXT NOT NULL, lang TEXT NOT NULL, UNIQUE(unit_id, form, lang));
-CREATE TABLE IF NOT EXISTS versions(id TEXT PRIMARY KEY, rendition_id TEXT NOT NULL, semver TEXT NOT NULL, major INTEGER NOT NULL, minor INTEGER NOT NULL, patch INTEGER NOT NULL, basis_revision INTEGER NOT NULL, author TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', created_ms INTEGER NOT NULL, fragment_hash TEXT NOT NULL, page_count INTEGER NOT NULL, pages_json TEXT NOT NULL, text_all TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'normal', scripts_json TEXT NOT NULL DEFAULT '[]');
+CREATE TABLE IF NOT EXISTS versions(id TEXT PRIMARY KEY, rendition_id TEXT NOT NULL, semver TEXT NOT NULL, major INTEGER NOT NULL, minor INTEGER NOT NULL, patch INTEGER NOT NULL, basis_revision INTEGER NOT NULL, author TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', created_ms INTEGER NOT NULL, fragment_hash TEXT NOT NULL, page_count INTEGER NOT NULL, pages_json TEXT NOT NULL, text_all TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'normal', scripts_json TEXT NOT NULL DEFAULT '[]', line_pos INTEGER, pub_reason TEXT NOT NULL DEFAULT '', pub_by TEXT NOT NULL DEFAULT '', pub_at INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS version_renumbers(id TEXT PRIMARY KEY, version_id TEXT NOT NULL, from_semver TEXT NOT NULL DEFAULT '', to_semver TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', by TEXT NOT NULL DEFAULT '', at_ms INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS version_use_sel(unit_id TEXT NOT NULL, rendition_id TEXT NOT NULL, version_id TEXT NOT NULL, PRIMARY KEY(unit_id, rendition_id));
+CREATE TABLE IF NOT EXISTS version_lang_mounts(unit_id TEXT NOT NULL, version_id TEXT NOT NULL, lang TEXT NOT NULL, state TEXT NOT NULL, updated_ms INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(unit_id, version_id, lang));
 CREATE TABLE IF NOT EXISTS indexes_tbl(id TEXT PRIMARY KEY, name TEXT NOT NULL, folder_id TEXT, group_id TEXT NOT NULL, maintainer TEXT NOT NULL, lifecycle TEXT NOT NULL DEFAULT 'active', scope TEXT NOT NULL DEFAULT 'company', created_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS index_branches(index_id TEXT NOT NULL, name TEXT NOT NULL, head_commit TEXT, PRIMARY KEY(index_id, name));
 CREATE TABLE IF NOT EXISTS index_commits(id TEXT PRIMARY KEY, index_id TEXT NOT NULL, branch TEXT NOT NULL, parent_id TEXT, author TEXT NOT NULL, message TEXT NOT NULL, created_ms INTEGER NOT NULL, entries_json TEXT NOT NULL);
@@ -1130,6 +1192,10 @@ impl Store {
             ("users", "must_change_password", "INTEGER NOT NULL DEFAULT 0"),
             ("pages", "desc", "TEXT NOT NULL DEFAULT ''"),
             ("units", "sort", "INTEGER NOT NULL DEFAULT 0"),
+            ("versions", "line_pos", "INTEGER"),
+            ("versions", "pub_reason", "TEXT NOT NULL DEFAULT ''"),
+            ("versions", "pub_by", "TEXT NOT NULL DEFAULT ''"),
+            ("versions", "pub_at", "INTEGER NOT NULL DEFAULT 0"),
         ] {
             let has: bool = conn
                 .prepare(&format!("PRAGMA table_info({table})"))
@@ -3328,10 +3394,14 @@ impl Store {
             pages: serde_json::from_str(&pages_json).unwrap_or_default(),
             status: r.get(10)?,
             scripts: serde_json::from_str(&scripts_json).unwrap_or_default(),
+            line_pos: r.get(12)?,
+            pub_reason: r.get(13)?,
+            pub_by: r.get(14)?,
+            pub_at: r.get(15)?,
         })
     }
 
-    const VERSION_COLS: &'static str = "id, rendition_id, semver, basis_revision, author, note, created_ms, fragment_hash, page_count, pages_json, status, scripts_json";
+    const VERSION_COLS: &'static str = "id, rendition_id, semver, basis_revision, author, note, created_ms, fragment_hash, page_count, pages_json, status, scripts_json, line_pos, pub_reason, pub_by, pub_at";
 
     /// Insert a version from a fragment PPTX: computes per-page fingerprints,
     /// titles and searchable text from the fragment itself.
@@ -3434,9 +3504,10 @@ impl Store {
         }
         let hash = self.file_put(fragment)?;
         let id = new_id("ver");
+        let line_pos = self.birth_line_pos(rendition_id)?;
         self.conn
             .execute(
-                "INSERT INTO versions(id, rendition_id, semver, major, minor, patch, basis_revision, author, note, created_ms, fragment_hash, page_count, pages_json, text_all, status, scripts_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                "INSERT INTO versions(id, rendition_id, semver, major, minor, patch, basis_revision, author, note, created_ms, fragment_hash, page_count, pages_json, text_all, status, scripts_json, line_pos) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
                 params![
                     id,
                     rendition_id,
@@ -3453,7 +3524,8 @@ impl Store {
                     serde_json::to_string(&pages).unwrap_or_default(),
                     texts.join("\n"),
                     status,
-                    serde_json::to_string(&scripts).unwrap_or_default()
+                    serde_json::to_string(&scripts).unwrap_or_default(),
+                    line_pos
                 ],
             )
             .map_err(db_err)?;
@@ -3604,9 +3676,10 @@ impl Store {
         }
         self.check_semver_free(rendition_id, semver, None)?;
         let id = new_id("ver");
+        let line_pos = self.birth_line_pos(rendition_id)?;
         self.conn
             .execute(
-                "INSERT INTO versions(id, rendition_id, semver, major, minor, patch, basis_revision, author, note, created_ms, fragment_hash, page_count, pages_json, text_all, status, scripts_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                "INSERT INTO versions(id, rendition_id, semver, major, minor, patch, basis_revision, author, note, created_ms, fragment_hash, page_count, pages_json, text_all, status, scripts_json, line_pos) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
                 params![
                     id,
                     rendition_id,
@@ -3623,7 +3696,8 @@ impl Store {
                     serde_json::to_string(&pages).unwrap_or_default(),
                     texts.join("\n"),
                     status,
-                    serde_json::to_string(&scripts).unwrap_or_default()
+                    serde_json::to_string(&scripts).unwrap_or_default(),
+                    line_pos
                 ],
             )
             .map_err(db_err)?;
@@ -3674,7 +3748,10 @@ impl Store {
         page_ids: &[String],
     ) -> SResult<VersionRec> {
         let ver = self.get_version(version_id)?;
-        if ver.status != "draft" {
+        // Numbered drafts and the unnumbered working draft are
+        // both editable working copies; published / recalled /
+        // rejected versions are closed history.
+        if ver.status != "draft" && ver.status != "working" {
             return Err("只有草稿版本可以调整页序".into());
         }
         let cur: Vec<String> = ver.pages.iter().map(|p| p.id.clone()).collect();
@@ -3860,10 +3937,13 @@ impl Store {
     /// (audit M2). Callers must not serve content to a
     /// distribution face from this accessor.
     pub fn latest_version(&self, rendition_id: &str) -> SResult<Option<VersionRec>> {
-        Ok(self
-            .list_versions(rendition_id)?
-            .into_iter()
-            .find(|v| v.status != "recalled"))
+        Ok(self.list_versions(rendition_id)?.into_iter().find(|v| {
+            // The unnumbered working draft and a not-passed
+            // version are never the working head: the draft is
+            // reached through `working_version`, and a rejected
+            // version is closed business like a recalled one.
+            v.status != "recalled" && v.status != "working" && v.status != "rejected"
+        }))
     }
 
     pub fn set_version_status(&self, id: &str, status: &str) -> SResult<()> {
@@ -3915,6 +3995,21 @@ impl Store {
                 params![id],
             )
             .map_err(db_err)?;
+        // Governance rows addressed at the version die with it
+        // too (the renumber ledger is kept — it is an audit
+        // trail, not working state).
+        self.conn
+            .execute(
+                "DELETE FROM version_lang_mounts WHERE version_id=?1",
+                params![id],
+            )
+            .map_err(db_err)?;
+        self.conn
+            .execute(
+                "DELETE FROM version_use_sel WHERE version_id=?1",
+                params![id],
+            )
+            .map_err(db_err)?;
         let n = self
             .conn
             .execute("DELETE FROM versions WHERE id=?1", params![id])
@@ -3945,6 +4040,620 @@ impl Store {
             return Err("版本不存在".into());
         }
         Ok(())
+    }
+
+    // ---------- publish governance (user ruling 2026-11-25) ----------
+    //
+    // The governance model the #101 rebuild carries: an
+    // UNNUMBERED working draft (status "working", semver '' with
+    // major/minor/patch = -1 so the rendition-semver unique index
+    // and `check_semver_free` never see it as a number), a
+    // not-passed state (status "rejected" + pub_* fields), a
+    // renumber ledger (`version_renumbers`), a per-rendition
+    // version-use marker (`version_use_sel`), explicit history
+    // language mounts (`version_lang_mounts`), and a user-arranged
+    // display order for the version line (`versions.line_pos`).
+    // Numbered drafts (status "draft") are the stock form and
+    // keep their existing publish path untouched.
+
+    /// Line position for a version born into a rendition whose
+    /// line the user has arranged by dragging history cards:
+    /// the new version takes the head (min - 1). An unarranged
+    /// line stays position-less, so the stock semver display
+    /// order is untouched until the first arrangement.
+    fn birth_line_pos(&self, rendition_id: &str) -> SResult<Option<i64>> {
+        let min: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT MIN(line_pos) FROM versions WHERE rendition_id=?1 AND line_pos IS NOT NULL",
+                params![rendition_id],
+                |r| r.get(0),
+            )
+            .map_err(db_err)?;
+        Ok(min.map(|m| m - 1))
+    }
+
+    /// The rendition's unnumbered working draft, if one exists.
+    pub fn working_version(&self, rendition_id: &str) -> SResult<Option<VersionRec>> {
+        Ok(self
+            .list_versions(rendition_id)?
+            .into_iter()
+            .find(|v| v.status == "working"))
+    }
+
+    /// Birth (or fetch) the rendition's unnumbered working
+    /// draft: a copy of the current head version's page
+    /// reference sequence and scripts, its fragment reassembled
+    /// from the page packages exactly the way a draft reorder
+    /// rebuilds it. Governance edits (page drags on a published
+    /// version, binds, script edits) land on this row; publish
+    /// converts it in place, so everything addressed at the row
+    /// survives numbering. Refused while a NUMBERED draft is the
+    /// head — that draft is the working copy then, and a second
+    /// working surface would fork the edit stream.
+    pub fn seed_working_draft(&self, rendition_id: &str, author: &str) -> SResult<VersionRec> {
+        if let Some(w) = self.working_version(rendition_id)? {
+            return Ok(w);
+        }
+        let src = self
+            .latest_version(rendition_id)?
+            .ok_or_else(|| "该形态尚无版本，无法建立未定号草稿".to_string())?;
+        if src.status != "normal" {
+            return Err("当前已有草稿版本，先处理草稿后再建立未定号草稿".into());
+        }
+        let singles = self.version_page_packages(&src)?;
+        if singles.len() != src.pages.len() {
+            return Err("源版本页面组包数量不一致，无法建立未定号草稿".into());
+        }
+        let frag = crate::pptx::reassemble(&singles)?;
+        let hash = self.file_put(&frag.to_bytes()?)?;
+        let text_all: String = self
+            .conn
+            .query_row(
+                "SELECT text_all FROM versions WHERE id=?1",
+                params![src.id],
+                |r| r.get(0),
+            )
+            .map_err(db_err)?;
+        let id = new_id("ver");
+        self.conn
+            .execute(
+                "INSERT INTO versions(id, rendition_id, semver, major, minor, patch, basis_revision, author, note, created_ms, fragment_hash, page_count, pages_json, text_all, status, scripts_json) VALUES(?1,?2,'',-1,-1,-1,?3,?4,'',?5,?6,?7,?8,?9,'working',?10)",
+                params![
+                    id,
+                    rendition_id,
+                    src.basis_revision,
+                    author,
+                    now_ms(),
+                    hash,
+                    src.pages.len() as i64,
+                    serde_json::to_string(&src.pages).unwrap_or_default(),
+                    text_all,
+                    serde_json::to_string(&src.scripts).unwrap_or_default()
+                ],
+            )
+            .map_err(db_err)?;
+        self.get_version(&id)
+    }
+
+    /// Publish the unnumbered working draft: the SAME row takes
+    /// a number (minor bump of the current published head, per
+    /// the prototype's default 定号段 — the segment picker is
+    /// gone from the page, the mechanism stays minor) and turns
+    /// normal. An empty note takes the prototype's default text
+    /// with the count of pages the draft added over the
+    /// published head.
+    pub fn publish_working_draft(
+        &self,
+        version_id: &str,
+        note: &str,
+        author: &str,
+    ) -> SResult<VersionRec> {
+        let ver = self.get_version(version_id)?;
+        if ver.status != "working" {
+            return Err("只有未定号草稿可以这样发布".into());
+        }
+        let rend_id = ver.rendition_id.clone();
+        let versions = self.list_versions(&rend_id)?;
+        let head_normal = versions.iter().find(|v| v.status == "normal");
+        let added = match head_normal {
+            Some(h) => {
+                let hs: HashSet<&str> = h.pages.iter().map(|p| p.id.as_str()).collect();
+                ver.pages
+                    .iter()
+                    .filter(|p| !hs.contains(p.id.as_str()))
+                    .count()
+            }
+            None => ver.pages.len(),
+        };
+        let base_sv = head_normal
+            .map(|v| v.semver.clone())
+            .or_else(|| {
+                versions
+                    .iter()
+                    .find(|v| v.status != "working")
+                    .map(|v| v.semver.clone())
+            })
+            .and_then(|s| SemVer::parse(&s).ok());
+        let mut cand = match base_sv {
+            Some(sv) => sv.bumped(crate::semver::Increment::Minor),
+            None => SemVer {
+                major: 0,
+                minor: 1,
+                patch: 0,
+            },
+        };
+        // The candidate must be free across ALL rows of the
+        // rendition (a numbered draft may already hold it);
+        // keep minor-bumping, the prototype cascade's guard.
+        let mut guard = 0;
+        while self.check_semver_free(&rend_id, cand, None).is_err() {
+            cand = cand.bumped(crate::semver::Increment::Minor);
+            guard += 1;
+            if guard > 10000 {
+                return Err("版本号分配失败".into());
+            }
+        }
+        let note_final = if note.trim().is_empty() {
+            format!("草稿发布为正式最新版本（新增 {} 页）", added)
+        } else {
+            note.trim().to_string()
+        };
+        let line_pos = self.birth_line_pos(&rend_id)?;
+        self.conn
+            .execute(
+                "UPDATE versions SET semver=?2, major=?3, minor=?4, patch=?5, status='normal', note=?6, author=?7, created_ms=?8, line_pos=?9 WHERE id=?1",
+                params![
+                    version_id,
+                    cand.to_string(),
+                    semver_part(cand.major),
+                    semver_part(cand.minor),
+                    semver_part(cand.patch),
+                    note_final,
+                    author,
+                    now_ms(),
+                    line_pos
+                ],
+            )
+            .map_err(db_err)?;
+        self.get_version(version_id)
+    }
+
+    /// Publish a NUMBERED draft, optionally replacing its note
+    /// (the #101 draft card's inline publish input). Without a
+    /// note this is exactly the old publish-draft flip.
+    pub fn publish_draft(&self, version_id: &str, note: Option<&str>) -> SResult<VersionRec> {
+        let ver = self.get_version(version_id)?;
+        if ver.status != "draft" {
+            return Err("只有草稿版本可以发布".into());
+        }
+        match note {
+            Some(n) => {
+                self.conn
+                    .execute(
+                        "UPDATE versions SET status='normal', note=?2 WHERE id=?1",
+                        params![version_id, n],
+                    )
+                    .map_err(db_err)?;
+            }
+            None => self.set_version_status(version_id, "normal")?,
+        }
+        self.get_version(version_id)
+    }
+
+    /// 定号插入： convert the unnumbered working draft into a
+    /// numbered version slotted right after `base_version_id`
+    /// in the line (the prototype's applyHistInsert): the
+    /// inserted number is base's minor bump, and every version
+    /// displayed NEWER than base is minor-bumped in turn (from
+    /// base's neighbour toward the head, each strictly above
+    /// the last assigned), every shift leaving a renumber
+    /// record. The cascade runs over the DISPLAY order — the
+    /// line as the user arranged it — exactly like the
+    /// prototype's array. Returns the converted version and
+    /// the (from, to) shift list in assignment order.
+    pub fn insert_working_at(
+        &self,
+        version_id: &str,
+        base_version_id: &str,
+        author: &str,
+    ) -> SResult<(VersionRec, Vec<(String, String)>)> {
+        let ver = self.get_version(version_id)?;
+        if ver.status != "working" {
+            return Err("只有未定号草稿可以定号插入".into());
+        }
+        let base = self.get_version(base_version_id)?;
+        if base.rendition_id != ver.rendition_id || base.status == "working" {
+            return Err("插入基点无效".into());
+        }
+        let rend_id = ver.rendition_id.clone();
+        let line = self.version_line_order(&rend_id)?;
+        let Some(k) = line.iter().position(|v| v.id == base.id) else {
+            return Err("插入基点不在版本线内".into());
+        };
+        let base_sv = SemVer::parse(&base.semver)
+            .map_err(|_| "基点版本编号无效".to_string())?;
+        let inserted = base_sv.bumped(crate::semver::Increment::Minor);
+        let mut last = inserted;
+        let mut plan: Vec<(String, SemVer, SemVer)> = Vec::new();
+        for v in line[..k].iter().rev() {
+            let from = SemVer::parse(&v.semver)
+                .map_err(|_| "版本线编号无效".to_string())?;
+            let mut nv = from.bumped(crate::semver::Increment::Minor);
+            while nv <= last {
+                nv = nv.bumped(crate::semver::Increment::Minor);
+            }
+            plan.push((v.id.clone(), from, nv));
+            last = nv;
+        }
+        let at = now_ms();
+        // Phase 1: park every shifting version on a temporary
+        // high number so the unique index never sees two rows
+        // holding the same number mid-cascade.
+        for (idx, (vid, from, _)) in plan.iter().enumerate() {
+            let tmp_major = from.major + 1_000_000 + idx as u64;
+            self.conn
+                .execute(
+                    "UPDATE versions SET semver=?2, major=?3 WHERE id=?1",
+                    params![vid, format!("{tmp_major}.{}.{}", from.minor, from.patch), tmp_major as i64],
+                )
+                .map_err(db_err)?;
+        }
+        // Phase 2: land the final numbers, each with its record.
+        let reason = format!("插入新版 {} 于其后，编号级联顺移", inserted);
+        for (vid, from, to) in &plan {
+            self.conn
+                .execute(
+                    "UPDATE versions SET semver=?2, major=?3, minor=?4, patch=?5 WHERE id=?1",
+                    params![
+                        vid,
+                        to.to_string(),
+                        semver_part(to.major),
+                        semver_part(to.minor),
+                        semver_part(to.patch)
+                    ],
+                )
+                .map_err(db_err)?;
+            self.conn
+                .execute(
+                    "INSERT INTO version_renumbers(id, version_id, from_semver, to_semver, reason, by, at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                    params![new_id("rnm"), vid, from.to_string(), to.to_string(), reason, author, at],
+                )
+                .map_err(db_err)?;
+        }
+        let note = format!(
+            "手动拖拽插入归位的新版（以 {} 为基 · 小版本定号）",
+            base.semver
+        );
+        self.conn
+            .execute(
+                "UPDATE versions SET semver=?2, major=?3, minor=?4, patch=?5, status='normal', note=?6, author=?7, created_ms=?8 WHERE id=?1",
+                params![
+                    version_id,
+                    inserted.to_string(),
+                    semver_part(inserted.major),
+                    semver_part(inserted.minor),
+                    semver_part(inserted.patch),
+                    note,
+                    author,
+                    at
+                ],
+            )
+            .map_err(db_err)?;
+        self.conn
+            .execute(
+                "INSERT INTO version_renumbers(id, version_id, from_semver, to_semver, reason, by, at_ms) VALUES(?1,?2,'',?3,?4,?5,?6)",
+                params![
+                    new_id("rnm"),
+                    version_id,
+                    inserted.to_string(),
+                    format!("手动拖拽插入定号（以 {} 为基 · 小版本定号）", base.semver),
+                    author,
+                    at
+                ],
+            )
+            .map_err(db_err)?;
+        // An arranged line keeps its arrangement: the inserted
+        // version takes the slot right before its base.
+        if line.iter().any(|v| v.line_pos.is_some()) {
+            let mut ids: Vec<String> = line.iter().map(|v| v.id.clone()).collect();
+            ids.insert(k, version_id.to_string());
+            self.set_version_line_order(&rend_id, &ids)?;
+        }
+        Ok((
+            self.get_version(version_id)?,
+            plan.iter()
+                .map(|(_, f, t)| (f.to_string(), t.to_string()))
+                .collect(),
+        ))
+    }
+
+    /// The rendition's numbered versions in DISPLAY order: the
+    /// user's arranged order when any row carries a line
+    /// position, else the stock semver order. The working
+    /// draft is not part of the line (its card always leads).
+    pub fn version_line_order(&self, rendition_id: &str) -> SResult<Vec<VersionRec>> {
+        let mut versions: Vec<VersionRec> = self
+            .list_versions(rendition_id)?
+            .into_iter()
+            .filter(|v| v.status != "working")
+            .collect();
+        if versions.iter().any(|v| v.line_pos.is_some()) {
+            versions.sort_by_key(|v| v.line_pos.unwrap_or(i64::MAX));
+        }
+        Ok(versions)
+    }
+
+    /// Write a full display order for the rendition's line
+    /// (history-card drag). The id set must be exactly the
+    /// line's current numbered versions — a stale order from
+    /// an out-of-date page is refused, never half-applied.
+    pub fn set_version_line_order(
+        &self,
+        rendition_id: &str,
+        version_ids: &[String],
+    ) -> SResult<()> {
+        let current = self.version_line_order(rendition_id)?;
+        if version_ids.len() != current.len()
+            || !current.iter().all(|v| version_ids.contains(&v.id))
+        {
+            return Err("版本线顺序与当前版本不一致，请刷新后重试".into());
+        }
+        for (pos, vid) in version_ids.iter().enumerate() {
+            self.conn
+                .execute(
+                    "UPDATE versions SET line_pos=?2 WHERE id=?1 AND rendition_id=?3",
+                    params![vid, pos as i64, rendition_id],
+                )
+                .map_err(db_err)?;
+        }
+        Ok(())
+    }
+
+    /// Renumber with a ledger record (the governance 改号）.
+    /// `renumber_version` itself is unchanged for its existing
+    /// callers; every governance renumber goes through here.
+    pub fn renumber_version_recorded(
+        &self,
+        id: &str,
+        semver: SemVer,
+        by: &str,
+        reason: &str,
+    ) -> SResult<()> {
+        let cur = self.get_version(id)?;
+        let from = cur.semver.clone();
+        self.renumber_version(id, semver)?;
+        self.conn
+            .execute(
+                "INSERT INTO version_renumbers(id, version_id, from_semver, to_semver, reason, by, at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![new_id("rnm"), id, from, semver.to_string(), reason, by, now_ms()],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// The renumber ledger of one version, oldest first.
+    pub fn list_renumbers(&self, version_id: &str) -> SResult<Vec<RenumberRec>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, version_id, from_semver, to_semver, reason, by, at_ms FROM version_renumbers WHERE version_id=?1 ORDER BY at_ms, rowid")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![version_id], |r| {
+                Ok(RenumberRec {
+                    id: r.get(0)?,
+                    version_id: r.get(1)?,
+                    from_semver: r.get(2)?,
+                    to_semver: r.get(3)?,
+                    reason: r.get(4)?,
+                    by: r.get(5)?,
+                    at_ms: r.get(6)?,
+                })
+            })
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(rows)
+    }
+
+    /// Mark a version not-passed （未通过） with its reason.
+    /// The state arrives from the review flow outside #101;
+    /// the page only renders it. A working draft has no number
+    /// to fail and is refused.
+    pub fn reject_version(&self, id: &str, reason: &str, by: &str) -> SResult<()> {
+        let ver = self.get_version(id)?;
+        if ver.status == "working" {
+            return Err("未定号草稿不能标记未通过".into());
+        }
+        let n = self
+            .conn
+            .execute(
+                "UPDATE versions SET status='rejected', pub_reason=?2, pub_by=?3, pub_at=?4 WHERE id=?1",
+                params![id, reason, by, now_ms()],
+            )
+            .map_err(db_err)?;
+        if n == 0 {
+            return Err("版本不存在".into());
+        }
+        Ok(())
+    }
+
+    /// Undo a not-passed mark: back to normal, record cleared.
+    pub fn restore_version(&self, id: &str) -> SResult<()> {
+        let ver = self.get_version(id)?;
+        if ver.status != "rejected" {
+            return Err("只有未通过版本可以恢复".into());
+        }
+        self.conn
+            .execute(
+                "UPDATE versions SET status='normal', pub_reason='', pub_by='', pub_at=0 WHERE id=?1",
+                params![id],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// The version a rendition's line is marked as using
+    /// (USE_SEL): a display/governance marker only — entry
+    /// resolution never reads it.
+    pub fn get_use_sel(&self, unit_id: &str, rendition_id: &str) -> SResult<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT version_id FROM version_use_sel WHERE unit_id=?1 AND rendition_id=?2",
+                params![unit_id, rendition_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_err)
+    }
+
+    pub fn set_use_sel(
+        &self,
+        unit_id: &str,
+        rendition_id: &str,
+        version_id: Option<&str>,
+    ) -> SResult<()> {
+        match version_id {
+            Some(vid) => {
+                let ver = self.get_version(vid)?;
+                if ver.rendition_id != rendition_id {
+                    return Err("选用版本不属于该形态".into());
+                }
+                self.conn
+                    .execute(
+                        "INSERT OR REPLACE INTO version_use_sel(unit_id, rendition_id, version_id) VALUES(?1,?2,?3)",
+                        params![unit_id, rendition_id, vid],
+                    )
+                    .map_err(db_err)?;
+            }
+            None => {
+                self.conn
+                    .execute(
+                        "DELETE FROM version_use_sel WHERE unit_id=?1 AND rendition_id=?2",
+                        params![unit_id, rendition_id],
+                    )
+                    .map_err(db_err)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Explicit history language mounts of a unit (the
+    /// prototype's 历史_LANG): which translation hangs on
+    /// which version, where a user has cycled the state by
+    /// hand. Absence of a row means "derive it" (the client
+    /// derives from basis revisions).
+    pub fn list_lang_mounts(&self, unit_id: &str) -> SResult<Vec<LangMountRec>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT unit_id, version_id, lang, state FROM version_lang_mounts WHERE unit_id=?1")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![unit_id], |r| {
+                Ok(LangMountRec {
+                    unit_id: r.get(0)?,
+                    version_id: r.get(1)?,
+                    lang: r.get(2)?,
+                    state: r.get(3)?,
+                })
+            })
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(rows)
+    }
+
+    pub fn set_lang_mount(
+        &self,
+        unit_id: &str,
+        version_id: &str,
+        lang: &str,
+        state: &str,
+    ) -> SResult<()> {
+        if !matches!(state, "synced" | "stale" | "missing") {
+            return Err("语言挂载状态无效".into());
+        }
+        self.get_version(version_id)?;
+        self.conn
+            .execute(
+                "INSERT INTO version_lang_mounts(unit_id, version_id, lang, state, updated_ms) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(unit_id, version_id, lang) DO UPDATE SET state=excluded.state, updated_ms=excluded.updated_ms",
+                params![unit_id, version_id, lang, state, now_ms()],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// The header status badges of a unit, derived at assembly
+    /// (the prototype's real.status): the head rendition's
+    /// published freshness, multi-form availability, and
+    /// per-language staleness against the unit's current
+    /// revision. Returns (kind, text) with kind "ok" | "warn".
+    /// The prototype's 编辑中 badge has no state source in the
+    /// client (no external-editor session is tracked) and is
+    /// deliberately not fabricated here.
+    pub fn unit_status_badges(&self, unit_id: &str) -> SResult<Vec<(String, String)>> {
+        let unit = self.get_unit(unit_id)?;
+        let rends = self.list_renditions(unit_id)?;
+        let mut out: Vec<(String, String)> = Vec::new();
+        if let Some(head) = rends.first() {
+            if let Some(latest) = self.latest_version(&head.id)? {
+                if latest.status == "normal" {
+                    out.push(("ok".to_string(), "最新版".to_string()));
+                }
+            }
+        }
+        let mut forms: Vec<&str> = Vec::new();
+        for r in &rends {
+            if !forms.contains(&r.form.as_str()) {
+                forms.push(r.form.as_str());
+            }
+        }
+        if forms.len() > 1 {
+            out.push(("warn".to_string(), "形态可选".to_string()));
+        }
+        for (idx, r) in rends.iter().enumerate() {
+            if idx == 0 {
+                continue;
+            }
+            if let Some(latest) = self.latest_version(&r.id)? {
+                if latest.basis_revision < unit.current_revision {
+                    if r.lang == "bi" {
+                        out.push(("warn".to_string(), "双语待同步".to_string()));
+                    } else {
+                        out.push((
+                            "warn".to_string(),
+                            format!("内容过期 · {}版待更新", badge_lang_name(&r.lang)),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The governed page-reorder entry (the #101 wall drag):
+    /// a draft or working version reorders in place; a
+    /// PUBLISHED version's drag first seeds the unnumbered
+    /// working draft from it and lands the new order there —
+    /// published history is never rewritten (user ruling
+    /// 2026-11-25: drag on any version, the result is a new
+    /// version — here, the unnumbered draft awaiting its
+    /// number). Returns the version that now holds the order.
+    pub fn reorder_version_pages(
+        &self,
+        version_id: &str,
+        page_ids: &[String],
+        author: &str,
+    ) -> SResult<VersionRec> {
+        let ver = self.get_version(version_id)?;
+        match ver.status.as_str() {
+            "draft" | "working" => self.reorder_draft_pages(version_id, page_ids),
+            "normal" => {
+                let w = self.seed_working_draft(&ver.rendition_id, author)?;
+                self.reorder_draft_pages(&w.id, page_ids)
+            }
+            _ => Err("该版本不可调整页序".into()),
+        }
     }
 
     // ---------- version tags (collaborative tagging, spec §3.6) ----------

@@ -913,6 +913,9 @@ fn heavy_arm(method: &str, path: &str) -> bool {
     ) || (method == "POST"
         && p.starts_with("/v1/versions/")
         && (p.ends_with("/edit-pages") || p.ends_with("/reorder-pages")))
+        || (method == "POST"
+            && p.starts_with("/v1/renditions/")
+            && p.ends_with("/seed-working"))
         || (method == "POST" && p.starts_with("/v1/folders/") && p.ends_with("/delete"))
         || (method == "POST" && p.starts_with("/v1/indexes/") && p.ends_with("/export"))
 }
@@ -2186,6 +2189,7 @@ impl LocalStore {
                         Err(_) => return Err(UNHANDLED.to_string()),
                     };
                     let mut payload = unit_json(&store, &unit);
+                    unit_detail_extras(&store, &mut payload, &unit);
                     attach_children(&store, &mut payload, &unit);
                     Ok(payload)
                 }
@@ -2309,24 +2313,183 @@ impl LocalStore {
                 }
                 ("POST", ["v1", "versions", id, "publish-draft"]) => {
                     // #101 history card 「发布为最新版本」 (server
-                    // publish_draft_version): drafts only.
+                    // publish_draft_version): drafts only; the
+                    // card's inline publish input may carry a
+                    // note that replaces the draft's stored one.
                     let store = self.store.lock().unwrap();
-                    let ver = store
+                    store
                         .get_version(id)
                         .map_err(|_| NOT_FOUND.to_string())?;
-                    if ver.status != "draft" {
-                        return Err("只有草稿版本可以发布".to_string());
+                    let note = body
+                        .get("note")
+                        .and_then(|v| v.as_str())
+                        .filter(|n| !n.trim().is_empty());
+                    let ver = store.publish_draft(id, note)?;
+                    Ok(json!({
+                        "version": serde_json::to_value(&ver).unwrap_or(Value::Null),
+                    }))
+                }
+                ("POST", ["v1", "versions", id, "publish-working"]) => {
+                    // Publish governance (server publish_working):
+                    // the unnumbered working draft's own row
+                    // takes the next minor number in place.
+                    let store = self.store.lock().unwrap();
+                    if store.get_version(id).is_err() {
+                        return Err(UNHANDLED.to_string());
                     }
-                    store.set_version_status(id, "normal")?;
+                    let note = body
+                        .get("note")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let ver = store.publish_working_draft(
+                        id,
+                        note,
+                        &self.owner.display_name,
+                    )?;
+                    Ok(json!({
+                        "version": serde_json::to_value(&ver).unwrap_or(Value::Null),
+                    }))
+                }
+                ("POST", ["v1", "versions", id, "insert-at"]) => {
+                    // 定号插入 (server insert_working_at): number
+                    // the working draft into the line after the
+                    // base version, cascade-shifting newer
+                    // numbers with ledger records.
+                    let store = self.store.lock().unwrap();
+                    if store.get_version(id).is_err() {
+                        return Err(UNHANDLED.to_string());
+                    }
+                    let base_id = body
+                        .get("base_version_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let (ver, shifts) = store.insert_working_at(
+                        id,
+                        base_id,
+                        &self.owner.display_name,
+                    )?;
+                    Ok(json!({
+                        "version": serde_json::to_value(&ver).unwrap_or(Value::Null),
+                        "shifts": shifts
+                            .iter()
+                            .map(|(from, to)| json!({ "from": from, "to": to }))
+                            .collect::<Vec<_>>(),
+                    }))
+                }
+                ("POST", ["v1", "versions", id, "renumber"]) => {
+                    // Super-admin manual renumber (server
+                    // renumber_version_h). The server face checks
+                    // the role; the local face is the owner's own
+                    // library and the page only renders the entry
+                    // for super — same posture as the other local
+                    // governance arms.
+                    let store = self.store.lock().unwrap();
+                    if store.get_version(id).is_err() {
+                        return Err(UNHANDLED.to_string());
+                    }
+                    let semver = body
+                        .get("semver")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let semver = qimu_core::semver::SemVer::parse(semver)?;
+                    store.renumber_version_recorded(
+                        id,
+                        semver,
+                        &self.owner.display_name,
+                        "超级管理员手动改号",
+                    )?;
+                    Ok(json!({ "ok": true }))
+                }
+                ("POST", ["v1", "versions", id, "reject"]) => {
+                    // 未通过 (server reject_version_h): the
+                    // not-passed state with its reason.
+                    let store = self.store.lock().unwrap();
+                    if store.get_version(id).is_err() {
+                        return Err(UNHANDLED.to_string());
+                    }
+                    let reason = body
+                        .get("reason")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    store.reject_version(id, reason, &self.owner.display_name)?;
+                    Ok(json!({ "ok": true }))
+                }
+                ("POST", ["v1", "versions", id, "restore"]) => {
+                    let store = self.store.lock().unwrap();
+                    if store.get_version(id).is_err() {
+                        return Err(UNHANDLED.to_string());
+                    }
+                    store.restore_version(id)?;
+                    Ok(json!({ "ok": true }))
+                }
+                ("POST", ["v1", "renditions", id, "seed-working"]) => {
+                    // Birth (or fetch) the rendition's unnumbered
+                    // working draft (server seed_working).
+                    let store = self.store.lock().unwrap();
+                    if store.get_rendition(id).is_err() {
+                        return Err(UNHANDLED.to_string());
+                    }
+                    let ver = store.seed_working_draft(id, &self.owner.display_name)?;
+                    Ok(json!({
+                        "version": serde_json::to_value(&ver).unwrap_or(Value::Null),
+                    }))
+                }
+                ("POST", ["v1", "units", id, "use-sel"]) => {
+                    let store = self.store.lock().unwrap();
+                    store.get_unit(id).map_err(|_| NOT_FOUND.to_string())?;
+                    let rendition_id = body
+                        .get("rendition_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let version_id = body.get("version_id").and_then(|v| v.as_str());
+                    store.set_use_sel(id, rendition_id, version_id)?;
+                    Ok(json!({ "ok": true }))
+                }
+                ("POST", ["v1", "units", id, "lang-mount"]) => {
+                    let store = self.store.lock().unwrap();
+                    store.get_unit(id).map_err(|_| NOT_FOUND.to_string())?;
+                    let version_id = body
+                        .get("version_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let lang = body
+                        .get("lang")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let state = body
+                        .get("state")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    store.set_lang_mount(id, version_id, lang, state)?;
+                    Ok(json!({ "ok": true }))
+                }
+                ("POST", ["v1", "units", id, "line-order"]) => {
+                    let store = self.store.lock().unwrap();
+                    store.get_unit(id).map_err(|_| NOT_FOUND.to_string())?;
+                    let rendition_id = body
+                        .get("rendition_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let version_ids: Vec<String> = body
+                        .get("version_ids")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .map(|x| x.as_str().unwrap_or("").to_string())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    store.set_version_line_order(rendition_id, &version_ids)?;
                     Ok(json!({ "ok": true }))
                 }
                 ("POST", ["v1", "versions", id, "reorder-pages"]) => {
-                    // #101 draft wall drag reorder (server
-                    // reorder_version_pages): core rewrites the
-                    // draft's page order in place and refuses
-                    // non-drafts. Like the scripts arm, a version
-                    // this library does not hold falls through to
-                    // REST — the draft may live on the server.
+                    // #101 wall drag reorder, governed (server
+                    // reorder_version_pages): drafts and the
+                    // working draft reorder in place; a published
+                    // version's drag seeds the working draft and
+                    // lands the order there. Like the scripts arm,
+                    // a version this library does not hold falls
+                    // through to REST.
                     let store = self.store.lock().unwrap();
                     if store.get_version(id).is_err() {
                         return Err(UNHANDLED.to_string());
@@ -2340,7 +2503,11 @@ impl LocalStore {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    let ver = store.reorder_draft_pages(id, &page_ids)?;
+                    let ver = store.reorder_version_pages(
+                        id,
+                        &page_ids,
+                        &self.owner.display_name,
+                    )?;
                     Ok(json!({
                         "version": serde_json::to_value(&ver).unwrap_or(Value::Null),
                     }))
@@ -3262,12 +3429,32 @@ fn unit_json(store: &Store, unit: &qimu_core::store::UnitRec) -> Value {
     let mut rends = Vec::new();
     if let Ok(list) = store.list_renditions(&unit.id) {
         for r in &list {
-            let versions = store.list_versions(&r.id).unwrap_or_default();
+            let all = store.list_versions(&r.id).unwrap_or_default();
+            // The unnumbered working draft leaves the version
+            // list and rides its own field (server unit_json
+            // parity): the history line is numbered versions.
+            let working = all.iter().find(|v| v.status == "working").cloned();
+            let numbered: Vec<_> =
+                all.into_iter().filter(|v| v.status != "working").collect();
+            // `versions` itself keeps the payload (semver)
+            // order every other consumer reads; the arranged
+            // display order rides `line_order` alone.
+            let line_order: Vec<String> = if numbered.iter().any(|v| v.line_pos.is_some()) {
+                let mut arranged = numbered.clone();
+                arranged.sort_by_key(|v| v.line_pos.unwrap_or(i64::MAX));
+                arranged.iter().map(|v| v.id.clone()).collect()
+            } else {
+                numbered.iter().map(|v| v.id.clone()).collect()
+            };
             let latest = store.latest_version(&r.id).ok().flatten();
+            let use_sel = store.get_use_sel(&unit.id, &r.id).ok().flatten();
             rends.push(json!({
                 "rendition": serde_json::to_value(r).unwrap_or(Value::Null),
                 "latest": serde_json::to_value(latest).unwrap_or(Value::Null),
-                "versions": serde_json::to_value(versions).unwrap_or(Value::Null),
+                "versions": serde_json::to_value(numbered).unwrap_or(Value::Null),
+                "working": serde_json::to_value(working).unwrap_or(Value::Null),
+                "line_order": line_order,
+                "use_sel": use_sel,
             }));
         }
     }
@@ -3278,6 +3465,27 @@ fn unit_json(store: &Store, unit: &qimu_core::store::UnitRec) -> Value {
     );
     obj.insert("renditions".into(), Value::Array(rends));
     Value::Object(obj)
+}
+
+/// The detail-face payload extras (server unit_json parity):
+/// the derived header status badges and the explicit history
+/// language mounts. Only the single-unit detail assembly pays
+/// for them — list rows and kids rows carry empty arrays.
+fn unit_detail_extras(store: &Store, payload: &mut Value, unit: &qimu_core::store::UnitRec) {
+    let badges: Vec<Value> = store
+        .unit_status_badges(&unit.id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(kind, text)| json!({ "kind": kind, "text": text }))
+        .collect();
+    let mounts = store.list_lang_mounts(&unit.id).unwrap_or_default();
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("status_badges".into(), Value::Array(badges));
+        obj.insert(
+            "lang_mounts".into(),
+            serde_json::to_value(mounts).unwrap_or(Value::Null),
+        );
+    }
 }
 
 /// Cap on the #101 「内嵌内容块」 child list — the server's
