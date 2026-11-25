@@ -1638,7 +1638,11 @@ struct WallState {
     /// Ctrl/⌘-click multi-selection (组合 / 剪贴板复制·剪切的前置):
     /// unit ids, in click order. `selected` stays the anchor card.
     /// A Shift+click replaces this set with the anchor-to-target
-    /// range; Ctrl+Shift+click appends the range to it.
+    /// range; Ctrl+Shift+click appends the range to it. A plain
+    /// click (no Ctrl/⌘, no Shift) clears the set — it is a fresh
+    /// single selection — and a click on the wall's blank
+    /// background clears it together with the anchor (user
+    /// ruling 2026-11-26).
     multi: Vec<String>,
     /// Folder-flow header edit currently open on a folder block
     /// (name or note), if any.
@@ -1674,11 +1678,30 @@ struct WallState {
     /// append drop onto an empty folder paints its feedback
     /// frame on the placeholder itself.
     empty_rects: Vec<(Option<String>, egui::Rect)>,
+    /// Folder header-row rects of the current frame (name row +
+    /// rule, full flow width), real-built headers only — a
+    /// virtualized header spacer sits outside the visible band
+    /// and can never be pointed at. The blank-click hit test
+    /// reads them: a header row is content, never background.
+    header_rects: Vec<egui::Rect>,
+    /// A primary press that landed on the wall's blank
+    /// background (inside the viewport but on no card, header
+    /// row or placeholder), remembered until the release: a
+    /// release near the press point, still on background, is a
+    /// blank click and clears the selection (user ruling
+    /// 2026-11-26). Any other release consumes it silently.
+    blank_press: Option<egui::Pos2>,
 }
 
 /// Card count at which the content wall's folder flow switches
 /// to virtualized rendering (see `App::content_wall`).
 const FLOW_VIRTUALIZE_MIN: usize = 200;
+
+/// How far a primary press may travel and still count as a
+/// click on the wall's blank background (user ruling
+/// 2026-11-26): egui's own click travel — a press that moves
+/// further is a scroll or drag gesture, never a click.
+const BLANK_CLICK_TRAVEL: f32 = 6.0;
 
 /// Layout heights the folder-flow virtualization measured from
 /// real widgets. Fonts come from the system provider, so a
@@ -19121,6 +19144,19 @@ impl App {
 
     /// The maintenance wall (root frame body): the block card
     /// grid (plus the deep-jump back link when arriving from Home).
+    /// Whether `p` is blank wall background: inside the scroll
+    /// viewport but on no card, folder header row or
+    /// empty-folder placeholder of the current frame. Gaps
+    /// between cards, the tail of a card row and the space
+    /// below the last block are background; everything the
+    /// flow built as content is not.
+    fn wall_blank_hit(w: &WallState, viewport: egui::Rect, p: egui::Pos2) -> bool {
+        viewport.contains(p)
+            && !w.card_rects.iter().any(|(_, _, r)| r.contains(p))
+            && !w.header_rects.iter().any(|r| r.contains(p))
+            && !w.empty_rects.iter().any(|(_, r)| r.contains(p))
+    }
+
     fn content_wall(&mut self, ui: &mut egui::Ui, w: &mut WallState) {
         // Card drag long-press gate (user ruling 2026-11-25):
         // the folder tree's gate in the same shape — a press on
@@ -19239,6 +19275,10 @@ impl App {
                 .as_ref()
                 .map(|u| s(u, "display_name"))
                 .unwrap_or_default();
+            // The scroll viewport, stashed from inside the
+            // closure for the blank-click hit test after the
+            // render (NOTHING until the closure first runs).
+            let mut wall_viewport = egui::Rect::NOTHING;
             egui::ScrollArea::vertical()
                 .id_salt("content-wall")
                 .show(ui, |ui| {
@@ -19330,6 +19370,7 @@ impl App {
                     // wall takes the original path verbatim.
                     let virt = all_units.len() >= FLOW_VIRTUALIZE_MIN;
                     let clip = ui.clip_rect();
+                    wall_viewport = clip;
                     let band = egui::Rect::from_min_max(
                         egui::pos2(clip.min.x, clip.min.y - clip.height()),
                         egui::pos2(clip.max.x, clip.max.y + clip.height()),
@@ -19344,6 +19385,7 @@ impl App {
                     w.card_rects.clear();
                     w.block_rects.clear();
                     w.empty_rects.clear();
+                    w.header_rects.clear();
                     let per_row_n = (per_row as usize).max(1);
                     let mut first_block = true;
                     for f in &ordered {
@@ -19395,6 +19437,14 @@ impl App {
                         } else {
                             let y0 = ui.cursor().min.y;
                             self.flow_folder_header(ui, w, f, depth, is_anchor);
+                            // The header row is content for
+                            // the blank-click hit test (its
+                            // double-click rename must never
+                            // read as a background click).
+                            w.header_rects.push(egui::Rect::from_min_max(
+                                egui::pos2(clip.min.x, y0),
+                                egui::pos2(clip.max.x, ui.cursor().min.y),
+                            ));
                             if !editing_this {
                                 let adv = ui.cursor().min.y - y0;
                                 w.flow_metrics.record_header(&fid, depth, adv);
@@ -19636,6 +19686,54 @@ impl App {
             // folder tree, which renders before this panel and
             // cleared the press.
             self.card_drag_resolve(ui, w);
+            // Blank-background click clears the selection (user
+            // ruling 2026-11-26): a primary press inside the
+            // viewport that lands on background is remembered in
+            // `w.blank_press`; a release within
+            // BLANK_CLICK_TRAVEL of it, still on background,
+            // drops the anchor and the multi-selection together,
+            // and the deck bar's count and greying follow on
+            // their own (they read these two fields every frame —
+            // no refresh path is involved). A press that travels
+            // is a scroll, not a click; a press that starts or
+            // ends on content belongs to that content — a card
+            // press never records a candidate, so a drag's
+            // release over background cannot clear the set it is
+            // moving. Pick mode and open dialogs shield the
+            // selection, the same shield the keyboard shortcuts
+            // use (`delete_key_dialog_open`).
+            let (bg_pressed, bg_released, bg_pos) = ui.input(|i| {
+                (
+                    i.pointer.primary_pressed(),
+                    i.pointer.primary_released(),
+                    i.pointer.interact_pos(),
+                )
+            });
+            if bg_pressed {
+                let hit = bg_pos
+                    .is_some_and(|p| Self::wall_blank_hit(w, wall_viewport, p));
+                w.blank_press =
+                    if hit && self.pick.is_none() && !self.delete_key_dialog_open() {
+                        bg_pos
+                    } else {
+                        None
+                    };
+            }
+            if bg_released {
+                if let Some(origin) = w.blank_press.take() {
+                    let on_blank = bg_pos.is_some_and(|p| {
+                        p.distance(origin) <= BLANK_CLICK_TRAVEL
+                            && Self::wall_blank_hit(w, wall_viewport, p)
+                    });
+                    if on_blank
+                        && self.pick.is_none()
+                        && !self.delete_key_dialog_open()
+                    {
+                        w.selected = None;
+                        w.multi.clear();
+                    }
+                }
+            }
             // The press watch ends with the gesture.
             if !ui.input(|i| i.pointer.primary_down()) {
                 self.card_press = None;
@@ -20637,13 +20735,14 @@ impl App {
         } else if click.clicked() {
             // Ctrl/⌘-click toggles the card in the
             // multi-selection （组合 / 剪贴板的前置）;
-            // a plain click stays the single selection. Both
-            // move the range anchor (`w.selected`) to the
-            // clicked card. Shift+click instead selects the
-            // display-order range from the anchor to this card
-            // (Ctrl+Shift appends the range) and leaves the
-            // anchor where it is; with no usable anchor it
-            // falls back to a plain click.
+            // a plain click is a fresh single selection: it
+            // clears the multi-selection and moves the range
+            // anchor (`w.selected`) to the clicked card.
+            // Shift+click instead selects the display-order
+            // range from the anchor to this card (Ctrl+Shift
+            // appends the range) and leaves the anchor where
+            // it is; with no usable anchor it falls back to a
+            // plain click.
             let mods = ui.ctx().input(|inp| inp.modifiers);
             let multi_key = mods.command || mods.ctrl;
             if mods.shift && self.wall_range_select(w, &uid, multi_key) {
@@ -20655,6 +20754,19 @@ impl App {
                     } else {
                         w.multi.push(uid.clone());
                     }
+                } else {
+                    // A plain click drops the multi-selection
+                    // (user ruling 2026-11-26): until now only
+                    // the anchor moved and the deck bar kept
+                    // acting on the old set, so the click read
+                    // as a no-op. This runs at the click — the
+                    // release — never at the press: the press
+                    // above already captured the set it would
+                    // drag from the pre-click selection, and an
+                    // armed drag never reaches this branch, so
+                    // a batch drag keeps its set intact and only
+                    // a true click converges to one card.
+                    w.multi.clear();
                 }
                 w.selected = Some(uid.clone());
             }
