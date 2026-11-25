@@ -1945,6 +1945,19 @@ impl LocalStore {
                     )?;
                     Ok(serde_json::to_value(&outcome).unwrap_or_default())
                 }
+                // The split worker's retry cap landed: mark the
+                // deck failed with the failing step's own error
+                // text, so a deterministically failing page ends
+                // in the failed presentation instead of spinning
+                // the queue forever.
+                ("POST", ["v1", "import", "lazy-fail"]) => {
+                    let store = self.store.lock().unwrap();
+                    let state = store.lazy_fail(
+                        &str_field(&body, "pending_id").unwrap_or_default(),
+                        &str_field(&body, "error").unwrap_or_default(),
+                    )?;
+                    Ok(serde_json::to_value(&state).unwrap_or_default())
+                }
                 ("POST", ["v1", "import", "lazy-forget"]) => {
                     let store = self.store.lock().unwrap();
                     store.delete_pending_import(

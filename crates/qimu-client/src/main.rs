@@ -4553,6 +4553,19 @@ fn lazy_worker_thread(
     use std::collections::VecDeque;
     let mut boost: VecDeque<(String, usize)> = VecDeque::new();
     let mut visible: VecDeque<(String, usize)> = VecDeque::new();
+    // Consecutive split-step failures per (deck, page), held
+    // ONLY in this worker's memory: a page that errors
+    // LAZY_PAGE_MAX_ATTEMPTS times in a row is deterministic,
+    // not transient, and its deck is marked failed (below)
+    // instead of being retried forever. A successful step
+    // clears the page's count; a user click (Boost) clears it
+    // too — a manual retry gets a fresh budget. A worker (or
+    // app) restart starts every count at zero, so a deck still
+    // marked "splitting" gets to prove itself again; a deck
+    // already marked failed is durable state and never revives
+    // on its own.
+    let mut fail_counts: std::collections::HashMap<(String, usize), u32> =
+        std::collections::HashMap::new();
     // Whether any deck might still have unsplit pages. The
     // worker only spawns when a pending deck exists, and every
     // new deck arrives with a command, so once a background pick
@@ -4573,7 +4586,7 @@ fn lazy_worker_thread(
             match got {
                 Ok(cmd) => {
                     dirty = true;
-                    apply_lazy_cmd(cmd, &mut boost, &mut visible);
+                    apply_lazy_cmd(cmd, &mut boost, &mut visible, &mut fail_counts);
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
@@ -4581,7 +4594,7 @@ fn lazy_worker_thread(
         }
         while let Ok(cmd) = cmd_rx.try_recv() {
             dirty = true;
-            apply_lazy_cmd(cmd, &mut boost, &mut visible);
+            apply_lazy_cmd(cmd, &mut boost, &mut visible, &mut fail_counts);
         }
         let next = boost.pop_front().or_else(|| visible.pop_front());
         let next = match next {
@@ -4604,6 +4617,9 @@ fn lazy_worker_thread(
             .unwrap_or_else(|| Err("本地库未接管分割请求".to_string()));
         match r {
             Ok(v) => {
+                // A landed step clears the page's failure count:
+                // only CONSECUTIVE failures count toward the cap.
+                fail_counts.remove(&(pending_id.clone(), index));
                 let info = LazyProgressInfo {
                     pending_id: pending_id.clone(),
                     index,
@@ -4618,21 +4634,68 @@ fn lazy_worker_thread(
                     failed: v.get("failed").and_then(|x| x.as_bool()).unwrap_or(false),
                     error: s(&v, "error"),
                 };
-                if info.failed {
+                if info.failed || info.done {
                     boost.retain(|(p, _)| p != &pending_id);
                     visible.retain(|(p, _)| p != &pending_id);
+                    fail_counts.retain(|(p, _), _| p != &pending_id);
                 }
                 let _ = tx.send(ImportEvent::LazyProgress(info));
                 if let Some(ctx) = &wake {
                     ctx.request_repaint();
                 }
             }
-            Err(_) => {
-                // A failed step (transient store error, a deck
-                // forgotten mid-flight): back off briefly instead
-                // of spinning on it; the page stays pending and a
-                // later Kick or click retries it.
-                std::thread::sleep(std::time::Duration::from_millis(400));
+            Err(e) => {
+                // A failed step. Transient causes (a briefly
+                // locked file, a store hiccup) keep the old
+                // posture: back off briefly and let a later pick
+                // retry the page. But the SAME page failing
+                // LAZY_PAGE_MAX_ATTEMPTS times in a row is a
+                // deterministic failure (diagnosis 2026-11-25,
+                // suspect 2): mark the whole deck failed with
+                // this step's own error text — the existing
+                // failed presentation (red status slot + 忽略;
+                // re-importing the deck heals it) — purge its
+                // queued pages, and stop working on it, instead
+                // of retrying it forever while the status slot
+                // hangs on "splitting" and every page behind it
+                // starves.
+                let key = (pending_id.clone(), index);
+                let attempts = {
+                    let c = fail_counts.entry(key.clone()).or_insert(0);
+                    *c += 1;
+                    *c
+                };
+                if attempts < LAZY_PAGE_MAX_ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                } else {
+                    fail_counts.remove(&key);
+                    let body = json!({ "pending_id": pending_id, "error": e });
+                    let marked = local
+                        .dispatch("POST", "/v1/import/lazy-fail", Some(&body))
+                        .and_then(|r| r.ok());
+                    boost.retain(|(p, _)| p != &pending_id);
+                    visible.retain(|(p, _)| p != &pending_id);
+                    let info = LazyProgressInfo {
+                        pending_id: pending_id.clone(),
+                        index,
+                        split_count: marked
+                            .as_ref()
+                            .map(|v| i(v, "split_count") as usize)
+                            .unwrap_or(0),
+                        slide_count: marked
+                            .as_ref()
+                            .map(|v| i(v, "slide_count") as usize)
+                            .unwrap_or(0),
+                        grouped: false,
+                        done: false,
+                        failed: true,
+                        error: e,
+                    };
+                    let _ = tx.send(ImportEvent::LazyProgress(info));
+                    if let Some(ctx) = &wake {
+                        ctx.request_repaint();
+                    }
+                }
             }
         }
         if !turbo.load(std::sync::atomic::Ordering::Relaxed) {
@@ -4641,16 +4704,28 @@ fn lazy_worker_thread(
     }
 }
 
+/// How many consecutive failures of the SAME page's split step
+/// the worker tolerates before calling the failure terminal:
+/// the first failures may be transient (a briefly locked file,
+/// a store hiccup) and keep the old back-off-and-retry posture;
+/// the third in a row is treated as deterministic.
+const LAZY_PAGE_MAX_ATTEMPTS: u32 = 3;
+
 fn apply_lazy_cmd(
     cmd: LazyCmd,
     boost: &mut std::collections::VecDeque<(String, usize)>,
     visible: &mut std::collections::VecDeque<(String, usize)>,
+    fail_counts: &mut std::collections::HashMap<(String, usize), u32>,
 ) {
     match cmd {
         // Front of the queue, argument order preserved: the
-        // first page named is the next page split.
+        // first page named is the next page split. A click is a
+        // MANUAL retry: the page's failure count resets, so a
+        // page the user explicitly asks for again gets a fresh
+        // attempt budget.
         LazyCmd::Boost(pages) => {
             for p in pages.into_iter().rev() {
+                fail_counts.remove(&p);
                 boost.push_front(p);
             }
         }
@@ -4666,11 +4741,15 @@ fn apply_lazy_cmd(
 }
 
 /// The worker's background pick: the oldest pending deck's
-/// first unsplit page, straight from the durable states. A deck
-/// whose pages all read split but whose record still exists
-/// (grouping / the deck-level gate not yet run — e.g. right
-/// after a restart) is picked once at its first page, which
-/// runs exactly that advance inside the core.
+/// first unresolved page, straight from the durable states. A
+/// page whose wrapper was deleted before its split is gone:
+/// resolved, but `split` stays false for it forever — it must
+/// be skipped here, or the pick lands on it every round and
+/// every page behind it starves (diagnosis 2026-11-25,
+/// suspect 4). A deck whose pages all read resolved but whose
+/// record still exists (grouping / the deck-level gate not yet
+/// run — e.g. right after a restart) is picked once at its
+/// first page, which runs exactly that advance inside the core.
 fn lazy_background_pick(
     local: &local_store::LocalStore,
 ) -> Option<(String, usize)> {
@@ -4683,10 +4762,10 @@ fn lazy_background_pick(
         }
         let pid = s(st, "pending_id");
         let pages = st.get("pages").and_then(|p| p.as_array())?;
-        if let Some(p) = pages
-            .iter()
-            .find(|p| p.get("split").and_then(|x| x.as_bool()) != Some(true))
-        {
+        if let Some(p) = pages.iter().find(|p| {
+            p.get("split").and_then(|x| x.as_bool()) != Some(true)
+                && p.get("gone").and_then(|x| x.as_bool()) != Some(true)
+        }) {
             return Some((pid, i(p, "index") as usize));
         }
         if !pages.is_empty() {
@@ -17142,6 +17221,22 @@ impl App {
     /// completion event lands in the drain in `ui`, which shows
     /// the message and refreshes.
     fn act_import_ppt(&mut self) {
+        let folder_id = self.content.folder_filter.clone();
+        self.act_import_ppt_into(folder_id);
+    }
+
+    /// 导入 PPT into an explicit target folder: the folder id is
+    /// captured by value here and rides the worker closure into
+    /// the lazy-open / staged-import body, so the deck's blocks
+    /// land in THIS folder even if the sidebar selection moves
+    /// while the asynchronous import runs (the empty-folder
+    /// placeholder's import button passes its own folder; the
+    /// toolbar / home entries pass the current selection via
+    /// act_import_ppt). The pipeline below already threads
+    /// folder_id end to end — `lazy_open` files its wrapper units
+    /// under it and the pending record carries it into the fold,
+    /// so grouped blocks land there too.
+    fn act_import_ppt_into(&mut self, folder_id: Option<String>) {
         if !self.need_identity_local("导入 PPT") {
             return;
         }
@@ -17158,7 +17253,6 @@ impl App {
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
-                let folder_id = self.content.folder_filter.clone();
                 let group_id = self.content.import_group.clone();
                 let (local, server, token, tx) = (
                     self.local.clone(),
@@ -17488,8 +17582,24 @@ impl App {
                         if items.is_empty() {
                             // Empty folder: a one-card-high frame
                             // where its cards would be (the
-                            // content_add_card placeholder's frame,
-                            // without its actions).
+                            // content_add_card placeholder's frame),
+                            // carrying the two import entries (user
+                            // ruling 2026-11-25): 导入 PPT opens the
+                            // picker and files the deck into THIS
+                            // folder (act_import_ppt_into), and 智能
+                            // 分块导入 renders in the greyed
+                            // placeholder form until the AI proposer
+                            // lands. The frame's allocation is the
+                            // bare placeholder's, unchanged — the
+                            // buttons live inside it, so the flow's
+                            // geometry (and FlowMetrics, which never
+                            // measured this frame) is untouched. The
+                            // placeholder shows exactly while the
+                            // folder holds no unit rows: lazy-open
+                            // wrapper units are unit rows, so it
+                            // disappears the moment an import starts
+                            // landing, and returns if the folder is
+                            // emptied again.
                             let (rect, _) = ui.allocate_exact_size(
                                 egui::vec2(card_w, card_h),
                                 egui::Sense::hover(),
@@ -17500,6 +17610,91 @@ impl App {
                                 egui::Stroke::new(1.0, palette_color(CARD_BORDER)),
                                 egui::StrokeKind::Middle,
                             );
+                            let mut do_import = false;
+                            ui.scope_builder(
+                                egui::UiBuilder::new().max_rect(rect),
+                                |ui| {
+                                    ui.vertical_centered(|ui| {
+                                        ui.add_space((rect.height() - 28.0) / 2.0);
+                                        // The smart-import button
+                                        // is hand-painted (the
+                                        // placeholder doctrine of
+                                        // tool_slot_placeholder /
+                                        // deckbar_placeholder: a
+                                        // disabled widget swallows
+                                        // its hover text), so both
+                                        // widths are measured up
+                                        // front to centre the pair.
+                                        let smart_label = tr("智能分块导入");
+                                        let smart_galley = ui.painter().layout_no_wrap(
+                                            smart_label.to_string(),
+                                            egui::FontId::proportional(12.5),
+                                            palette_color(TEXT_WEAK).gamma_multiply(0.5),
+                                        );
+                                        let smart_w = smart_galley.size().x + 24.0;
+                                        let import_label = tr("导入 PPT");
+                                        let import_galley = ui.painter().layout_no_wrap(
+                                            import_label.to_string(),
+                                            egui::FontId::proportional(12.5),
+                                            egui::Color32::WHITE,
+                                        );
+                                        let import_w = import_galley.size().x + 32.0;
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 0.0;
+                                            let w = ui.available_width();
+                                            ui.add_space(
+                                                (w - import_w - 8.0 - smart_w).max(0.0)
+                                                    / 2.0,
+                                            );
+                                            // The primary form,
+                                            // identical to
+                                            // btn_primary's
+                                            // construction (accent
+                                            // fill, white 12.5 label,
+                                            // radius 6, 28 high) at
+                                            // the measured width.
+                                            if ui
+                                                .add_sized(
+                                                    [import_w, 28.0],
+                                                    egui::Button::new(
+                                                        egui::RichText::new(import_label)
+                                                            .size(12.5)
+                                                            .color(egui::Color32::WHITE),
+                                                    )
+                                                    .fill(ACCENT)
+                                                    .corner_radius(6),
+                                                )
+                                                .clicked()
+                                            {
+                                                do_import = true;
+                                            }
+                                            ui.add_space(8.0);
+                                            let (srect, sresp) = ui.allocate_exact_size(
+                                                egui::vec2(smart_w, 28.0),
+                                                egui::Sense::hover(),
+                                            );
+                                            ui.painter().rect_filled(
+                                                srect,
+                                                6.0,
+                                                palette_color(BTN_BG).gamma_multiply(0.5),
+                                            );
+                                            let spos =
+                                                srect.center() - smart_galley.size() / 2.0;
+                                            ui.painter().galley(
+                                                spos,
+                                                smart_galley,
+                                                palette_color(TEXT_WEAK).gamma_multiply(0.5),
+                                            );
+                                            sresp.on_hover_text(tr(
+                                                "智能分块导入（AI 即将上线）",
+                                            ));
+                                        });
+                                    });
+                                },
+                            );
+                            if do_import {
+                                self.act_import_ppt_into(Some(fid.clone()));
+                            }
                         } else if virt {
                             self.flow_grid_virtual(
                                 ui,
@@ -17764,7 +17959,15 @@ impl App {
         let mut commit = false;
         let mut cancel = false;
         if let Some(edit) = &mut w.flow_edit {
-            let resp = ui.add_sized([width, 26.0], egui::TextEdit::singleline(&mut edit.text));
+            // LEFT_CENTER align (the folder_edit_row fix's rule:
+            // the builder align outranks every other placement
+            // input) — without it the single-line galley anchors
+            // to the top of the 26pt box and the text rides high.
+            let resp = ui.add_sized(
+                [width, 26.0],
+                egui::TextEdit::singleline(&mut edit.text)
+                    .align(egui::Align2::LEFT_CENTER),
+            );
             if w.flow_edit_focus {
                 resp.request_focus();
                 w.flow_edit_focus = false;
@@ -18237,7 +18440,14 @@ impl App {
         };
         let uid = st.unit_id.clone();
         match self.call_work("PATCH", &format!("/v1/units/{uid}"), Some(body)) {
-            Ok(_) => self.reload_unit_detail(&uid),
+            Ok(_) => {
+                self.reload_unit_detail(&uid);
+                // The wall card carries the name and the intro
+                // line: mark Units so the rename shows on return
+                // (this used to ride on the return path's
+                // refresh_all, removed 2026-11-25).
+                self.changed(Change::Units);
+            }
             Err(e) => self.msg = format!("保存失败：{e}"),
         }
     }
@@ -18298,8 +18508,16 @@ impl App {
         // one without a crumb bar, headed by a plain back button.
         let unit_name = s(&unit, "name");
         if crumb_bar(ui, &[tr("页面"), &unit_name]) == Some(0) {
+            // Back to the wall: pop only, no refresh. The wall
+            // list is kept current by the phase-1 change events
+            // the detail's own mutations fire (rename / bind /
+            // publish mark Change::Units, consumed at the frame
+            // point); with no mutation there is nothing to
+            // re-read. The unconditional refresh_all that used
+            // to sit here (full four-table re-read + the whole
+            // org sweep on the UI thread) was the #101 → wall
+            // return lag reported 2026-11-25.
             st.closed = true;
-            self.refresh_all();
             return;
         }
         // Type tag (unified content model, user ruling
@@ -18622,6 +18840,9 @@ impl App {
                             Ok(v) => {
                                 self.msg = format!("已发布 v{}", s(&v, "semver"));
                                 self.reload_unit_detail(&uid);
+                                // A new latest version changes the
+                                // wall card (version / page count).
+                                self.changed(Change::Units);
                             }
                             Err(e) => self.msg = format!("发布失败：{e}"),
                         }

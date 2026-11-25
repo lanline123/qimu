@@ -347,6 +347,9 @@ impl App {
                     Ok(_) => {
                         self.msg = "草稿已发布为最新版本".into();
                         self.reload_unit_detail(unit_id);
+                        // The wall card's latest version / page
+                        // count changed with the publish.
+                        self.changed(Change::Units);
                     }
                     Err(e) => self.msg = format!("发布草稿失败：{e}"),
                 }
@@ -360,6 +363,7 @@ impl App {
                     Ok(_) => {
                         self.msg = "已放弃该草稿".into();
                         self.reload_unit_detail(unit_id);
+                        self.changed(Change::Units);
                     }
                     Err(e) => self.msg = format!("放弃草稿失败：{e}"),
                 }
@@ -1766,6 +1770,9 @@ impl App {
         }
         self.msg = "页面绑定已更新".into();
         self.reload_unit_detail(&request.unit_id);
+        // Bindings reshape the resolved page sequence, so the
+        // wall card's page count can move with them.
+        self.changed(Change::Units);
     }
 
     fn restore_page_binding(&mut self, unit_id: &str, binding: &Value) {
@@ -1795,6 +1802,9 @@ impl App {
             Ok(_) => {
                 self.msg = ok_msg.into();
                 self.reload_unit_detail(unit_id);
+                // Same reasoning as apply_page_binding: the
+                // resolved sequence (and page count) can move.
+                self.changed(Change::Units);
             }
             Err(error) => self.msg = format!("解绑失败：{error}"),
         }
@@ -1847,6 +1857,7 @@ impl App {
             Ok(_) => {
                 self.msg = "已标缺译".into();
                 self.reload_unit_detail(unit_id);
+                self.changed(Change::Units);
             }
             Err(e) => self.msg = format!("标缺译失败：{e}"),
         }

@@ -106,6 +106,15 @@ pub struct LazyPage {
     pub rendition_id: String,
     pub version_id: String,
     pub split: bool,
+    /// The wrapper unit was deleted before this page's split
+    /// landed: the page is resolved (it counts toward progress
+    /// and toward the deck's completion) but will never split.
+    /// Consumers choosing work must skip gone pages — `split`
+    /// stays false for them forever, so a picker keying on
+    /// `!split` alone would select one endlessly and starve
+    /// every page behind it (diagnosis 2026-11-25, suspect 4).
+    #[serde(default)]
+    pub gone: bool,
 }
 
 /// The result of opening a deck the lazy way: the deck is in
@@ -162,6 +171,7 @@ fn lazy_page_of(p: &PendingPage) -> LazyPage {
         rendition_id: p.rendition_id.clone(),
         version_id: p.version_id.clone(),
         split: p.split,
+        gone: p.gone,
     }
 }
 
@@ -1587,6 +1597,35 @@ impl Store {
             failed,
             error,
         })
+    }
+
+    /// Mark a pending import failed from OUTSIDE the split step
+    /// itself: the client's split worker calls this after one
+    /// page's split step has errored repeatedly (its retry cap),
+    /// because `lazy_split_page` only self-marks the fingerprint
+    /// gate — every other error propagates as Err, and a worker
+    /// that merely retries a deterministically failing page
+    /// would spin on it forever, silently starving the rest of
+    /// the deck (diagnosis 2026-11-25, suspect 2). The terminal
+    /// handling is exactly the fingerprint gate's: the row stays,
+    /// marked failed with the error text, its already-split pages
+    /// and folded blocks untouched; the user dismisses it via
+    /// lazy-forget and may re-import the deck to heal. A record
+    /// already failed keeps its original error.
+    pub fn lazy_fail(
+        &self,
+        pending_id: &str,
+        error: &str,
+    ) -> Result<LazyState, String> {
+        let mut rec = self
+            .get_pending_import(pending_id)?
+            .ok_or_else(|| "待分割记录不存在".to_string())?;
+        if rec.state != "failed" {
+            rec.state = "failed".to_string();
+            rec.error = error.to_string();
+            self.update_pending_import(&rec)?;
+        }
+        Ok(lazy_state_of(&rec))
     }
 
     /// Every pending import's current split state (the worker's

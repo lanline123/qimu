@@ -1537,8 +1537,17 @@ impl App {
                 if self.content_light_open() {
                     self.overlays.pop();
                 } else if let ContentFrame::Unit(st) = self.content.stack.top_mut() {
+                    // Pop only — the breadcrumb return in
+                    // unit_detail does the same. Mutations made
+                    // inside the detail mark their slices dirty
+                    // (phase 1), so the wall is already current;
+                    // the refresh_all that used to run here was
+                    // the #101 return lag (2026-11-25). This is
+                    // the §3.4 deckbar_back re-evaluation the
+                    // phase-1 design scheduled, settled by the
+                    // real-machine report: the full sweep goes,
+                    // the dirty-set consumption stays.
                     st.closed = true;
-                    self.refresh_all();
                 } else {
                     self.navigate_to(Page::Home);
                 }
