@@ -35,7 +35,87 @@ RequestExecutionLevel admin
 !insertmacro MUI_UNPAGE_INSTFILES
 !insertmacro MUI_LANGUAGE "SimpChinese"
 
+; ── 安装时「服务器正在运行」处理 (用户 2026-11-25, 客户端版同款移植) ──
+; 背景: 服务器是常开进程 (开机自启 + 常驻), 覆盖/升级安装时
+; qimu-server.exe 几乎必然正在运行, File 指令直接报错、安装半途
+; 失败。本段在写任何文件之前 (.onInit 与安装段开头各查一次, 后者
+; 防向导期间服务器又被拉起) 检测进程: 在运行 → 弹框问是否关闭 →
+; 选是先温和关闭、复检仍在再强杀、再复检; 选否或杀不掉 → Abort,
+; 此时未写任何文件, 不留半装状态。
+; 检测手段与客户端版一致: nsExec 跑 tasklist 按映像名过滤、管道给
+; find, 以 find 退出码判定 (0 = 在运行)。nsExec 是 NSIS 官方发行
+; 自带插件 (与本脚本已在用的 MUI2/LogicLib 同源, CI 的 apt nsis
+; 包内齐备), 且执行外部命令不弹控制台窗口。判定不解析 tasklist
+; 输出文本, 不受系统语言影响; nsExec 执行失败时 Pop 回错误串、
+; 不等于 "0", 自动降级为「未运行」, 不比现状更差。没在运行时只
+; 多跑两次 tasklist (百毫秒级、无 Sleep), 零感知。tasklist/find
+; 均为 System32 常驻工具。
+; 检测对象: qimu-server.exe 为主; 另含 deckcraft-cli.exe (缩略图
+; 渲染器, 由服务器按需拉起、与服务器同装同目录、同被 File 覆盖,
+; 服务器关闭后残留的孤儿进程同样会锁文件导致 File 失败) —— 与
+; 客户端版把 qimu.exe (CLI) 一并纳入检测同一道理。
+; 关闭方式注意: qimu-server.exe 是控制台进程、无窗口, taskkill
+; 不带 /F 的温和关闭对它多半无效 (与客户端版 qimu.exe 同), 强杀
+; 兜底是实际主路径 (用户已在弹框中同意关闭); 关闭顺序先服务器
+; 后渲染器, 防服务器在渲染器被杀后又拉起新的渲染进程。
+; 自启衔接: 关闭进程不动 HKCU Run 自启项; 安装段仍按既有行为以
+; $INSTDIR 重写该项, 下次登录生效。安装程序不会在装完后自动拉起
+; 服务器 (既有行为, 本段不改): 升级后到下次登录之间需手动从开始
+; 菜单启动一次, 或等下次登录自启。
+; 只用 $R 寄存器, 不碰 .onInit 既有的 $0。$R8 = 检测结果。
+Function QimuDetectRunning
+  StrCpy $R8 0
+  nsExec::Exec '"$SYSDIR\cmd.exe" /C tasklist /FI "IMAGENAME eq qimu-server.exe" /NH | find /I "qimu-server.exe" > NUL'
+  Pop $R0
+  ${If} $R0 == "0"
+    StrCpy $R8 1
+    Return
+  ${EndIf}
+  nsExec::Exec '"$SYSDIR\cmd.exe" /C tasklist /FI "IMAGENAME eq deckcraft-cli.exe" /NH | find /I "deckcraft-cli.exe" > NUL'
+  Pop $R0
+  ${If} $R0 == "0"
+    StrCpy $R8 1
+  ${EndIf}
+FunctionEnd
+
+Function QimuEnsureClosed
+  Call QimuDetectRunning
+  ${If} $R8 == 0
+    Return
+  ${EndIf}
+  MessageBox MB_YESNO|MB_ICONQUESTION "检测到启幕服务器正在运行，需要先关闭才能继续安装。$\r$\n$\r$\n关闭期间，局域网内的启幕客户端将暂时无法连接服务器。$\r$\n$\r$\n是否立即关闭并继续安装？选「否」将取消安装。" IDYES QimuCloseYes
+  Abort
+  QimuCloseYes:
+  ; 温和关闭: taskkill 不带 /F; 服务器是控制台进程, 此步多半无效,
+  ; 靠下面的强杀兜底 (用户已在弹框中同意关闭)。先关服务器再关
+  ; 渲染器, 顺序不可反。
+  nsExec::Exec '"$SYSDIR\taskkill.exe" /IM qimu-server.exe'
+  Pop $R0
+  nsExec::Exec '"$SYSDIR\taskkill.exe" /IM deckcraft-cli.exe'
+  Pop $R0
+  Sleep 2000
+  Call QimuDetectRunning
+  ${If} $R8 == 0
+    Return
+  ${EndIf}
+  ; 温和关闭未生效 → 强杀后最后复检
+  nsExec::Exec '"$SYSDIR\taskkill.exe" /F /IM qimu-server.exe'
+  Pop $R0
+  nsExec::Exec '"$SYSDIR\taskkill.exe" /F /IM deckcraft-cli.exe'
+  Pop $R0
+  Sleep 1000
+  Call QimuDetectRunning
+  ${If} $R8 == 0
+    Return
+  ${EndIf}
+  MessageBox MB_OK|MB_ICONEXCLAMATION "无法自动关闭启幕服务器，请手动关闭启幕服务器后，重新运行安装程序。"
+  Abort
+FunctionEnd
+
 Function .onInit
+  ; 服务器正在运行 → 先提示关闭 (见上方 QimuEnsureClosed); 选否即
+  ; 在此 Abort, 向导都不会打开, 更不写任何文件。
+  Call QimuEnsureClosed
   ; 审计 X1: 已装过 (注册表有 InstallDir) 时绝不改道 —— 旧逻辑只要
   ; D 盘存在就无条件改目录, 升级装进新目录后服务器会在新目录开空库
   ; 并种默认口令管理员, 真数据留在旧目录。D 盘默认只对全新安装生效。
@@ -49,6 +129,10 @@ FunctionEnd
 
 Section "启幕服务器" SEC_SERVER
   SectionIn RO
+  ; 写文件前最后复检一次: 防向导期间服务器又被拉起 (.onInit 已查
+  ; 过, 没在运行时这里只是百毫秒级静默通过)。仍在运行且关不掉/
+  ; 选否 → Abort, 此刻本段尚未写任何文件。
+  Call QimuEnsureClosed
   SetOutPath "$INSTDIR"
   ; X13(修订): 同客户端脚本, File 不接受 /REBOOTOK, 撤下待标准写法验证
   File "win/qimu-server.exe"
