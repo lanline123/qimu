@@ -1552,10 +1552,16 @@ struct WallState {
     search_text: String,
     search_hits: Option<Value>,
     /// Single-click selection on the wall (the accent ring). The
-    /// drill-down itself is the Unit frame, not this field.
+    /// drill-down itself is the Unit frame, not this field. This
+    /// field is also the range-selection anchor: every card click
+    /// (plain or Ctrl/⌘) moves it to the clicked card, and a
+    /// Shift+click selects the display-order range between it
+    /// and the clicked card without moving it.
     selected: Option<String>,
     /// Ctrl/⌘-click multi-selection (组合 / 剪贴板复制·剪切的前置):
     /// unit ids, in click order. `selected` stays the anchor card.
+    /// A Shift+click replaces this set with the anchor-to-target
+    /// range; Ctrl+Shift+click appends the range to it.
     multi: Vec<String>,
     /// Folder-flow header edit currently open on a folder block
     /// (name or note), if any.
@@ -11600,6 +11606,14 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
 
+        // Keyboard Delete → the deckbar sdDel path (gates and
+        // execution live in shell.rs::deckbar_delete_key). Runs
+        // before the workspace draws so a press is answered in
+        // the same frame; the hosted show at the top of this
+        // function has already claimed the keyboard while a
+        // show is live.
+        self.deckbar_delete_key(ui.ctx());
+
         let screen = ui.max_rect();
         self.workspace_ui(ui);
         self.toast(ui, screen);
@@ -17709,11 +17723,15 @@ impl App {
                                 is_anchor,
                             );
                         } else {
-                            ui.horizontal_wrapped(|ui| {
-                                for item in &items {
-                                    self.flow_unit_card(ui, w, item, card_w, card_h, &my_name);
-                                }
-                            });
+                            self.flow_grid_plain(
+                                ui,
+                                w,
+                                &items,
+                                card_w,
+                                card_h,
+                                per_row_n,
+                                &my_name,
+                            );
                         }
                         ui.add_space(12.0);
                     }
@@ -17749,11 +17767,15 @@ impl App {
                                 false,
                             );
                         } else {
-                            ui.horizontal_wrapped(|ui| {
-                                for item in &root_items {
-                                    self.flow_unit_card(ui, w, item, card_w, card_h, &my_name);
-                                }
-                            });
+                            self.flow_grid_plain(
+                                ui,
+                                w,
+                                &root_items,
+                                card_w,
+                                card_h,
+                                per_row_n,
+                                &my_name,
+                            );
                         }
                     }
                     if do_scroll {
@@ -17763,11 +17785,48 @@ impl App {
         });
     }
 
+    /// The folder-flow card grid on the plain (below-threshold)
+    /// path: rows of `per_row` cards chunked by hand and built
+    /// with plain `ui.horizontal` — the exact row geometry
+    /// `flow_grid_virtual` spacers for, so the wall looks the
+    /// same on both sides of FLOW_VIRTUALIZE_MIN. Do NOT
+    /// "simplify" this back to `ui.horizontal_wrapped`: a wall
+    /// card is an `egui::Frame`, and a Frame allocates in its
+    /// parent by exact rect (`Frame::end` →
+    /// `Ui::allocate_rect`), which never passes through the
+    /// placer's wrap check (`Layout::next_frame`) — in a
+    /// wrapping layout the cards march right in a single row
+    /// past the clip edge and the overflow is unreachable (the
+    /// 2026-11-25 33-card folder: one visible row of ~6,
+    /// deleting the front cards surfaced the next ones).
+    /// Size-first widgets (buttons, labels) wrap fine; Frame
+    /// cards never do, so every card grid in this client chunks
+    /// its rows itself (see also `showroom_cards` and
+    /// `index_overview`).
+    fn flow_grid_plain(
+        &mut self,
+        ui: &mut egui::Ui,
+        w: &mut WallState,
+        items: &[Value],
+        card_w: f32,
+        card_h: f32,
+        per_row: usize,
+        my_name: &str,
+    ) {
+        for row in items.chunks(per_row.max(1)) {
+            ui.horizontal(|ui| {
+                for item in row {
+                    self.flow_unit_card(ui, w, item, card_w, card_h, my_name);
+                }
+            });
+        }
+    }
+
     /// The folder-flow card grid on the virtualized path: the
-    /// same rows `horizontal_wrapped` would form — fluid columns
+    /// same rows `flow_grid_plain` forms — fluid columns
     /// of `card_w` with 12pt gaps, a row's height the tallest
     /// card in it, cards centred within their row (`ui.horizontal`
-    /// is the wrapped row's own layout, minus the wrap) — but a
+    /// is the row's own layout) — but a
     /// row whose rect misses `band` is one equal-height spacer
     /// allocation instead of built cards. A spacer row advances
     /// the cursor by its height plus the layout's trailing item
@@ -18194,17 +18253,117 @@ impl App {
         } else if click.clicked() {
             // Ctrl/⌘-click toggles the card in the
             // multi-selection （组合 / 剪贴板的前置）;
-            // a plain click stays the single selection.
-            let multi_key = ui.ctx().input(|inp| inp.modifiers.command || inp.modifiers.ctrl);
-            if multi_key {
-                if let Some(pos) = w.multi.iter().position(|u| u == &uid) {
-                    w.multi.remove(pos);
-                } else {
-                    w.multi.push(uid.clone());
+            // a plain click stays the single selection. Both
+            // move the range anchor (`w.selected`) to the
+            // clicked card. Shift+click instead selects the
+            // display-order range from the anchor to this card
+            // (Ctrl+Shift appends the range) and leaves the
+            // anchor where it is; with no usable anchor it
+            // falls back to a plain click.
+            let mods = ui.ctx().input(|inp| inp.modifiers);
+            let multi_key = mods.command || mods.ctrl;
+            if mods.shift && self.wall_range_select(w, &uid, multi_key) {
+                // Range applied; the anchor stays put.
+            } else {
+                if multi_key {
+                    if let Some(pos) = w.multi.iter().position(|u| u == &uid) {
+                        w.multi.remove(pos);
+                    } else {
+                        w.multi.push(uid.clone());
+                    }
+                }
+                w.selected = Some(uid.clone());
+            }
+        }
+    }
+
+    /// The content wall's card ids in display order: the
+    /// folder flow flattened — each content-scope folder's
+    /// blocks in depth-first tree order (a folder's own blocks
+    /// keep the units list order), then the folder-less tail
+    /// group. This must match the order `content_wall` renders
+    /// in; it is computed on demand (only a Shift+click needs
+    /// it), so the render path itself is untouched.
+    fn wall_display_order(&self) -> Vec<String> {
+        let mut folders = self.folders.clone();
+        folders.retain(|f| s(f, "scope") == "content");
+        folders.sort_by_key(|f| i(f, "sort"));
+        let mut ordered: Vec<Value> = Vec::new();
+        fn walk(folders: &[Value], parent: &str, out: &mut Vec<Value>) {
+            for f in folders {
+                if s(f, "parent_id") == parent {
+                    out.push(f.clone());
+                    let id = s(f, "id");
+                    walk(folders, &id, out);
                 }
             }
-            w.selected = Some(uid.clone());
         }
+        walk(&folders, "", &mut ordered);
+        for f in &folders {
+            if !ordered.iter().any(|x| s(x, "id") == s(f, "id")) {
+                ordered.push(f.clone());
+            }
+        }
+        let unit_folder = |it: &Value| -> String {
+            s(&it.get("unit").cloned().unwrap_or(json!({})), "folder_id")
+        };
+        let unit_id =
+            |it: &Value| -> String { s(&it.get("unit").cloned().unwrap_or(json!({})), "id") };
+        let mut out: Vec<String> = Vec::new();
+        for f in &ordered {
+            let fid = s(f, "id");
+            for it in self.units.iter().filter(|it| unit_folder(it) == fid) {
+                out.push(unit_id(it));
+            }
+        }
+        for it in self.units.iter().filter(|it| {
+            let fid = unit_folder(it);
+            fid.is_empty() || !self.folders.iter().any(|f| s(f, "id") == fid)
+        }) {
+            out.push(unit_id(it));
+        }
+        out
+    }
+
+    /// Shift+click on a wall card: select the display-order
+    /// range between the anchor (`w.selected`, moved by the
+    /// last plain / Ctrl click) and `target`. Without Ctrl the
+    /// range replaces the multi-selection; with Ctrl it is
+    /// appended to it (ids already present keep their place).
+    /// Unsplit (not-yet-usable) cards inside the range are
+    /// skipped, matching their click exclusion — they can
+    /// never be selected. The anchor itself does not move.
+    /// Returns false when there is no usable anchor — none
+    /// set, or either end is outside the current display
+    /// order (a stale anchor after the wall's contents
+    /// changed) — and the caller falls back to a plain click.
+    fn wall_range_select(&self, w: &mut WallState, target: &str, append: bool) -> bool {
+        let Some(anchor) = w.selected.clone() else {
+            return false;
+        };
+        let order = self.wall_display_order();
+        let (Some(a), Some(t)) = (
+            order.iter().position(|id| id == &anchor),
+            order.iter().position(|id| id == target),
+        ) else {
+            return false;
+        };
+        let (lo, hi) = if a <= t { (a, t) } else { (t, a) };
+        let range: Vec<String> = order[lo..=hi]
+            .iter()
+            .filter(|id| !self.lazy_unit_page.contains_key(*id))
+            .cloned()
+            .collect();
+        if append {
+            for id in range {
+                if !w.multi.contains(&id) {
+                    w.multi.push(id);
+                }
+            }
+        } else {
+            w.multi = range;
+        }
+        true
     }
 
     /// Content page · local cache management (prototype #6b
@@ -22240,6 +22399,7 @@ impl App {
             // min 236px wide, 12px gaps.
             let avail = ui.available_width();
             let per_row = ((avail + 12.0) / 248.0).floor().max(1.0);
+            let per_row_n = (per_row as usize).max(1);
             let outer_width = ((avail + 12.0) / per_row - 12.0).floor().max(3.0);
             // egui frames include the border in their outer allocation.
             let card_w = outer_width - 2.0;
@@ -22284,10 +22444,18 @@ impl App {
                 } else {
                     ui.add_space(10.0);
                 }
-                ui.with_layout(
-                    egui::Layout::left_to_right(egui::Align::Min).with_main_wrap(true),
-                    |ui| {
-                        for x in group {
+                // Rows are chunked by hand, not left to a
+                // wrapping layout: the cards are Frames, and a
+                // Frame's exact-rect allocation never triggers
+                // the placer's wrap check — under
+                // `with_main_wrap(true)` they formed one endless
+                // row, the content wall's 2026-11-25 defect (see
+                // flow_grid_plain). `horizontal_top` keeps the
+                // Align::Min tops the wrapped layout promised.
+                for row in group.chunks(per_row_n) {
+                    ui.horizontal_top(|ui| {
+                        for x in row {
+                            let x = x.clone();
                             let xid = s(&x, "id");
                             let selected = ov.selected.as_deref() == Some(xid.as_str());
                             let scope_color = IndexScope::of(&x).color();
@@ -22386,8 +22554,8 @@ impl App {
                                 open = Some(xid);
                             }
                         }
-                    },
-                );
+                    });
+                }
                 ui.add_space(8.0);
             }
         });

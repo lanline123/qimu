@@ -1597,6 +1597,98 @@ impl App {
         }
     }
 
+    /// Keyboard Delete (user report 2026-11-25: with cards
+    /// selected the key did nothing — it was never wired
+    /// anywhere in the client). Runs the deckbar sdDel path
+    /// verbatim — same `deckbar_delete_targets`, same
+    /// `deckbar_delete_selection` — so the key inherits the
+    /// button's whole semantics: the five target kinds, trash
+    /// categorisation, the pin-guarded version refusal, the
+    /// spoken result line. Three gates, all must pass:
+    /// - a plain Delete press, first press only (key repeats
+    ///   are ignored: holding the key down must not chain from
+    ///   a selected history version into its owning block),
+    ///   and no Ctrl/Alt/Cmd chord;
+    /// - no widget holds focus — the page editor undo/redo
+    ///   idiom (`memory.focused()`): a focused TextEdit keeps
+    ///   Delete for its own text, so renaming a folder or
+    ///   typing in a search box can never delete a card;
+    /// - no overlay or dialog is open
+    ///   (`delete_key_dialog_open`): Delete must never reach
+    ///   through a confirm, the login window or a share
+    ///   dialog at the wall behind it.
+    /// With no selection the targets list is empty and the
+    /// key is a silent no-op — exactly the button's grey
+    /// state. Backspace is deliberately not mapped: on
+    /// Windows Delete is the delete key, and Backspace stays
+    /// unclaimed.
+    pub(super) fn deckbar_delete_key(&mut self, ctx: &egui::Context) {
+        let pressed = ctx.input(|i| {
+            i.events.iter().any(|e| match e {
+                egui::Event::Key {
+                    key,
+                    pressed,
+                    repeat,
+                    modifiers,
+                    ..
+                } => {
+                    *key == egui::Key::Delete
+                        && *pressed
+                        && !*repeat
+                        && !modifiers.ctrl
+                        && !modifiers.alt
+                        && !modifiers.command
+                }
+                _ => false,
+            })
+        });
+        if !pressed {
+            return;
+        }
+        if ctx.memory(|m| m.focused().is_some()) {
+            return;
+        }
+        if self.delete_key_dialog_open() {
+            return;
+        }
+        let targets = self.deckbar_delete_targets();
+        if targets.is_empty() {
+            return;
+        }
+        ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete));
+        self.deckbar_delete_selection(targets);
+    }
+
+    /// Any overlay or standalone dialog that must shield the
+    /// wall from the keyboard Delete shortcut. The overlay
+    /// stack covers Confirm / Light / PickTemplate / PageEdit /
+    /// DeckInfo / Present / AllVersions; the rest are the
+    /// App-level windows and modals drawn beside it, plus the
+    /// index detail's pending more-action modal and the
+    /// toolbar popup menus. The search-results window is
+    /// deliberately NOT a shield: it is a persistent companion
+    /// the wall stays fully interactive under, so selecting a
+    /// card and pressing Delete keeps working while it floats.
+    fn delete_key_dialog_open(&self) -> bool {
+        if !self.overlays.is_empty()
+            || self.login_open
+            || self.about_open
+            || self.folder_sync_open
+            || self.must_change_pw
+            || self.folder_delete_confirm.is_some()
+            || self.share_dialog.is_some()
+            || self.pull_dialog.is_some()
+            || self.push_dialog.is_some()
+            || self.workspace_controls.menu_open()
+        {
+            return true;
+        }
+        match self.index.stack.top() {
+            IndexFrame::Detail(st) => st.more_action.is_some(),
+            _ => false,
+        }
+    }
+
     /// sdDel's targets for the current context (user ruling
     /// 2026-11-25: clickable whenever anything is selected, on
     /// any page). Resolution per page:

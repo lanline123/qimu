@@ -123,6 +123,14 @@ impl WorkspaceControls {
             }
         }
     }
+
+    /// Either toolbar popup menu (account / server) is open.
+    /// A popup menu owns the user's attention while it is up,
+    /// so global shortcuts (the deckbar Delete key) stand down
+    /// until it closes.
+    pub(super) fn menu_open(&self) -> bool {
+        self.account_menu.is_open() || self.server_menu.is_open()
+    }
 }
 
 fn menu_item(ui: &mut egui::Ui, label: &str) -> bool {
