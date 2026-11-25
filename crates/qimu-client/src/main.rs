@@ -4528,6 +4528,12 @@ impl App {
         // the local library, so this launch re-adopts them and
         // restarts the split worker.
         app.lazy_resume();
+        // Plaza wall backfill (2026-11-25): seed the showroom
+        // wall from the local cache index before any refresh
+        // runs, so a cold start with no reachable server still
+        // shows the decks this machine holds cached; the first
+        // successful live fetch replaces the list wholesale.
+        app.backfill_showroom_from_cache();
         if env_autologin_requested() && !app.password.is_empty() {
             app.do_login();
             // Screenshot helper: QIMU_OPEN=index|unit opens the first item's detail.
@@ -5355,7 +5361,7 @@ impl App {
     /// plus the local offline cache index. Named-session data
     /// loads through refresh_all instead.
     fn refresh_guest(&mut self) {
-        if let Ok(v) = self.call("GET", "/v1/showroom?state=live", None) {
+        let live_fetched = if let Ok(v) = self.call("GET", "/v1/showroom?state=live", None) {
             self.showroom_live = v
                 .get("items")
                 .and_then(|f| f.as_array())
@@ -5369,8 +5375,17 @@ impl App {
             // session (audit L5).
             self.index_covers.retain(|_, v| !v.is_empty());
             self.resolve_showroom_covers();
-        }
+            true
+        } else {
+            false
+        };
         self.cache_entries = load_cache_index();
+        if !live_fetched {
+            // No live list this pass: if none has landed yet
+            // this session either, floor the wall with the
+            // local cache index instead of leaving it empty.
+            self.backfill_showroom_from_cache();
+        }
     }
 
     /// Plaza card covers: resolve each live item's source index to
@@ -5678,7 +5693,7 @@ impl App {
         if let Ok(v) = self.call("GET", "/v1/org", None) {
             self.org = v;
         }
-        if let Ok(v) = self.call("GET", "/v1/showroom?state=live", None) {
+        let live_fetched = if let Ok(v) = self.call("GET", "/v1/showroom?state=live", None) {
             self.showroom_live = v
                 .get("items")
                 .and_then(|f| f.as_array())
@@ -5687,6 +5702,12 @@ impl App {
             self.reconcile_cache_staleness();
             self.index_covers.retain(|_, v| !v.is_empty());
             self.resolve_showroom_covers();
+            true
+        } else {
+            false
+        };
+        if !live_fetched {
+            self.backfill_showroom_from_cache();
         }
         if let Ok(v) = self.call("GET", "/v1/showroom?state=pending", None) {
             self.showroom_pending = v
@@ -5847,7 +5868,7 @@ impl App {
         if let Ok(v) = self.call("GET", "/v1/org", None) {
             self.org = v;
         }
-        if let Ok(v) = self.call("GET", "/v1/showroom?state=live", None) {
+        let live_fetched = if let Ok(v) = self.call("GET", "/v1/showroom?state=live", None) {
             self.showroom_live = v
                 .get("items")
                 .and_then(|f| f.as_array())
@@ -5860,6 +5881,12 @@ impl App {
             // the blanks.
             self.index_covers.retain(|_, v| !v.is_empty());
             self.resolve_showroom_covers();
+            true
+        } else {
+            false
+        };
+        if !live_fetched {
+            self.backfill_showroom_from_cache();
         }
         for x in self.indexes.clone() {
             let xid = s(&x, "id");
@@ -10739,6 +10766,78 @@ impl App {
         }
         if changed {
             save_cache_index(&self.cache_entries);
+        }
+    }
+
+    /// Plaza wall backfill (2026-11-25): the wall list comes
+    /// from the live showroom list only, so a cold start with
+    /// no reachable server rendered an empty wall even when
+    /// the machine holds complete offline cache bundles. When
+    /// no live list has been fetched this session (the list is
+    /// still empty), seed it from the cache index's showroom
+    /// bundles (`sr_*` entries): the wall gets a floor of what
+    /// this machine actually holds, and each card keeps the
+    /// existing offline semantics — a complete bundle opens
+    /// offline through the cached detail cascade in
+    /// `open_showroom_deck`, an incomplete or stale one reads
+    /// through `sr_bundle_cached` and the persisted stale flag
+    /// exactly as a card in an in-session list does. A
+    /// successful live fetch replaces the list wholesale (the
+    /// refresh paths own that assignment), so backfilled rows
+    /// never mix into or duplicate live rows; card selection
+    /// is keyed by item id, so it survives the swap.
+    fn backfill_showroom_from_cache(&mut self) {
+        if !self.showroom_live.is_empty() {
+            return;
+        }
+        // The on-disk index is the floor's source: reload it
+        // so a backfill after a failed refresh also sees
+        // bundles cached earlier in this session. Every cache
+        // mutation persists the index, so this never rolls
+        // the in-memory state back.
+        self.cache_entries = load_cache_index();
+        let mut seen = std::collections::HashSet::new();
+        let mut items = Vec::new();
+        for e in &self.cache_entries {
+            let key = s(e, "key");
+            let Some(item_id) = key.strip_prefix("sr_") else {
+                continue;
+            };
+            if item_id.is_empty() || !seen.insert(item_id.to_string()) {
+                continue;
+            }
+            items.push(json!({
+                "id": item_id,
+                "title": s(e, "title"),
+                "source_index_id": s(e, "source_index_id"),
+                "created_ms": i(e, "cached_ms"),
+            }));
+        }
+        if items.is_empty() {
+            return;
+        }
+        self.showroom_live = items;
+        // Seed covers from the bundles' cached index details —
+        // the same first-resolved-version extraction the live
+        // cover pass performs — so a complete bundle's card
+        // shows its cover offline instead of a blank.
+        for item in self.showroom_live.clone() {
+            let src = s(&item, "source_index_id");
+            if src.is_empty() || self.index_covers.contains_key(&src) {
+                continue;
+            }
+            if let Some(d) = self.cached_index_detail(&s(&item, "id")) {
+                if let Some(vid) = d
+                    .get("resolved_entries")
+                    .and_then(|r| r.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|e| e.get("resolved"))
+                    .and_then(|r| r.get("id"))
+                    .and_then(|x| x.as_str())
+                {
+                    self.index_covers.insert(src, vid.to_string());
+                }
+            }
         }
     }
 

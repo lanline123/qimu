@@ -38,7 +38,74 @@ RequestExecutionLevel admin
 !insertmacro MUI_UNPAGE_INSTFILES
 !insertmacro MUI_LANGUAGE "SimpChinese"
 
+; ── 安装时「软件正在运行」处理 (用户 2026-11-25) ──────────────────
+; 背景: 覆盖安装时若 qimu-client.exe 正在运行, File 指令直接报错、
+; 安装半途失败。本段在写任何文件之前 (.onInit 与安装段开头各查
+; 一次, 后者防用户在向导期间又把软件打开) 检测进程: 在运行 →
+; 弹框问是否关闭 → 选是先温和关闭、复检仍在再强杀、再复检;
+; 选否或杀不掉 → Abort, 此时未写任何文件, 不留半装状态。
+; 检测手段: nsExec 跑 tasklist 按映像名过滤、管道给 find, 以 find
+; 退出码判定 (0 = 在运行)。nsExec 是 NSIS 官方发行自带插件 (与
+; 本脚本已在用的 MUI2/LogicLib 同源, CI 的 apt nsis 包内齐备),
+; 且执行外部命令不弹控制台窗口。判定不解析 tasklist 输出文本,
+; 不受系统语言影响。没在运行时只多跑两次 tasklist (百毫秒级、
+; 无 Sleep), 零感知。tasklist/find 均为 System32 常驻工具。
+; 检测对象含 qimu.exe (CLI): 它与主程序同装同目录、同被 File
+; 覆盖, 在运行 (长命令/计划任务) 时同样会锁文件导致 File 失败。
+; 只用 $R 寄存器, 不碰 .onInit 既有的 $0。$R8 = 检测结果。
+Function QimuDetectRunning
+  StrCpy $R8 0
+  nsExec::Exec '"$SYSDIR\cmd.exe" /C tasklist /FI "IMAGENAME eq qimu-client.exe" /NH | find /I "qimu-client.exe" > NUL'
+  Pop $R0
+  ${If} $R0 == "0"
+    StrCpy $R8 1
+    Return
+  ${EndIf}
+  nsExec::Exec '"$SYSDIR\cmd.exe" /C tasklist /FI "IMAGENAME eq qimu.exe" /NH | find /I "qimu.exe" > NUL'
+  Pop $R0
+  ${If} $R0 == "0"
+    StrCpy $R8 1
+  ${EndIf}
+FunctionEnd
+
+Function QimuEnsureClosed
+  Call QimuDetectRunning
+  ${If} $R8 == 0
+    Return
+  ${EndIf}
+  MessageBox MB_YESNO|MB_ICONQUESTION "检测到启幕正在运行，需要先关闭才能继续安装。$\r$\n$\r$\n是否立即关闭并继续安装？选「否」将取消安装。" IDYES QimuCloseYes
+  Abort
+  QimuCloseYes:
+  ; 温和关闭: taskkill 不带 /F 对 GUI 程序发 WM_CLOSE 关闭消息,
+  ; 客户端可走正常退出路径; qimu.exe 是控制台程序、无窗口, 此步
+  ; 对它无效, 靠下面的强杀兜底 (用户已在弹框中同意关闭)。
+  nsExec::Exec '"$SYSDIR\taskkill.exe" /IM qimu-client.exe'
+  Pop $R0
+  nsExec::Exec '"$SYSDIR\taskkill.exe" /IM qimu.exe'
+  Pop $R0
+  Sleep 2000
+  Call QimuDetectRunning
+  ${If} $R8 == 0
+    Return
+  ${EndIf}
+  ; 温和关闭未生效 → 强杀后最后复检
+  nsExec::Exec '"$SYSDIR\taskkill.exe" /F /IM qimu-client.exe'
+  Pop $R0
+  nsExec::Exec '"$SYSDIR\taskkill.exe" /F /IM qimu.exe'
+  Pop $R0
+  Sleep 1000
+  Call QimuDetectRunning
+  ${If} $R8 == 0
+    Return
+  ${EndIf}
+  MessageBox MB_OK|MB_ICONEXCLAMATION "无法自动关闭启幕，请手动关闭启幕后，重新运行安装程序。"
+  Abort
+FunctionEnd
+
 Function .onInit
+  ; 软件正在运行 → 先提示关闭 (见上方 QimuEnsureClosed); 选否即
+  ; 在此 Abort, 向导都不会打开, 更不写任何文件。
+  Call QimuEnsureClosed
   ; 审计 X1: 已装过 (注册表有 InstallDir) 时绝不改道 —— 旧逻辑只要
   ; D 盘存在就无条件改目录, 升级装进新目录后客户端找不到旧库。
   ; D 盘默认只对全新安装生效。
@@ -52,6 +119,10 @@ FunctionEnd
 
 Section "启幕客户端" SEC_CLIENT
   SectionIn RO
+  ; 写文件前最后复检一次: 防向导期间软件又被打开 (.onInit 已查过,
+  ; 没在运行时这里只是百毫秒级静默通过)。仍在运行且关不掉/选否 →
+  ; Abort, 此刻本段尚未写任何文件。
+  Call QimuEnsureClosed
   SetOutPath "$INSTDIR"
   ; X13(修订): File 指令不接受 /REBOOTOK (makensis 会把它当文件名,
   ; 2026-11-25 构建实证), 锁住 exe 的重启替换本轮撤下, 待用
