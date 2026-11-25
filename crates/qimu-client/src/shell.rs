@@ -1706,6 +1706,26 @@ impl App {
                         }]
                     }
                 }
+                SrFrame::Present(pv) => {
+                    // The 讲稿视图 sheet sits on top of the deck
+                    // frame and carries that deck's item: the
+                    // open deck is still the current object, so
+                    // the target is the deck itself, exactly as
+                    // in the Deck arm above. (The matching
+                    // cleanup in deckbar_delete_selection
+                    // collapses the stack to the wall, so the
+                    // buried deck frame never resurfaces.)
+                    let id = s(&pv.item, "id");
+                    if id.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![DelTarget {
+                            kind: "showroom",
+                            id,
+                            label: s(&pv.item, "title"),
+                        }]
+                    }
+                }
                 SrFrame::Wall => match &self.showroom.selected_card {
                     Some(id) => {
                         let label = self
@@ -1786,6 +1806,22 @@ impl App {
                     }
                 }
                 "showroom" => {
+                    // The 讲稿视图 sheet may top the stack with
+                    // the deck frame buried beneath it: if the
+                    // sheet's deck is the deleted one, collapse
+                    // the stack to the wall — the buried deck
+                    // frame must not resurface rendering a
+                    // trashed entry. (NavStack exposes no
+                    // below-top access; pop_to is the close.
+                    // The match reads the item id out first,
+                    // same borrow dance as deckbar_back.)
+                    let present_is_target = match self.showroom.stack.top() {
+                        SrFrame::Present(pv) => s(&pv.item, "id") == t.id,
+                        _ => false,
+                    };
+                    if present_is_target {
+                        self.showroom.stack.pop_to(0);
+                    }
                     if let SrFrame::Deck(st) = self.showroom.stack.top_mut() {
                         if s(&st.item, "id") == t.id {
                             st.closed = true;

@@ -14018,7 +14018,7 @@ impl App {
                                                 )
                                                 .desired_width(note_w - 28.0)
                                                 .desired_rows(5)
-                                                .frame(false)
+                                                .frame(egui::Frame::NONE)
                                                 .hint_text("暂无讲稿"),
                                             );
                                             if resp.lost_focus() {
