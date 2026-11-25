@@ -11253,7 +11253,7 @@ impl App {
             return;
         };
         let label = entry.label.clone();
-        let result: Result<(Vec<Change>, Option<UndoEntry>), String> = match entry.action {
+        let result: Result<(Vec<Change>, Option<UndoAction>), String> = match entry.action {
             RedoAction::MoveUnits { positions } => match &self.local {
                 Some(local) => {
                     // Counter-capture: the library's CURRENT
