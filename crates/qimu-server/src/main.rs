@@ -39,6 +39,13 @@ struct AppState {
     /// Guest-token issuance throttle (audit L1): key peer ip →
     /// (tokens issued in the window, window start ms).
     guest_guard: Mutex<HashMap<String, (u32, i64)>>,
+    /// Controlled shutdown handle (user ruling 2026-11-25: the
+    /// server can be closed from inside the software): the admin
+    /// shutdown endpoint flips this watch flag; the serve loop's
+    /// graceful-shutdown waiter observes it and drains. A watch
+    /// channel (not a Notify) so a flip can never be lost between
+    /// the endpoint and the waiter.
+    shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 type St = Arc<AppState>;
@@ -1794,6 +1801,49 @@ async fn list_units(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
     Ok(Json(json!({ "units": out })))
 }
 
+/// Cap on the #101 「内嵌内容块」 child list (D4): a block whose
+/// latest version embeds more blocks than this is pathological;
+/// the zone is a card grid, not a listing surface.
+const EMBEDDED_CHILDREN_LIMIT: usize = 100;
+
+/// Attach the `children` array to a unit detail payload (D4): the
+/// units embedded in this one, shaped exactly like list rows
+/// (`unit_json` without versions) so the client's kids zone can
+/// render them as standard cards; each child in turn carries its
+/// own embedded units as minimal `{unit}` rows — the zone only
+/// counts those for its 「内含 N 个子块」 badge. No embedding →
+/// empty array (the client renders no zone), never an error: a
+/// failure to compute containment must not take the detail down.
+fn attach_children(st: &St, payload: &mut Value, unit: &UnitRec, visible: Option<&std::collections::HashSet<String>>) {
+    let kids = {
+        let store = st.store.lock().unwrap();
+        store
+            .embedded_children(&unit.id, visible, EMBEDDED_CHILDREN_LIMIT)
+            .unwrap_or_default()
+    };
+    let rows: Vec<Value> = kids
+        .iter()
+        .map(|kid| {
+            let mut row = unit_json(st, &kid.unit, false);
+            if let Some(obj) = row.as_object_mut() {
+                obj.insert(
+                    "children".into(),
+                    Value::Array(
+                        kid.grandchildren
+                            .iter()
+                            .map(|g| json!({ "unit": g }))
+                            .collect(),
+                    ),
+                );
+            }
+            row
+        })
+        .collect();
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("children".into(), Value::Array(rows));
+    }
+}
+
 async fn get_unit(State(st): State<St>, headers: HeaderMap, Path(id): Path<String>) -> Api<Value> {
     let user = auth(&st, &headers)?;
     let unit = {
@@ -1806,7 +1856,10 @@ async fn get_unit(State(st): State<St>, headers: HeaderMap, Path(id): Path<Strin
     } {
         return Err(not_found());
     }
-    Ok(Json(unit_json(&st, &unit, true)))
+    let visible = visible_set(&st, &user)?;
+    let mut payload = unit_json(&st, &unit, true);
+    attach_children(&st, &mut payload, &unit, visible.as_ref());
+    Ok(Json(payload))
 }
 
 #[derive(Deserialize)]
@@ -4275,6 +4328,22 @@ fn trash_check_cap(
                     Some(unit.group_id.clone()),
                 )
             }
+            "version" => {
+                // A history version files under its owning block
+                // (title names block + version; rights follow the
+                // block's group). The pin guard rides along inside
+                // Store::trash_add.
+                let ver = store.get_version(object_id).map_err(|_| not_found())?;
+                let rend = store
+                    .get_rendition(&ver.rendition_id)
+                    .map_err(|_| not_found())?;
+                let unit = store.get_unit(&rend.unit_id).map_err(|_| not_found())?;
+                (
+                    format!("{} · v{}", unit.name, ver.semver),
+                    trash_origin(&store, unit.folder_id.as_deref(), "内容页"),
+                    Some(unit.group_id.clone()),
+                )
+            }
             "showroom" => {
                 let item = store
                     .get_showroom(object_id)
@@ -4311,6 +4380,18 @@ fn trash_row_cap(st: &St, user: &UserRec, row: &TrashRec) -> Result<(), (StatusC
                 .get_index(&row.object_id)
                 .map(|x| x.group_id)
                 .map_err(|_| not_found())?,
+            "version" => {
+                let ver = store
+                    .get_version(&row.object_id)
+                    .map_err(|_| not_found())?;
+                let rend = store
+                    .get_rendition(&ver.rendition_id)
+                    .map_err(|_| not_found())?;
+                store
+                    .get_unit(&rend.unit_id)
+                    .map(|u| u.group_id)
+                    .map_err(|_| not_found())?
+            }
             _ => return Err(forbidden()),
         }
     };
@@ -4328,6 +4409,10 @@ fn trash_cover(store: &Store, row: &TrashRec) -> (Option<String>, i64) {
             .ok()
             .and_then(|rs| rs.into_iter().next())
             .and_then(|r| store.latest_version(&r.id).ok().flatten()),
+        // A version row's cover is the version itself (read
+        // directly — list_versions hides trashed versions, which
+        // is exactly what this row is).
+        "version" => store.get_version(&row.object_id).ok(),
         "index" => store
             .branch_head(&row.object_id, "main")
             .ok()
@@ -4367,6 +4452,12 @@ async fn list_trash(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
                 "index" => store
                     .get_index(&row.object_id)
                     .map(|x| in_groups(&x.group_id))
+                    .unwrap_or(false),
+                "version" => store
+                    .get_version(&row.object_id)
+                    .and_then(|v| store.get_rendition(&v.rendition_id))
+                    .and_then(|r| store.get_unit(&r.unit_id))
+                    .map(|u| in_groups(&u.group_id))
                     .unwrap_or(false),
                 _ => false,
             }
@@ -5964,6 +6055,44 @@ fn acquire_server_lock(data_dir: &std::path::Path) -> Result<ServerLock, String>
     ))
 }
 
+/// POST /v1/admin/shutdown — controlled server shutdown (user
+/// ruling 2026-11-25: the server can be closed from inside the
+/// software). A named-admin door: `auth` refuses guests and
+/// anonymous callers outright, and the role gate below refuses
+/// members — only super / dept_admin may close the server. The
+/// success response returns FIRST; the shutdown flag flips
+/// ~300 ms later on a spawned task, so this request (and anything
+/// else in flight) completes before axum's graceful shutdown
+/// stops accepting new connections and drains. Recovery happens
+/// on the server machine: the start-menu shortcut, or the HKCU
+/// Run autostart at the next logon (the installer also relaunches
+/// the server after an upgrade install).
+async fn admin_shutdown(
+    State(st): State<St>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let user = auth(&st, &headers)?;
+    if user.role != "super" && user.role != "dept_admin" {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            "关闭服务器需要管理员权限",
+        ));
+    }
+    println!(
+        "服务器关机：管理员 {}（{}，角色 {}）通过 POST /v1/admin/shutdown 请求关闭服务器",
+        user.display_name, user.username, user.role
+    );
+    let tx = st.shutdown.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let _ = tx.send(true);
+    });
+    Ok(Json(json!({
+        "ok": true,
+        "message": "服务器正在关闭",
+    })))
+}
+
 #[tokio::main]
 async fn main() {
     let data_dir = resolve_data_dir();
@@ -6016,6 +6145,7 @@ async fn main() {
     if standalone {
         println!("单机模式：回环来源的免登录请求按本机所有者处理（设 QIMU_STANDALONE=0 可禁用）");
     }
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let state: St = Arc::new(AppState {
         store: Mutex::new(store),
         translate_jobs: Mutex::new(HashMap::new()),
@@ -6023,6 +6153,7 @@ async fn main() {
         standalone,
         login_guard: Mutex::new(HashMap::new()),
         guest_guard: Mutex::new(HashMap::new()),
+        shutdown: shutdown_tx,
     });
     let app = Router::new()
         .route(
@@ -6043,6 +6174,7 @@ async fn main() {
         .route("/v1/auth/logout", post(logout))
         .route("/v1/me", get(me))
         .route("/v1/me/password", post(change_password))
+        .route("/v1/admin/shutdown", post(admin_shutdown))
         .route("/v1/me/profile", axum::routing::put(put_profile))
         .route("/v1/org", get(org))
         .route("/v1/org/contacts", get(org_contacts))
@@ -6210,12 +6342,35 @@ async fn main() {
         data_dir.display()
     );
     tokio::spawn(discovery_task(port));
-    if let Err(e) = axum::serve(
+    // Graceful shutdown has two triggers: the controlled admin
+    // shutdown endpoint (watch flag in AppState) and Ctrl-C on the
+    // console. Either one stops accepting new connections and lets
+    // in-flight requests finish before the process exits.
+    let shutdown_wait = {
+        let mut rx = shutdown_rx;
+        async move {
+            loop {
+                if *rx.borrow() {
+                    break;
+                }
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
+    };
+    let serve = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .await
-    {
+    .with_graceful_shutdown(async move {
+        tokio::select! {
+            _ = shutdown_wait => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+    });
+    if let Err(e) = serve.await {
         fatal_startup(&format!("服务器运行中断：{e}"));
     }
+    println!("qimu-server 已关闭");
 }

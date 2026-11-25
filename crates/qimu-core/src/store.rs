@@ -9,7 +9,7 @@ use crate::auth::{hash_password, new_id, new_token, now_ms, verify_password};
 use crate::model::IndexEntry;
 use crate::pptx::Package;
 use crate::semver::SemVer;
-use crate::text::{slide_full_text, slide_title};
+use crate::text::{slide_desc, slide_full_text, slide_title};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -197,6 +197,15 @@ pub struct PageInfo {
     pub id: String,
     pub fp: String,
     pub title: String,
+    /// The page's one-line content summary (the prototype's
+    /// per-page `d`): the first visible-text paragraph after
+    /// the title, extracted at import / version creation (see
+    /// `crate::text::slide_desc`). Empty when the page carries
+    /// no body text — and on every row written before this
+    /// field existed (serde default), which the UI presents
+    /// as the prototype's empty state rather than a stand-in.
+    #[serde(default)]
+    pub desc: String,
 }
 
 /// The page entity id for a content fingerprint. Pages are content,
@@ -222,6 +231,10 @@ pub struct PageRec {
     pub fp: String,
     pub hash: String,
     pub title: String,
+    /// The page's one-line content summary as first registered
+    /// (see PageInfo::desc). First registration is canonical,
+    /// so a stock page keeps the empty desc it was born with.
+    pub desc: String,
 }
 
 /// One page of a deck whose import is still splitting (lazy
@@ -236,6 +249,11 @@ pub struct PendingPage {
     pub index: usize,
     pub fp: String,
     pub title: String,
+    /// The page's one-line summary (PageInfo::desc), extracted
+    /// in the open pass; serde-defaulted so pending rows written
+    /// before this field existed still parse (desc stays empty).
+    #[serde(default)]
+    pub desc: String,
     pub text: String,
     pub script: String,
     pub unit_id: String,
@@ -294,6 +312,26 @@ pub struct VersionRec {
     /// from the fragment's notes; editable without bumping the version.
     #[serde(default)]
     pub scripts: Vec<String>,
+}
+
+/// One unit embedded in another (see `Store::embedded_children`):
+/// the child unit plus the units embedded in the child itself
+/// (attached one level deep — the #101 kids zone only counts them
+/// for its 「内含 N 个子块」 badge).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddedChild {
+    pub unit: UnitRec,
+    pub grandchildren: Vec<UnitRec>,
+}
+
+/// First index at which `needle` occurs in `hay` as a contiguous
+/// run, or None. Page-entity sequences are short (a block's page
+/// count), so the naive window scan is the right tool.
+fn subseq_pos(hay: &[String], needle: &[String]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > hay.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -827,7 +865,7 @@ CREATE TABLE IF NOT EXISTS submissions(id TEXT PRIMARY KEY, title TEXT NOT NULL,
 CREATE TABLE IF NOT EXISTS trash_items(id TEXT PRIMARY KEY, kind TEXT NOT NULL, object_id TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', origin TEXT NOT NULL DEFAULT '', deleted_by TEXT NOT NULL DEFAULT '', deleted_ms INTEGER NOT NULL DEFAULT 0, UNIQUE(kind, object_id));
 CREATE TABLE IF NOT EXISTS assemblies(id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, entries_json TEXT NOT NULL, created_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS page_bindings(id TEXT PRIMARY KEY, unit_id TEXT NOT NULL, from_version_id TEXT NOT NULL, from_slot INTEGER NOT NULL, to_version_id TEXT NOT NULL, to_slot INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'manual', author TEXT NOT NULL, created_ms INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS pages(id TEXT PRIMARY KEY, fp TEXT NOT NULL, hash TEXT NOT NULL, title TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS pages(id TEXT PRIMARY KEY, fp TEXT NOT NULL, hash TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', desc TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS custom_groups(id TEXT PRIMARY KEY, name TEXT NOT NULL, owner_id TEXT NOT NULL, created_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS custom_group_members(group_id TEXT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY(group_id, user_id));
 CREATE TABLE IF NOT EXISTS shares(id TEXT PRIMARY KEY, item_kind TEXT NOT NULL, item_id TEXT NOT NULL, title TEXT NOT NULL, from_user TEXT NOT NULL, target_kind TEXT NOT NULL, target_id TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', created_ms INTEGER NOT NULL);
@@ -926,6 +964,7 @@ impl Store {
             ("page_bindings", "to_page_id", "TEXT NOT NULL DEFAULT ''"),
             ("showroom_pins", "commit_id", "TEXT NOT NULL DEFAULT ''"),
             ("users", "must_change_password", "INTEGER NOT NULL DEFAULT 0"),
+            ("pages", "desc", "TEXT NOT NULL DEFAULT ''"),
         ] {
             let has: bool = conn
                 .prepare(&format!("PRAGMA table_info({table})"))
@@ -1094,7 +1133,13 @@ impl Store {
     /// bytes are NOT stored (first registration is canonical — a
     /// same-fingerprint package is the same page). Otherwise the
     /// package goes into the file store and the row is created.
-    pub fn register_page(&self, fp: &str, title: &str, single: &[u8]) -> SResult<PageRec> {
+    pub fn register_page(
+        &self,
+        fp: &str,
+        title: &str,
+        desc: &str,
+        single: &[u8],
+    ) -> SResult<PageRec> {
         let id = page_id_for_fp(fp);
         if let Some(rec) = self.get_page(&id)? {
             return Ok(rec);
@@ -1102,8 +1147,8 @@ impl Store {
         let hash = self.file_put(single)?;
         self.conn
             .execute(
-                "INSERT OR IGNORE INTO pages(id, fp, hash, title) VALUES(?1,?2,?3,?4)",
-                params![id, fp, hash, title],
+                "INSERT OR IGNORE INTO pages(id, fp, hash, title, desc) VALUES(?1,?2,?3,?4,?5)",
+                params![id, fp, hash, title, desc],
             )
             .map_err(db_err)?;
         self.get_page(&id)?.ok_or_else(|| "页实体登记失败".to_string())
@@ -1112,7 +1157,7 @@ impl Store {
     pub fn get_page(&self, id: &str) -> SResult<Option<PageRec>> {
         self.conn
             .query_row(
-                "SELECT id, fp, hash, title FROM pages WHERE id=?1",
+                "SELECT id, fp, hash, title, desc FROM pages WHERE id=?1",
                 params![id],
                 |r| {
                     Ok(PageRec {
@@ -1120,6 +1165,7 @@ impl Store {
                         fp: r.get(1)?,
                         hash: r.get(2)?,
                         title: r.get(3)?,
+                        desc: r.get(4)?,
                     })
                 },
             )
@@ -1466,7 +1512,7 @@ impl Store {
                     filled = false;
                     break;
                 };
-                match self.register_page(&page.fp, &page.title, &single_bytes) {
+                match self.register_page(&page.fp, &page.title, &page.desc, &single_bytes) {
                     Ok(rec) => page.id = rec.id,
                     Err(_) => {
                         filled = false;
@@ -2684,6 +2730,134 @@ impl Store {
         })
     }
 
+    /// The units embedded in `unit_id` — the #101 「内嵌内容块」
+    /// zone's data (D4). The data model keeps no block→block
+    /// relation table: embedding exists only as page-entity
+    /// containment. A version's page sequence is a list of
+    /// content-addressed page entities shared by every block, so
+    /// unit V is embedded in unit U exactly when V's lead
+    /// rendition's latest version's page sequence occurs as a
+    /// contiguous run inside U's lead rendition's latest version's
+    /// page sequence — which is precisely what 组合为内容块 and
+    /// paste-as-block produce (the combined block's pages ARE the
+    /// source blocks' pages, in order). The containment must be
+    /// strict (a verbatim copy is not an embedding) and the child
+    /// must hold at least one page. Children are ordered by where
+    /// their first page lands in the parent's sequence, then by
+    /// name. `visible` filters candidates exactly like
+    /// `list_units` (trashed units never appear). Each child's own
+    /// embedded units ride along as `grandchildren` (one level —
+    /// the zone only counts them). Cost is bounded: one
+    /// `list_units` plus ONE join query fetching every unit's lead
+    /// latest page sequence — no per-unit query fan-out, however
+    /// many units the library holds. `limit` caps the child list.
+    pub fn embedded_children(
+        &self,
+        unit_id: &str,
+        visible: Option<&HashSet<String>>,
+        limit: usize,
+    ) -> SResult<Vec<EmbeddedChild>> {
+        let units = self.list_units(visible)?;
+        if !units.iter().any(|u| u.id == unit_id) {
+            return Ok(Vec::new());
+        }
+        // Every unit's lead rendition's latest version's page
+        // sequence, in one query. Lead rendition = first by
+        // (form, lang) — renditions are UNIQUE(unit_id, form,
+        // lang), so this is the same row `list_renditions` puts
+        // first; latest version = first by the `list_versions`
+        // ordering among non-recalled rows, as `latest_version`.
+        let seqs: std::collections::HashMap<String, Vec<String>> = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT u.id, v.pages_json FROM units u \
+                     JOIN renditions r ON r.unit_id = u.id AND r.id = (\
+                       SELECT r2.id FROM renditions r2 WHERE r2.unit_id = u.id \
+                       ORDER BY r2.form, r2.lang LIMIT 1) \
+                     JOIN versions v ON v.rendition_id = r.id AND v.id = (\
+                       SELECT v2.id FROM versions v2 WHERE v2.rendition_id = r.id \
+                       AND v2.status != 'recalled' \
+                       ORDER BY v2.major DESC, v2.minor DESC, v2.patch DESC, \
+                       v2.created_ms DESC, v2.rowid DESC LIMIT 1)",
+                )
+                .map_err(db_err)?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .map_err(db_err)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(db_err)?;
+            rows.into_iter()
+                .map(|(uid, pages_json)| {
+                    let pages: Vec<PageInfo> =
+                        serde_json::from_str(&pages_json).unwrap_or_default();
+                    let seq = pages
+                        .iter()
+                        .map(|p| {
+                            if p.id.is_empty() {
+                                page_id_for_fp(&p.fp)
+                            } else {
+                                p.id.clone()
+                            }
+                        })
+                        .collect();
+                    (uid, seq)
+                })
+                .collect()
+        };
+        let parent_seq = match seqs.get(unit_id) {
+            Some(s) if s.len() >= 2 => s.clone(),
+            _ => return Ok(Vec::new()),
+        };
+        // (position in parent, unit) for every strict containment.
+        let mut found: Vec<(usize, &UnitRec)> = Vec::new();
+        for u in &units {
+            if u.id == unit_id {
+                continue;
+            }
+            let Some(seq) = seqs.get(&u.id) else {
+                continue;
+            };
+            if seq.is_empty() || seq.len() >= parent_seq.len() {
+                continue;
+            }
+            if let Some(pos) = subseq_pos(&parent_seq, seq) {
+                found.push((pos, u));
+            }
+        }
+        found.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.name.cmp(&b.1.name)));
+        found.truncate(limit);
+        let mut out = Vec::new();
+        for (_, child) in found {
+            let child_seq = seqs.get(&child.id).cloned().unwrap_or_default();
+            let mut grands: Vec<(usize, &UnitRec)> = Vec::new();
+            if child_seq.len() >= 2 {
+                for u in &units {
+                    if u.id == child.id || u.id == unit_id {
+                        continue;
+                    }
+                    let Some(seq) = seqs.get(&u.id) else {
+                        continue;
+                    };
+                    if seq.is_empty() || seq.len() >= child_seq.len() {
+                        continue;
+                    }
+                    if let Some(pos) = subseq_pos(&child_seq, seq) {
+                        grands.push((pos, u));
+                    }
+                }
+                grands.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.name.cmp(&b.1.name)));
+            }
+            out.push(EmbeddedChild {
+                unit: child.clone(),
+                grandchildren: grands.into_iter().map(|(_, u)| u.clone()).collect(),
+            });
+        }
+        Ok(out)
+    }
+
     pub fn update_unit(
         &self,
         id: &str,
@@ -2875,6 +3049,7 @@ impl Store {
                 id: String::new(),
                 fp: s.fingerprint.clone(),
                 title: slide_title(&xml),
+                desc: slide_desc(&xml),
             });
             texts.push(slide_full_text(&xml));
             scripts.push(crate::text::notes_text(&pkg, &s.part));
@@ -2908,7 +3083,7 @@ impl Store {
                 for (i, page) in pages.iter_mut().enumerate() {
                     match singles[i]
                         .to_bytes()
-                        .and_then(|b| self.register_page(&page.fp, &page.title, &b))
+                        .and_then(|b| self.register_page(&page.fp, &page.title, &page.desc, &b))
                     {
                         Ok(rec) => page.id = rec.id,
                         Err(_) => entity_failures += 1,
@@ -3200,7 +3375,19 @@ impl Store {
             .map_err(db_err)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(db_err)?;
-        Ok(rows)
+        // Trashed versions hide exactly like trashed units /
+        // indexes / showroom items hide from their lists (the
+        // trash overlay): every consumer of this list — the
+        // detail history, latest_version, published resolution,
+        // import lookups — sees the version as deleted until the
+        // trash row is restored, and purge makes it permanent.
+        // Direct reads (get_version) are unaffected, which is
+        // what purge / restore / cover resolution rely on.
+        let trashed = self.trashed_ids("version")?;
+        Ok(rows
+            .into_iter()
+            .filter(|v| !trashed.contains(&v.id))
+            .collect())
     }
 
     /// The newest surviving version, drafts included: this is
@@ -5600,6 +5787,31 @@ impl Store {
         if let Some(existing) = self.trash_find(kind, object_id)? {
             return Ok(existing);
         }
+        if kind == "version" {
+            // The delete-time face of delete_version's publish-pin
+            // guard (pin audit N1, user ruling 2026-11-25): a
+            // version a live showroom item pins as its formal
+            // version is refused at the trash door itself, with
+            // the guard's own wording — hiding it would leave the
+            // item pinned to a version its owner believes deleted.
+            // The guard lives here so both faces (local dispatch
+            // and the server handler) inherit it from the one call
+            // they share; delete_version's own check is untouched.
+            let pinned_live: i64 = self
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM showroom_pins p JOIN showroom s ON s.id = p.showroom_id WHERE p.version_id = ?1 AND s.state = 'live'",
+                    params![object_id],
+                    |r| r.get(0),
+                )
+                .map_err(db_err)?;
+            if pinned_live > 0 {
+                return Err(
+                    "该版本正被演示厅条目钉为正式版，不能删除；请先更新该条目的演示推送或将其下架"
+                        .into(),
+                );
+            }
+        }
         let rec = TrashRec {
             id: new_id("trs"),
             kind: kind.into(),
@@ -5789,6 +6001,43 @@ impl Store {
                 .map_err(db_err)?;
                 tx.execute("DELETE FROM showroom WHERE id = ?1", params![oid])
                     .map_err(db_err)?;
+            }
+            "version" => {
+                // delete_version's cascade, inside this purge's
+                // transaction, with its publish-pin guard first
+                // (same query, same refusal): a version that went
+                // to the trash unpinned can still have been pinned
+                // since — by another item's re-push — and purging
+                // it would silently re-resolve that item.
+                let pinned_live: i64 = tx
+                    .query_row(
+                        "SELECT COUNT(*) FROM showroom_pins p JOIN showroom s ON s.id = p.showroom_id WHERE p.version_id = ?1 AND s.state = 'live'",
+                        params![oid],
+                        |r| r.get(0),
+                    )
+                    .map_err(db_err)?;
+                if pinned_live > 0 {
+                    return Err(
+                        "该版本正被演示厅条目钉为正式版，不能彻底删除；请先更新该条目的演示推送或将其下架"
+                            .into(),
+                    );
+                }
+                tx.execute(
+                    "DELETE FROM version_tags WHERE version_id=?1",
+                    params![oid],
+                )
+                .map_err(db_err)?;
+                tx.execute(
+                    "DELETE FROM page_bindings WHERE from_version_id=?1 OR to_version_id=?1",
+                    params![oid],
+                )
+                .map_err(db_err)?;
+                let n = tx
+                    .execute("DELETE FROM versions WHERE id=?1", params![oid])
+                    .map_err(db_err)?;
+                if n == 0 {
+                    return Err("版本不存在".into());
+                }
             }
             other => return Err(format!("unknown trash kind: {other}")),
         }

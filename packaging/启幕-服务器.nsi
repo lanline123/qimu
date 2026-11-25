@@ -59,9 +59,9 @@ RequestExecutionLevel admin
 ; 兜底是实际主路径 (用户已在弹框中同意关闭); 关闭顺序先服务器
 ; 后渲染器, 防服务器在渲染器被杀后又拉起新的渲染进程。
 ; 自启衔接: 关闭进程不动 HKCU Run 自启项; 安装段仍按既有行为以
-; $INSTDIR 重写该项, 下次登录生效。安装程序不会在装完后自动拉起
-; 服务器 (既有行为, 本段不改): 升级后到下次登录之间需手动从开始
-; 菜单启动一次, 或等下次登录自启。
+; $INSTDIR 重写该项, 下次登录生效。且安装段结尾会立即拉起新版
+; 服务器 (用户 2026-11-25 裁定: 装完自动拉启, 见安装段末尾
+; ExecShell), 升级后服务不留空窗, 无需等下次登录。
 ; 只用 $R 寄存器, 不碰 .onInit 既有的 $0。$R8 = 检测结果。
 Function QimuDetectRunning
   StrCpy $R8 0
@@ -155,6 +155,15 @@ Section "启幕服务器" SEC_SERVER
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\QimuServer" "UninstallString" "$INSTDIR\uninstall.exe"
   WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\QimuServer" "NoModify" 1
   WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\QimuServer" "NoRepair" 1
+  ; 装完自动拉启 (用户 2026-11-25 裁定): 服务器装来就是常开的 ——
+  ; 升级时被 QimuEnsureClosed 关掉的进程必须拉回, 全新安装也直接
+  ; 拉启, 与上面的 HKCU Run 自启口径一致 (不等下次登录)。用
+  ; ExecShell 异步拉起: 不等待、不查退出码, 拉起失败 (如被安全
+  ; 软件拦截) 也不会让安装报错收尾 —— 用户仍可从开始菜单手动
+  ; 启动, 或等下次登录自启。此刻进程刚由安装器拉起, 与既有
+  ; 「端口被占 = 已有实例在跑」的服务器自检不冲突 (那是第二个
+  ; 实例才会遇到的情形)。
+  ExecShell "" "$INSTDIR\qimu-server.exe"
 SectionEnd
 
 Section "Uninstall"

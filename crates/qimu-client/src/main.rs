@@ -1226,6 +1226,35 @@ fn load_present_engine() -> PresentEngine {
     }
 }
 
+/// Plaza folder assignments (user ruling 2026-11-25, option (a)):
+/// a showroom item carries its OWN folder home in the plaza
+/// sidebar's "showroom"-scope folder tree — the wall filters by
+/// the item's assignment, never by its source index's folder
+/// (the two id spaces are disjoint since sidebar isolation, so
+/// the old filter could only ever produce an empty wall).
+///
+/// The assignment is a client-side mapping, persisted in
+/// client-settings.json under `plaza_item_folders` as
+/// { item_id: folder_id }: the server's showroom record has no
+/// folder field (see the report's server-gap note), and the
+/// plaza folders themselves are this client's organizational
+/// view, so the mapping lives and dies with the client. Keying
+/// by item id keeps the assignment across live-list replacement
+/// and lets offline cache-backfilled items carry one too.
+fn load_plaza_item_folders() -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    if let Some(obj) = client_settings()["plaza_item_folders"].as_object() {
+        for (item_id, folder_id) in obj {
+            if let Some(fid) = folder_id.as_str() {
+                if !item_id.is_empty() && !fid.is_empty() {
+                    out.insert(item_id.clone(), fid.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// One JSON-lines control connection to a DeckCraft instance.
 struct DcControl {
     reader: std::io::BufReader<std::net::TcpStream>,
@@ -1619,9 +1648,48 @@ enum MetaField {
 /// scripts editor, AI translation target). Drafts die with the
 /// frame — what used to leak from one block into the next through
 /// ContentState now cannot.
+/// The version policy of the index entry this block detail was
+/// opened THROUGH (audit R1): the #101 header's third hint
+/// segment is entry data （锁定版本 / 跟随最新）, and the same
+/// block can sit in several indexes under different policies —
+/// so the policy travels with the entry path that opened the
+/// detail, never with the block itself. Set only by the index
+/// entry path (`start_pick_pages`); every other entry point
+/// leaves it None and the header renders the prototype's
+/// default form (a block's policy defaults to follow — the
+/// segment reads 跟随最新）.
+#[derive(Clone)]
+enum EntryPolicyView {
+    FollowLatest,
+    Locked { semver: String },
+}
+
+/// The header view of one index entry's stored policy
+/// (`"follow_latest"` | `{"locked": {"version_id": …}}`). The
+/// locked display number prefers the entry's captured
+/// `locked_semver`; the resolved version (which for a locked
+/// entry IS the locked version) backs it up.
+fn entry_policy_view(entry: &Value, resolved: &Value) -> EntryPolicyView {
+    if entry.get("policy").and_then(|p| p.get("locked")).is_some() {
+        let semver = entry
+            .get("locked_semver")
+            .and_then(|x| x.as_str())
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| s(resolved, "semver"));
+        EntryPolicyView::Locked { semver }
+    } else {
+        EntryPolicyView::FollowLatest
+    }
+}
+
 struct UnitState {
     unit_id: String,
     detail: Value,
+    /// The entry policy carried in by the opening path (see
+    /// EntryPolicyView); survives detail reloads, which mutate
+    /// this state in place.
+    entry_policy: Option<EntryPolicyView>,
     publish_bump: usize, // 0 major 1 minor 2 patch
     publish_form: String,
     publish_lang: String,
@@ -1659,6 +1727,7 @@ impl UnitState {
         Self {
             unit_id: unit_id.to_string(),
             detail,
+            entry_policy: None,
             publish_bump: 1, // default preselect: minor （小版本）, as at App::new before
             publish_form: String::new(),
             publish_lang: String::new(),
@@ -1981,6 +2050,32 @@ struct TrashState {
     items: Vec<Value>,
     loaded: bool,
     load_error: String,
+}
+
+/// One bottom-bar delete target (user ruling 2026-11-25): the
+/// trash kind ("showroom" | "index" | "unit" | "version"), the
+/// object id, and the human label failure reports name. The
+/// shell computes the current selection's targets
+/// (deckbar_delete_targets); App::trash_add_many executes them.
+#[derive(Clone)]
+struct DelTarget {
+    kind: &'static str,
+    id: String,
+    label: String,
+}
+
+/// Whether a trash row belongs to a positional trash filter
+/// (0 all | 1 index | 2 页面 | 3 showroom). History versions
+/// file under 页面 with the units — their owning blocks' home
+/// category (user ruling 2026-11-25).
+fn trash_kind_in_filter(kind: &str, filter: usize) -> bool {
+    match filter {
+        0 => true,
+        1 => kind == "index",
+        2 => kind == "unit" || kind == "version",
+        3 => kind == "showroom",
+        _ => true,
+    }
 }
 
 impl TrashState {
@@ -2935,6 +3030,10 @@ enum ConfirmAction {
     /// affirmative answer — delete the source library a verified
     /// relocation into the standard directory left behind.
     DeleteOldLibrary(std::path::PathBuf),
+    /// Settings → 服务器卡片「关闭服务器」 (user ruling
+    /// 2026-11-25): carries the saved-connection index whose
+    /// server receives POST /v1/admin/shutdown.
+    ShutdownServer(usize),
 }
 
 /// Showroom page state (drill retrofit): zone + folder filter
@@ -2968,6 +3067,40 @@ impl Default for ShowroomState {
 enum SrFrame {
     Wall,
     Deck(DeckState),
+    Present(SrPresentState),
+}
+
+/// 讲稿视图帧（原型 presentDlg，整页 sheetpage）：压在 deck 详情帧
+/// 之上的一整页页面流——每页一行，左稿面（真实渲染图）、右讲稿
+/// 栏。关闭即弹栈回详情帧，详情帧状态原样恢复；本帧保存过的
+/// 讲稿在弹栈时回写详情帧的页列表（见 sync_present_notes）。
+struct SrPresentState {
+    item: Value,
+    pages: Vec<ShowroomPage>,
+    /// Per-page slide titles (captions under the rendered slide;
+    /// empty when the resolving payload carried none).
+    titles: Vec<String>,
+    /// Full scripts arrays per resolved version id — the save
+    /// payload base: PUT /v1/versions/:id/scripts takes the whole
+    /// array, so a save must start from the version's complete
+    /// scripts, never from this view's excerpted pages alone. A
+    /// page whose version is absent here renders its script
+    /// read-only: reconstructing a partial array could blank
+    /// scripts at slots this view never loaded.
+    scripts: std::collections::HashMap<String, Vec<String>>,
+    /// Per-page edit buffers, seeded from the pages' scripts;
+    /// a buffer commits on focus loss （就地保存， prototype
+    /// presentCommit) through the same scripts path the unit
+    /// detail uses — saving never bumps a version.
+    edits: Vec<String>,
+    /// 讲稿栏开关 (prototype 讲稿：开/关）: off hides the note
+    /// column and the slides take the full row width.
+    script_on: bool,
+    /// The prototype toasts 已就地保存这一页。 exactly once per
+    /// opening (presentState.edited); later saves stay silent.
+    saved_once: bool,
+    /// Set by the breadcrumb / 关闭预览； the dispatcher pops.
+    closed: bool,
 }
 
 /// 演示 deck 帧状态：条目本体 + 已解析的来源索引（可空：个人
@@ -3053,6 +3186,58 @@ fn showroom_pages(deck: &Value) -> Vec<ShowroomPage> {
     pages
 }
 
+/// Page titles in the same flattened order showroom_pages
+/// produces (the 讲稿视图's per-row captions): each resolved
+/// version's own page titles at the excerpted slots.
+fn showroom_page_titles(deck: &Value) -> Vec<String> {
+    let mut titles = Vec::new();
+    for entry in deck["resolved_entries"].as_array().into_iter().flatten() {
+        let version = &entry["resolved"];
+        let version_id = s(version, "id");
+        if version_id.is_empty() {
+            continue;
+        }
+        let total = i(version, "page_count").max(0) as usize;
+        let slots = match entry["entry"]["excerpt_slots"].as_array() {
+            Some(slots) => excerpt_positions_json(version, slots),
+            None => (0..total).collect(),
+        };
+        titles.extend(slots.into_iter().map(|slot| {
+            version["pages"]
+                .get(slot)
+                .map(|p| s(p, "title"))
+                .unwrap_or_default()
+        }));
+    }
+    titles
+}
+
+/// Full scripts arrays per resolved version id, padded to the
+/// version's page count — the base a 讲稿视图 save writes back
+/// (see SrPresentState.scripts).
+fn version_scripts_map(deck: &Value) -> std::collections::HashMap<String, Vec<String>> {
+    let mut map = std::collections::HashMap::new();
+    for entry in deck["resolved_entries"].as_array().into_iter().flatten() {
+        let version = &entry["resolved"];
+        let version_id = s(version, "id");
+        if version_id.is_empty() || map.contains_key(&version_id) {
+            continue;
+        }
+        let total = i(version, "page_count").max(0) as usize;
+        let mut scripts: Vec<String> = version["scripts"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|v| v.as_str().unwrap_or_default().to_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        scripts.resize(total, String::new());
+        map.insert(version_id, scripts);
+    }
+    map
+}
+
 /// Events from the AI-translation worker thread: progress ticks
 /// while the server job runs, then exactly one terminal result (the
 /// same payload the synchronous translate endpoint returns).
@@ -3122,6 +3307,140 @@ enum LazyCmd {
     Boost(Vec<(String, usize)>),
     Visible(Vec<(String, usize)>),
     Kick,
+}
+
+/// Phase-1 change events (design §2.2): a mutation point marks
+/// the view slices it actually touched; `App::apply_dirty`
+/// re-reads exactly those slices once, between the frame's
+/// channel drains and its drawing. Daily mutation points may
+/// only fire the smallest slice events — the composites
+/// (LocalWork / OrgAll / All) exist for the login / connection
+/// switch class of full-context changes and the migration
+/// terminal points the design names.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Change {
+    Folders,
+    Groups,
+    Units,
+    Indexes,
+    IndexMeta,
+    OrgTree,
+    ShowroomLive,
+    ShowroomPending,
+    ReviewQueue,
+    MySubmissions,
+    Assemblies,
+    Inbox,
+    GroupSpaces,
+    MyTeams,
+    Library,
+    SessionProfile,
+    CacheIndex,
+    Trash,
+    LocalWork,
+    OrgAll,
+    All,
+}
+
+// DirtySet slice bits.
+const D_FOLDERS: u32 = 1 << 0;
+const D_GROUPS: u32 = 1 << 1;
+const D_UNITS: u32 = 1 << 2;
+const D_INDEXES: u32 = 1 << 3;
+const D_INDEX_META: u32 = 1 << 4;
+const D_ORG_TREE: u32 = 1 << 5;
+const D_SHOWROOM_LIVE: u32 = 1 << 6;
+const D_SHOWROOM_PENDING: u32 = 1 << 7;
+const D_REVIEW_QUEUE: u32 = 1 << 8;
+const D_MY_SUBMISSIONS: u32 = 1 << 9;
+const D_ASSEMBLIES: u32 = 1 << 10;
+const D_INBOX: u32 = 1 << 11;
+const D_GROUP_SPACES: u32 = 1 << 12;
+const D_MY_TEAMS: u32 = 1 << 13;
+const D_LIBRARY: u32 = 1 << 14;
+const D_SESSION_PROFILE: u32 = 1 << 15;
+const D_CACHE_INDEX: u32 = 1 << 16;
+const D_TRASH: u32 = 1 << 17;
+const D_LOCAL_BITS: u32 = D_FOLDERS | D_GROUPS | D_UNITS | D_INDEXES;
+const D_ORG_BITS: u32 = D_ORG_TREE
+    | D_SHOWROOM_LIVE
+    | D_SHOWROOM_PENDING
+    | D_REVIEW_QUEUE
+    | D_MY_SUBMISSIONS
+    | D_ASSEMBLIES
+    | D_INBOX
+    | D_GROUP_SPACES
+    | D_MY_TEAMS
+    | D_LIBRARY
+    | D_SESSION_PROFILE
+    | D_CACHE_INDEX;
+
+/// The dirty set (design §2.1): a UI-thread slice bitset plus
+/// the fine-grained L5 index-id set. Marking is a bit set —
+/// synchronous, no queue, no lock; consumption happens at the
+/// single frame point in `apply_dirty`. Cross-thread producers
+/// never touch this: they keep posting through their existing
+/// channels, and the UI-thread drain marks on their behalf.
+#[derive(Default)]
+struct DirtySet {
+    bits: u32,
+    index_ids: std::collections::HashSet<String>,
+    /// A consistent four-table snapshot was explicitly asked
+    /// for (LocalWork / All), not merely implied by ≥2 L bits.
+    local_consistent: bool,
+}
+
+impl DirtySet {
+    fn mark(&mut self, c: Change) {
+        match c {
+            Change::Folders => self.bits |= D_FOLDERS,
+            Change::Groups => self.bits |= D_GROUPS,
+            Change::Units => self.bits |= D_UNITS,
+            Change::Indexes => self.bits |= D_INDEXES,
+            Change::IndexMeta => self.bits |= D_INDEX_META,
+            Change::OrgTree => self.bits |= D_ORG_TREE,
+            Change::ShowroomLive => self.bits |= D_SHOWROOM_LIVE,
+            Change::ShowroomPending => self.bits |= D_SHOWROOM_PENDING,
+            Change::ReviewQueue => self.bits |= D_REVIEW_QUEUE,
+            Change::MySubmissions => self.bits |= D_MY_SUBMISSIONS,
+            Change::Assemblies => self.bits |= D_ASSEMBLIES,
+            Change::Inbox => self.bits |= D_INBOX,
+            Change::GroupSpaces => self.bits |= D_GROUP_SPACES,
+            Change::MyTeams => self.bits |= D_MY_TEAMS,
+            Change::Library => self.bits |= D_LIBRARY,
+            Change::SessionProfile => self.bits |= D_SESSION_PROFILE,
+            Change::CacheIndex => self.bits |= D_CACHE_INDEX,
+            Change::Trash => self.bits |= D_TRASH,
+            Change::LocalWork => {
+                self.bits |= D_LOCAL_BITS;
+                self.local_consistent = true;
+            }
+            Change::OrgAll => self.bits |= D_ORG_BITS,
+            Change::All => {
+                self.bits |= D_LOCAL_BITS | D_ORG_BITS | D_INDEX_META;
+                self.local_consistent = true;
+            }
+        }
+    }
+
+    fn mark_index(&mut self, id: &str) {
+        self.bits |= D_INDEX_META;
+        self.index_ids.insert(id.to_string());
+    }
+
+    fn has(&self, bit: u32) -> bool {
+        self.bits & bit != 0
+    }
+
+    fn is_empty(&self) -> bool {
+        self.bits == 0 && self.index_ids.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.bits = 0;
+        self.index_ids.clear();
+        self.local_consistent = false;
+    }
 }
 
 struct App {
@@ -3196,7 +3515,17 @@ struct App {
     org: Value,
     grants: Vec<Value>,
     showroom_live: Vec<Value>,
+    /// Plaza item → folder assignments (client-side mapping;
+    /// see load_plaza_item_folders). An item with no entry is
+    /// unassigned and appears only under the plaza 全部 node.
+    plaza_item_folders: std::collections::HashMap<String, String>,
     showroom_pending: Vec<Value>,
+    /// This local library's OWN showroom rows (bundled-server era
+    /// rows in the library's showroom table), surfaced in the
+    /// showroom 我的 zone as 本地演示. Fed by refresh_local only —
+    /// never mixed into showroom_live, which stays the
+    /// organization wall's single data face.
+    local_showroom: Vec<Value>,
     /// P3 submission chain (design §6.3): pending real-byte
     /// submissions feeding the super approval queue, and the
     /// signed-in user's own submissions for 「我的提交」.
@@ -3309,6 +3638,17 @@ struct App {
     /// holds it): retried on the following frames instead of
     /// blocking the frame that collected the beat.
     open_refresh_pending: bool,
+    /// Phase-1 dirty set (design §2.1): slices marked dirty by
+    /// mutation points through `changed()`, consumed once per
+    /// frame by `apply_dirty` between the channel drains and
+    /// drawing. Cleared by `clear_account_state` alongside the
+    /// generation bumps, so a previous context's marks can never
+    /// be consumed against a new context's data face.
+    dirty: DirtySet,
+    /// When `apply_dirty` last actually re-read a local slice —
+    /// the lazy-split throttle (design §3.1 point 1) spaces
+    /// grouped-beat re-reads from here.
+    last_local_reread: Option<std::time::Instant>,
     /// Generation of the current import context (audit N4): same
     /// discipline as `translate_gen` for the REST-fallback import
     /// worker, which captures the connection at spawn.
@@ -3853,6 +4193,28 @@ fn raw_call_k(
     body: Option<Value>,
     short_timeout: bool,
 ) -> Result<Value, CallFail> {
+    // Phase-1 measurement M3 (design §4.1): every REST call is
+    // timed and counted (thread-local counters feed the refresh
+    // summaries); with the perf switch off this is one flag read.
+    if !perf_enabled() {
+        return raw_call_k_impl(url, token, method, path, body, short_timeout);
+    }
+    let t = std::time::Instant::now();
+    let r = raw_call_k_impl(url, token, method, path, body, short_timeout);
+    let ms = t.elapsed().as_millis();
+    perf_rest_note(ms);
+    perf_log(&format!("rest {method} {path} {ms}ms"));
+    r
+}
+
+fn raw_call_k_impl(
+    url: &str,
+    token: Option<&str>,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+    short_timeout: bool,
+) -> Result<Value, CallFail> {
     let full = format!("{}{}", normalize_url(url), path);
     let mut req = if short_timeout {
         let agent = ureq::AgentBuilder::new()
@@ -4381,6 +4743,7 @@ impl App {
             org: json!({}),
             grants: vec![],
             showroom_live: vec![],
+            local_showroom: vec![],
             showroom_pending: vec![],
             submissions_pending: vec![],
             my_submissions: vec![],
@@ -4440,6 +4803,8 @@ impl App {
             lazy_wake_ctx: Some(cc.egui_ctx.clone()),
             egui_ctx: None,
             open_refresh_pending: false,
+            dirty: DirtySet::default(),
+            last_local_reread: None,
             import_gen: 0,
             import_open_units: vec![],
             pdf_seq: 0,
@@ -4461,6 +4826,7 @@ impl App {
             dc_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             dc_auto_quit: load_dc_auto_quit(),
             present_engine: load_present_engine(),
+            plaza_item_folders: load_plaza_item_folders(),
             hosted: None,
             login_open: false,
             about_open: false,
@@ -5286,6 +5652,88 @@ impl App {
         self.msg = format!("已断开服务器 {name}（保存的地址保留）");
     }
 
+    /// 设置 → 服务器卡片「关闭服务器」 (user ruling 2026-11-25):
+    /// permission prompts come first — per the button-state
+    /// standard the button is never greyed for permission, it
+    /// stays clickable and explains — then the danger
+    /// confirmation. The server re-checks the same gate, so a
+    /// saved connection whose role is not known locally (not the
+    /// active one) goes to the confirmation and lets the server
+    /// decide.
+    fn ask_shutdown_server(&mut self, i: usize) {
+        let Some(c) = self.conns.get(i) else {
+            return;
+        };
+        if c.anon {
+            self.msg = "关闭服务器需要以管理员身份登录该服务器（当前是匿名连接）".into();
+            return;
+        }
+        if self.active == Some(i) {
+            let role = self
+                .user
+                .as_ref()
+                .map(|u| s(u, "role"))
+                .unwrap_or_default();
+            if role != "super" && role != "dept_admin" {
+                self.msg = "关闭服务器需要管理员权限（当前账号不是管理员）".into();
+                return;
+            }
+        }
+        let name = c.name.clone();
+        self.overlays.push(Overlay::Confirm(ConfirmState {
+            title: "关闭服务器".to_string(),
+            body: format!(
+                "将关闭服务器「{name}」。关闭后，局域网内的客户端都将断开连接，组织内容暂时无法访问；恢复需要在服务器所在的电脑上重新启动启幕服务器，或等下次登录时自启。"
+            ),
+            confirm_label: "关闭服务器".to_string(),
+            danger: true,
+            action: ConfirmAction::ShutdownServer(i),
+        }));
+    }
+
+    /// Execute the confirmed server shutdown: POST the admin
+    /// endpoint with that connection's own token (never the
+    /// active connection's), then let the local state fall to
+    /// disconnected quietly — no logout call (the server is
+    /// going away), no reconnect attempt, one message only.
+    fn do_shutdown_server(&mut self, i: usize) {
+        let Some(c) = self.conns.get(i).cloned() else {
+            return;
+        };
+        let Some(token) = c.token.as_deref() else {
+            self.msg = "关闭服务器需要先以管理员身份登录该服务器".into();
+            return;
+        };
+        match raw_call(
+            &c.url,
+            Some(token),
+            "POST",
+            "/v1/admin/shutdown",
+            Some(json!({})),
+            false,
+        ) {
+            Ok(_) => {
+                let name = c.name.clone();
+                if let Some(conn) = self.conns.get_mut(i) {
+                    conn.token = None;
+                    conn.status = ConnStatus::LoggedOut;
+                }
+                if self.active == Some(i) {
+                    self.token = None;
+                    self.user = None;
+                    self.clear_account_state();
+                }
+                self.persist_conns();
+                self.msg = format!(
+                    "服务器「{name}」已关闭（局域网客户端已断开，恢复需在服务器电脑上重新启动）"
+                );
+            }
+            Err(e) => {
+                self.msg = format!("关闭服务器失败：{e}");
+            }
+        }
+    }
+
     fn active_server_label(&self) -> String {
         if let Some(i) = self.active {
             if let Some(c) = self.conns.get(i) {
@@ -5529,6 +5977,16 @@ impl App {
         // this context (audit H1).
         self.translating = None;
         self.translate_gen += 1;
+        // Phase-1 (design §5.1): the dirty set dies with the
+        // context that marked it — same point as the generation
+        // bumps — or the next frame would consume the previous
+        // account's marks against the new account's data face.
+        self.dirty.clear();
+        self.last_local_reread = None;
+        // The snapshot-retry latch belongs to the old context's
+        // in-flight import too; with the dirt gone nothing would
+        // ever clear it and the 50ms retry tick would spin on.
+        self.open_refresh_pending = false;
         // Same for an in-flight folder delete: in REST-fallback
         // mode it runs against the previous context's server, so
         // its result must not land here either.
@@ -5644,18 +6102,28 @@ impl App {
             }
             None => {
                 self.open_refresh_pending = true;
+                // Phase-1 (design §2.5): the retry latch is now
+                // shared with the dirty set — a failed snapshot
+                // also marks LocalWork so the frame-point
+                // apply_dirty owns the retry, not just this
+                // function's callers.
+                self.dirty.mark(Change::LocalWork);
                 false
             }
         }
     }
 
     fn refresh_all(&mut self) {
+        // M3 summary line (kind=all); a no-op unless perf is on.
+        let perf_t = std::time::Instant::now();
+        let perf_before = perf_rest_snapshot();
         if self.local.is_some() {
             self.refresh_local();
             self.refresh_org();
         } else {
             self.refresh_all_rest();
         }
+        perf_refresh_summary("all", perf_t, perf_before, &[]);
     }
 
     /// Re-read a chosen subset of the working-data lists
@@ -5815,14 +6283,36 @@ impl App {
             overview.graphs = None;
         }
         self.indexes = local.list_indexes();
+        self.local_showroom = local.list_local_showroom();
         // Per-index detail pass (P1): covers and search tags for
         // local indexes are assembled from the local store,
         // mirroring the REST loop in refresh_all_rest (which skips
         // indexes whose tags are already remembered).
+        self.reread_index_meta_local(None);
+    }
+
+    /// The L5 slice (design §1.1): per-index cover + search-tag
+    /// fill from the local store. `only` restricts the pass to
+    /// the given index ids (the fine-grained dirty set); `None`
+    /// is the full form — every not-yet-remembered index. The
+    /// remembered-tags memo skips apply in both forms, so an
+    /// already-filled id costs nothing.
+    fn reread_index_meta_local(
+        &mut self,
+        only: Option<&std::collections::HashSet<String>>,
+    ) {
+        let Some(local) = self.local.clone() else {
+            return;
+        };
         for x in self.indexes.clone() {
             let xid = s(&x, "id");
             if xid.is_empty() || self.index_search_tags.contains_key(&xid) {
                 continue;
+            }
+            if let Some(ids) = only {
+                if !ids.contains(&xid) {
+                    continue;
+                }
             }
             if let Some(d) = local.index_detail(&xid, "main") {
                 if self
@@ -5854,6 +6344,63 @@ impl App {
     /// and the offline cache backfill when the fetch fails —
     /// instead of the whole org sweep.
     fn refresh_showroom_live(&mut self) {
+        // Phase-1 merge note: the verbatim block now lives in
+        // the O2 slice (`reread_showroom_live`, byte-identical);
+        // this name remains as the direct-call entry the
+        // post-delete refresh paths use.
+        self.reread_showroom_live();
+    }
+
+    /// Organization surfaces over REST: the org-facing half of the
+    /// legacy refresh (same calls, same order) — org tree, showroom,
+    /// assemblies, cache policy, inbox, group spaces, teams, library,
+    /// profile/company/languages/AI status.
+    ///
+    /// Phase-1 (design §1.1/§2.3): the body is decomposed into
+    /// one method per slice (`reread_*` below, verbatim blocks in
+    /// the original order); this composite remains the full sweep
+    /// for refresh_all, while `apply_dirty` calls only the slices
+    /// a mutation actually dirtied.
+    fn refresh_org(&mut self) {
+        self.reread_org_tree();
+        self.reread_showroom_live();
+        self.reread_showroom_pending();
+        self.reread_review_queue();
+        self.reread_my_submissions();
+        self.reread_assemblies();
+        self.reread_cache_policy();
+        self.reread_inbox();
+        self.reread_group_spaces();
+        self.reread_my_teams();
+        self.reread_library();
+        self.reread_cache_index();
+        self.reread_profile_tail();
+        self.default_import_group();
+    }
+
+    /// The O11 slice (design §1.1): cache policy + profile /
+    /// company / languages / AI status — five GETs whose content
+    /// barely ever changes inside a session. Physically split
+    /// into the cache-policy block and the profile tail (their
+    /// original positions in the sweep); together they are the
+    /// slice `apply_dirty` re-reads.
+    fn reread_session_profile(&mut self) {
+        self.reread_cache_policy();
+        self.reread_profile_tail();
+    }
+
+    /// The O1 slice: the organization tree.
+    fn reread_org_tree(&mut self) {
+        if let Ok(v) = self.call("GET", "/v1/org", None) {
+            self.org = v;
+        }
+    }
+
+    /// The O2 slice: the public showroom wall, with its three
+    /// §1.2 side effects (cache staleness reconciliation, empty
+    /// cover eviction + cover resolution) and the offline cache
+    /// backfill when the fetch itself fails.
+    fn reread_showroom_live(&mut self) {
         let live_fetched = if let Ok(v) = self.call("GET", "/v1/showroom?state=live", None) {
             self.showroom_live = v
                 .get("items")
@@ -5872,15 +6419,8 @@ impl App {
         }
     }
 
-    /// Organization surfaces over REST: the org-facing half of the
-    /// legacy refresh (same calls, same order) — org tree, showroom,
-    /// assemblies, cache policy, inbox, group spaces, teams, library,
-    /// profile/company/languages/AI status.
-    fn refresh_org(&mut self) {
-        if let Ok(v) = self.call("GET", "/v1/org", None) {
-            self.org = v;
-        }
-        self.refresh_showroom_live();
+    /// The O3 slice: the pending-review showroom wall.
+    fn reread_showroom_pending(&mut self) {
         if let Ok(v) = self.call("GET", "/v1/showroom?state=pending", None) {
             self.showroom_pending = v
                 .get("items")
@@ -5888,6 +6428,10 @@ impl App {
                 .cloned()
                 .unwrap_or_default();
         }
+    }
+
+    /// The O4 slice: the submission approval queue (super only).
+    fn reread_review_queue(&mut self) {
         // P3 submission chain (design §6.3): the approval queue
         // also counts real-byte submissions, and the signed-in
         // user's own submissions feed the 「我的提交」 face.
@@ -5896,11 +6440,19 @@ impl App {
                 self.submissions_pending = v.get("items").and_then(|f| f.as_array()).cloned().unwrap_or_default();
             }
         }
+    }
+
+    /// The O5 slice: the signed-in user's own submissions.
+    fn reread_my_submissions(&mut self) {
         if self.user.is_some() {
             if let Ok(v) = self.call("GET", "/v1/submissions?mine=1", None) {
                 self.my_submissions = v.get("items").and_then(|f| f.as_array()).cloned().unwrap_or_default();
             }
         }
+    }
+
+    /// The O6 slice: my assemblies.
+    fn reread_assemblies(&mut self) {
         if let Ok(v) = self.call("GET", "/v1/assemblies", None) {
             self.my_assemblies = v
                 .get("assemblies")
@@ -5908,9 +6460,17 @@ impl App {
                 .cloned()
                 .unwrap_or_default();
         }
+    }
+
+    /// O11 part 1: the cache policy.
+    fn reread_cache_policy(&mut self) {
         if let Ok(v) = self.call("GET", "/v1/settings/cache-policy", None) {
             self.cache_policy = v;
         }
+    }
+
+    /// The O7 slice: the share inbox.
+    fn reread_inbox(&mut self) {
         if let Ok(v) = self.call("GET", "/v1/shares/inbox", None) {
             self.inbox = v
                 .get("shares")
@@ -5918,6 +6478,10 @@ impl App {
                 .cloned()
                 .unwrap_or_default();
         }
+    }
+
+    /// The O8 slice: group spaces.
+    fn reread_group_spaces(&mut self) {
         if let Ok(v) = self.call("GET", "/v1/group-space", None) {
             self.group_spaces = v
                 .get("spaces")
@@ -5925,6 +6489,10 @@ impl App {
                 .cloned()
                 .unwrap_or_default();
         }
+    }
+
+    /// The O9 slice: my custom groups.
+    fn reread_my_teams(&mut self) {
         if let Ok(v) = self.call("GET", "/v1/custom-groups", None) {
             self.my_teams = v
                 .get("groups")
@@ -5932,6 +6500,10 @@ impl App {
                 .cloned()
                 .unwrap_or_default();
         }
+    }
+
+    /// The O10 slice: my library references.
+    fn reread_library(&mut self) {
         if let Ok(v) = self.call("GET", "/v1/library", None) {
             self.library_refs = v
                 .get("entries")
@@ -5939,7 +6511,19 @@ impl App {
                 .cloned()
                 .unwrap_or_default();
         }
+    }
+
+    /// The C1 slice: the on-disk cache-bundle index. (The
+    /// staleness reconciliation against the live wall rides the
+    /// O2 re-read, per design §1.2; this slice is the disk read
+    /// itself.)
+    fn reread_cache_index(&mut self) {
         self.cache_entries = load_cache_index();
+    }
+
+    /// O11 part 2: /v1/me + company profile + languages + AI
+    /// status (their original position at the sweep's tail).
+    fn reread_profile_tail(&mut self) {
         if let Ok(v) = self.call("GET", "/v1/me", None) {
             if let Some(u) = v.get("user") {
                 self.my_id = s(u, "id");
@@ -5994,6 +6578,12 @@ impl App {
         if let Ok(v) = self.call("GET", "/v1/ai/status", None) {
             self.ai_status = Some(v);
         }
+    }
+
+    /// The org sweep's tail side effect: a default import group
+    /// from the first local group, when none was ever chosen.
+    /// Depends on the (local) groups list, not on any org slice.
+    fn default_import_group(&mut self) {
         if self.content.import_group.is_empty() {
             if let Some(g) = self.groups.first() {
                 self.content.import_group = g
@@ -6006,6 +6596,15 @@ impl App {
     }
 
     fn refresh_all_rest(&mut self) {
+        self.refresh_tables_rest();
+        self.refresh_org_rest_tail();
+    }
+
+    /// The REST-fallback four-table segment (design §5.1): the
+    /// working lists fed over REST when no local library is
+    /// open. `apply_dirty` upgrades L-slice dirt to exactly this
+    /// segment — never the org sweep below.
+    fn refresh_tables_rest(&mut self) {
         if let Ok(v) = self.call("GET", "/v1/folders", None) {
             self.folders = v
                 .get("folders")
@@ -6037,6 +6636,11 @@ impl App {
                 .cloned()
                 .unwrap_or_default();
         }
+    }
+
+    /// Everything in the all-REST refresh past the four tables:
+    /// the org sweep in its REST form (verbatim blocks).
+    fn refresh_org_rest_tail(&mut self) {
         if let Ok(v) = self.call("GET", "/v1/org", None) {
             self.org = v;
         }
@@ -6060,32 +6664,7 @@ impl App {
         if !live_fetched {
             self.backfill_showroom_from_cache();
         }
-        for x in self.indexes.clone() {
-            let xid = s(&x, "id");
-            if xid.is_empty() || self.index_search_tags.contains_key(&xid) {
-                continue;
-            }
-            if let Ok(d) = self.call("GET", &format!("/v1/indexes/{xid}"), None) {
-                if self
-                    .index_covers
-                    .get(&xid)
-                    .map(|c| c.is_empty())
-                    .unwrap_or(true)
-                {
-                    if let Some(vid) = d
-                        .get("resolved_entries")
-                        .and_then(|r| r.as_array())
-                        .and_then(|a| a.first())
-                        .and_then(|e| e.get("resolved"))
-                        .and_then(|r| r.get("id"))
-                        .and_then(|v| v.as_str())
-                    {
-                        self.index_covers.insert(xid.clone(), vid.to_string());
-                    }
-                }
-                self.remember_index_tags(&xid, &d);
-            }
-        }
+        self.reread_index_meta_rest();
         if let Ok(v) = self.call("GET", "/v1/showroom?state=pending", None) {
             self.showroom_pending = v
                 .get("items")
@@ -6093,9 +6672,6 @@ impl App {
                 .cloned()
                 .unwrap_or_default();
         }
-        // P3 submission chain (design §6.3): the approval queue
-        // also counts real-byte submissions, and the signed-in
-        // user's own submissions feed the 「我的提交」 face.
         if self.role() == "super" {
             if let Ok(v) = self.call("GET", "/v1/submissions?state=pending", None) {
                 self.submissions_pending = v.get("items").and_then(|f| f.as_array()).cloned().unwrap_or_default();
@@ -6207,6 +6783,287 @@ impl App {
                     .unwrap_or("")
                     .to_string();
             }
+        }
+    }
+
+    /// The L5 slice in REST-fallback mode: per-index cover + tag
+    /// fill over REST, skipping remembered indexes (the REST
+    /// twin of `reread_index_meta_local`, full form only — the
+    /// fallback's per-index GET loop is the unit the legacy code
+    /// already had).
+    fn reread_index_meta_rest(&mut self) {
+        for x in self.indexes.clone() {
+            let xid = s(&x, "id");
+            if xid.is_empty() || self.index_search_tags.contains_key(&xid) {
+                continue;
+            }
+            if let Ok(d) = self.call("GET", &format!("/v1/indexes/{xid}"), None) {
+                if self
+                    .index_covers
+                    .get(&xid)
+                    .map(|c| c.is_empty())
+                    .unwrap_or(true)
+                {
+                    if let Some(vid) = d
+                        .get("resolved_entries")
+                        .and_then(|r| r.as_array())
+                        .and_then(|a| a.first())
+                        .and_then(|e| e.get("resolved"))
+                        .and_then(|r| r.get("id"))
+                        .and_then(|v| v.as_str())
+                    {
+                        self.index_covers.insert(xid.clone(), vid.to_string());
+                    }
+                }
+                self.remember_index_tags(&xid, &d);
+            }
+        }
+    }
+
+    // ---------- Phase 1: change events + sliced re-reads ----------
+    // (design §2 — the refresh_all replacement machinery. The
+    // gray switch QIMU_REFRESH_V2 lives at this one entry family:
+    // with it off, every entry below falls back to the legacy
+    // refresh_all() and the migration call sites stay single-form.)
+
+    /// Mark slices dirty; consumed at the frame point
+    /// (`apply_dirty` in `ui`, after the channel drains).
+    fn changed(&mut self, c: Change) {
+        if refresh_v2_enabled() {
+            self.dirty.mark(c);
+        } else {
+            self.refresh_all();
+        }
+    }
+
+    /// Mark one index's L5 slice dirty (the fine-grained form).
+    fn changed_index_meta(&mut self, id: &str) {
+        if refresh_v2_enabled() {
+            self.dirty.mark_index(id);
+        } else {
+            self.refresh_all();
+        }
+    }
+
+    /// Mark + consume immediately — for call points that read
+    /// the refreshed fields later in the same function (design
+    /// §2.3's read-after-write rule).
+    fn changed_now(&mut self, c: Change) {
+        if refresh_v2_enabled() {
+            self.dirty.mark(c);
+            self.apply_dirty_inner(true);
+        } else {
+            self.refresh_all();
+        }
+    }
+
+    /// Mark only (composition helper: multi-slice points mark
+    /// each slice, then flush once through `flush_dirty_now`).
+    fn mark(&mut self, c: Change) {
+        if refresh_v2_enabled() {
+            self.dirty.mark(c);
+        }
+    }
+
+    fn mark_index_meta(&mut self, id: &str) {
+        if refresh_v2_enabled() {
+            self.dirty.mark_index(id);
+        }
+    }
+
+    /// Consume everything marked so far, immediately (or, with
+    /// the gray switch off, the legacy full refresh).
+    fn flush_dirty_now(&mut self) {
+        if refresh_v2_enabled() {
+            self.apply_dirty_inner(true);
+        } else {
+            self.refresh_all();
+        }
+    }
+
+    /// The frame-point consumer (design §2.3): called once per
+    /// frame from `ui`, after all channel drains, before drawing.
+    fn apply_dirty(&mut self) {
+        self.apply_dirty_inner(false);
+    }
+
+    fn apply_dirty_inner(&mut self, forced: bool) {
+        if self.dirty.is_empty() {
+            return;
+        }
+        let perf_t = std::time::Instant::now();
+        let perf_before = perf_rest_snapshot();
+        let mut slices: Vec<String> = Vec::new();
+        let mut consumed_any = false;
+
+        // ---- local group (or its REST-fallback upgrade) ----
+        let local_bits = self.dirty.bits & D_LOCAL_BITS;
+        let meta_dirty = self.dirty.has(D_INDEX_META);
+        if self.local.is_none() {
+            // REST fallback (design §5.1): the L slices are
+            // REST-fed in this mode, so their dirt upgrades to
+            // the four-table REST segment — never the org sweep.
+            if local_bits != 0 || meta_dirty {
+                let t = std::time::Instant::now();
+                self.refresh_tables_rest();
+                if meta_dirty {
+                    self.reread_index_meta_rest();
+                }
+                self.dirty.bits &= !(D_LOCAL_BITS | D_INDEX_META);
+                self.dirty.index_ids.clear();
+                self.dirty.local_consistent = false;
+                self.last_local_reread = Some(std::time::Instant::now());
+                slices.push(format!("LRest:{}ms", t.elapsed().as_millis()));
+                consumed_any = true;
+            }
+        } else {
+            if local_bits != 0 {
+                // Lazy-split throttle (design §3.1 point 1):
+                // while a split is running, grouped beats arrive
+                // every frame; without this the local group would
+                // be re-read per frame instead of at most once
+                // per 500ms. Forced consumption (completion
+                // beats, read-after-write points) never throttles.
+                let throttled = !forced
+                    && !self.lazy_pendings.is_empty()
+                    && self
+                        .last_local_reread
+                        .map(|t| t.elapsed() < std::time::Duration::from_millis(500))
+                        .unwrap_or(false);
+                if !throttled {
+                    let t = std::time::Instant::now();
+                    let touched_wall = local_bits & (D_UNITS | D_INDEXES) != 0;
+                    let consumed = if local_bits.count_ones() >= 2
+                        || self.dirty.local_consistent
+                    {
+                        // Consistent snapshot — refresh_opened's
+                        // body (design §2.5). On lock contention
+                        // it returns false and the bits (plus the
+                        // open_refresh_pending retry latch) stay
+                        // set: no lost update.
+                        self.refresh_opened()
+                    } else {
+                        if local_bits & D_FOLDERS != 0 {
+                            self.reread_folders();
+                        }
+                        if local_bits & D_GROUPS != 0 {
+                            self.reread_groups();
+                        }
+                        if local_bits & D_UNITS != 0 {
+                            self.reread_units();
+                        }
+                        if local_bits & D_INDEXES != 0 {
+                            self.reread_indexes();
+                        }
+                        true
+                    };
+                    if consumed {
+                        self.dirty.bits &= !D_LOCAL_BITS;
+                        self.dirty.local_consistent = false;
+                        self.last_local_reread = Some(std::time::Instant::now());
+                        if touched_wall {
+                            // Design §3.3 point 4: a replaced
+                            // units/indexes list must not leave
+                            // the wall selection pointing at
+                            // vanished ids.
+                            self.prune_wall_selection();
+                        }
+                        slices.push(format!("L:{}ms", t.elapsed().as_millis()));
+                        consumed_any = true;
+                    }
+                }
+            }
+            if self.dirty.has(D_INDEX_META) {
+                let t = std::time::Instant::now();
+                let ids = std::mem::take(&mut self.dirty.index_ids);
+                if ids.is_empty() {
+                    self.reread_index_meta_local(None);
+                } else {
+                    self.reread_index_meta_local(Some(&ids));
+                }
+                self.dirty.bits &= !D_INDEX_META;
+                slices.push(format!("L5:{}ms", t.elapsed().as_millis()));
+                consumed_any = true;
+            }
+        }
+
+        // ---- org group: O2 first (the wall is the user's
+        // focus), then enum order (design §2.3 step 4). A failed
+        // GET keeps the old value and still clears the bit — the
+        // legacy sweep's semantics; the next related event
+        // re-reads.
+        let org_order: [(u32, &str, fn(&mut App)); 12] = [
+            (D_SHOWROOM_LIVE, "O2", App::reread_showroom_live),
+            (D_ORG_TREE, "O1", App::reread_org_tree),
+            (D_SHOWROOM_PENDING, "O3", App::reread_showroom_pending),
+            (D_REVIEW_QUEUE, "O4", App::reread_review_queue),
+            (D_MY_SUBMISSIONS, "O5", App::reread_my_submissions),
+            (D_ASSEMBLIES, "O6", App::reread_assemblies),
+            (D_INBOX, "O7", App::reread_inbox),
+            (D_GROUP_SPACES, "O8", App::reread_group_spaces),
+            (D_MY_TEAMS, "O9", App::reread_my_teams),
+            (D_LIBRARY, "O10", App::reread_library),
+            (D_SESSION_PROFILE, "O11", App::reread_session_profile),
+            (D_CACHE_INDEX, "C1", App::reread_cache_index),
+        ];
+        for (bit, label, reread) in org_order {
+            if self.dirty.has(bit) {
+                let t = std::time::Instant::now();
+                reread(self);
+                self.dirty.bits &= !bit;
+                slices.push(format!("{label}:{}ms", t.elapsed().as_millis()));
+                consumed_any = true;
+            }
+        }
+
+        // ---- trash (T1 keeps its on-demand shape, design §1.3):
+        // reload at once when the trash page is up, else just
+        // invalidate the loaded flag for the next entry.
+        if self.dirty.has(D_TRASH) {
+            self.dirty.bits &= !D_TRASH;
+            if self.page == Page::Trash {
+                self.trash_load();
+            } else {
+                self.trash.loaded = false;
+            }
+            slices.push("T1".to_string());
+            consumed_any = true;
+        }
+
+        if consumed_any {
+            self.default_import_group();
+        }
+        perf_refresh_summary("dirty", perf_t, perf_before, &slices);
+    }
+
+    /// Single-slice local re-reads (design §2.3 step 2): exactly
+    /// one list call each — the saving over the four-table sweep
+    /// is the point (a Units-only change pays the unit_json
+    /// expansion and nothing else).
+    fn reread_folders(&mut self) {
+        if let Some(local) = self.local.clone() {
+            self.folders = local.list_folders();
+        }
+    }
+
+    fn reread_groups(&mut self) {
+        if let Some(local) = self.local.clone() {
+            self.groups = local.list_groups();
+        }
+    }
+
+    fn reread_units(&mut self) {
+        if let Some(local) = self.local.clone() {
+            self.units = local.list_units();
+        }
+    }
+
+    fn reread_indexes(&mut self) {
+        if let Some(local) = self.local.clone() {
+            if let IndexFrame::Overview(overview) = self.index.stack.root_mut() {
+                overview.graphs = None;
+            }
+            self.indexes = local.list_indexes();
         }
     }
 
@@ -6832,10 +7689,16 @@ impl App {
     }
 
     /// 选页 on an index entry: jump to the content page in pick mode,
-    /// with the entry's block opened (§3.10 scenario 44).
+    /// with the entry's block opened (§3.10 scenario 44). The
+    /// entry's version policy travels into the opened detail
+    /// (audit R1): the #101 header's policy segment describes
+    /// THIS entry's hold on the block, so entering through a
+    /// different entry of the same block re-reads that entry's
+    /// policy — the states never bleed into each other.
     fn start_pick_pages(&mut self, pos: usize, re: &Value, sel: Vec<bool>) {
         let entry = re.get("entry").cloned().unwrap_or(json!({}));
         let resolved = re.get("resolved").cloned().unwrap_or(Value::Null);
+        let policy = entry_policy_view(&entry, &resolved);
         let unit_id = s(&entry, "unit_id");
         self.pick = Some(PickState::Pages {
             index_name: self.current_index_name(),
@@ -6860,6 +7723,15 @@ impl App {
         }
         self.page = Page::Content;
         self.open_unit_detail(&unit_id);
+        // Stamp the entry policy onto the freshly opened frame
+        // (open_unit_detail may have refused — a lazy wrapper or
+        // a mid-import page — in which case there is no frame to
+        // stamp and nothing to show).
+        if let ContentFrame::Unit(st) = self.content.stack.top_mut() {
+            if st.unit_id == unit_id {
+                st.entry_policy = Some(policy);
+            }
+        }
     }
 
     /// The context bar shown on the content page while a pick mode
@@ -7149,7 +8021,10 @@ impl App {
                 } else {
                     s(&v.get("unit").cloned().unwrap_or(json!({})), "id")
                 };
-                self.refresh_all();
+                // Phase-1 (design §3.1 point 7): read-after-
+                // write — the detail open below navigates from
+                // the refreshed list, so consume at once.
+                self.changed_now(Change::Units);
                 if !id.is_empty() {
                     self.open_unit_detail(&id);
                 }
@@ -7201,7 +8076,9 @@ impl App {
         if let Some(uid) = self.publish_bytes_as_unit(&bytes, "未命名内容块", "剪贴板粘贴新建")
         {
             self.msg = "已粘贴新建内容块".into();
-            self.refresh_all();
+            // Phase-1 (design §3.1 point 8): same read-after-
+            // write shape as point 7.
+            self.changed_now(Change::Units);
             self.open_unit_detail(&uid);
         }
     }
@@ -7483,7 +8360,9 @@ impl App {
                 self.msg = "已整组成块：新建 1 个内容块".into();
             }
         }
-        self.refresh_all();
+        // Phase-1 (design §3.1 point 9): both paste shapes only
+        // ever add units.
+        self.changed(Change::Units);
     }
 
     /// 解除组合：split one multi-page block back into one
@@ -7582,7 +8461,10 @@ impl App {
                 "解除组合失败：未能新建任何单页内容块，原内容块「{name}」保留未动"
             ));
         }
-        self.refresh_all();
+        // Phase-1 (design §3.1 point 10): the split blocks are
+        // new units; the original's move to the bin already
+        // emitted its own events through trash_add.
+        self.changed(Change::Units);
         fully_done
     }
 
@@ -7755,7 +8637,15 @@ impl App {
                         unit_ids.len() - trashed
                     ));
                 }
-                self.refresh_all();
+                // Phase-1 (design §3.1 point 11, as re-checked
+                // against this baseline): the pure-copy path
+                // returns above and never refreshed — this point
+                // sits in the CUT branch, whose library writes
+                // ride through trash_add (which emits Units +
+                // Trash itself). Per the design's fallback rule
+                // for points that do write the library, Units is
+                // marked here as a backstop.
+                self.changed(Change::Units);
                 all
             }
             Err(e) => {
@@ -7845,7 +8735,8 @@ impl App {
             } else {
                 self.say("已剪切全部页面，但原内容块移入回收站失败，仍保留在页面墙上");
             }
-            self.refresh_all();
+            // Phase-1 (design §3.1 point 12).
+            self.changed(Change::Units);
             return;
         }
         let rest: Vec<usize> = (0..total).filter(|p| !pages.contains(p)).collect();
@@ -7863,7 +8754,8 @@ impl App {
             ) {
                 Ok(_) => {
                     self.msg = format!("已剪切 {} 页（原内容块已发布新版本）", pages.len());
-                    self.refresh_all();
+                    // Phase-1 (design §3.1 point 13).
+                    self.changed(Change::Units);
                 }
                 Err(e) => self.msg = format!("页面已复制到剪贴板，但源块发布新版本失败：{e}"),
             },
@@ -7895,7 +8787,8 @@ impl App {
                     .is_some()
                 {
                     self.say(format!("已组合为新内容块「{name}」"));
-                    self.refresh_all();
+                    // Phase-1 (design §3.1 point 14).
+                    self.changed(Change::Units);
                     true
                 } else {
                     false
@@ -7944,9 +8837,21 @@ impl App {
                 "entries": entries,
             })),
         ) {
-            Ok(_) => {
+            Ok(v) => {
                 self.say(format!("已组合为新索引「{name}」"));
-                self.refresh_all();
+                // Phase-1 (design §3.1 point 15): a new index
+                // (meta for the new id) over a units-backed
+                // entry set; consumed at once — the caller acts
+                // on the refreshed lists.
+                let new_id = s(&v, "id");
+                self.mark(Change::Units);
+                self.mark(Change::Indexes);
+                if new_id.is_empty() {
+                    self.mark(Change::IndexMeta);
+                } else {
+                    self.mark_index_meta(&new_id);
+                }
+                self.flush_dirty_now();
                 true
             }
             Err(e) => {
@@ -8492,6 +9397,7 @@ impl App {
                     ("收藏", ChromeIcon::Folder),
                     ("本地缓存", ChromeIcon::Cache),
                     ("我的组装", ChromeIcon::Folder),
+                    ("本地演示", ChromeIcon::Showroom),
                 ]
                 .into_iter()
                 .enumerate()
@@ -8902,16 +9808,12 @@ impl App {
             TrashFrame::List(state) => state.filter,
             TrashFrame::Preview(_) => usize::MAX,
         };
-        for (filter, kind, label) in [
-            (3, "showroom", "演示"),
-            (1, "index", "索引"),
-            (2, "unit", "页面"),
-        ] {
+        for (filter, label) in [(3, "演示"), (1, "索引"), (2, "页面")] {
             let count = self
                 .trash
                 .items
                 .iter()
-                .filter(|item| s(item, "kind") == kind)
+                .filter(|item| trash_kind_in_filter(&s(item, "kind"), filter))
                 .count();
             let text = format!("{} {}", tr(label), count);
             let icon = if active == filter {
@@ -9285,23 +10187,123 @@ impl App {
             Ok(_) => {
                 self.say("已移入回收站，可随时恢复");
                 self.trash.loaded = false;
-                // Only the trashed object's own list can change
-                // (delete-freeze round 2): a unit leaves the
-                // units list, an index the indexes list, a
-                // showroom item the live wall. The old
-                // refresh_all re-read every surface on the UI
-                // thread for each single-item trash.
+                // Phase-1 (design §3.1 point 18): the source
+                // slice follows the trashed kind (this funnel
+                // serves the unit / index / showroom walls);
+                // Trash itself is invalidated above and marked
+                // here for the slice machinery's bookkeeping.
+                // (The per-kind set is delete-freeze round 2's
+                // narrowing, in event form.)
                 match kind {
-                    "unit" => self.refresh_work_lists(false, true, false),
-                    "index" => self.refresh_work_lists(false, false, true),
-                    "showroom" => self.refresh_showroom_live(),
-                    _ => self.refresh_work_lists(false, true, true),
+                    "unit" => self.changed(Change::Units),
+                    "index" => self.changed(Change::Indexes),
+                    "showroom" => self.changed(Change::ShowroomLive),
+                    _ => {
+                        self.changed(Change::Units);
+                        self.changed(Change::Indexes);
+                    }
                 }
+                self.changed(Change::Trash);
                 true
             }
             Err(e) => {
                 self.say(format!("删除失败：{e}"));
                 false
+            }
+        }
+    }
+
+    /// The batch face of trash_add for the bottom bar's delete
+    /// (user ruling 2026-11-25: every selected object, of every
+    /// kind, deletes in one click; failures report per item and
+    /// never block the rest). Each target goes through the same
+    /// POST /v1/trash the single-item path uses — the importing
+    /// guard is trash_add's own, repeated here because trash_add
+    /// folds its verdict into the message bar, while the batch
+    /// needs the reason per item. Returns the failures as
+    /// (target, reason); successes only mark the trash stale —
+    /// the caller refreshes once, scoped to the kinds that
+    /// actually went away (refresh_after_trash_delete).
+    fn trash_add_many(&mut self, targets: &[DelTarget]) -> Vec<(DelTarget, String)> {
+        let mut failures = Vec::new();
+        let mut any_ok = false;
+        for t in targets {
+            if t.kind == "unit"
+                && self.importing.is_some()
+                && self.import_open_units.iter().any(|u| u == &t.id)
+            {
+                failures.push((
+                    t.clone(),
+                    "正在导入成块，暂不能移入回收站".to_string(),
+                ));
+                continue;
+            }
+            match self.call_work(
+                "POST",
+                "/v1/trash",
+                Some(json!({ "kind": t.kind, "object_id": t.id })),
+            ) {
+                Ok(_) => any_ok = true,
+                Err(e) => failures.push((t.clone(), e)),
+            }
+        }
+        if any_ok {
+            self.trash.loaded = false;
+        }
+        failures
+    }
+
+    /// Post-delete refresh for the bottom-bar batch, scoped to
+    /// the kinds that were deleted (the delete-freeze line's
+    /// rule: a delete re-reads only the slices it can have
+    /// changed — never a fresh refresh_all). Units and versions
+    /// share the units list (its rows carry the version strips);
+    /// indexes reload their list and drop the overview graphs;
+    /// showroom entries re-run refresh_org's live arm verbatim
+    /// (fetch → cache staleness reconciliation → cover
+    /// resolution, cache backfill when the fetch fails).
+    fn refresh_after_trash_delete(&mut self, kinds: &[&str]) {
+        if kinds.iter().any(|k| *k == "unit" || *k == "version") {
+            if let Some(local) = self.local.clone() {
+                self.units = local.list_units();
+            } else if let Ok(v) = self.call("GET", "/v1/units", None) {
+                self.units = v
+                    .get("units")
+                    .and_then(|f| f.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+            }
+            self.prune_wall_selection();
+        }
+        if kinds.iter().any(|k| *k == "index") {
+            if let Some(local) = self.local.clone() {
+                if let IndexFrame::Overview(overview) = self.index.stack.root_mut() {
+                    overview.graphs = None;
+                }
+                self.indexes = local.list_indexes();
+            } else if let Ok(v) = self.call("GET", "/v1/indexes", None) {
+                if let IndexFrame::Overview(overview) = self.index.stack.root_mut() {
+                    overview.graphs = None;
+                }
+                self.indexes = v
+                    .get("indexes")
+                    .and_then(|f| f.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+            }
+        }
+        if kinds.iter().any(|k| *k == "showroom") {
+            if let Ok(v) = self.call("GET", "/v1/showroom?state=live", None) {
+                self.showroom_live = v
+                    .get("items")
+                    .and_then(|f| f.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                self.reconcile_cache_staleness();
+                self.index_covers.retain(|_, v| !v.is_empty());
+                self.resolve_showroom_covers();
+            } else {
+                self.backfill_showroom_from_cache();
             }
         }
     }
@@ -9315,10 +10317,12 @@ impl App {
             Ok(_) => {
                 self.msg = "已恢复".into();
                 self.trash.loaded = false;
-                // The restored object re-enters exactly one list
-                // (delete-freeze round 2; the row's kind is known
-                // from the loaded trash items — unknown kinds
-                // conservatively re-read both working lists).
+                // The restored object re-enters exactly one
+                // list (delete-freeze round 2's kind precision,
+                // phase-1 §3.1 point 19's event form): the row's
+                // kind is known from the loaded trash items —
+                // unknown kinds conservatively mark both working
+                // lists.
                 let kind = self
                     .trash
                     .items
@@ -9327,11 +10331,15 @@ impl App {
                     .map(|t| s(t, "kind"))
                     .unwrap_or_default();
                 match kind.as_str() {
-                    "unit" => self.refresh_work_lists(false, true, false),
-                    "index" => self.refresh_work_lists(false, false, true),
-                    "showroom" => self.refresh_showroom_live(),
-                    _ => self.refresh_work_lists(false, true, true),
+                    "unit" => self.changed(Change::Units),
+                    "index" => self.changed(Change::Indexes),
+                    "showroom" => self.changed(Change::ShowroomLive),
+                    _ => {
+                        self.changed(Change::Units);
+                        self.changed(Change::Indexes);
+                    }
                 }
+                self.changed(Change::Trash);
             }
             Err(e) => self.msg = format!("恢复失败：{e}"),
         }
@@ -9354,12 +10362,14 @@ impl App {
                 if showing {
                     self.trash.stack.pop();
                 }
-                // No refresh: the purged object was already
-                // absent from every wall and list (it sat in the
-                // trash), so nothing visible can change — the
-                // old refresh_all here was pure cost
-                // (delete-freeze round 2). The trash page itself
-                // re-reads via trash.loaded above.
+                // Phase-1 (design §3.1 point 20): a purge only
+                // ever touches the bin itself — no wall refresh
+                // (the purged object was already absent from
+                // every list; delete-freeze round 2 deleted the
+                // old refresh_all here as pure cost). The Trash
+                // mark is the bin's bookkeeping; the page itself
+                // also re-reads via trash.loaded above.
+                self.changed(Change::Trash);
             }
             Err(e) => self.msg = format!("彻底删除失败：{e}"),
         }
@@ -9375,12 +10385,7 @@ impl App {
         let items = self.trash.items.clone();
         let shown: Vec<Value> = items
             .iter()
-            .filter(|t| match filter {
-                1 => s(t, "kind") == "index",
-                2 => s(t, "kind") == "unit",
-                3 => s(t, "kind") == "showroom",
-                _ => true,
-            })
+            .filter(|t| trash_kind_in_filter(&s(t, "kind"), filter))
             .cloned()
             .collect();
 
@@ -9466,6 +10471,7 @@ impl App {
                 let (kind_label, tone) = match kind.as_str() {
                     "index" => (tr("索引"), BadgeTone::Info),
                     "unit" => (tr("内容块"), BadgeTone::Info),
+                    "version" => (tr("历史版本"), BadgeTone::Info),
                     _ => (tr("演示稿"), BadgeTone::Neutral),
                 };
                 let title = s(t, "title");
@@ -9589,17 +10595,20 @@ impl App {
                     ls.selected.clear();
                 }
                 self.trash.loaded = false;
-                // Restored objects re-enter the working lists
-                // (and showroom rows the live wall) — re-read
-                // just those (delete-freeze round 2).
-                self.refresh_work_lists(false, true, true);
+                // Phase-1 (design §3.1 point 21): batch restore,
+                // same event set as the single restore; the
+                // showroom-rows check is delete-freeze round 2's
+                // conditional live-wall cover, in mark form.
+                self.changed(Change::Trash);
+                self.changed(Change::Units);
+                self.changed(Change::Indexes);
                 if ids.iter().any(|id| {
                     self.trash
                         .items
                         .iter()
                         .any(|t| s(t, "id") == *id && s(t, "kind") == "showroom")
                 }) {
-                    self.refresh_showroom_live();
+                    self.changed(Change::ShowroomLive);
                 }
             }
             Some("purge") => {
@@ -9963,6 +10972,8 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // M5 frame timer (design §4.1): logs frames over 50ms.
+        let _perf_frame = PerfFrame::new();
         // T2 hosted show: while the guest show is live it owns the
         // whole window (SlideApp::ui short-circuits to the show, so
         // no guest editor chrome is drawn either) and qimu's own
@@ -10069,6 +11080,11 @@ impl eframe::App for App {
                         if self.index.overview_folder.as_deref() == Some(id.as_str()) {
                             self.index.overview_folder = None;
                         }
+                        // Plaza assignments homed in the deleted
+                        // folder follow the same lift/trash
+                        // semantics (read before the refresh
+                        // below reloads the folder list).
+                        self.apply_plaza_folder_delete(&id, &mode);
                         // Contents moved (lift) or vanished into
                         // the trash (trash): the folder tree and
                         // the unit / index lists are stale either
@@ -10191,8 +11207,19 @@ impl eframe::App for App {
                         self.open_refresh_pending = false;
                         self.import_open_units.clear();
                         self.say(m);
-                        self.refresh_all();
-                        self.prune_wall_selection();
+                        // Phase-1 (design §3.1 point 3): the
+                        // event payload carries no new-index id
+                        // set, so IndexMeta goes in its full form;
+                        // the wall-selection prune rides along in
+                        // apply_dirty's local group. (Gray-off
+                        // mode refreshed synchronously above, so
+                        // it still prunes here.)
+                        self.changed(Change::Units);
+                        self.changed(Change::Indexes);
+                        self.changed(Change::IndexMeta);
+                        if !refresh_v2_enabled() {
+                            self.prune_wall_selection();
+                        }
                     }
                 }
                 ImportEvent::Done(g, Err(m)) => {
@@ -10209,8 +11236,15 @@ impl eframe::App for App {
                         self.say(format!(
                             "{m}（已落库的部分不会回滚，墙面已按实际状态刷新）"
                         ));
-                        self.refresh_all();
-                        self.prune_wall_selection();
+                        // Phase-1 (design §3.1 point 4): a failed
+                        // import may still have landed stage-1
+                        // parts — conservatively mark both lists,
+                        // but no IndexMeta.
+                        self.changed(Change::Units);
+                        self.changed(Change::Indexes);
+                        if !refresh_v2_enabled() {
+                            self.prune_wall_selection();
+                        }
                     }
                 }
                 ImportEvent::LazyOpened(pending_id) => {
@@ -10222,7 +11256,11 @@ impl eframe::App for App {
                     self.lazy_sync_pending(&pending_id);
                     self.lazy_ensure_worker();
                     self.lazy_send(LazyCmd::Kick);
-                    self.refresh_all();
+                    // Phase-1 (design §3.1 point 5): the opened
+                    // beat formally homes in the event set as
+                    // LocalWork consumed at once — the snapshot
+                    // path, with the F3 non-blocking semantics.
+                    self.changed_now(Change::LocalWork);
                 }
                 ImportEvent::LazyProgress(info) => {
                     self.lazy_on_progress(info);
@@ -10230,10 +11268,19 @@ impl eframe::App for App {
             }
             ctx.request_repaint();
         }
-        if self.open_refresh_pending && !self.refresh_opened() {
+        // Phase-1 consumption point (design §2.3/§2.5): every
+        // frame, after all channel drains and before drawing,
+        // consume the dirty set once. The open_refresh_pending
+        // latch is generalized to "local dirt awaiting retry":
+        // a snapshot that failed on the store lock keeps its
+        // bits, and the 50ms tick below re-runs apply_dirty
+        // until it lands — the old refresh_opened retry, widened
+        // to the whole local group.
+        self.apply_dirty();
+        if self.open_refresh_pending {
             // The grouping stage still holds the store lock;
-            // retry the `Opened` refresh on a short tick rather
-            // than ever blocking a frame on that lock.
+            // retry on a short tick rather than ever blocking a
+            // frame on that lock.
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
         if self.importing.is_some() {
@@ -12132,6 +13179,122 @@ impl App {
         }
     }
 
+    /// Open the 讲稿视图 (prototype presentDlg) over the open
+    /// deck frame: a full-page stream of the deck's pages, each
+    /// page's script editable in place. The deck frame stays
+    /// beneath untouched — closing this frame restores it
+    /// exactly (drill standard: 浮层关闭回发起帧、状态恢复）.
+    /// The save base (full per-version scripts) comes from the
+    /// same payloads the deck's pages were resolved from, in the
+    /// deck loader's own order: the item itself, the offline
+    /// cache bundle, then the source index detail.
+    fn open_showroom_present(&mut self) {
+        let (item, pages) = match self.showroom.stack.top() {
+            SrFrame::Deck(d) => (d.item.clone(), d.pages.clone()),
+            _ => return,
+        };
+        if pages.is_empty() {
+            self.msg = "该稿件暂无可查看的页面".into();
+            return;
+        }
+        let mut scripts = version_scripts_map(&item);
+        let mut titles = showroom_page_titles(&item);
+        let uncovered = |scripts: &std::collections::HashMap<String, Vec<String>>| {
+            pages.iter().any(|p| !scripts.contains_key(&p.version_id))
+        };
+        if uncovered(&scripts) || titles.len() < pages.len() {
+            if let Some(v) = self.cached_index_detail(&s(&item, "id")) {
+                for (k, arr) in version_scripts_map(&v) {
+                    scripts.entry(k).or_insert(arr);
+                }
+                if titles.len() < pages.len() {
+                    let t = showroom_page_titles(&v);
+                    if t.len() > titles.len() {
+                        titles = t;
+                    }
+                }
+            }
+        }
+        if uncovered(&scripts) || titles.len() < pages.len() {
+            let src = s(&item, "source_index_id");
+            if !src.is_empty() {
+                if let Ok(v) = self.call("GET", &format!("/v1/indexes/{src}"), None) {
+                    for (k, arr) in version_scripts_map(&v) {
+                        scripts.entry(k).or_insert(arr);
+                    }
+                    if titles.len() < pages.len() {
+                        let t = showroom_page_titles(&v);
+                        if t.len() > titles.len() {
+                            titles = t;
+                        }
+                    }
+                }
+            }
+        }
+        titles.resize(pages.len(), String::new());
+        let edits = pages.iter().map(|p| p.note.clone()).collect();
+        self.showroom.stack.push(SrFrame::Present(SrPresentState {
+            item,
+            pages,
+            titles,
+            scripts,
+            edits,
+            script_on: true,
+            saved_once: false,
+            closed: false,
+        }));
+    }
+
+    /// Commit one page's edited script （就地保存）: write the
+    /// page's slot into its version's full scripts array and PUT
+    /// it through the exact path the unit detail's scripts
+    /// editor uses — saving never bumps a version. A failed save
+    /// keeps the buffer text (the next focus loss retries) and
+    /// reports through the status line.
+    fn save_present_script(&mut self, st: &mut SrPresentState, idx: usize) {
+        let Some(page) = st.pages.get(idx) else { return };
+        let new_text = st.edits.get(idx).cloned().unwrap_or_default();
+        if new_text == page.note {
+            return;
+        }
+        let (vid, slot) = (page.version_id.clone(), page.slot);
+        let Some(scripts) = st.scripts.get_mut(&vid) else {
+            return;
+        };
+        if scripts.len() <= slot {
+            scripts.resize(slot + 1, String::new());
+        }
+        scripts[slot] = new_text.clone();
+        let payload = scripts.clone();
+        match self.call_work(
+            "PUT",
+            &format!("/v1/versions/{vid}/scripts"),
+            Some(json!({ "scripts": payload })),
+        ) {
+            Ok(_) => {
+                st.pages[idx].note = new_text;
+                if !st.saved_once {
+                    st.saved_once = true;
+                    self.msg = "已就地保存这一页。".into();
+                }
+            }
+            Err(e) => self.msg = format!("讲稿保存失败：{e}"),
+        }
+    }
+
+    /// Fold a popped 讲稿视图's page scripts back into the deck
+    /// frame beneath it (same flattened order — the present
+    /// frame's pages were cloned from that deck), so the detail
+    /// the user returns to shows the edited scripts without a
+    /// reload.
+    fn sync_present_notes(&mut self, notes: Vec<String>) {
+        if let SrFrame::Deck(d) = self.showroom.stack.top_mut() {
+            for (page, note) in d.pages.iter_mut().zip(notes) {
+                page.note = note;
+            }
+        }
+    }
+
     /// Icon-only action button: an IconPark glyph (20px) inside a 30px
     /// hot zone, with a hover tooltip and an accessibility label — an
     /// icon button is never shipped without its name (hard floor).
@@ -12685,6 +13848,202 @@ impl App {
         self.showroom_deck_pages(ui, st, &item);
     }
 
+    /// The 讲稿视图 (prototype presentDlg): a full-page stream —
+    /// one row per page, the rendered slide on the left (1.7fr)
+    /// and its script panel on the right (1fr), the script
+    /// editable in place and committed on focus loss. The
+    /// header mirrors the prototype's: title + meta on the left,
+    /// 讲稿 toggle / 开始演示 / 导出 PPTX / 关闭预览 on the
+    /// right. 开始演示 closes this frame first (the prototype's
+    /// closePageView-then-openPlay order) and goes through the
+    /// one unified presentation path — never a second engine
+    /// entry. The slide face is the real rendered page (the
+    /// prototype's big-slide is a text mock of it); the page
+    /// title and 第 N 页 sit in a caption row under the image,
+    /// where the mock carries its foot line.
+    fn showroom_present(&mut self, ui: &mut egui::Ui, st: &mut SrPresentState) {
+        let item = st.item.clone();
+        if crumb_bar(ui, &["稿件详情", "讲稿视图"]) == Some(0) {
+            st.closed = true;
+            return;
+        }
+        ui.add_space(8.0);
+        let mut play_act = false;
+        let mut export_act = false;
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("预览 · 讲稿视图 · {}", s(&item, "title")))
+                        .strong()
+                        .size(18.0)
+                        .color(palette_color(TEXT_MAIN)),
+                );
+                let mut segs = vec![format!("{} 页", st.pages.len())];
+                if !s(&item, "source_index_id").is_empty() {
+                    segs.push(self.deck_commit_label(&item));
+                }
+                let by = s(&item, "submitted_by");
+                if !by.is_empty() {
+                    segs.push(format!("维护人 {by}"));
+                }
+                segs.push("预览不触发缓存".to_string());
+                ui.label(
+                    egui::RichText::new(segs.join(" · "))
+                        .size(11.5)
+                        .color(palette_color(TEXT_FAINT)),
+                );
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                // Right-to-left: added in reverse of the
+                // prototype's reading order （讲稿：开 · 开始演示 ·
+                // 导出 PPTX · 关闭预览）.
+                if btn_default(ui, "关闭预览").clicked() {
+                    st.closed = true;
+                }
+                if btn_default(ui, "导出 PPTX").clicked() {
+                    export_act = true;
+                }
+                if btn_primary(ui, "开始演示").clicked() {
+                    play_act = true;
+                }
+                let script_label = if st.script_on { "讲稿：开" } else { "讲稿：关" };
+                if btn_default(ui, script_label).clicked() {
+                    st.script_on = !st.script_on;
+                }
+            });
+        });
+        if export_act {
+            self.export_showroom_pptx(&item);
+        }
+        if play_act {
+            st.closed = true;
+            if !self.present_via_deckcraft(
+                &s(&item, "id"),
+                &s(&item, "title"),
+                DcMode::Play,
+                0,
+            ) {
+                let pages = st.pages.clone();
+                self.start_presentation(ui, &item, &pages);
+            }
+            return;
+        }
+        if st.pages.is_empty() {
+            ui.add_space(12.0);
+            ui.label(
+                egui::RichText::new("该稿件暂无可查看的页面").color(palette_color(TEXT_WEAK)),
+            );
+            return;
+        }
+        ui.add_space(12.0);
+        let mut save_idx: Option<usize> = None;
+        egui::ScrollArea::vertical()
+            .id_salt(("showroom-present", item["id"].as_str()))
+            .show(ui, |ui| {
+                let total = st.pages.len();
+                for idx in 0..total {
+                    let (vid, slot) = (
+                        st.pages[idx].version_id.clone(),
+                        st.pages[idx].slot,
+                    );
+                    let title = st.titles.get(idx).cloned().unwrap_or_default();
+                    let editable = st.scripts.contains_key(&vid);
+                    ui.horizontal_top(|ui| {
+                        let avail = ui.available_width();
+                        let gap = 14.0;
+                        let slide_w = if st.script_on {
+                            ((avail - gap) * 1.7 / 2.7).max(200.0)
+                        } else {
+                            avail
+                        };
+                        ui.allocate_ui(
+                            egui::vec2(slide_w, slide_w * 9.0 / 16.0 + 24.0),
+                            |ui| {
+                                ui.vertical(|ui| {
+                                    self.thumb_ui(ui, &vid, slot, slide_w);
+                                    ui.horizontal(|ui| {
+                                        if !title.is_empty() {
+                                            ui.label(
+                                                egui::RichText::new(&title)
+                                                    .size(12.0)
+                                                    .color(palette_color(TEXT_WEAK)),
+                                            );
+                                        }
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "第 {} 页",
+                                                        idx + 1
+                                                    ))
+                                                    .size(12.0)
+                                                    .color(palette_color(TEXT_FAINT)),
+                                                );
+                                            },
+                                        );
+                                    });
+                                });
+                            },
+                        );
+                        if st.script_on {
+                            let note_w = (avail - gap - slide_w).max(160.0);
+                            ui.allocate_ui(egui::vec2(note_w, 140.0), |ui| {
+                                egui::Frame::NONE
+                                    .fill(palette_color(HOVER_BG))
+                                    .corner_radius(egui::CornerRadius::same(6))
+                                    .inner_margin(egui::Margin {
+                                        left: 14,
+                                        right: 14,
+                                        top: 12,
+                                        bottom: 12,
+                                    })
+                                    .show(ui, |ui| {
+                                        ui.set_min_width(note_w - 28.0);
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "讲稿 · 第 {} 页",
+                                                idx + 1
+                                            ))
+                                            .strong()
+                                            .size(12.0)
+                                            .color(palette_color(TEXT_FAINT)),
+                                        );
+                                        ui.add_space(4.0);
+                                        if editable {
+                                            let resp = ui.add(
+                                                egui::TextEdit::multiline(
+                                                    &mut st.edits[idx],
+                                                )
+                                                .desired_width(note_w - 28.0)
+                                                .desired_rows(5)
+                                                .frame(false)
+                                                .hint_text("暂无讲稿"),
+                                            );
+                                            if resp.lost_focus() {
+                                                save_idx = Some(idx);
+                                            }
+                                        } else if st.pages[idx].note.is_empty() {
+                                            ui.label(
+                                                egui::RichText::new("暂无讲稿")
+                                                    .color(palette_color(TEXT_WEAK)),
+                                            );
+                                        } else {
+                                            ui.label(&st.pages[idx].note);
+                                        }
+                                    });
+                            });
+                        }
+                    });
+                    ui.add_space(16.0);
+                }
+            });
+        if let Some(idx) = save_idx {
+            self.save_present_script(st, idx);
+        }
+    }
+
     fn showroom_deck_pages(&mut self, ui: &mut egui::Ui, st: &mut DeckState, item: &Value) {
         if st.pages.is_empty() {
             ui.label(egui::RichText::new("该稿件暂无可查看的页面").color(palette_color(TEXT_WEAK)));
@@ -13190,6 +14549,120 @@ impl App {
                                         Err(e) => app.msg = format!("缓存失败：{e}"),
                                     }
                                 }
+                            });
+                        },
+                    );
+                }
+                if section == 0 || section == 4 {
+                    if section == 0 {
+                        ui.add_space(18.0);
+                    }
+                    // 本地演示: this library's own showroom rows
+                    // (local_showroom, fed by refresh_local). Pure
+                    // local data — every action below works
+                    // offline; only 提交到组织 leaves the machine,
+                    // through the existing submission chain.
+                    self.showroom_cards(
+                        ui,
+                        &self.local_showroom.clone(),
+                        |app, ui, e, width| {
+                            // Cover: the item's pinned first
+                            // resolved version; the plaza helper
+                            // reads showroom_live only, so local
+                            // rows fall back to the source index's
+                            // cover here.
+                            let cover = e["resolved_entries"]
+                                .as_array()
+                                .and_then(|a| a.first())
+                                .map(|en| s(&en["resolved"], "id"))
+                                .filter(|v| !v.is_empty())
+                                .unwrap_or_else(|| {
+                                    app.index_covers
+                                        .get(&s(e, "source_index_id"))
+                                        .cloned()
+                                        .unwrap_or_default()
+                                });
+                            app.showroom_card(ui, width, &s(e, "title"), &cover, false, |app, ui| {
+                                // Source line: the 本地演示 marker
+                                // keeps these rows distinct from
+                                // organization items on the shared
+                                // 全部 wall; the source index name
+                                // follows deck_source_label.
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "本地演示 · 来源 {}",
+                                        app.deck_source_label(e)
+                                    ))
+                                    .small()
+                                    .weak(),
+                                );
+                                let intro = s(e, "intro");
+                                if !intro.is_empty() {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(intro).small().weak(),
+                                        )
+                                        .truncate(),
+                                    );
+                                }
+                                let state_label = match s(e, "state").as_str() {
+                                    "pending" => "待审（本地）",
+                                    "rejected" => "已驳回（本地）",
+                                    _ => "正式版（本地）",
+                                };
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{} · {} · {}",
+                                        state_label,
+                                        s(e, "submitted_by"),
+                                        fmt_time(i(e, "created_ms"))
+                                    ))
+                                    .small()
+                                    .weak(),
+                                );
+                                if s(e, "state") == "rejected"
+                                    && !s(e, "review_note").is_empty()
+                                {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "驳回理由：{}",
+                                            s(e, "review_note")
+                                        ))
+                                        .small()
+                                        .weak(),
+                                    );
+                                }
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui.small_button("打开详情").clicked() {
+                                        app.open_showroom_deck(e);
+                                    }
+                                    if ui.small_button("开始演示").clicked() {
+                                        app.open_showroom_deck(e);
+                                        if !app.present_via_deckcraft(
+                                            &s(e, "id"),
+                                            &s(e, "title"),
+                                            DcMode::Play,
+                                            0,
+                                        ) {
+                                            app.start_present_from_deck(ui);
+                                        }
+                                    }
+                                    let src = s(e, "source_index_id");
+                                    if !src.is_empty()
+                                        && ui.small_button("提交到组织").clicked()
+                                    {
+                                        let title = s(e, "title");
+                                        app.open_push_dialog(&src, &title);
+                                    }
+                                    if text_action(
+                                        ui,
+                                        "删除",
+                                        palette_color(BADGE_BAD_FG),
+                                        12.0,
+                                    ) {
+                                        app.trash_add("showroom", &s(e, "id"));
+                                    }
+                                });
                             });
                         },
                     );
@@ -14566,6 +16039,25 @@ impl App {
             self.showroom_wall(ui);
             return;
         }
+        // The 讲稿视图 frame sits on top of the deck frame: the
+        // same take-out pattern, and on close its saved scripts
+        // fold back into the deck frame it restores.
+        if matches!(self.showroom.stack.top(), SrFrame::Present(_)) {
+            if let SrFrame::Present(mut pv) =
+                self.showroom.stack.replace_top(SrFrame::Wall)
+            {
+                self.showroom_present(ui, &mut pv);
+                if pv.closed {
+                    let notes =
+                        pv.pages.iter().map(|p| p.note.clone()).collect::<Vec<_>>();
+                    self.showroom.stack.pop();
+                    self.sync_present_notes(notes);
+                } else {
+                    self.showroom.stack.replace_top(SrFrame::Present(pv));
+                }
+            }
+            return;
+        }
         if let SrFrame::Deck(mut deck) = self.showroom.stack.replace_top(SrFrame::Wall) {
             self.showroom_deck(ui, &mut deck);
             if deck.closed {
@@ -14611,13 +16103,20 @@ impl App {
             self.groups_view(ui);
             return;
         }
+        // Plaza folder filtering is by the item's OWN folder
+        // assignment (option (a), 2026-11-25): the sidebar's
+        // "showroom"-scope folders are the plaza's own tree, so
+        // filtering by the source index's folder — a disjoint
+        // id space since sidebar isolation — could only ever
+        // empty the wall. 全部 (None) passes everything;
+        // unassigned items pass only there.
         let items = self
             .showroom_live
             .iter()
             .filter(|item| {
                 self.folder_filter_ok(
                     &self.showroom.folder,
-                    &self.index_folder_of(&s(item, "source_index_id")),
+                    &self.plaza_folder_of(&s(item, "id")),
                 )
             })
             .cloned()
@@ -14711,6 +16210,45 @@ impl App {
                 s(item, "submitted_by"),
                 fmt_time(i(item, "created_ms"))
             ));
+        // Move-to-folder (option (a) intake): a right-click menu
+        // on the cover — the same response that takes the card's
+        // click/double-click, and the same context-menu form the
+        // sidebar folder rows use. The assignment is local state,
+        // so the menu is offered offline and on cache-backfilled
+        // cards too. The pick is captured and applied after the
+        // menu closes (the folder_tree discipline).
+        let mut move_pick: Option<String> = None;
+        response.context_menu(|ui| {
+            ui.menu_button("移动到文件夹", |ui| {
+                let cur = self.plaza_folder_of(&id);
+                let mut pick = |ui: &mut egui::Ui, target: &str, label: String| {
+                    let text = if cur == target {
+                        format!("✓ {label}")
+                    } else {
+                        label
+                    };
+                    if ui.button(text).clicked() {
+                        move_pick = Some(target.to_string());
+                        ui.close();
+                    }
+                };
+                pick(ui, "", "无文件夹（仅在「全部」显示）".to_string());
+                let options = self.plaza_folder_options();
+                if !options.is_empty() {
+                    ui.separator();
+                    for (fid, name, depth) in options {
+                        pick(
+                            ui,
+                            &fid,
+                            format!("{}{name}", "　".repeat(depth)),
+                        );
+                    }
+                }
+            });
+        });
+        if let Some(target) = move_pick {
+            self.set_plaza_item_folder(&id, &target);
+        }
         if response.clicked() {
             self.showroom.selected_card = Some(id.clone());
         }
@@ -15019,7 +16557,12 @@ impl App {
             self.lazy_unit_page
                 .retain(|_, (p, _)| p != &info.pending_id);
             self.msg = format!("「{stem}」分割完成");
-            self.refresh_all();
+            // Phase-1 (design §3.1 point 2): the terminal beat —
+            // full local snapshot + index meta, consumed at once;
+            // the split throttle never defers completion.
+            self.mark(Change::LocalWork);
+            self.mark(Change::IndexMeta);
+            self.flush_dirty_now();
             return;
         }
         if info.failed {
@@ -15043,7 +16586,13 @@ impl App {
             // wall's unit set changed, and this deck's remaining
             // map entries are rebuilt exactly.
             self.lazy_sync_pending(&info.pending_id);
-            self.refresh_all();
+            // Phase-1 (design §3.1 point 1): the old code paid a
+            // full refresh_all per folded block (S per deck);
+            // now the beat only marks Units+Indexes — the frame
+            // point consumes them, throttled to one local
+            // re-read per 500ms while the split runs.
+            self.changed(Change::Units);
+            self.changed(Change::Indexes);
         }
     }
 
@@ -17690,10 +19239,15 @@ impl App {
                         ls.selected.clear();
                     }
                     self.trash.loaded = false;
-                    // No refresh_all: purged rows were already
-                    // absent from every wall (same reasoning as
+                    // Phase-1 (design §3.1 point 22): no wall
+                    // refresh — purged rows were already absent
+                    // from every wall (same reasoning as
                     // trash_purge, delete-freeze round 2); the
-                    // trash list re-reads via loaded = false.
+                    // Trash mark is the bin's own bookkeeping.
+                    self.changed(Change::Trash);
+                }
+                ConfirmAction::ShutdownServer(i) => {
+                    self.do_shutdown_server(i);
                 }
                 ConfirmAction::EmptyTrash => {
                     // F6: rows merged from the server (marked
@@ -17730,9 +19284,14 @@ impl App {
                                 selected: Default::default(),
                             }));
                             self.trash.loaded = false;
-                            // No refresh_all: every purged row was
-                            // already absent from the walls
-                            // (delete-freeze round 2).
+                            // Phase-1 (design §3.1 point 23): the
+                            // per-row REST purges above are the
+                            // operation itself (phase-3 territory);
+                            // only the trailing refresh is replaced
+                            // (no wall refresh — every purged row
+                            // was already absent from the walls,
+                            // delete-freeze round 2).
+                            self.changed(Change::Trash);
                         }
                         Err(e) => self.msg = format!("清空失败：{e}"),
                     }
@@ -18069,7 +19628,18 @@ impl App {
                     }
                     self.msg = "已从模板创建".into();
                     self.page = Page::Index;
-                    self.refresh_all();
+                    // Phase-1 (design §3.1 point 17): read-after-
+                    // write — the detail open below navigates
+                    // from the refreshed lists, so consume at
+                    // once (new index's meta by id).
+                    self.mark(Change::Indexes);
+                    self.mark(Change::Units);
+                    if new_id.is_empty() {
+                        self.mark(Change::IndexMeta);
+                    } else {
+                        self.mark_index_meta(&new_id);
+                    }
+                    self.flush_dirty_now();
                     if !new_id.is_empty() {
                         self.open_index_detail(&new_id);
                     }
@@ -18400,7 +19970,10 @@ impl App {
         if let Some(uid) = open_uid {
             self.reload_unit_detail(&uid);
         }
-        self.refresh_all();
+        // Phase-1 (design §3.1 point 16): the detail reload
+        // above is the D1 path; the wall only needs Units. The
+        // caller reads nothing but the returned version id.
+        self.changed(Change::Units);
         Some(saved_version_id)
     }
 
@@ -19302,6 +20875,144 @@ impl App {
             .find(|x| s(x, "id") == index_id)
             .map(|x| s(x, "folder_id"))
             .unwrap_or_default()
+    }
+
+    /// A showroom item's own plaza folder home (client-side
+    /// assignment; empty = unassigned, shows only under 全部).
+    fn plaza_folder_of(&self, item_id: &str) -> String {
+        self.plaza_item_folders
+            .get(item_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Set (or, with an empty folder id, clear) a showroom
+    /// item's plaza folder assignment and persist the mapping.
+    fn set_plaza_item_folder(&mut self, item_id: &str, folder_id: &str) {
+        if item_id.is_empty() {
+            return;
+        }
+        let changed = if folder_id.is_empty() {
+            self.plaza_item_folders.remove(item_id).is_some()
+        } else {
+            self.plaza_item_folders
+                .insert(item_id.to_string(), folder_id.to_string())
+                .as_deref()
+                != Some(folder_id)
+        };
+        if changed {
+            save_client_settings(json!({
+                "plaza_item_folders": self.plaza_item_folders.clone(),
+            }));
+        }
+    }
+
+    /// The plaza sidebar's folders ("showroom" scope) in tree
+    /// order, as (id, name, depth) — the move menu's targets.
+    fn plaza_folder_options(&self) -> Vec<(String, String, usize)> {
+        let mut folders: Vec<Value> = self
+            .folders
+            .iter()
+            .filter(|f| s(*f, "scope") == "showroom")
+            .cloned()
+            .collect();
+        folders.sort_by_key(|f| i(f, "sort"));
+        fn depth_of(folders: &[Value], f: &Value) -> usize {
+            let mut d = 0;
+            let mut cur = s(f, "parent_id");
+            while !cur.is_empty() && d < 8 {
+                d += 1;
+                match folders.iter().find(|x| s(x, "id") == cur) {
+                    Some(p) => cur = s(p, "parent_id"),
+                    None => break,
+                }
+            }
+            d
+        }
+        let mut ordered: Vec<Value> = Vec::new();
+        fn walk(folders: &[Value], parent: &str, out: &mut Vec<Value>) {
+            for f in folders {
+                if s(f, "parent_id") == parent {
+                    out.push(f.clone());
+                    let id = s(f, "id");
+                    walk(folders, &id, out);
+                }
+            }
+        }
+        walk(&folders, "", &mut ordered);
+        for f in &folders {
+            if !ordered.iter().any(|x| s(x, "id") == s(f, "id")) {
+                ordered.push(f.clone());
+            }
+        }
+        ordered
+            .iter()
+            .map(|f| (s(f, "id"), s(f, "name"), depth_of(&folders, f)))
+            .collect()
+    }
+
+    /// Folder-delete bookkeeping for plaza assignments, run on
+    /// the delete drain BEFORE the refresh reloads the folder
+    /// list (the deleted record is still readable here). Mirrors
+    /// the core's own semantics: "lift" promotes the deleted
+    /// folder's items to its parent (subfolder items keep their
+    /// folders — the subfolders themselves are promoted, not
+    /// deleted); "trash" removes the whole subtree, so items
+    /// homed anywhere inside it become unassigned.
+    fn apply_plaza_folder_delete(&mut self, id: &str, mode: &str) {
+        if self.plaza_item_folders.is_empty() {
+            return;
+        }
+        let showroom_folders: Vec<Value> = self
+            .folders
+            .iter()
+            .filter(|f| s(*f, "scope") == "showroom")
+            .cloned()
+            .collect();
+        let parent = showroom_folders
+            .iter()
+            .find(|f| s(f, "id") == id)
+            .map(|f| s(f, "parent_id"))
+            .unwrap_or_default();
+        // subtree of `id` within the showroom scope (id included)
+        let mut subtree: Vec<String> = vec![id.to_string()];
+        let mut grew = true;
+        while grew {
+            grew = false;
+            for f in &showroom_folders {
+                let fid = s(f, "id");
+                if !subtree.contains(&fid) && subtree.contains(&s(f, "parent_id")) {
+                    subtree.push(fid);
+                    grew = true;
+                }
+            }
+        }
+        let mut changed = false;
+        if mode == "trash" {
+            let before = self.plaza_item_folders.len();
+            self.plaza_item_folders
+                .retain(|_, fid| !subtree.contains(fid));
+            changed = self.plaza_item_folders.len() != before;
+        } else {
+            for fid in self.plaza_item_folders.values_mut() {
+                if *fid == id {
+                    *fid = parent.clone();
+                    changed = true;
+                }
+            }
+            // A root folder's parent is "": promoted items
+            // become unassigned (the empty value is not a home).
+            if parent.is_empty() {
+                let before = self.plaza_item_folders.len();
+                self.plaza_item_folders.retain(|_, fid| !fid.is_empty());
+                changed = changed || self.plaza_item_folders.len() != before;
+            }
+        }
+        if changed {
+            save_client_settings(json!({
+                "plaza_item_folders": self.plaza_item_folders.clone(),
+            }));
+        }
     }
 
     /// Does an item whose home is `folder_id` pass the folder filter?
@@ -20402,6 +22113,14 @@ impl App {
                             if c.token.is_some() && ui.button("断开").clicked() {
                                 action = Some((i, "disconnect"));
                             }
+                            // 关闭服务器 (user ruling 2026-11-25):
+                            // shown on every card and never greyed
+                            // for permission — the click prompts
+                            // when the identity cannot close it
+                            // (button-state standard).
+                            if ui.button("关闭服务器").clicked() {
+                                action = Some((i, "shutdown"));
+                            }
                             if !is_active && ui.button("设为当前").clicked() {
                                 action = Some((i, "activate"));
                             }
@@ -20435,6 +22154,7 @@ impl App {
             match op {
                 "activate" => self.activate(i),
                 "disconnect" => self.disconnect_conn(i),
+                "shutdown" => self.ask_shutdown_server(i),
                 "delete" => {
                     if i < self.conns.len() {
                         let was_active = self.active == Some(i);
@@ -21626,6 +23346,120 @@ impl App {
 /// logging failure must never take the app down with it). The GUI
 /// subsystem has no console, so without this file a startup failure is
 /// a silent vanish ("闪一下就没") with zero evidence left behind.
+/// Phase-1 measurement switch (design §4.1): every perf
+/// instrumentation point in the client (M1–M5) hangs off this one
+/// flag — `QIMU_PERF_LOG=1` writes to `client-perf.log` in the
+/// qimu home; unset/anything else is off and costs one cached
+/// flag read per call site.
+pub(crate) fn perf_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("QIMU_PERF_LOG")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// Append one line to the perf log (no-op when the switch is
+/// off). Same home and line shape as `startup_log`, separate
+/// file so metric extraction never wades through launch noise.
+pub(crate) fn perf_log(msg: &str) {
+    if !perf_enabled() {
+        return;
+    }
+    let dir = qimu_home();
+    let _ = std::fs::create_dir_all(&dir);
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let line = format!("[{secs}] {msg}\n");
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("client-perf.log"))
+        .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+}
+
+thread_local! {
+    /// M3 REST counters for the calling thread: (call count,
+    /// total ms). The UI thread's refresh summaries diff two
+    /// snapshots; worker threads accumulate into their own cells
+    /// and never pollute a UI-thread summary.
+    static REST_STAT: std::cell::Cell<(u64, u128)> = std::cell::Cell::new((0, 0));
+}
+
+fn perf_rest_note(ms: u128) {
+    REST_STAT.with(|c| {
+        let (n, t) = c.get();
+        c.set((n + 1, t + ms));
+    });
+}
+
+fn perf_rest_snapshot() -> (u64, u128) {
+    REST_STAT.with(|c| c.get())
+}
+
+/// The `refresh <kind> …` summary line (design §4.1 M3/M4):
+/// REST calls and REST wait inside one refresh_all / apply_dirty
+/// pass, plus the pass's total wall time and — for apply_dirty —
+/// the per-slice breakdown.
+fn perf_refresh_summary(
+    kind: &str,
+    start: std::time::Instant,
+    before: (u64, u128),
+    slices: &[String],
+) {
+    if !perf_enabled() {
+        return;
+    }
+    let (n, t) = perf_rest_snapshot();
+    let mut line = format!(
+        "refresh {kind} rest_count={} rest_ms={} total_ms={}",
+        n.saturating_sub(before.0),
+        t.saturating_sub(before.1),
+        start.elapsed().as_millis()
+    );
+    if !slices.is_empty() {
+        line += &format!(" slices={}", slices.join(","));
+    }
+    perf_log(&line);
+}
+
+/// M5 frame timer: logs `frame <ms>` on drop when the frame
+/// exceeded 50ms, so slow frames can be aligned by timestamp
+/// with the M1–M4 lines that caused them.
+struct PerfFrame(std::time::Instant);
+
+impl PerfFrame {
+    fn new() -> Self {
+        Self(std::time::Instant::now())
+    }
+}
+
+impl Drop for PerfFrame {
+    fn drop(&mut self) {
+        let ms = self.0.elapsed().as_millis();
+        if ms > 50 {
+            perf_log(&format!("frame {ms}ms"));
+        }
+    }
+}
+
+/// Phase-1 gray switch (design §5.2): `QIMU_REFRESH_V2=0`
+/// turns the event machinery off — `changed`/`changed_now`
+/// then fall back to the legacy `refresh_all()` at their single
+/// shared entry, never at the migration call sites. Missing =
+/// on.
+fn refresh_v2_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("QIMU_REFRESH_V2")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
 fn startup_log(msg: &str) {
     let dir = qimu_home();
     let _ = std::fs::create_dir_all(&dir);

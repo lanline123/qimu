@@ -915,10 +915,13 @@ impl App {
             let item = item.clone().unwrap();
             self.export_showroom_pptx(&item);
         }
-        // sdPreview — the #212 script screen. In the client that
-        // screen is the deck's own 讲稿 (Notes) view — the deck
-        // page's segmented 讲稿 tab — so the button lands there;
-        // it carries no mode-selected state of its own.
+        // sdPreview — the #212 script screen (prototype
+        // presentDlg): a full-page 讲稿视图 pushed over the deck
+        // frame, NOT the deck's in-detail 讲稿 tier — that tier
+        // is the 备注视图 button's target (prototype sdDeckNotes)
+        // and the detail's own segmented control. The present
+        // frame carries its own header actions, so this button
+        // has no mode-selected state of its own.
         if ChromeIcons
             .tool(
                 ui,
@@ -930,9 +933,7 @@ impl App {
             )
             .clicked()
         {
-            if let SrFrame::Deck(st) = self.showroom.stack.top_mut() {
-                st.view = DeckView::Notes;
-            }
+            self.open_showroom_present();
         }
         tool_vsep(ui);
         if editing {
@@ -1120,24 +1121,26 @@ impl App {
                 }
             }
         }
-        // sdDel — wired only where a clean delete target with an
-        // existing handler exists: the open content block (the
-        // unit detail's own 删除内容块 path). Everywhere else it
-        // greys with the group, as in the prototype.
-        let unit_open =
-            self.page == Page::Content && matches!(self.content.stack.top(), ContentFrame::Unit(_));
+        // sdDel — wired on every page (user ruling 2026-11-25):
+        // whatever object the current context has selected is
+        // the target — a showroom entry (open deck or plaza
+        // card), an index (open detail or overview selection),
+        // wall blocks (单页 and 内容块 alike), or, in the open
+        // block's detail, the clicked history version when one
+        // is selected and the block itself otherwise. It greys
+        // only where nothing is selected — the one objectively
+        // unexecutable state.
+        let del_targets = self.deckbar_delete_targets();
+        let del_tip = match del_targets.len() {
+            0 => "删除".to_string(),
+            1 => format!("删除「{}」", del_targets[0].label),
+            n => format!("删除选中的 {n} 项"),
+        };
         if ChromeIcons
-            .tool(
-                ui,
-                ChromeIcon::Trash,
-                "删除选中的内容块",
-                unit_open,
-                false,
-                true,
-            )
+            .tool(ui, ChromeIcon::Trash, &del_tip, !del_targets.is_empty(), false, true)
             .clicked()
         {
-            self.deckbar_delete_unit();
+            self.deckbar_delete_selection(del_targets);
         }
         // 清空选择 — directly in front of 删除 (added after it
         // in this right-to-left layout): drops the wall's
@@ -1459,6 +1462,7 @@ impl App {
         match self.page {
             Page::Home => None,
             Page::Showroom => match self.showroom.stack.top() {
+                SrFrame::Present(_) => Some("关闭当前整页视图"),
                 SrFrame::Deck(st) => Some(if st.preview_open {
                     "返回稿件详情"
                 } else {
@@ -1511,7 +1515,19 @@ impl App {
         match self.page {
             Page::Home => {}
             Page::Showroom => {
-                if matches!(self.showroom.stack.top(), SrFrame::Deck(_)) {
+                if matches!(self.showroom.stack.top(), SrFrame::Present(_)) {
+                    // Close the 讲稿视图 frame: pop back to the
+                    // deck frame it covered, folding in any
+                    // scripts saved while it was open.
+                    let notes = match self.showroom.stack.top() {
+                        SrFrame::Present(pv) => {
+                            pv.pages.iter().map(|p| p.note.clone()).collect::<Vec<_>>()
+                        }
+                        _ => Vec::new(),
+                    };
+                    self.showroom.stack.pop();
+                    self.sync_present_notes(notes);
+                } else if matches!(self.showroom.stack.top(), SrFrame::Deck(_)) {
                     self.back_from_showroom_detail();
                 } else {
                     self.navigate_to(Page::Home);
@@ -1572,23 +1588,246 @@ impl App {
         }
     }
 
-    /// sdDel's one wired context: delete the open content block
-    /// through the unit detail's own path (trash_add + close).
-    fn deckbar_delete_unit(&mut self) {
-        let uid = match self.content.stack.top() {
-            ContentFrame::Unit(st) => {
-                let unit = st.detail.get("unit").cloned().unwrap_or(json!({}));
-                s(&unit, "id")
-            }
-            _ => return,
-        };
-        if uid.is_empty() {
+    /// sdDel's targets for the current context (user ruling
+    /// 2026-11-25: clickable whenever anything is selected, on
+    /// any page). Resolution per page:
+    /// - Content, block detail open: the clicked history
+    ///   version when one is selected (deleting it deletes THAT
+    ///   version), else the open block itself.
+    /// - Content, wall: the multi-selection, else the anchor
+    ///   card — 单页 and 内容块 are both "unit" targets.
+    ///   Unsplit lazy wrappers never appear (their cards take
+    ///   no selection; filtered again here so a stale selection
+    ///   can never name one).
+    /// - Index: the open detail's index, else the overview's
+    ///   selected card.
+    /// - Showroom: the open deck's entry, else the plaza wall's
+    ///   selected card.
+    /// Everywhere else (home, trash, settings, messages):
+    /// nothing — the button greys.
+    fn deckbar_delete_targets(&self) -> Vec<DelTarget> {
+        match self.page {
+            Page::Content => match self.content.stack.top() {
+                ContentFrame::Unit(st) => {
+                    let unit = st.detail.get("unit").cloned().unwrap_or(json!({}));
+                    let uid = s(&unit, "id");
+                    if uid.is_empty() {
+                        return Vec::new();
+                    }
+                    let name = s(&unit, "name");
+                    if let Some(vid) = &st.selected_version {
+                        let label = super::content_detail::unit_versions(&st.detail)
+                            .into_iter()
+                            .find(|v| s(&v.version, "id") == *vid)
+                            .map(|v| format!("{name} · v{}", s(&v.version, "semver")))
+                            .unwrap_or_else(|| format!("{name} · 历史版本"));
+                        return vec![DelTarget {
+                            kind: "version",
+                            id: vid.clone(),
+                            label,
+                        }];
+                    }
+                    vec![DelTarget {
+                        kind: "unit",
+                        id: uid,
+                        label: name,
+                    }]
+                }
+                ContentFrame::Wall(w) => {
+                    let ids: Vec<String> = if !w.multi.is_empty() {
+                        w.multi.clone()
+                    } else if let Some(sel) = &w.selected {
+                        vec![sel.clone()]
+                    } else {
+                        Vec::new()
+                    };
+                    ids.into_iter()
+                        .filter(|id| !self.lazy_unit_page.contains_key(id))
+                        .map(|id| {
+                            let label = self
+                                .units
+                                .iter()
+                                .find_map(|it| {
+                                    let u = it.get("unit")?;
+                                    (s(u, "id") == id).then(|| s(u, "name"))
+                                })
+                                .unwrap_or_default();
+                            DelTarget {
+                                kind: "unit",
+                                id,
+                                label,
+                            }
+                        })
+                        .collect()
+                }
+            },
+            Page::Index => match self.index.stack.top() {
+                IndexFrame::Detail(d) => {
+                    let label = self
+                        .indexes
+                        .iter()
+                        .find(|x| s(x, "id") == d.index_id)
+                        .map(|x| s(x, "name"))
+                        .unwrap_or_default();
+                    vec![DelTarget {
+                        kind: "index",
+                        id: d.index_id.clone(),
+                        label,
+                    }]
+                }
+                IndexFrame::Overview(ov) => match &ov.selected {
+                    Some(id) => {
+                        let label = self
+                            .indexes
+                            .iter()
+                            .find(|x| s(x, "id") == *id)
+                            .map(|x| s(x, "name"))
+                            .unwrap_or_default();
+                        vec![DelTarget {
+                            kind: "index",
+                            id: id.clone(),
+                            label,
+                        }]
+                    }
+                    None => Vec::new(),
+                },
+                _ => Vec::new(),
+            },
+            Page::Showroom => match self.showroom.stack.top() {
+                SrFrame::Deck(st) => {
+                    let id = s(&st.item, "id");
+                    if id.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![DelTarget {
+                            kind: "showroom",
+                            id,
+                            label: s(&st.item, "title"),
+                        }]
+                    }
+                }
+                SrFrame::Wall => match &self.showroom.selected_card {
+                    Some(id) => {
+                        let label = self
+                            .showroom_live
+                            .iter()
+                            .find(|it| s(it, "id") == *id)
+                            .map(|it| s(it, "title"))
+                            .unwrap_or_default();
+                        vec![DelTarget {
+                            kind: "showroom",
+                            id: id.clone(),
+                            label,
+                        }]
+                    }
+                    None => Vec::new(),
+                },
+            },
+            _ => Vec::new(),
+        }
+    }
+
+    /// sdDel: run the batch (App::trash_add_many), then apply
+    /// the context cleanup for what actually went away — open
+    /// frames whose object was deleted close, selections shed
+    /// the dead ids, an open detail whose history version was
+    /// deleted reloads without it — refresh once, scoped to the
+    /// deleted kinds, and report: one line for the successes,
+    /// every failure named with its reason (a pin-guarded
+    /// version refuses, the rest still delete).
+    fn deckbar_delete_selection(&mut self, targets: Vec<DelTarget>) {
+        if targets.is_empty() {
             return;
         }
-        if let ContentFrame::Unit(st) = self.content.stack.top_mut() {
-            st.closed = true;
+        let failures = self.trash_add_many(&targets);
+        let failed: std::collections::HashSet<&str> =
+            failures.iter().map(|(t, _)| t.id.as_str()).collect();
+        let succeeded: Vec<&DelTarget> = targets
+            .iter()
+            .filter(|t| !failed.contains(t.id.as_str()))
+            .collect();
+        let mut version_gone = false;
+        for t in &succeeded {
+            match t.kind {
+                "version" => {
+                    version_gone = true;
+                    if let ContentFrame::Unit(st) = self.content.stack.top_mut() {
+                        if st.selected_version.as_deref() == Some(t.id.as_str()) {
+                            st.selected_version = None;
+                            st.selected_page = None;
+                            st.bind_pick = None;
+                            st.bind_panel = None;
+                        }
+                    }
+                }
+                "unit" => {
+                    if let ContentFrame::Unit(st) = self.content.stack.top_mut() {
+                        if st.unit_id == t.id {
+                            st.closed = true;
+                        }
+                    }
+                    if let ContentFrame::Wall(w) = self.content.stack.root_mut() {
+                        w.multi.retain(|id| id != &t.id);
+                        if w.selected.as_deref() == Some(t.id.as_str()) {
+                            w.selected = None;
+                        }
+                    }
+                }
+                "index" => {
+                    if let IndexFrame::Detail(st) = self.index.stack.top_mut() {
+                        if st.index_id == t.id {
+                            st.closed = true;
+                        }
+                    }
+                    if let IndexFrame::Overview(ov) = self.index.stack.root_mut() {
+                        if ov.selected.as_deref() == Some(t.id.as_str()) {
+                            ov.selected = None;
+                        }
+                    }
+                }
+                "showroom" => {
+                    if let SrFrame::Deck(st) = self.showroom.stack.top_mut() {
+                        if s(&st.item, "id") == t.id {
+                            st.closed = true;
+                        }
+                    }
+                    if self.showroom.selected_card.as_deref() == Some(t.id.as_str()) {
+                        self.showroom.selected_card = None;
+                    }
+                }
+                _ => {}
+            }
         }
-        self.trash_add("unit", &uid);
+        if !succeeded.is_empty() {
+            let kinds: Vec<&str> = succeeded.iter().map(|t| t.kind).collect();
+            self.refresh_after_trash_delete(&kinds);
+            if version_gone {
+                if let ContentFrame::Unit(st) = self.content.stack.top() {
+                    let uid = st.unit_id.clone();
+                    self.reload_unit_detail(&uid);
+                }
+            }
+        }
+        match (succeeded.len(), failures.len()) {
+            (1, 0) => self.say("已移入回收站，可随时恢复"),
+            (n, 0) => self.say(format!("已移入回收站 {n} 项，可随时恢复")),
+            (0, _) => {
+                let list = failures
+                    .iter()
+                    .map(|(t, e)| format!("「{}」：{e}", t.label))
+                    .collect::<Vec<_>>()
+                    .join("；");
+                self.say(format!("删除失败：{list}"));
+            }
+            (n, _) => {
+                let list = failures
+                    .iter()
+                    .map(|(t, e)| format!("「{}」：{e}", t.label))
+                    .collect::<Vec<_>>()
+                    .join("；");
+                self.say(format!("已移入回收站 {n} 项；未能删除：{list}"));
+            }
+        }
     }
 
     fn page_footer(&mut self, ui: &mut egui::Ui) {

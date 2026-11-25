@@ -65,6 +65,11 @@ pub struct OpenedPage {
     pub page_id: String,
     pub fp: String,
     pub title: String,
+    /// The page's one-line summary (PageInfo::desc), read in
+    /// the same pass; serde-defaulted for symmetry with the
+    /// persisted carriers.
+    #[serde(default)]
+    pub desc: String,
     pub text: String,
     pub script: String,
     pub unit_id: String,
@@ -366,11 +371,13 @@ impl Store {
         // extractions `insert_version_with_scripts` performs per
         // fragment, done here once per slide.
         let mut titles = Vec::with_capacity(slide_refs.len());
+        let mut descs = Vec::with_capacity(slide_refs.len());
         let mut texts = Vec::with_capacity(slide_refs.len());
         let mut scripts = Vec::with_capacity(slide_refs.len());
         for s in &slide_refs {
             let xml = pkg.get_text(&s.part)?;
             titles.push(crate::text::slide_title(&xml));
+            descs.push(crate::text::slide_desc(&xml));
             texts.push(crate::text::slide_full_text(&xml));
             scripts.push(crate::text::notes_text(&pkg, &s.part));
         }
@@ -486,6 +493,7 @@ impl Store {
                     page_id,
                     fp: s.fingerprint.clone(),
                     title: titles[i].clone(),
+                    desc: descs[i].clone(),
                     text: texts[i].clone(),
                     script: scripts[i].clone(),
                     unit_id: uid,
@@ -504,7 +512,8 @@ impl Store {
                 Some(rec) => self.file_get(&rec.hash)?,
                 None => singles[i].to_bytes()?,
             };
-            let rec = self.register_page(&s.fingerprint, &titles[i], &frag_bytes)?;
+            let rec =
+                self.register_page(&s.fingerprint, &titles[i], &descs[i], &frag_bytes)?;
             let unit = self.create_unit(&name, folder_id, group_id, author, lang, "")?;
             created_units.push(unit.id.clone());
             let rend = self.get_or_create_rendition(&unit.id, form, lang)?;
@@ -512,6 +521,7 @@ impl Store {
                 id: rec.id.clone(),
                 fp: s.fingerprint.clone(),
                 title: titles[i].clone(),
+                desc: descs[i].clone(),
             };
             let ver = self.insert_version_from_pages(
                 &rend.id,
@@ -530,6 +540,7 @@ impl Store {
                 page_id: rec.id,
                 fp: s.fingerprint.clone(),
                 title: titles[i].clone(),
+                desc: descs[i].clone(),
                 text: texts[i].clone(),
                 script: scripts[i].clone(),
                 unit_id: unit.id,
@@ -771,6 +782,7 @@ impl Store {
                             id: p.page_id.clone(),
                             fp: p.fp.clone(),
                             title: p.title.clone(),
+                            desc: p.desc.clone(),
                         }
                     })
                     .collect();
@@ -978,6 +990,7 @@ impl Store {
                         id: p.page_id.clone(),
                         fp: p.fp.clone(),
                         title: p.title.clone(),
+                        desc: p.desc.clone(),
                     }
                 })
                 .collect();
@@ -1100,11 +1113,13 @@ impl Store {
         let pkg = Package::load(bytes)?;
         let slide_refs = pptx::slides(&pkg)?;
         let mut titles = Vec::with_capacity(slide_refs.len());
+        let mut descs = Vec::with_capacity(slide_refs.len());
         let mut texts = Vec::with_capacity(slide_refs.len());
         let mut scripts = Vec::with_capacity(slide_refs.len());
         for s in &slide_refs {
             let xml = pkg.get_text(&s.part)?;
             titles.push(crate::text::slide_title(&xml));
+            descs.push(crate::text::slide_desc(&xml));
             texts.push(crate::text::slide_full_text(&xml));
             scripts.push(crate::text::notes_text(&pkg, &s.part));
         }
@@ -1154,6 +1169,7 @@ impl Store {
                     id: page_id.clone(),
                     fp: s.fingerprint.clone(),
                     title: titles[i].clone(),
+                    desc: descs[i].clone(),
                 };
                 let known = self.get_page(&page_id)?;
                 // Adopt a wrapper an earlier open of this deck
@@ -1176,6 +1192,7 @@ impl Store {
                         index: i,
                         fp: s.fingerprint.clone(),
                         title: titles[i].clone(),
+                        desc: descs[i].clone(),
                         text: texts[i].clone(),
                         script: scripts[i].clone(),
                         unit_id: uid,
@@ -1261,6 +1278,7 @@ impl Store {
                     index: i,
                     fp: s.fingerprint.clone(),
                     title: titles[i].clone(),
+                    desc: descs[i].clone(),
                     text: texts[i].clone(),
                     script: scripts[i].clone(),
                     unit_id: unit.id.clone(),
@@ -1372,6 +1390,7 @@ impl Store {
                     page_id: crate::store::page_id_for_fp(&p.fp),
                     fp: p.fp.clone(),
                     title: p.title.clone(),
+                    desc: p.desc.clone(),
                     text: p.text.clone(),
                     script: p.script.clone(),
                     unit_id: p.unit_id.clone(),
@@ -1541,8 +1560,9 @@ impl Store {
                 let single_bytes = single.to_bytes()?;
                 let fp = rec.pages[index].fp.clone();
                 let title = rec.pages[index].title.clone();
+                let desc = rec.pages[index].desc.clone();
                 let version_id = rec.pages[index].version_id.clone();
-                let entity = self.register_page(&fp, &title, &single_bytes)?;
+                let entity = self.register_page(&fp, &title, &desc, &single_bytes)?;
                 self.set_version_fragment_hash(&version_id, &entity.hash)?;
                 rec.pages[index].split = true;
                 self.lazy_advance(&mut rec)?

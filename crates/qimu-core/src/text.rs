@@ -31,6 +31,55 @@ pub fn slide_full_text(slide_xml: &str) -> String {
     extract_texts(slide_xml).join(" ")
 }
 
+/// The page's one-line content summary — the per-page `desc`
+/// (prototype page field `d`: 「架构图 · 分层与关键组件」, the
+/// summary line shown under the title in #406, in the #101
+/// thumbnail cell and on bind candidates).
+///
+/// Source choice (weighed against the prototype's semantics):
+/// `d` is a summary of the page's VISIBLE content — in the
+/// prototype's page editor it is the page's editable body text —
+/// so it is NOT the speaker notes (those are the page's 讲稿,
+/// already carried separately as the version's scripts). The
+/// on-slide source is the first paragraph of visible text after
+/// the title paragraph: on a laid-out deck that is the subtitle
+/// placeholder when one exists, and the body's first paragraph
+/// otherwise. Whitespace is collapsed, the result is capped at
+/// 60 chars (a summary line, not the full body), and a page with
+/// nothing after its title yields an empty desc — never a
+/// fabricated one.
+pub fn slide_desc(slide_xml: &str) -> String {
+    let Ok(root) = crate::pptx::parse_xml(slide_xml, "slide part") else {
+        return String::new();
+    };
+    let title = slide_title(slide_xml);
+    let mut paras: Vec<String> = Vec::new();
+    for p in root.find_all(craft_xml::Local("p")) {
+        let raw: String = p
+            .find_all(craft_xml::Local("t"))
+            .map(|t| t.text().to_string())
+            .collect();
+        let text = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !text.is_empty() {
+            paras.push(text);
+        }
+    }
+    // The first paragraph carries the title (the title is the
+    // first text run on the slide); the desc is the first later
+    // paragraph that is not just the title repeated (footers and
+    // master furniture repeat it).
+    for (i, para) in paras.iter().enumerate() {
+        if i == 0 || para == &title || para == &paras[0] {
+            continue;
+        }
+        let capped: String = para.chars().take(60).collect();
+        return capped
+            .trim_end_matches([' ', '·', '、', '，', ',', '；', ';', '：', ':'])
+            .to_string();
+    }
+    String::new()
+}
+
 /// The speaker-notes text of one slide (its 讲稿): the text of the notes
 /// page's body placeholder, paragraphs joined by newlines. Empty when the
 /// slide has no notes or the body is empty.

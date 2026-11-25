@@ -894,6 +894,24 @@ pub struct LocalStore {
     lock_path: PathBuf,
 }
 
+/// The nine heavy dispatch arms of the phase-1 measurement plan
+/// (design §4.1 M2): routes that hold the store lock through
+/// second-scale CPU/IO work. Matched on the query-stripped path.
+fn heavy_arm(method: &str, path: &str) -> bool {
+    let p = path.split('?').next().unwrap_or(path);
+    matches!(
+        (method, p),
+        ("POST", "/v1/import/open")
+            | ("POST", "/v1/import/group")
+            | ("POST", "/v1/import/lazy-open")
+            | ("POST", "/v1/import")
+            | ("POST", "/v1/attachments")
+            | ("GET", "/v1/trash")
+    ) || (method == "POST" && p.starts_with("/v1/versions/") && p.ends_with("/edit-pages"))
+        || (method == "POST" && p.starts_with("/v1/folders/") && p.ends_with("/delete"))
+        || (method == "POST" && p.starts_with("/v1/indexes/") && p.ends_with("/export"))
+}
+
 /// Read the holder pid from a lock file (line 1). `None` when the
 /// file is missing, unreadable, or carries no parsable pid — e.g. a
 /// lock written by the P0 build, which stored only the pid line.
@@ -1090,23 +1108,90 @@ impl LocalStore {
         opened
     }
 
+    /// Phase-1 measurement M1 (design §4.1): the store Mutex is
+    /// the client's single serialization point — time the wait
+    /// at the measured acquisition sites (the four list methods,
+    /// index_detail, and the dispatch heavy arms) and log waits
+    /// over 5ms to the perf log. Zero cost when QIMU_PERF_LOG is
+    /// off beyond the Instant read itself.
+    fn lock_timed(&self, what: &str) -> std::sync::MutexGuard<'_, Store> {
+        let t = std::time::Instant::now();
+        let guard = self.store.lock().unwrap();
+        let waited = t.elapsed().as_millis();
+        if waited > 5 {
+            crate::perf_log(&format!("lock_wait {what} {waited}ms"));
+        }
+        guard
+    }
+
     /// GET /v1/folders shape: bare folder records.
     pub fn list_folders(&self) -> Vec<Value> {
-        let store = self.store.lock().unwrap();
+        let store = self.lock_timed("list_folders");
         store.list_folders().map(values_of).unwrap_or_default()
     }
 
     /// GET /v1/groups shape: bare group records (the local owner is
     /// the seeded super user, so no visibility filtering applies).
     pub fn list_groups(&self) -> Vec<Value> {
-        let store = self.store.lock().unwrap();
+        let store = self.lock_timed("list_groups");
         store.list_groups().map(values_of).unwrap_or_default()
     }
 
     /// GET /v1/indexes shape: bare index records.
     pub fn list_indexes(&self) -> Vec<Value> {
-        let store = self.store.lock().unwrap();
+        let store = self.lock_timed("list_indexes");
         store.list_indexes(None).map(values_of).unwrap_or_default()
+    }
+
+    /// GET /v1/showroom shape for THIS library's own showroom
+    /// rows (the local showroom surface): rows the bundled-server
+    /// era wrote into this library's showroom table (reference
+    /// submissions and approval landings against what was then a
+    /// server data root), invisible to every client list until
+    /// now — `refresh_local` never read the table and the local
+    /// dispatch owned no showroom route. The server handler's
+    /// shaping is mirrored field for field: bare record,
+    /// `submitted_by_id` alongside the display name, and
+    /// `resolved_entries` resolved through the item's publish
+    /// pins, so the deck face consumes these items exactly like
+    /// organization items. All states are returned (this is the
+    /// owner's own library; the state field drives the card's
+    /// status label, and the trash overlay in `list_showroom`
+    /// already hides trashed rows).
+    pub fn list_local_showroom(&self) -> Vec<Value> {
+        let store = self.store.lock().unwrap();
+        let items = store.list_showroom(None).unwrap_or_default();
+        let submitter_names: std::collections::HashMap<String, String> = store
+            .list_users()
+            .map(|us| us.into_iter().map(|u| (u.id, u.display_name)).collect())
+            .unwrap_or_default();
+        items
+            .into_iter()
+            .map(|item| {
+                let commit = match &item.commit_id {
+                    Some(cid) => store.get_commit(cid).ok(),
+                    None => item
+                        .source_index_id
+                        .as_ref()
+                        .and_then(|id| store.branch_head(id, "main").ok().flatten())
+                        .and_then(|head| store.get_commit(&head).ok()),
+                };
+                let entries = match &commit {
+                    Some(c) => {
+                        let pins = store.showroom_pins(&item.id).unwrap_or_default();
+                        resolved_entries_pinned(&store, c, &pins)
+                    }
+                    None => Vec::new(),
+                };
+                let mut value = serde_json::to_value(&item).unwrap_or(Value::Null);
+                value["submitted_by_id"] = json!(item.submitted_by.clone());
+                if let Some(name) = submitter_names.get(&item.submitted_by) {
+                    value["submitted_by"] = json!(name);
+                }
+                value["resolved_entries"] = json!(entries);
+                value
+            })
+            .collect()
     }
 
     /// One-lock snapshot of the four working-data lists
@@ -1138,7 +1223,7 @@ impl LocalStore {
     /// both — P1 — because the version strips read it from the
     /// list data.)
     pub fn list_units(&self) -> Vec<Value> {
-        let store = self.store.lock().unwrap();
+        let store = self.lock_timed("list_units");
         let units = store.list_units(None).unwrap_or_default();
         units.iter().map(|u| unit_json(&store, u)).collect()
     }
@@ -1588,7 +1673,7 @@ impl LocalStore {
     /// library. Used by the refresh per-index pass and by the
     /// working-data dispatcher below.
     pub fn index_detail(&self, id: &str, branch: &str) -> Option<Value> {
-        let store = self.store.lock().unwrap();
+        let store = self.lock_timed("index_detail");
         let index = store.get_index(id).ok()?;
         let branches = store.list_branches(id).unwrap_or_default();
         let tags = store.list_tags(id).unwrap_or_default();
@@ -1675,12 +1760,38 @@ impl LocalStore {
     /// capability checks they add are vacuous for the library's
     /// seeded super owner). Returns None for anything else —
     /// organization surfaces, and the few objects that live on the
-    /// server even in local mode (showroom trash rows) — so the
+    /// server even in local mode (organization showroom items) — so the
     /// caller falls through to REST unchanged. The arms added in
     /// P4 additionally fall through when the target object is not
     /// in this library at all, so a stray organization object can
-    /// never be answered from the wrong store.
+    /// never be answered from the wrong store. The trash arm owns
+    /// showroom rows this library itself holds (its own showroom
+    /// table); organization showroom items fall through the same
+    /// way, by the same ownership test.
     pub fn dispatch(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Option<Result<Value, String>> {
+        // Phase-1 measurement M2 (design §4.1): end-to-end timing
+        // of the nine heavy arms — the routes that hold the store
+        // lock through CPU/IO work — logged over 20ms when
+        // QIMU_PERF_LOG is on. All other routes pass through
+        // untimed (a single env-flag read).
+        if !crate::perf_enabled() {
+            return self.dispatch_impl(method, path, body);
+        }
+        let t = std::time::Instant::now();
+        let r = self.dispatch_impl(method, path, body);
+        let ms = t.elapsed().as_millis();
+        if ms > 20 && heavy_arm(method, path) {
+            crate::perf_log(&format!("arm {method} {path} {ms}ms"));
+        }
+        r
+    }
+
+    fn dispatch_impl(
         &self,
         method: &str,
         path: &str,
@@ -1713,7 +1824,7 @@ impl LocalStore {
                 ("POST", ["v1", "import", "open"]) => {
                     let bytes = b64_field(&body, "data_base64")?;
                     let blocks = import_block_specs(&body);
-                    let store = self.store.lock().unwrap();
+                    let store = self.lock_timed("POST /v1/import/open");
                     let opened = store.import_open(
                         &str_field(&body, "filename").unwrap_or_default(),
                         &bytes,
@@ -1733,7 +1844,7 @@ impl LocalStore {
                         serde_json::from_value(body.get("opened").cloned().unwrap_or_default())
                             .map_err(|e| format!("打开状态无效：{e}"))?;
                     let blocks = import_block_specs(&body);
-                    let store = self.store.lock().unwrap();
+                    let store = self.lock_timed("POST /v1/import/group");
                     let outcome = store.import_group(
                         &opened,
                         opt_str_field(&body, "folder_id"),
@@ -1757,7 +1868,7 @@ impl LocalStore {
                 ("POST", ["v1", "import", "lazy-open"]) => {
                     let bytes = b64_field(&body, "data_base64")?;
                     let blocks = import_block_specs(&body);
-                    let store = self.store.lock().unwrap();
+                    let store = self.lock_timed("POST /v1/import/lazy-open");
                     let opened = store.lazy_open(
                         &str_field(&body, "filename").unwrap_or_default(),
                         &bytes,
@@ -1796,7 +1907,7 @@ impl LocalStore {
                 ("POST", ["v1", "import"]) => {
                     let bytes = b64_field(&body, "data_base64")?;
                     let blocks = import_block_specs(&body);
-                    let store = self.store.lock().unwrap();
+                    let store = self.lock_timed("POST /v1/import");
                     let outcome = store.import_blocks(
                         &str_field(&body, "filename").unwrap_or_default(),
                         &bytes,
@@ -1839,7 +1950,9 @@ impl LocalStore {
                         Ok(u) => u,
                         Err(_) => return Err(UNHANDLED.to_string()),
                     };
-                    Ok(unit_json(&store, &unit))
+                    let mut payload = unit_json(&store, &unit);
+                    attach_children(&store, &mut payload, &unit);
+                    Ok(payload)
                 }
                 ("PATCH", ["v1", "units", id]) => {
                     // Header meta edits (rename / intro): mirrors
@@ -2033,7 +2146,7 @@ impl LocalStore {
                     {
                         return Err("编辑操作过多".to_string());
                     }
-                    let store = self.store.lock().unwrap();
+                    let store = self.lock_timed("POST /v1/versions/:id/edit-pages");
                     let ver = match store.get_version(id) {
                         Ok(v) => v,
                         Err(_) => return Err(UNHANDLED.to_string()),
@@ -2198,7 +2311,7 @@ impl LocalStore {
                             ))
                         }
                     };
-                    let store = self.store.lock().unwrap();
+                    let store = self.lock_timed("POST /v1/folders/:id/delete");
                     store.delete_folder(id, mode, &self.owner.display_name)?;
                     Ok(json!({ "ok": true }))
                 }
@@ -2214,7 +2327,7 @@ impl LocalStore {
                 }
                 // ---- trash ----
                 ("GET", ["v1", "trash"]) => {
-                    let store = self.store.lock().unwrap();
+                    let store = self.lock_timed("GET /v1/trash");
                     let rows = store.trash_list()?;
                     let mut items = Vec::new();
                     for row in rows {
@@ -2229,12 +2342,6 @@ impl LocalStore {
                 ("POST", ["v1", "trash"]) => {
                     let kind = str_field(&body, "kind").unwrap_or_default();
                     let object_id = str_field(&body, "object_id").unwrap_or_default();
-                    if kind == "showroom" {
-                        // Showroom items live on the organization
-                        // server even in local mode; their trash
-                        // rows are the server's, not this library's.
-                        return Err(UNHANDLED.to_string());
-                    }
                     let store = self.store.lock().unwrap();
                     let (title, origin) = match kind.as_str() {
                         "index" => {
@@ -2254,6 +2361,44 @@ impl LocalStore {
                                 unit.name.clone(),
                                 trash_origin(&store, unit.folder_id.as_deref(), "页面"),
                             )
+                        }
+                        "version" => {
+                            // A history version files under its
+                            // owning block: the row's title names
+                            // the block and the version, its origin
+                            // is the block's home — the trash page
+                            // groups it with the 页面 category.
+                            // The pin guard rides along inside
+                            // Store::trash_add.
+                            let ver = store
+                                .get_version(&object_id)
+                                .map_err(|_| NOT_FOUND.to_string())?;
+                            let rend = store
+                                .get_rendition(&ver.rendition_id)
+                                .map_err(|_| NOT_FOUND.to_string())?;
+                            let unit = store
+                                .get_unit(&rend.unit_id)
+                                .map_err(|_| NOT_FOUND.to_string())?;
+                            (
+                                format!("{} · v{}", unit.name, ver.semver),
+                                trash_origin(&store, unit.folder_id.as_deref(), "页面"),
+                            )
+                        }
+                        "showroom" => {
+                            // A showroom row THIS library holds
+                            // (bundled-server era rows, local
+                            // landings) trashes locally, with the
+                            // server handler's title and origin
+                            // (演示厅). A row this library does not
+                            // hold is an organization item — its
+                            // trash row is the server's, so fall
+                            // through unchanged.
+                            let item = match store.get_showroom(&object_id) {
+                                Ok(Some(it)) => it,
+                                Ok(None) => return Err(UNHANDLED.to_string()),
+                                Err(e) => return Err(e),
+                            };
+                            (item.title.clone(), "演示厅".to_string())
                         }
                         _ => return Err("unknown trash kind".to_string()),
                     };
@@ -2455,7 +2600,7 @@ impl LocalStore {
                     // library's working data. A parent this library
                     // does not hold falls through to REST.
                     let parent_id = str_field(&body, "parent_id").unwrap_or_default();
-                    let store = self.store.lock().unwrap();
+                    let store = self.lock_timed("POST /v1/attachments");
                     if store.get_unit(&parent_id).is_err()
                         && store.get_index(&parent_id).is_err()
                     {
@@ -2508,7 +2653,7 @@ impl LocalStore {
                     // assemble in-process, register the export and
                     // return the deck inline — same response shape,
                     // same personalization verdicts.
-                    let store = self.store.lock().unwrap();
+                    let store = self.lock_timed("POST /v1/indexes/:id/export");
                     if store.get_index(id).is_err() {
                         return Err(UNHANDLED.to_string());
                     }
@@ -2787,6 +2932,45 @@ fn unit_json(store: &Store, unit: &qimu_core::store::UnitRec) -> Value {
     Value::Object(obj)
 }
 
+/// Cap on the #101 「内嵌内容块」 child list — the server's
+/// EMBEDDED_CHILDREN_LIMIT, mirrored (the two detail faces must
+/// agree on the payload).
+const EMBEDDED_CHILDREN_LIMIT: usize = 100;
+
+/// Attach the `children` array to a unit detail payload (D4) —
+/// the server's `attach_children`, over an already-locked store:
+/// the units embedded in this one, shaped like list rows so the
+/// kids zone renders them as standard cards; each child carries
+/// its own embedded units as minimal `{unit}` rows (the zone
+/// only counts them). The local library is the owner's own —
+/// no visibility filter. No embedding → empty array (no zone).
+fn attach_children(store: &Store, payload: &mut Value, unit: &qimu_core::store::UnitRec) {
+    let kids = store
+        .embedded_children(&unit.id, None, EMBEDDED_CHILDREN_LIMIT)
+        .unwrap_or_default();
+    let rows: Vec<Value> = kids
+        .iter()
+        .map(|kid| {
+            let mut row = unit_json(store, &kid.unit);
+            if let Some(obj) = row.as_object_mut() {
+                obj.insert(
+                    "children".into(),
+                    Value::Array(
+                        kid.grandchildren
+                            .iter()
+                            .map(|g| json!({ "unit": g }))
+                            .collect(),
+                    ),
+                );
+            }
+            row
+        })
+        .collect();
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("children".into(), Value::Array(rows));
+    }
+}
+
 /// One commit's entries with their resolved versions — the
 /// server's `resolved_entries` helper, over an already-locked
 /// store.
@@ -2798,6 +2982,49 @@ fn resolved_entries(store: &Store, commit: &qimu_core::store::CommitRec) -> Vec<
             let unit = store.get_unit(&e.unit_id.0).ok();
             let rend = store.get_rendition(&e.rendition_id.0).ok();
             let resolved = store.resolve_entry_version(e).ok().flatten();
+            let locked_id = match &e.policy {
+                qimu_core::model::EntryPolicy::Locked { version_id } => {
+                    Some(version_id.0.clone())
+                }
+                _ => None,
+            };
+            let substituted = match (&locked_id, &resolved) {
+                (Some(lid), Some(v)) => &v.id != lid,
+                _ => false,
+            };
+            json!({
+                "entry": e,
+                "unit_name": unit.map(|u| u.name),
+                "form": rend.as_ref().map(|r| r.form.clone()),
+                "lang": rend.as_ref().map(|r| r.lang.clone()),
+                "resolved": resolved,
+                "substituted": substituted,
+            })
+        })
+        .collect()
+}
+
+/// One commit's entries resolved through a showroom item's
+/// publish pins — the server's `resolved_entries_showroom`,
+/// over an already-locked store. The unpinned sibling above is
+/// the index face's follow-latest resolution; a showroom item
+/// publishes its pinned formal version.
+fn resolved_entries_pinned(
+    store: &Store,
+    commit: &qimu_core::store::CommitRec,
+    pins: &[String],
+) -> Vec<Value> {
+    commit
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(pos, e)| {
+            let unit = store.get_unit(&e.unit_id.0).ok();
+            let rend = store.get_rendition(&e.rendition_id.0).ok();
+            let resolved = store
+                .resolve_showroom_entry(e, pins.get(pos).map(|s| s.as_str()))
+                .ok()
+                .flatten();
             let locked_id = match &e.policy {
                 qimu_core::model::EntryPolicy::Locked { version_id } => {
                     Some(version_id.0.clone())
@@ -2848,6 +3075,10 @@ fn trash_cover(
             .ok()
             .and_then(|rs| rs.into_iter().next())
             .and_then(|r| store.latest_version(&r.id).ok().flatten()),
+        // A version row's cover is the version itself (read
+        // directly — list_versions hides trashed versions, which
+        // is exactly what this row is).
+        "version" => store.get_version(&row.object_id).ok(),
         "index" => store
             .branch_head(&row.object_id, "main")
             .ok()
@@ -2855,6 +3086,26 @@ fn trash_cover(
             .and_then(|cid| store.get_commit(&cid).ok())
             .and_then(|c| c.entries.into_iter().next())
             .and_then(|e| store.resolve_entry_version(&e).ok().flatten()),
+        "showroom" => store
+            .get_showroom_any(&row.object_id)
+            .ok()
+            .flatten()
+            .and_then(|item| {
+                let commit = match &item.commit_id {
+                    Some(cid) => store.get_commit(cid).ok(),
+                    None => item
+                        .source_index_id
+                        .as_ref()
+                        .and_then(|id| store.branch_head(id, "main").ok().flatten())
+                        .and_then(|head| store.get_commit(&head).ok()),
+                }?;
+                let pins = store.showroom_pins(&item.id).ok()?;
+                let first = commit.entries.into_iter().next()?;
+                store
+                    .resolve_showroom_entry(&first, pins.first().map(|s| s.as_str()))
+                    .ok()
+                    .flatten()
+            }),
         _ => None,
     };
     match ver {

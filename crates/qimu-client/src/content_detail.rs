@@ -166,6 +166,31 @@ fn page_title(version: &Value, slot: usize) -> String {
         .unwrap_or_else(|| format!("第 {} 页", slot + 1))
 }
 
+/// The page's one-line content summary (the prototype's `d`,
+/// carried on the version's page rows since the R3 data line).
+/// Empty for pages imported before the field existed — callers
+/// present that as the prototype's empty state, never a
+/// stand-in text.
+fn page_desc(version: &Value, slot: usize) -> String {
+    version
+        .get("pages")
+        .and_then(Value::as_array)
+        .and_then(|pages| pages.get(slot))
+        .map(|page| s(page, "desc"))
+        .unwrap_or_default()
+}
+
+/// Cap a desc for a single-line painted slot (bind candidate,
+/// #406 badge): the data keeps the full line; only the painted
+/// copy is cut, with an ellipsis marking the cut.
+fn desc_line(desc: &str, max_chars: usize) -> String {
+    if desc.chars().count() <= max_chars {
+        return desc.to_string();
+    }
+    let cut: String = desc.chars().take(max_chars).collect();
+    format!("{}…", cut.trim_end())
+}
+
 /// The light view's bind head names the target language
 /// (prototype .lb-bind-head: 英语), not its code.
 fn lang_display_name(code: &str) -> String {
@@ -346,12 +371,15 @@ impl App {
     // Header (SPEC 一): one baseline row — h2 title (double-click
     // inline edit), the intro + 「当前 v…」 hint, the kind tag in
     // the badges slot. The prototype's third hint segment is the
-    // version POLICY (锁定版本 / 跟随最新), which is index-entry
-    // data the unit payload does not carry — it is NOT replaced
-    // by the maintainer here (audit R1); see the rebuild report's
-    // data-gap list. The header delete button the old page had
-    // does not exist in the prototype and is gone (D1, report);
-    // deletion stays on the shell bottom bar.
+    // version POLICY (锁定版本 / 跟随最新): entry-level data,
+    // plumbed into the frame by the index entry path that opened
+    // it (audit R1, EntryPolicyView on UnitState) — it is NOT
+    // replaced by the maintainer here. Opened through no entry
+    // (content wall, search, home…), the segment renders the
+    // prototype's default form: a block's policy defaults to
+    // follow, so it reads 跟随最新. The header delete button the
+    // old page had does not exist in the prototype and is gone
+    // (D1, report); deletion stays on the shell bottom bar.
     // ------------------------------------------------------------
     pub(super) fn unit_header_ui(
         &mut self,
@@ -406,21 +434,46 @@ impl App {
                     st.meta_edit_focus = true;
                 }
             }
+            // The prototype's hint version segment is always
+            // the plain version string straight from the data
+            // (prototype @2600: intro, then the version, then
+            // the policy); it has no fallback form, so when the
+            // shown rendition carries no semver the segment is
+            // simply absent. The earlier revision-counter text
+            // here was a client invention and is gone.
             let head_semver = s(&head_latest, "semver");
-            ui.label(
-                egui::RichText::new(if head_semver.is_empty() {
-                    format!(
-                        "{}内容修订 r{}",
-                        if hint_has_intro { " · " } else { "" },
-                        i(unit, "current_revision")
-                    )
-                } else {
-                    format!(
+            if !head_semver.is_empty() {
+                ui.label(
+                    egui::RichText::new(format!(
                         "{}当前 v{}",
                         if hint_has_intro { " · " } else { "" },
                         head_semver
-                    )
-                })
+                    ))
+                    .size(13.0)
+                    .color(palette_color(TEXT_FAINT)),
+                );
+            }
+            // Third hint segment: the version policy of the
+            // entry this detail was opened through (prototype:
+            // 锁定版本 / 跟随最新; a locked entry names its
+            // version). No entry context → the prototype's
+            // default form, 跟随最新 (see the header note).
+            let policy_text = match &st.entry_policy {
+                Some(EntryPolicyView::Locked { semver }) if !semver.is_empty() => {
+                    format!("锁定版本 v{semver}")
+                }
+                Some(EntryPolicyView::Locked { .. }) => "锁定版本".to_string(),
+                _ => "跟随最新".to_string(),
+            };
+            ui.label(
+                egui::RichText::new(format!(
+                    "{}{policy_text}",
+                    if hint_has_intro || !head_semver.is_empty() {
+                        " · "
+                    } else {
+                        ""
+                    }
+                ))
                 .size(13.0)
                 .color(palette_color(TEXT_FAINT)),
             );
@@ -619,13 +672,15 @@ impl App {
                             });
                             ui.horizontal(|ui| {
                                 ui.add_space(10.0);
-                                // .tb-desc: the page's 说明 (d).
-                                // Version pages carry no d — the
-                                // title stands in this slot (data
-                                // gap, see report; same family as
-                                // audit R3).
+                                // .tb-desc: the page's 说明 (d),
+                                // carried on the version's page
+                                // rows since the R3 data line. A
+                                // page without one (stock imported
+                                // before the field) renders the
+                                // prototype's empty state — an
+                                // empty line, no stand-in text.
                                 ui.label(
-                                    egui::RichText::new(page_title(&shown.version, slot))
+                                    egui::RichText::new(page_desc(&shown.version, slot))
                                         .size(12.0)
                                         .color(palette_color(TEXT_FAINT)),
                                 );
@@ -960,99 +1015,128 @@ impl App {
                     ui.add_space(10.0);
                     let saved_spacing = ui.spacing().item_spacing;
                     ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
-                    ui.horizontal_wrapped(|ui| {
-                        for ci in 0..cand_pages {
-                            let cand = PageBindingRequest {
-                                unit_id: st.unit_id.clone(),
-                                from_version_id: version_id.clone(),
-                                from_slot: pi as i64,
-                                to_version_id: target_id.clone(),
-                                to_slot: ci as i64,
-                            };
-                            let is_cur = exact_binding(&st.bindings, &cand).is_some();
-                            let owner = occupied_binding(&st.bindings, &cand)
-                                .map(|b| i(&b, "from_slot"));
-                            // .bind-cand: 2px --line border (the
-                            // current one accent on accent-soft),
-                            // radius 6, 9/10 padding, two lines.
-                            let (rect, resp) = ui.allocate_exact_size(
-                                egui::vec2(232.0, 58.0),
-                                egui::Sense::click(),
-                            );
-                            let painter = ui.painter();
-                            let hovered = resp.hovered();
-                            let (fill, stroke) = if is_cur {
-                                (SEL_BG, egui::Stroke::new(2.0, ACCENT))
-                            } else if hovered {
-                                (
-                                    palette_color(PANEL_BG),
-                                    egui::Stroke::new(2.0, ACCENT),
-                                )
-                            } else {
-                                (
-                                    palette_color(PANEL_BG),
-                                    egui::Stroke::new(2.0, palette_color(LINE_34)),
-                                )
-                            };
-                            painter.rect_filled(rect, 6.0, fill);
-                            painter.rect_stroke(
-                                rect,
-                                6.0,
-                                stroke,
-                                egui::StrokeKind::Inside,
-                            );
-                            let line1 = format!(
-                                "第 {} 页 · {}",
-                                ci + 1,
-                                page_title(&t.version, ci)
-                            );
-                            let g1 = painter.layout_no_wrap(
-                                line1,
-                                egui::FontId::new(13.0, egui::FontFamily::Proportional),
-                                palette_color(TEXT_MAIN),
-                            );
-                            painter.galley(
-                                egui::pos2(rect.min.x + 10.0, rect.min.y + 9.0),
-                                g1,
-                                palette_color(TEXT_MAIN),
-                            );
-                            let mut line2 = t.label();
-                            if is_cur {
-                                line2.push_str(" · 当前绑定");
-                            } else if let Some(owner_slot) = owner {
-                                line2.push_str(&format!(
-                                    " · 已绑在中文第 {} 页，点选将移动绑定",
-                                    owner_slot + 1
-                                ));
-                            }
-                            let g2 = painter.layout_no_wrap(
-                                line2,
-                                egui::FontId::new(11.5, egui::FontFamily::Proportional),
-                                palette_color(TEXT_FAINT),
-                            );
-                            painter.galley(
-                                egui::pos2(rect.min.x + 10.0, rect.min.y + 32.0),
-                                g2,
-                                palette_color(TEXT_FAINT),
-                            );
-                            if resp.clicked() {
-                                if is_cur {
-                                    self.msg = format!(
-                                        "第 {} 页已经绑在{}第 {} 页上了。",
-                                        pi + 1,
-                                        lang_display_name(&lang),
-                                        ci + 1
-                                    );
+                    let avail_w = ui.available_width();
+                    // .bind-cands (prototype @687): CSS grid,
+                    // repeat(auto-fill, minmax(170px, 1fr)),
+                    // gap 8 -- the candidate cards stretch
+                    // with the panel width. egui has no CSS
+                    // grid, so the column count is derived
+                    // from the available width with the same
+                    // minmax semantics and the rows are laid
+                    // out explicitly; the card height stays
+                    // fixed at 58, approximating the
+                    // prototype's two-line content height
+                    // (9px vertical padding around a 13px
+                    // line and an 11.5px line).
+                    let cols = (((avail_w + 8.0) / (170.0 + 8.0)).floor() as usize).max(1);
+                    let card_w = (avail_w - (cols - 1) as f32 * 8.0) / cols as f32;
+                    for row_start in (0..cand_pages).step_by(cols) {
+                        ui.horizontal(|ui| {
+                            for ci in row_start..(row_start + cols).min(cand_pages) {
+                                let cand = PageBindingRequest {
+                                    unit_id: st.unit_id.clone(),
+                                    from_version_id: version_id.clone(),
+                                    from_slot: pi as i64,
+                                    to_version_id: target_id.clone(),
+                                    to_slot: ci as i64,
+                                };
+                                let is_cur = exact_binding(&st.bindings, &cand).is_some();
+                                let owner = occupied_binding(&st.bindings, &cand)
+                                    .map(|b| i(&b, "from_slot"));
+                                // .bind-cand: 2px --line border (the
+                                // current one accent on accent-soft),
+                                // radius 6, 9/10 padding, two lines.
+                                let (rect, resp) = ui.allocate_exact_size(
+                                    egui::vec2(card_w, 58.0),
+                                    egui::Sense::click(),
+                                );
+                                let painter = ui.painter();
+                                let hovered = resp.hovered();
+                                let (fill, stroke) = if is_cur {
+                                    (SEL_BG, egui::Stroke::new(2.0, ACCENT))
+                                } else if hovered {
+                                    (
+                                        palette_color(PANEL_BG),
+                                        egui::Stroke::new(2.0, ACCENT),
+                                    )
                                 } else {
-                                    st.bind_panel = None;
-                                    acts.push(DetailAct::Bind(cand));
+                                    (
+                                        palette_color(PANEL_BG),
+                                        egui::Stroke::new(2.0, palette_color(LINE_34)),
+                                    )
+                                };
+                                painter.rect_filled(rect, 6.0, fill);
+                                painter.rect_stroke(
+                                    rect,
+                                    6.0,
+                                    stroke,
+                                    egui::StrokeKind::Inside,
+                                );
+                                let line1 = format!(
+                                    "第 {} 页 · {}",
+                                    ci + 1,
+                                    page_title(&t.version, ci)
+                                );
+                                let g1 = painter.layout_no_wrap(
+                                    line1,
+                                    egui::FontId::new(13.0, egui::FontFamily::Proportional),
+                                    palette_color(TEXT_MAIN),
+                                );
+                                painter.galley(
+                                    egui::pos2(rect.min.x + 10.0, rect.min.y + 9.0),
+                                    g1,
+                                    palette_color(TEXT_MAIN),
+                                );
+                                // Line 2 is the candidate page's own
+                                // 说明 (prototype: cp.d) plus the state
+                                // suffix. A page without a desc (stock)
+                                // falls back to the target rendition's
+                                // label — real data about the target,
+                                // not an invented page summary.
+                                let cand_desc = page_desc(&t.version, ci);
+                                let mut line2 = if cand_desc.is_empty() {
+                                    t.label()
+                                } else {
+                                    desc_line(&cand_desc, 30)
+                                };
+                                if is_cur {
+                                    line2.push_str(" · 当前绑定");
+                                } else if let Some(owner_slot) = owner {
+                                    line2.push_str(&format!(
+                                        " · 已绑在中文第 {} 页，点选将移动绑定",
+                                        owner_slot + 1
+                                    ));
+                                }
+                                let g2 = painter.layout_no_wrap(
+                                    line2,
+                                    egui::FontId::new(11.5, egui::FontFamily::Proportional),
+                                    palette_color(TEXT_FAINT),
+                                );
+                                painter.galley(
+                                    egui::pos2(rect.min.x + 10.0, rect.min.y + 32.0),
+                                    g2,
+                                    palette_color(TEXT_FAINT),
+                                );
+                                if resp.clicked() {
+                                    if is_cur {
+                                        self.msg = format!(
+                                            "第 {} 页已经绑在{}第 {} 页上了。",
+                                            pi + 1,
+                                            lang_display_name(&lang),
+                                            ci + 1
+                                        );
+                                    } else {
+                                        st.bind_panel = None;
+                                        acts.push(DetailAct::Bind(cand));
+                                    }
                                 }
                             }
-                        }
-                    });
+                        });
+                    }
                     ui.spacing_mut().item_spacing = saved_spacing;
                 } else {
                     ui.add_space(10.0);
+
                     ui.label(
                         egui::RichText::new(format!(
                             "尚无{}版本，暂时没有可绑定的对应页。",
@@ -1417,18 +1501,6 @@ impl App {
                                 if is_recalled {
                                     chip(ui, "已撤回", palette_color(ROSE), ROSE_SOFT_BG);
                                 }
-                                if is_draft {
-                                    // The prototype's draft
-                                    // actions (h.draft): publish
-                                    // it as the newest version,
-                                    // or drop it.
-                                    if vh_btn_primary(ui, "发布为最新版本").clicked() {
-                                        acts.push(DetailAct::PublishDraft(vid.clone()));
-                                    }
-                                    if vh_btn(ui, "放弃").clicked() {
-                                        acts.push(DetailAct::DropVersion(vid.clone()));
-                                    }
-                                }
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
@@ -1491,6 +1563,34 @@ impl App {
                                         if !is_recalled && vh_btn(ui, "编辑页面").clicked() {
                                             self.open_page_editor(&unit, v, 0);
                                         }
+                                        if is_draft {
+                                            // The prototype puts
+                                            // ALL card-head actions
+                                            // after the flex spacer,
+                                            // in the one right-hand
+                                            // group (prototype
+                                            // @2564); the draft
+                                            // pair leads that group.
+                                            // This right-to-left
+                                            // layout stacks later
+                                            // widgets further left,
+                                            // so adding 放弃 then
+                                            // 发布为最新版本 here
+                                            // renders them at the
+                                            // group's left edge in
+                                            // the prototype's
+                                            // order.
+                                            if vh_btn(ui, "放弃").clicked() {
+                                                acts.push(DetailAct::DropVersion(
+                                                    vid.clone(),
+                                                ));
+                                            }
+                                            if vh_btn_primary(ui, "发布为最新版本").clicked() {
+                                                acts.push(DetailAct::PublishDraft(
+                                                    vid.clone(),
+                                                ));
+                                            }
+                                        }
                                     },
                                 );
                             });
@@ -1518,13 +1618,17 @@ impl App {
                             });
                             ui.add_space(8.0);
                             // .vh-caption: meta line, then the
-                            // revision note.
+                            // revision note. The .vh-cap-meta
+                            // order is the prototype's: date
+                            // first, then author (prototype
+                            // @2564: (h.date||h.time), then
+                            // h.author, joined by " · ").
                             let meta = ui.add(
                                 egui::Label::new(
                                     egui::RichText::new(format!(
                                         "{} · {}",
-                                        s(v, "author"),
-                                        fmt_time(i(v, "created_ms"))
+                                        fmt_time(i(v, "created_ms")),
+                                        s(v, "author")
                                     ))
                                     .size(11.5)
                                     .color(palette_color(TEXT_FAINT)),
@@ -1956,13 +2060,46 @@ impl App {
                                                                 );
                                                             }
                                                         });
-                                                        if occupied.is_some() {
-                                                            chip(
-                                                                ui,
-                                                                "已被其他页占用",
-                                                                palette_color(CHIP_ORANGE_FG),
-                                                                CHIP_ORANGE_BG,
-                                                            );
+                                                        // Badges row (prototype
+                                                        // stdCard badges): the
+                                                        // candidate page's 说明
+                                                        // as an info badge
+                                                        // (audit R3 — the data
+                                                        // rides the version's
+                                                        // page rows since the
+                                                        // R3 data line; a page
+                                                        // without one shows no
+                                                        // badge), then the
+                                                        // occupied badge.
+                                                        let cand_desc =
+                                                            page_desc(&target.version, slot);
+                                                        if !cand_desc.is_empty()
+                                                            || occupied.is_some()
+                                                        {
+                                                            ui.horizontal_wrapped(|ui| {
+                                                                if !cand_desc.is_empty() {
+                                                                    chip(
+                                                                        ui,
+                                                                        &desc_line(
+                                                                            &cand_desc, 26,
+                                                                        ),
+                                                                        palette_color(
+                                                                            ACCENT_DEEP,
+                                                                        ),
+                                                                        CHIP_BLUE_BG,
+                                                                    );
+                                                                }
+                                                                if occupied.is_some() {
+                                                                    chip(
+                                                                        ui,
+                                                                        "已被其他页占用",
+                                                                        palette_color(
+                                                                            CHIP_ORANGE_FG,
+                                                                        ),
+                                                                        CHIP_ORANGE_BG,
+                                                                    );
+                                                                }
+                                                            });
                                                         }
                                                     });
                                                 response.clicked()
