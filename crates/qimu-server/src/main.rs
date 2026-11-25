@@ -6416,7 +6416,7 @@ async fn main() {
         .route("/v1/assemblies/:id/export", post(export_assembly))
         .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
         .layer(axum::middleware::from_fn(peer_ip_layer))
-        .with_state(state);
+        .with_state(state.clone());
     let port: u16 = std::env::var("QIMU_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
