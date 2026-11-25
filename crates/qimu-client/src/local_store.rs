@@ -1945,6 +1945,28 @@ impl LocalStore {
                     store.set_version_status(id, "recalled")?;
                     Ok(json!({ "ok": true }))
                 }
+                ("POST", ["v1", "versions", id, "publish-draft"]) => {
+                    // #101 history card 「发布为最新版本」 (server
+                    // publish_draft_version): drafts only.
+                    let store = self.store.lock().unwrap();
+                    let ver = store
+                        .get_version(id)
+                        .map_err(|_| NOT_FOUND.to_string())?;
+                    if ver.status != "draft" {
+                        return Err("只有草稿版本可以发布".to_string());
+                    }
+                    store.set_version_status(id, "normal")?;
+                    Ok(json!({ "ok": true }))
+                }
+                ("POST", ["v1", "versions", id, "delete"]) => {
+                    // #101 history card 「放弃」 on a draft (server
+                    // delete_version): core's delete refuses
+                    // versions pinned by live showroom entries.
+                    let store = self.store.lock().unwrap();
+                    store.get_version(id).map_err(|_| NOT_FOUND.to_string())?;
+                    store.delete_version(id)?;
+                    Ok(json!({ "ok": true }))
+                }
                 ("GET", ["v1", "versions", id, "page-text"]) => {
                     // P4: the page editor's read side (server
                     // `version_page_text`): the runs + element model

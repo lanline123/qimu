@@ -26,7 +26,9 @@ mod local_store;
 use prototype_dialogs::{PullDialogState, PushDialogState, ShareDialogState};
 
 use chrome_icons::{ChromeIcon, ChromeIcons};
-use content_detail::{binding_targets, LightState, PageBindingPick, PageBindingRequest};
+use content_detail::{
+    binding_targets, BindPanelState, LightState, PageBindingPick, PageBindingRequest,
+};
 use index_controls::{IndexMoreAction, IndexOverviewControls, IndexScope};
 use index_lineage::IndexGraphs;
 use qimu_core::store::IndexGraph;
@@ -1636,9 +1638,10 @@ struct UnitState {
     selected_version: Option<String>,
     selected_page: Option<usize>,
     bind_pick: Option<PageBindingPick>,
-    bind_from: String,
-    bind_to: String,
-    bind_from_slot: Option<i64>,
+    /// The #101 bind panel's open state (prototype bindPanel):
+    /// which page of the shown version it serves, and the target
+    /// language its candidates currently show.
+    bind_panel: Option<BindPanelState>,
     /// Header meta inline edit: (field, draft text) while the
     /// title or the intro is being edited in place.
     meta_edit: Option<(MetaField, String)>,
@@ -1666,9 +1669,7 @@ impl UnitState {
             selected_version: None,
             selected_page: None,
             bind_pick: None,
-            bind_from: String::new(),
-            bind_to: String::new(),
-            bind_from_slot: None,
+            bind_panel: None,
             meta_edit: None,
             meta_edit_focus: false,
             scripts_for: None,
@@ -16102,74 +16103,8 @@ impl App {
             None
         };
         ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            // Title (prototype data-dbl-edit): double-click turns
-            // it into an inline editor; committing PATCHes the
-            // name — a meta change, never a version bump. Size
-            // follows the prototype's drill h2 (no explicit rule
-            // there: the UA 1.5em over the 13.5px base ≈ 20px).
-            if matches!(&st.meta_edit, Some((MetaField::Name, _))) {
-                self.meta_edit_ui(ui, st, MetaField::Name);
-            } else {
-                let title = ui.add(
-                    egui::Label::new(egui::RichText::new(s(&unit, "name")).size(20.0))
-                        .sense(egui::Sense::click()),
-                );
-                if title.double_clicked() {
-                    st.meta_edit = Some((MetaField::Name, s(&unit, "name")));
-                    st.meta_edit_focus = true;
-                }
-            }
-            if let Some(tag) = kind_tag {
-                chip(ui, tag, palette_color(CHIP_GRAY_FG), CHIP_GRAY_BG);
-            }
-            // Header hint (prototype renderDetail): the intro
-            // rides the same baseline row as the title, followed
-            // by 当前 {version} · … — it no longer sits on its
-            // own line under the header. Double-click edits it
-            // in place (PATCH description, no version bump).
-            let mut hint_has_intro = false;
-            if matches!(&st.meta_edit, Some((MetaField::Description, _))) {
-                hint_has_intro = true;
-                self.meta_edit_ui(ui, st, MetaField::Description);
-            } else if !s(&unit, "description").is_empty() {
-                hint_has_intro = true;
-                let intro = ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(s(&unit, "description"))
-                            .color(palette_color(TEXT_WEAK)),
-                    )
-                    .sense(egui::Sense::click()),
-                );
-                if intro.double_clicked() {
-                    st.meta_edit = Some((MetaField::Description, s(&unit, "description")));
-                    st.meta_edit_focus = true;
-                }
-            }
-            let head_semver = s(&head_latest, "semver");
-            ui.label(if head_semver.is_empty() {
-                format!(
-                    "{}内容修订 r{} · 维护人 {}",
-                    if hint_has_intro { " · " } else { "" },
-                    i(&unit, "current_revision"),
-                    s(&unit, "maintainer")
-                )
-            } else {
-                format!(
-                    "{}当前 v{} · 维护人 {}",
-                    if hint_has_intro { " · " } else { "" },
-                    head_semver,
-                    s(&unit, "maintainer")
-                )
-            });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if btn_danger(ui, "删除内容块").clicked() {
-                    let uid = s(&unit, "id");
-                    self.trash_add("unit", &uid);
-                    st.closed = true;
-                }
-            });
-        });
+        self.unit_header_ui(ui, st, &unit, kind_tag);
+
         egui::ScrollArea::vertical().show(ui, |ui| {
             // pick-pages mode: the entry's currently resolved version,
             // page by page with checkboxes (initial state = the entry's
@@ -16234,217 +16169,7 @@ impl App {
                 ui.separator();
                 ui.add_space(6.0);
             }
-            self.unit_pages_ui(ui, st);
-            // History (prototype .dsec 历史版本 + .vh-card):
-            // one section; each version is a card — 2px border
-            // (radius 14, panel fill, 10px padding), a head row
-            // with the version chip, the version's page thumbs,
-            // and a caption (author · time, then the note). The
-            // client's versions arrive grouped per rendition;
-            // the rendition name rides as a small subhead above
-            // its cards (declared grouping difference).
-            ui.add_space(16.0);
-            ui.label(egui::RichText::new("历史版本").strong().size(16.0));
-            ui.add_space(6.0);
-            if let Some(rends) = detail.get("renditions").and_then(|r| r.as_array()) {
-                for r in rends.clone() {
-                    let rend = r.get("rendition").cloned().unwrap_or(json!({}));
-                    ui.label(
-                        egui::RichText::new(format!("{} · {}", s(&rend, "form"), s(&rend, "lang")))
-                            .size(13.0)
-                            .color(palette_color(TEXT_WEAK)),
-                    );
-                    ui.add_space(4.0);
-                    if let Some(versions) = r.get("versions").and_then(|v| v.as_array()) {
-                        for (vi, v) in versions.iter().enumerate() {
-                            // Versions arrive semver-desc: the
-                            // first is the rendition's current
-                            // (prototype .cur).
-                            let is_latest = vi == 0;
-                            let vid = s(v, "id");
-                            let is_draft = s(v, "status") == "draft";
-                            let is_recalled = s(v, "status") == "recalled";
-                            let picked =
-                                st.selected_version.as_deref() == Some(vid.as_str());
-                            let stroke_color = if is_draft {
-                                palette_color(CHIP_ORANGE_FG)
-                            } else if is_latest {
-                                ACCENT
-                            } else if picked {
-                                ACCENT_DEEP
-                            } else {
-                                palette_color(LINE_34)
-                            };
-                            egui::Frame::NONE
-                                .fill(palette_color(PANEL_BG))
-                                .stroke(egui::Stroke::new(2.0, stroke_color))
-                                .corner_radius(14)
-                                .inner_margin(10.0)
-                                .show(ui, |ui| {
-                                    ui.horizontal_wrapped(|ui| {
-                                        // .vh-bigver (final form):
-                                        // 12px, 24px tall, radius 6,
-                                        // --panel3 fill; the current
-                                        // version fills accent.
-                                        let ver_text = format!("v{}", s(v, "semver"));
-                                        let ver_font = egui::FontId::new(
-                                            12.0,
-                                            egui::FontFamily::Proportional,
-                                        );
-                                        let ver_fg = if is_latest {
-                                            egui::Color32::WHITE
-                                        } else {
-                                            palette_color(TEXT_MAIN)
-                                        };
-                                        let ver_bg = if is_latest {
-                                            ACCENT
-                                        } else {
-                                            palette_color(PRESSED_BG)
-                                        };
-                                        let galley = ui.painter().layout_no_wrap(
-                                            ver_text,
-                                            ver_font,
-                                            ver_fg,
-                                        );
-                                        let (rect, _) = ui.allocate_exact_size(
-                                            egui::vec2(galley.size().x + 16.0, 24.0),
-                                            egui::Sense::hover(),
-                                        );
-                                        ui.painter().rect_filled(rect, 6.0, ver_bg);
-                                        ui.painter().galley(
-                                            egui::pos2(
-                                                rect.min.x + 8.0,
-                                                rect.center().y - galley.size().y / 2.0,
-                                            ),
-                                            galley,
-                                            ver_fg,
-                                        );
-                                        if is_draft {
-                                            chip(
-                                                ui,
-                                                "草稿",
-                                                palette_color(CHIP_ORANGE_FG),
-                                                CHIP_ORANGE_BG,
-                                            );
-                                        }
-                                        if is_recalled {
-                                            chip(
-                                                ui,
-                                                "已撤回",
-                                                palette_color(ROSE),
-                                                ROSE_SOFT_BG,
-                                            );
-                                        }
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                if ui.small_button("下载片段").clicked() {
-                                    if let Ok(resp) = self.call_work(
-                                        "GET",
-                                        &format!("/v1/versions/{}/fragment", s(v, "id")),
-                                        None,
-                                    ) {
-                                        if let Some(data) =
-                                            resp.get("data_base64").and_then(|x| x.as_str())
-                                        {
-                                            if let (Ok(bytes), Some(path)) = (
-                                                b64d(data),
-                                                rfd::FileDialog::new()
-                                                    .set_file_name("fragment.pptx")
-                                                    .save_file(),
-                                            ) {
-                                                // Audit2 E-M10: the write result decides the message — a failed write no longer reports success.
-                                                self.msg = match std::fs::write(path, bytes) {
-                                                    Ok(()) => "已保存".into(),
-                                                    Err(e) => format!("保存失败：{e}"),
-                                                };
-                                            }
-                                        }
-                                    }
-                                }
-                                if ui.small_button("讲稿").clicked() {
-                                    let mut scripts: Vec<String> = v
-                                        .get("scripts")
-                                        .and_then(|x| x.as_array())
-                                        .map(|arr| {
-                                            arr.iter()
-                                                .map(|t| t.as_str().unwrap_or("").to_string())
-                                                .collect()
-                                        })
-                                        .unwrap_or_default();
-                                    let pages = i(v, "page_count") as usize;
-                                    while scripts.len() < pages {
-                                        scripts.push(String::new());
-                                    }
-                                    st.scripts_edit = scripts;
-                                    st.scripts_for = Some(s(v, "id"));
-                                }
-                                if s(v, "status") != "recalled" && ui.small_button("撤回").clicked() {
-                                    let _ = self.call_work(
-                                        "POST",
-                                        &format!("/v1/versions/{}/recall", s(v, "id")),
-                                        None,
-                                    );
-                                    self.reload_unit_detail(&st.unit_id.clone());
-                                }
-                                                if s(v, "status") != "recalled" && ui.small_button("编辑页面").clicked()
-                                                {
-                                                    self.open_page_editor(&unit, v, 0);
-                                                }
-                                            },
-                                        );
-                                    });
-                                    ui.add_space(8.0);
-                                    // .vh-thumbs: the version's
-                                    // pages. Click selects the
-                                    // version (views unification,
-                                    // user ruling 2026-11-25: the
-                                    // wall above and the bottom-bar
-                                    // views follow the pick);
-                                    // double-click opens the light
-                                    // view at that page.
-                                    ui.horizontal_wrapped(|ui| {
-                                        let page_count = i(v, "page_count").max(0) as usize;
-                                        for p in 0..page_count {
-                                            let thumb =
-                                                self.thumb_response(ui, &vid, p, 120.0, false);
-                                            if thumb.clicked() {
-                                                st.selected_version = Some(vid.clone());
-                                                st.selected_rendition = Some(s(&rend, "id"));
-                                                st.selected_page = None;
-                                                st.bind_pick = None;
-                                            }
-                                            if thumb.double_clicked() {
-                                                self.open_light(st, v, p);
-                                            }
-                                        }
-                                    });
-                                    ui.add_space(8.0);
-                                    // .vh-caption: author · time,
-                                    // then the version note.
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "{} · {}",
-                                            s(v, "author"),
-                                            fmt_time(i(v, "created_ms"))
-                                        ))
-                                        .size(11.5)
-                                        .color(palette_color(TEXT_FAINT)),
-                                    );
-                                    if !s(v, "note").is_empty() {
-                                        ui.label(
-                                            egui::RichText::new(s(v, "note"))
-                                                .size(11.5)
-                                                .color(palette_color(TEXT_FAINT)),
-                                        );
-                                    }
-                                });
-                            ui.add_space(12.0);
-                        }
-                    }
-                }
-            }
-            ui.add_space(8.0);
+            self.unit_101_body(ui, st);
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("AI 翻译（生成草稿）").strong().size(16.0));
                 // Configuration state from /v1/ai/status: a stub draft
@@ -16690,8 +16415,6 @@ impl App {
                     self.msg = "先选择片段文件".into();
                 }
             }
-            ui.add_space(20.0);
-            self.unit_bindings_ui(ui, st);
         });
         self.attachments_ui(ui, "unit", &st.unit_id.clone());
     }

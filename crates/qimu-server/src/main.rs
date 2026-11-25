@@ -2062,6 +2062,29 @@ async fn recall_version(
     Ok(Json(json!({ "ok": true })))
 }
 
+/// POST /v1/versions/:id/publish-draft — the #101 history card's
+/// 「发布为最新版本」: flip a draft version to normal. Only drafts
+/// qualify; anything else is a client error, not a silent no-op.
+async fn publish_draft_version(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    let store = st.store.lock().unwrap();
+    let ver = store.get_version(&id).map_err(|_| not_found())?;
+    if ver.status != "draft" {
+        return Err(bad("只有草稿版本可以发布".to_string()));
+    }
+    let rend = store.get_rendition(&ver.rendition_id).map_err(bad)?;
+    let unit = store.get_unit(&rend.unit_id).map_err(bad)?;
+    drop(store);
+    need_cap(&st, &user, &unit.group_id, "publish")?;
+    let store = st.store.lock().unwrap();
+    store.set_version_status(&id, "normal").map_err(bad)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
 async fn delete_version(
     State(st): State<St>,
     headers: HeaderMap,
@@ -6072,6 +6095,10 @@ async fn main() {
         .route("/v1/import/propose", post(import_propose))
         .route("/v1/units/:id/publish", post(publish))
         .route("/v1/versions/:id/recall", post(recall_version))
+        .route(
+            "/v1/versions/:id/publish-draft",
+            post(publish_draft_version),
+        )
         .route("/v1/versions/:id/delete", post(delete_version))
         .route("/v1/versions/:id/fragment", get(version_fragment))
         .route("/v1/versions/:id/thumb/:page", get(version_thumb))

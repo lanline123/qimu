@@ -3370,7 +3370,13 @@ impl Store {
             if r.unit_id != unit_id {
                 return Err("版本不属于该内容块".into());
             }
-            if from_slot < 0 || to_slot < 0 {
+            // A "missing" mark (#101 bind panel: 标缺译 / 无对应页)
+            // names a target version but no target page: it is the
+            // one row allowed to carry to_slot = -1. Its to_page_id
+            // resolves to "" (page_id_at below), which the read
+            // paths treat as "no page", never as a real binding.
+            let missing_mark = kind == "missing" && to_slot == -1;
+            if from_slot < 0 || (to_slot < 0 && !missing_mark) {
                 return Err("页位不能为负".into());
             }
         }

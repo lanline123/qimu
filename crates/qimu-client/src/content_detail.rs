@@ -1,5 +1,21 @@
 use super::*;
 
+// ----------------------------------------------------------------
+// #101 内容块详情页 — full rebuild (user order 2026-11-25: 不要基于
+// 现有的页面做，要完全重构，1:1 对齐原型). The rendering below is
+// written from the extracted spec (~/workspace/qimu-101-rebuild/
+// SPEC.md; prototype 启幕原型-内容索引页.html, renderDetail @2589)
+// rather than evolved from the previous page: header → thumbnails
+// wall (with the per-page language bind bar) → bind panel →
+// embedded blocks → history versions. The old "语言绑定（逐页）"
+// workbench section does not exist in the prototype and is gone;
+// binding lives in exactly the prototype's two places — the thumb
+// bar's chips (single-click direct toggle) and the panel below
+// the wall. Data assembly, the drill stack and the bottom-bar
+// contract stay with the caller (main.rs unit_detail keeps only
+// the crumb, the pick-pages mode and the client-only sections).
+// ----------------------------------------------------------------
+
 #[derive(Clone)]
 pub(super) struct UnitVersion {
     pub rendition_id: String,
@@ -34,6 +50,17 @@ pub(super) struct PageBindingRequest {
     pub from_slot: i64,
     pub to_version_id: String,
     pub to_slot: i64,
+}
+
+/// The bind panel's open state (prototype `bindPanel{key, pi,
+/// lang}`): which page of the shown version it serves, and which
+/// target language its candidate list currently shows. Lives on
+/// the frame's state so a detail reload (every bind action
+/// reloads) keeps the panel where the user left it.
+#[derive(Clone)]
+pub(super) struct BindPanelState {
+    pub page: usize,
+    pub lang: String,
 }
 
 #[derive(Clone)]
@@ -112,6 +139,7 @@ fn exact_binding(bindings: &[Value], request: &PageBindingRequest) -> Option<Val
                 && i(binding, "from_slot") == request.from_slot
                 && s(binding, "to_version_id") == request.to_version_id
                 && i(binding, "to_slot") == request.to_slot
+                && s(binding, "kind") != "missing"
         })
         .cloned()
 }
@@ -123,6 +151,7 @@ fn occupied_binding(bindings: &[Value], request: &PageBindingRequest) -> Option<
             s(binding, "from_version_id") != request.from_version_id
                 && s(binding, "to_version_id") == request.to_version_id
                 && i(binding, "to_slot") == request.to_slot
+                && s(binding, "kind") != "missing"
         })
         .cloned()
 }
@@ -144,6 +173,7 @@ fn lang_display_name(code: &str) -> String {
         "en" => "英语".to_string(),
         "zh" => "中文".to_string(),
         "ja" => "日语".to_string(),
+        "bi" => "双语".to_string(),
         other => other.to_uppercase(),
     }
 }
@@ -156,6 +186,62 @@ fn page_note(version: &Value, slot: usize) -> String {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string()
+}
+
+/// One page's bind state for one target language, read off the
+/// frame's binding rows (prototype bindsOf[pi][lang]): a real
+/// page binding, a missing-translation mark (kind = "missing",
+/// to_slot = -1 — see Store::add_page_binding), or nothing.
+enum PageBindState {
+    Bound(Value),
+    Missing(Value),
+    Unbound,
+}
+
+fn page_bind_state(
+    bindings: &[Value],
+    from_version_id: &str,
+    slot: usize,
+    target_version_id: &str,
+) -> PageBindState {
+    let mut missing = None;
+    for binding in bindings {
+        if s(binding, "from_version_id") != from_version_id
+            || i(binding, "from_slot") != slot as i64
+            || s(binding, "to_version_id") != target_version_id
+        {
+            continue;
+        }
+        if s(binding, "kind") == "missing" {
+            missing = Some(binding.clone());
+        } else if i(binding, "to_slot") >= 0 {
+            return PageBindState::Bound(binding.clone());
+        }
+    }
+    match missing {
+        Some(binding) => PageBindState::Missing(binding),
+        None => PageBindState::Unbound,
+    }
+}
+
+/// Deferred outcomes of one frame's wall/panel/history drawing.
+/// The draw closures borrow the thumbnail cache through `self`,
+/// so every store-touching follow-up is collected and executed
+/// after the section has been drawn (the pattern the previous
+/// page used for its binding requests).
+enum DetailAct {
+    Bind(PageBindingRequest),
+    Unbind {
+        binding_id: String,
+        ok_msg: &'static str,
+    },
+    MarkMissing {
+        from_version_id: String,
+        from_slot: i64,
+        to_version_id: String,
+    },
+    PublishDraft(String),
+    DropVersion(String),
 }
 
 impl App {
@@ -182,7 +268,170 @@ impl App {
         }));
     }
 
-    pub(super) fn unit_pages_ui(&mut self, ui: &mut egui::Ui, st: &mut UnitState) {
+    /// The prototype's bind language set for the thumb bar and
+    /// the panel (bindLangs @2730): the content languages minus
+    /// the shown rendition's own language, plus 双语 — always the
+    /// full set, whether a version in that language exists or not
+    /// (audit R5). The client's language list comes from the
+    /// server settings (lang_options); the zh/en/ja fallback
+    /// mirrors the translate picker when it has not loaded.
+    fn bind_lang_codes(&self, shown_lang: &str, targets: &[UnitVersion]) -> Vec<String> {
+        let mut codes: Vec<String> = Vec::new();
+        let mut push = |codes: &mut Vec<String>, code: &str| {
+            if code != shown_lang && !codes.iter().any(|c| c == code) {
+                codes.push(code.to_string());
+            }
+        };
+        if self.lang_options.is_empty() {
+            for code in ["zh", "en", "ja"] {
+                push(&mut codes, code);
+            }
+        } else {
+            for (code, _) in &self.lang_options {
+                push(&mut codes, code);
+            }
+        }
+        for target in targets {
+            push(&mut codes, &target.lang);
+        }
+        push(&mut codes, "bi");
+        codes
+    }
+
+    fn run_detail_act(&mut self, unit_id: &str, bindings: &[Value], act: DetailAct) {
+        match act {
+            DetailAct::Bind(request) => {
+                self.request_page_binding(request, bindings);
+            }
+            DetailAct::Unbind { binding_id, ok_msg } => {
+                self.delete_page_binding_msg(unit_id, &binding_id, ok_msg);
+            }
+            DetailAct::MarkMissing {
+                from_version_id,
+                from_slot,
+                to_version_id,
+            } => {
+                self.apply_missing_mark(unit_id, &from_version_id, from_slot, &to_version_id);
+            }
+            DetailAct::PublishDraft(version_id) => {
+                match self.call_work(
+                    "POST",
+                    &format!("/v1/versions/{version_id}/publish-draft"),
+                    None,
+                ) {
+                    Ok(_) => {
+                        self.msg = "草稿已发布为最新版本".into();
+                        self.reload_unit_detail(unit_id);
+                    }
+                    Err(e) => self.msg = format!("发布草稿失败：{e}"),
+                }
+            }
+            DetailAct::DropVersion(version_id) => {
+                match self.call_work(
+                    "POST",
+                    &format!("/v1/versions/{version_id}/delete"),
+                    None,
+                ) {
+                    Ok(_) => {
+                        self.msg = "已放弃该草稿".into();
+                        self.reload_unit_detail(unit_id);
+                    }
+                    Err(e) => self.msg = format!("放弃草稿失败：{e}"),
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------
+    // Header (SPEC 一): one baseline row — h2 title (double-click
+    // inline edit), the intro + 「当前 v…」 hint, the kind tag in
+    // the badges slot. The prototype's third hint segment is the
+    // version POLICY (锁定版本 / 跟随最新), which is index-entry
+    // data the unit payload does not carry — it is NOT replaced
+    // by the maintainer here (audit R1); see the rebuild report's
+    // data-gap list. The header delete button the old page had
+    // does not exist in the prototype and is gone (D1, report);
+    // deletion stays on the shell bottom bar.
+    // ------------------------------------------------------------
+    pub(super) fn unit_header_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        st: &mut UnitState,
+        unit: &Value,
+        kind_tag: Option<&'static str>,
+    ) {
+        let head_latest = st
+            .detail
+            .get("renditions")
+            .and_then(|r| r.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|r| r.get("latest"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        ui.horizontal(|ui| {
+            if matches!(&st.meta_edit, Some((MetaField::Name, _))) {
+                self.meta_edit_ui(ui, st, MetaField::Name);
+            } else {
+                let title = ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(s(unit, "name")).size(20.0).strong(),
+                    )
+                    .sense(egui::Sense::click()),
+                );
+                if title.double_clicked() {
+                    st.meta_edit = Some((MetaField::Name, s(unit, "name")));
+                    st.meta_edit_focus = true;
+                }
+            }
+            if let Some(tag) = kind_tag {
+                chip(ui, tag, palette_color(CHIP_GRAY_FG), CHIP_GRAY_BG);
+            }
+            // .hint: 13px, --muted, on the title's baseline row.
+            let mut hint_has_intro = false;
+            if matches!(&st.meta_edit, Some((MetaField::Description, _))) {
+                hint_has_intro = true;
+                self.meta_edit_ui(ui, st, MetaField::Description);
+            } else if !s(unit, "description").is_empty() {
+                hint_has_intro = true;
+                let intro = ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(s(unit, "description"))
+                            .size(13.0)
+                            .color(palette_color(TEXT_FAINT)),
+                    )
+                    .sense(egui::Sense::click()),
+                );
+                if intro.double_clicked() {
+                    st.meta_edit = Some((MetaField::Description, s(unit, "description")));
+                    st.meta_edit_focus = true;
+                }
+            }
+            let head_semver = s(&head_latest, "semver");
+            ui.label(
+                egui::RichText::new(if head_semver.is_empty() {
+                    format!(
+                        "{}内容修订 r{}",
+                        if hint_has_intro { " · " } else { "" },
+                        i(unit, "current_revision")
+                    )
+                } else {
+                    format!(
+                        "{}当前 v{}",
+                        if hint_has_intro { " · " } else { "" },
+                        head_semver
+                    )
+                })
+                .size(13.0)
+                .color(palette_color(TEXT_FAINT)),
+            );
+        });
+    }
+
+    // ------------------------------------------------------------
+    // The #101 body, in the prototype's block order: thumbnails
+    // (+ bind panel directly after), embedded blocks, history.
+    // ------------------------------------------------------------
+    pub(super) fn unit_101_body(&mut self, ui: &mut egui::Ui, st: &mut UnitState) {
         let versions = unit_versions(&st.detail);
         let Some(first) = versions.first() else {
             return;
@@ -195,38 +444,11 @@ impl App {
             st.selected_rendition = Some(first.rendition_id.clone());
         }
         let selected_id = st.selected_rendition.clone().unwrap_or_default();
-        ui.horizontal_wrapped(|ui| {
-            // One chip per rendition: the wall switches
-            // renditions, not versions — iterating every version
-            // repeated the same form · lang chip once per version
-            // in the row.
-            let mut seen_renditions: Vec<&str> = Vec::new();
-            for item in &versions {
-                if seen_renditions.contains(&item.rendition_id.as_str()) {
-                    continue;
-                }
-                seen_renditions.push(item.rendition_id.as_str());
-                if ui
-                    .selectable_label(
-                        selected_id == item.rendition_id,
-                        format!("{} · {}", item.form, item.lang),
-                    )
-                    .clicked()
-                {
-                    st.selected_rendition = Some(item.rendition_id.clone());
-                    st.selected_version = None;
-                    st.selected_page = None;
-                    st.bind_pick = None;
-                }
-            }
-        });
         // The shown version: a history version the user clicked
-        // in the version list below wins over the rendition's
-        // latest (views unification, user ruling 2026-11-25) —
-        // the wall, and with it the bottom-bar views, address
-        // that frozen page sequence. The rendition chips above
-        // clear the pick and return to the latest.
-        let Some(selected) = versions
+        // wins over the rendition's latest (views unification,
+        // user ruling 2026-11-25) — the wall, and with it the
+        // bottom-bar views, address that frozen page sequence.
+        let Some(shown) = versions
             .iter()
             .find(|item| {
                 item.rendition_id == selected_id
@@ -237,11 +459,70 @@ impl App {
         else {
             return;
         };
-        let version_id = s(&selected.version, "id");
-        let page_count = i(&selected.version, "page_count").max(0) as usize;
+        let mut acts: Vec<DetailAct> = Vec::new();
+        self.unit_thumbs_ui(ui, st, &versions, &shown, &mut acts);
+        self.unit_kids_ui(ui, st);
+        self.unit_history_ui(ui, st, &mut acts);
+        let unit_id = st.unit_id.clone();
+        // The bind confirm flow reads the frame's own binding
+        // snapshot (the same one the wall rendered from).
+        let bindings = st.bindings.clone();
+        for act in acts {
+            self.run_detail_act(&unit_id, &bindings, act);
+        }
+    }
+
+    /// Renditions of the detail, deduplicated in payload order —
+    /// the wall switches renditions, not versions.
+    fn rendition_rows(versions: &[UnitVersion]) -> Vec<(String, String, String)> {
+        let mut rows: Vec<(String, String, String)> = Vec::new();
+        for item in versions {
+            if !rows.iter().any(|(id, _, _)| *id == item.rendition_id) {
+                rows.push((
+                    item.rendition_id.clone(),
+                    item.form.clone(),
+                    item.lang.clone(),
+                ));
+            }
+        }
+        rows
+    }
+
+    // ------------------------------------------------------------
+    // Thumbnails section (SPEC 三): h3 + the rendition segctl,
+    // then the framed cells — real page thumbnails over the
+    // prototype's frame geometry (2px --line, radius 6, --panel),
+    // the toolbar strip (8/10/10) holding the bind bar and the
+    // caption. The CSS grid's minmax(230px, 1fr) columns are
+    // reproduced by measuring the available width and dividing
+    // it into equal columns (declared approximation: egui has
+    // no grid; the count follows the width, cells stay equal).
+    // ------------------------------------------------------------
+    fn unit_thumbs_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        st: &mut UnitState,
+        versions: &[UnitVersion],
+        shown: &UnitVersion,
+        acts: &mut Vec<DetailAct>,
+    ) {
+        let version_id = s(&shown.version, "id");
+        let page_count = i(&shown.version, "page_count").max(0) as usize;
+        let targets = binding_targets(&st.detail, &version_id);
+        let lang_codes = self.bind_lang_codes(&shown.lang, &targets);
+        let picked = st.selected_version.is_some();
         ui.horizontal(|ui| {
-            // Section heading (prototype .dsec h3): 16px.
             ui.label(egui::RichText::new("页面缩略图").strong().size(16.0));
+            if picked {
+                // The wall is showing a frozen history version,
+                // not the rendition's latest — the prototype's
+                // title suffix slot (its EN-mode version tag).
+                ui.label(
+                    egui::RichText::new(format!(" · v{}", s(&shown.version, "semver")))
+                        .size(16.0)
+                        .color(palette_color(TEXT_FAINT)),
+                );
+            }
             if let Some(pick) = &st.bind_pick {
                 ui.label(
                     egui::RichText::new(format!(
@@ -255,111 +536,96 @@ impl App {
                     st.bind_pick = None;
                 }
             }
+            // Rendition switch: the prototype's segctl form,
+            // right-aligned on the section title row. Only shown
+            // when the block actually has several renditions.
+            let rows = Self::rendition_rows(versions);
+            if rows.len() > 1 {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let labels: Vec<String> = rows
+                        .iter()
+                        .map(|(_, form, lang)| format!("{form} · {lang}"))
+                        .collect();
+                    let active = rows
+                        .iter()
+                        .position(|(id, _, _)| *id == shown.rendition_id)
+                        .unwrap_or(0);
+                    let label_refs: Vec<&str> = labels.iter().map(|l| l.as_str()).collect();
+                    if let Some(next) = segmented(ui, &label_refs, active, SegStyle::Soft) {
+                        st.selected_rendition = Some(rows[next].0.clone());
+                        st.selected_version = None;
+                        st.selected_page = None;
+                        st.bind_pick = None;
+                        st.bind_panel = None;
+                    }
+                });
+            }
         });
         ui.add_space(6.0);
-        let targets = binding_targets(&st.detail, &version_id);
-        let mut request = None;
+        let picking = st.bind_pick.is_some();
+        let saved_spacing = ui.spacing().item_spacing;
+        ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
+        let avail = ui.available_width();
+        let cols = (((avail + 12.0) / (230.0 + 12.0)).floor() as usize).max(1);
+        let cell_w = ((avail - 12.0 * (cols as f32 - 1.0)) / cols as f32).max(170.0);
+        let inner_w = (cell_w - 4.0).max(120.0);
         ui.horizontal_wrapped(|ui| {
             for slot in 0..page_count {
-                // Prototype .thumb-cell / .thumb-frame: a 2px
-                // --line frame (radius 6, --panel fill) with the
-                // slide flush at the top and a toolbar strip
-                // below it (8 top / 10 sides / 10 bottom) holding
-                // the bind chips and the page caption. (The CSS
-                // grid's equal columns become the wrapped flow's
-                // fixed 200px cells — declared approximation.)
-                egui::Frame::NONE
+                let frame_resp = egui::Frame::NONE
                     .fill(palette_color(PANEL_BG))
                     .stroke(egui::Stroke::new(2.0, palette_color(LINE_34)))
                     .corner_radius(6)
                     .inner_margin(egui::Margin::same(0))
                     .show(ui, |ui| {
                         ui.vertical(|ui| {
+                            ui.set_width(inner_w);
                             let response = self.thumb_response(
                                 ui,
                                 &version_id,
                                 slot,
-                                200.0,
+                                inner_w,
                                 st.selected_page == Some(slot),
                             );
-                            if let Some(pick) = st.bind_pick.clone() {
+                            if picking {
                                 if response.clicked() {
-                                    request = Some(PageBindingRequest {
-                                        unit_id: st.unit_id.clone(),
-                                        from_version_id: pick.from_version_id,
-                                        from_slot: pick.from_slot,
-                                        to_version_id: pick.to_version_id,
-                                        to_slot: slot as i64,
-                                    });
+                                    if let Some(pick) = st.bind_pick.clone() {
+                                        acts.push(DetailAct::Bind(PageBindingRequest {
+                                            unit_id: st.unit_id.clone(),
+                                            from_version_id: pick.from_version_id,
+                                            from_slot: pick.from_slot,
+                                            to_version_id: pick.to_version_id,
+                                            to_slot: slot as i64,
+                                        }));
+                                        st.bind_pick = None;
+                                    }
                                 }
                             } else {
                                 if response.clicked() {
                                     st.selected_page = Some(slot);
                                 }
                                 if response.double_clicked() {
-                                    self.open_light(st, &selected.version, slot);
+                                    self.open_light(st, &shown.version, slot);
                                 }
                             }
+                            // .tb: 8 top / 10 sides / 10 bottom.
                             ui.add_space(8.0);
                             ui.horizontal(|ui| {
                                 ui.add_space(10.0);
-                                for target in &targets {
-                                    let bound = st.bindings.iter().any(|binding| {
-                                        s(binding, "from_version_id") == version_id
-                                            && i(binding, "from_slot") == slot as i64
-                                            && s(binding, "to_version_id")
-                                                == s(&target.version, "id")
-                                    });
-                                    // Prototype .lang-chip: bound
-                                    // (.on) is the accent fill with
-                                    // white text; unbound rests on
-                                    // --panel2 with a --line2 border
-                                    // and muted text.
-                                    let chip = egui::Button::new(
-                                        egui::RichText::new(target.lang.to_uppercase())
-                                            .size(10.5)
-                                            .color(if bound {
-                                                egui::Color32::WHITE
-                                            } else {
-                                                palette_color(TEXT_WEAK)
-                                            }),
-                                    )
-                                    .fill(if bound {
-                                        ACCENT
-                                    } else {
-                                        palette_color(HOVER_BG)
-                                    })
-                                    .stroke(if bound {
-                                        egui::Stroke::new(1.0, ACCENT)
-                                    } else {
-                                        egui::Stroke::new(
-                                            1.0,
-                                            palette_color(FIELD_BORDER),
-                                        )
-                                    })
-                                    .corner_radius(6);
-                                    if ui
-                                        .add(chip)
-                                        .on_hover_text(if bound {
-                                            format!("{}已绑定", target.lang)
-                                        } else {
-                                            format!("绑定{}对应页", target.lang)
-                                        })
-                                        .clicked()
-                                    {
-                                        st.bind_pick = Some(PageBindingPick {
-                                            from_version_id: version_id.clone(),
-                                            from_slot: slot as i64,
-                                            to_version_id: s(&target.version, "id"),
-                                            target_lang: target.lang.clone(),
-                                        });
-                                    }
+                                if !picking {
+                                    self.bind_bar_ui(
+                                        ui, st, shown, slot, &targets, &lang_codes, acts,
+                                    );
                                 }
                             });
                             ui.horizontal(|ui| {
                                 ui.add_space(10.0);
+                                // .tb-desc: the page's 说明 (d).
+                                // Version pages carry no d — the
+                                // title stands in this slot (data
+                                // gap, see report; same family as
+                                // audit R3).
                                 ui.label(
-                                    egui::RichText::new(page_title(&selected.version, slot))
+                                    egui::RichText::new(page_title(&shown.version, slot))
                                         .size(12.0)
                                         .color(palette_color(TEXT_FAINT)),
                                 );
@@ -367,152 +633,956 @@ impl App {
                             ui.add_space(10.0);
                         });
                     });
+                if picking {
+                    // .thumb-grid.picking: a 2px dashed accent
+                    // outline per cell — egui strokes have no
+                    // dash, so the outline is solid (declared).
+                    let rect = frame_resp.response.rect.expand(2.0);
+                    ui.painter().rect_stroke(
+                        rect,
+                        8.0,
+                        egui::Stroke::new(2.0, ACCENT),
+                        egui::StrokeKind::Outside,
+                    );
+                }
             }
         });
-        if let Some(request) = request {
-            st.bind_pick = None;
-            self.request_page_binding(request, &st.bindings);
+        ui.spacing_mut().item_spacing = saved_spacing;
+        // The bind panel renders directly after the wall
+        // (prototype @2603 concatenation order).
+        if !picking && st.bind_panel.is_some() {
+            self.unit_bind_panel_ui(ui, st, shown, &targets, &lang_codes, acts);
         }
-        // Sections divide by space alone (prototype .dsec
-        // margin), not rule lines.
-        ui.add_space(4.0);
     }
 
-    pub(super) fn unit_bindings_ui(&mut self, ui: &mut egui::Ui, st: &mut UnitState) {
-        ui.label(egui::RichText::new("语言绑定（逐页）").strong().size(16.0));
-        let all_versions = unit_versions(&st.detail);
-        if all_versions.len() < 2 {
-            ui.label(egui::RichText::new("至少两个版本后可做逐页绑定").weak());
+    /// The per-page bind bar (SPEC 三, bindBarHtml @2744): one
+    /// chip per language of the full content-language set, in
+    /// the .lang-chip form enlarged for the thumb bar (min-width
+    /// 32, height 24), then the panel-open pill (.bind-open
+    /// @683 — its CSS and handler exist in the prototype build
+    /// but no element emits it there; the pill is restored here
+    /// to its CSS spec so the panel is reachable, see report).
+    /// Chip click is the prototype's DIRECT TOGGLE (@5026):
+    /// bound → unbind, missing → unmark, unbound → bind to the
+    /// same-index page (an occupied target goes through the
+    /// existing move-confirm overlay, the prototype's
+    /// bindConfirmDlg). When the same-index bind is impossible
+    /// (no version in that language, or the page has no
+    /// counterpart), the click opens the panel instead.
+    #[allow(clippy::too_many_arguments)]
+    fn bind_bar_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        st: &mut UnitState,
+        shown: &UnitVersion,
+        slot: usize,
+        targets: &[UnitVersion],
+        lang_codes: &[String],
+        acts: &mut Vec<DetailAct>,
+    ) {
+        let version_id = s(&shown.version, "id");
+        for lang in lang_codes {
+            let target = targets.iter().find(|t| &t.lang == lang);
+            let state = target.map(|t| {
+                page_bind_state(&st.bindings, &version_id, slot, &s(&t.version, "id"))
+            });
+            let (fill, stroke, fg) = match &state {
+                Some(PageBindState::Bound(_)) => {
+                    (ACCENT, egui::Stroke::new(1.0, ACCENT), egui::Color32::WHITE)
+                }
+                Some(PageBindState::Missing(_)) => (
+                    CHIP_ORANGE_BG,
+                    egui::Stroke::new(1.0, palette_color(CHIP_ORANGE_FG)),
+                    palette_color(CHIP_ORANGE_FG),
+                ),
+                _ => (
+                    palette_color(HOVER_BG),
+                    egui::Stroke::new(1.0, palette_color(FIELD_BORDER)),
+                    palette_color(TEXT_WEAK),
+                ),
+            };
+            let tip = match &state {
+                Some(PageBindState::Bound(b)) => format!(
+                    "{} · 已绑定 ↔ 第 {} 页（点击解绑）",
+                    lang_display_name(lang),
+                    i(b, "to_slot") + 1
+                ),
+                Some(PageBindState::Missing(_)) => {
+                    format!("{} · 已标缺译（点击取消）", lang_display_name(lang))
+                }
+                _ => format!(
+                    "{} · 未绑定（点击绑定到第 {} 页）",
+                    lang_display_name(lang),
+                    slot + 1
+                ),
+            };
+            let chip = egui::Button::new(
+                egui::RichText::new(lang.to_uppercase()).size(10.0).strong().color(fg),
+            )
+            .fill(fill)
+            .stroke(stroke)
+            .corner_radius(6)
+            .min_size(egui::vec2(32.0, 24.0));
+            if ui.add(chip).on_hover_text(tip).clicked() {
+                match (target, state) {
+                    (Some(_), Some(PageBindState::Bound(b))) => {
+                        acts.push(DetailAct::Unbind {
+                            binding_id: s(&b, "id"),
+                            ok_msg: "已解除页面绑定",
+                        });
+                    }
+                    (Some(_), Some(PageBindState::Missing(b))) => {
+                        acts.push(DetailAct::Unbind {
+                            binding_id: s(&b, "id"),
+                            ok_msg: "已取消缺译标记",
+                        });
+                    }
+                    (Some(t), _) if slot < i(&t.version, "page_count").max(0) as usize => {
+                        acts.push(DetailAct::Bind(PageBindingRequest {
+                            unit_id: st.unit_id.clone(),
+                            from_version_id: version_id.clone(),
+                            from_slot: slot as i64,
+                            to_version_id: s(&t.version, "id"),
+                            to_slot: slot as i64,
+                        }));
+                    }
+                    _ => {
+                        st.bind_panel = Some(BindPanelState {
+                            page: slot,
+                            lang: lang.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        // .bind-open pill: opens (or closes) the panel for this
+        // page; accent-filled while the panel serves this page.
+        let panel_here = st
+            .bind_panel
+            .as_ref()
+            .is_some_and(|p| p.page == slot);
+        let pill = egui::Button::new(
+            egui::RichText::new("绑定")
+                .size(11.5)
+                .strong()
+                .color(if panel_here {
+                    egui::Color32::WHITE
+                } else {
+                    palette_color(TEXT_MAIN)
+                }),
+        )
+        .fill(if panel_here {
+            ACCENT
+        } else {
+            palette_color(HOVER_BG)
+        })
+        .stroke(if panel_here {
+            egui::Stroke::new(1.0, ACCENT)
+        } else {
+            egui::Stroke::new(1.0, palette_color(LINE_34))
+        })
+        .corner_radius(6)
+        .min_size(egui::vec2(0.0, 28.0));
+        if ui.add(pill).clicked() {
+            if panel_here {
+                st.bind_panel = None;
+            } else {
+                // Default language: the first with no entry at
+                // all (prototype @2620), else the first code.
+                let default_lang = lang_codes
+                    .iter()
+                    .find(|code| {
+                        targets
+                            .iter()
+                            .find(|t| &t.lang == *code)
+                            .is_none_or(|t| {
+                                matches!(
+                                    page_bind_state(
+                                        &st.bindings,
+                                        &version_id,
+                                        slot,
+                                        &s(&t.version, "id")
+                                    ),
+                                    PageBindState::Unbound
+                                )
+                            })
+                    })
+                    .cloned()
+                    .or_else(|| lang_codes.first().cloned())
+                    .unwrap_or_else(|| "en".to_string());
+                st.bind_panel = Some(BindPanelState {
+                    page: slot,
+                    lang: default_lang,
+                });
+            }
+        }
+    }
+
+    // ------------------------------------------------------------
+    // Bind panel (SPEC 四, bindPanelHtml @2751): --panel fill,
+    // 1px --line border, radius 6, 14px padding, directly below
+    // the wall. Title, a segctl language switch whose labels
+    // carry the bind status, the candidate grid (targetPagesFor
+    // = the target rendition's latest version's pages), and the
+    // action row. Candidate click follows tryPageBind: the
+    // already-bound candidate only reports; an occupied one goes
+    // through the move-confirm overlay; otherwise it binds and
+    // the panel closes (applyPageBind @2761). When the page is
+    // marked missing for the language, the candidate area is
+    // replaced by the missing banner.
+    // ------------------------------------------------------------
+    #[allow(clippy::too_many_arguments)]
+    fn unit_bind_panel_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        st: &mut UnitState,
+        shown: &UnitVersion,
+        targets: &[UnitVersion],
+        lang_codes: &[String],
+        acts: &mut Vec<DetailAct>,
+    ) {
+        let Some(panel) = st.bind_panel.clone() else {
+            return;
+        };
+        let version_id = s(&shown.version, "id");
+        let page_count = i(&shown.version, "page_count").max(0) as usize;
+        if panel.page >= page_count {
+            st.bind_panel = None;
             return;
         }
-        if !all_versions
-            .iter()
-            .any(|item| item.version["id"].as_str() == Some(st.bind_from.as_str()))
-        {
-            st.bind_from = s(&all_versions[0].version, "id");
-            st.bind_from_slot = None;
-        }
-        if !all_versions
-            .iter()
-            .any(|item| item.version["id"].as_str() == Some(st.bind_to.as_str()))
-        {
-            st.bind_to = s(&all_versions[1].version, "id");
-        }
-        ui.horizontal(|ui| {
-            ui.label("基准");
-            let current = all_versions
-                .iter()
-                .find(|item| s(&item.version, "id") == st.bind_from)
-                .map(UnitVersion::label)
-                .unwrap_or_default();
-            egui::ComboBox::from_id_salt("bind_from")
-                .selected_text(current)
-                .show_ui(ui, |ui| {
-                    for item in &all_versions {
-                        ui.selectable_value(
-                            &mut st.bind_from,
-                            s(&item.version, "id"),
-                            item.label(),
-                        );
-                    }
-                });
-            ui.label("对应");
-            let current = all_versions
-                .iter()
-                .find(|item| s(&item.version, "id") == st.bind_to)
-                .map(UnitVersion::label)
-                .unwrap_or_default();
-            egui::ComboBox::from_id_salt("bind_to")
-                .selected_text(current)
-                .show_ui(ui, |ui| {
-                    for item in &all_versions {
-                        ui.selectable_value(&mut st.bind_to, s(&item.version, "id"), item.label());
-                    }
-                });
+        let pi = panel.page;
+        let lang = panel.lang.clone();
+        let target = targets.iter().find(|t| t.lang == lang).cloned();
+        let cur_state = target.as_ref().map(|t| {
+            page_bind_state(&st.bindings, &version_id, pi, &s(&t.version, "id"))
         });
-        let from_pages = all_versions
-            .iter()
-            .find(|item| s(&item.version, "id") == st.bind_from)
-            .map(|item| i(&item.version, "page_count").max(0) as usize)
-            .unwrap_or(0);
-        let to_pages = all_versions
-            .iter()
-            .find(|item| s(&item.version, "id") == st.bind_to)
-            .map(|item| i(&item.version, "page_count").max(0) as usize)
-            .unwrap_or(0);
-        ui.label("基准页（点选）：");
-        ui.horizontal_wrapped(|ui| {
-            for slot in 0..from_pages {
-                ui.vertical(|ui| {
-                    let version_id = st.bind_from.clone();
-                    let response = self.thumb_response(
-                        ui,
-                        &version_id,
-                        slot,
-                        84.0,
-                        st.bind_from_slot == Some(slot as i64),
-                    );
-                    if response.clicked() {
-                        st.bind_from_slot = Some(slot as i64);
-                    }
-                    if response.double_clicked() {
-                        if let Some(item) = all_versions
-                            .iter()
-                            .find(|item| s(&item.version, "id") == version_id)
-                        {
-                            self.open_light(st, &item.version, slot);
-                        }
-                    }
-                });
-            }
-        });
-        let mut request = None;
-        let mut unbind = None;
-        ui.label("对应页（点「绑定/已绑定」切换）：");
-        ui.horizontal_wrapped(|ui| {
-            for slot in 0..to_pages {
-                ui.vertical(|ui| {
-                    let version_id = st.bind_to.clone();
-                    self.thumb_ui(ui, &version_id, slot, 84.0);
-                    let Some(from_slot) = st.bind_from_slot else {
-                        ui.label("先选基准页");
-                        return;
-                    };
-                    let candidate = PageBindingRequest {
-                        unit_id: st.unit_id.clone(),
-                        from_version_id: st.bind_from.clone(),
-                        from_slot,
-                        to_version_id: st.bind_to.clone(),
-                        to_slot: slot as i64,
-                    };
-                    if let Some(binding) = exact_binding(&st.bindings, &candidate) {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("已绑定 ✓")
-                                        .color(palette_color(CHIP_GREEN_FG)),
+        let is_missing = matches!(cur_state, Some(PageBindState::Missing(_)));
+        ui.add_space(12.0);
+        egui::Frame::NONE
+            .fill(palette_color(PANEL_BG))
+            .stroke(egui::Stroke::new(1.0, palette_color(LINE_34)))
+            .corner_radius(6)
+            .inner_margin(egui::Margin::same(14))
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "第 {} 页「{}」· 绑定其他语言的对应页",
+                        pi + 1,
+                        page_title(&shown.version, pi)
+                    ))
+                    .size(15.0)
+                    .strong(),
+                );
+                ui.add_space(10.0);
+                // .segctl: --panel2 container, 2px inset, buttons
+                // 26px tall; the selected one steps to --panel3.
+                egui::Frame::NONE
+                    .fill(palette_color(HOVER_BG))
+                    .stroke(egui::Stroke::new(1.0, palette_color(SEPARATOR)))
+                    .corner_radius(6)
+                    .inner_margin(egui::Margin::same(2))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            ui.spacing_mut().button_padding = egui::vec2(12.0, 0.0);
+                            for code in lang_codes {
+                                let suffix = match targets.iter().find(|t| &t.lang == code) {
+                                    Some(t) => match page_bind_state(
+                                        &st.bindings,
+                                        &version_id,
+                                        pi,
+                                        &s(&t.version, "id"),
+                                    ) {
+                                        PageBindState::Bound(b) => {
+                                            format!(" · 已绑第 {} 页", i(&b, "to_slot") + 1)
+                                        }
+                                        PageBindState::Missing(_) => " · 缺译".to_string(),
+                                        PageBindState::Unbound => String::new(),
+                                    },
+                                    None => String::new(),
+                                };
+                                let active = *code == lang;
+                                let btn = egui::Button::new(
+                                    egui::RichText::new(format!(
+                                        "{}{}",
+                                        lang_display_name(code),
+                                        suffix
+                                    ))
+                                    .size(12.5)
+                                    .strong()
+                                    .color(if active {
+                                        palette_color(TEXT_MAIN)
+                                    } else {
+                                        palette_color(TEXT_WEAK)
+                                    }),
                                 )
-                                .fill(palette_color(CHIP_GREEN_BG))
-                                .corner_radius(6),
-                            )
+                                .fill(if active {
+                                    palette_color(PRESSED_BG)
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                })
+                                .stroke(egui::Stroke::NONE)
+                                .corner_radius(6)
+                                .min_size(egui::vec2(0.0, 26.0));
+                                if ui.add(btn).clicked() && !active {
+                                    if let Some(p) = &mut st.bind_panel {
+                                        p.lang = code.clone();
+                                    }
+                                }
+                            }
+                        });
+                    });
+                if is_missing {
+                    ui.add_space(10.0);
+                    egui::Frame::NONE
+                        .fill(CHIP_ORANGE_BG)
+                        .stroke(egui::Stroke::new(
+                            1.0,
+                            palette_color(CHIP_ORANGE_FG),
+                        ))
+                        .corner_radius(6)
+                        .inner_margin(egui::Margin {
+                            left: 12,
+                            right: 12,
+                            top: 10,
+                            bottom: 10,
+                        })
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new("已标缺译 / 无对应页")
+                                    .size(13.0)
+                                    .strong(),
+                            );
+                        });
+                } else if let Some(t) = &target {
+                    let target_id = s(&t.version, "id");
+                    let cand_pages = i(&t.version, "page_count").max(0) as usize;
+                    ui.add_space(10.0);
+                    let saved_spacing = ui.spacing().item_spacing;
+                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+                    ui.horizontal_wrapped(|ui| {
+                        for ci in 0..cand_pages {
+                            let cand = PageBindingRequest {
+                                unit_id: st.unit_id.clone(),
+                                from_version_id: version_id.clone(),
+                                from_slot: pi as i64,
+                                to_version_id: target_id.clone(),
+                                to_slot: ci as i64,
+                            };
+                            let is_cur = exact_binding(&st.bindings, &cand).is_some();
+                            let owner = occupied_binding(&st.bindings, &cand)
+                                .map(|b| i(&b, "from_slot"));
+                            // .bind-cand: 2px --line border (the
+                            // current one accent on accent-soft),
+                            // radius 6, 9/10 padding, two lines.
+                            let (rect, resp) = ui.allocate_exact_size(
+                                egui::vec2(232.0, 58.0),
+                                egui::Sense::click(),
+                            );
+                            let painter = ui.painter();
+                            let hovered = resp.hovered();
+                            let (fill, stroke) = if is_cur {
+                                (SEL_BG, egui::Stroke::new(2.0, ACCENT))
+                            } else if hovered {
+                                (
+                                    palette_color(PANEL_BG),
+                                    egui::Stroke::new(2.0, ACCENT),
+                                )
+                            } else {
+                                (
+                                    palette_color(PANEL_BG),
+                                    egui::Stroke::new(2.0, palette_color(LINE_34)),
+                                )
+                            };
+                            painter.rect_filled(rect, 6.0, fill);
+                            painter.rect_stroke(
+                                rect,
+                                6.0,
+                                stroke,
+                                egui::StrokeKind::Inside,
+                            );
+                            let line1 = format!(
+                                "第 {} 页 · {}",
+                                ci + 1,
+                                page_title(&t.version, ci)
+                            );
+                            let g1 = painter.layout_no_wrap(
+                                line1,
+                                egui::FontId::new(13.0, egui::FontFamily::Proportional),
+                                palette_color(TEXT_MAIN),
+                            );
+                            painter.galley(
+                                egui::pos2(rect.min.x + 10.0, rect.min.y + 9.0),
+                                g1,
+                                palette_color(TEXT_MAIN),
+                            );
+                            let mut line2 = t.label();
+                            if is_cur {
+                                line2.push_str(" · 当前绑定");
+                            } else if let Some(owner_slot) = owner {
+                                line2.push_str(&format!(
+                                    " · 已绑在中文第 {} 页，点选将移动绑定",
+                                    owner_slot + 1
+                                ));
+                            }
+                            let g2 = painter.layout_no_wrap(
+                                line2,
+                                egui::FontId::new(11.5, egui::FontFamily::Proportional),
+                                palette_color(TEXT_FAINT),
+                            );
+                            painter.galley(
+                                egui::pos2(rect.min.x + 10.0, rect.min.y + 32.0),
+                                g2,
+                                palette_color(TEXT_FAINT),
+                            );
+                            if resp.clicked() {
+                                if is_cur {
+                                    self.msg = format!(
+                                        "第 {} 页已经绑在{}第 {} 页上了。",
+                                        pi + 1,
+                                        lang_display_name(&lang),
+                                        ci + 1
+                                    );
+                                } else {
+                                    st.bind_panel = None;
+                                    acts.push(DetailAct::Bind(cand));
+                                }
+                            }
+                        }
+                    });
+                    ui.spacing_mut().item_spacing = saved_spacing;
+                } else {
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "尚无{}版本，暂时没有可绑定的对应页。",
+                            lang_display_name(&lang)
+                        ))
+                        .size(13.0)
+                        .color(palette_color(TEXT_FAINT)),
+                    );
+                }
+                // .bind-acts: the row under the candidates.
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if let Some(PageBindState::Bound(b)) = &cur_state {
+                        if btn_default(ui, &format!("解绑{}", lang_display_name(&lang)))
                             .clicked()
                         {
-                            unbind = Some((st.unit_id.clone(), s(&binding, "id")));
+                            acts.push(DetailAct::Unbind {
+                                binding_id: s(b, "id"),
+                                ok_msg: "已解除页面绑定",
+                            });
                         }
-                    } else if ui.button("绑定").clicked() {
-                        request = Some(candidate);
+                    }
+                    if is_missing {
+                        if btn_default(ui, "取消缺译标记").clicked() {
+                            if let Some(PageBindState::Missing(b)) = &cur_state {
+                                acts.push(DetailAct::Unbind {
+                                    binding_id: s(b, "id"),
+                                    ok_msg: "已取消缺译标记",
+                                });
+                            }
+                        }
+                    } else if let Some(t) = &target {
+                        if btn_default(ui, "标缺译 / 无对应页").clicked() {
+                            acts.push(DetailAct::MarkMissing {
+                                from_version_id: version_id.clone(),
+                                from_slot: pi as i64,
+                                to_version_id: s(&t.version, "id"),
+                            });
+                        }
+                    }
+                    if btn_default(ui, "收起").clicked() {
+                        st.bind_panel = None;
                     }
                 });
+            });
+    }
+
+    // ------------------------------------------------------------
+    // Embedded blocks (SPEC 五, kidsHtml @2597): rendered only
+    // when the detail payload carries a `children` array — the
+    // current payload does not (data gap, see report: the
+    // minimal fix is for the unit detail assembly to attach
+    // children shaped like list rows: {unit, renditions[].latest,
+    // children?}). When present, each child is a standard card:
+    // cover, title, a sub-page strip, and the accent main action
+    // that drills into the child.
+    // ------------------------------------------------------------
+    fn unit_kids_ui(&mut self, ui: &mut egui::Ui, st: &mut UnitState) {
+        let Some(children) = st
+            .detail
+            .get("children")
+            .and_then(Value::as_array)
+            .filter(|arr| !arr.is_empty())
+            .cloned()
+        else {
+            return;
+        };
+        ui.add_space(20.0);
+        ui.label(egui::RichText::new("内嵌内容块").strong().size(16.0));
+        ui.add_space(6.0);
+        let saved_spacing = ui.spacing().item_spacing;
+        ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
+        let avail = ui.available_width();
+        let cols = (((avail + 12.0) / (230.0 + 12.0)).floor() as usize).max(1);
+        let cell_w = ((avail - 12.0 * (cols as f32 - 1.0)) / cols as f32).max(170.0);
+        let inner_w = (cell_w - 2.0).max(120.0);
+        let mut drill: Option<String> = None;
+        ui.horizontal_wrapped(|ui| {
+            for child in &children {
+                let cunit = child.get("unit").cloned().unwrap_or(Value::Null);
+                let latest = child
+                    .get("renditions")
+                    .and_then(Value::as_array)
+                    .and_then(|arr| arr.first())
+                    .and_then(|r| r.get("latest"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let latest_id = s(&latest, "id");
+                let nested = child
+                    .get("children")
+                    .and_then(Value::as_array)
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                egui::Frame::NONE
+                    .fill(palette_color(PANEL_BG))
+                    .stroke(egui::Stroke::new(1.0, palette_color(LINE_34)))
+                    .corner_radius(6)
+                    .inner_margin(egui::Margin::same(0))
+                    .show(ui, |ui| {
+                        ui.vertical(|ui| {
+                            ui.set_width(inner_w);
+                            if !latest_id.is_empty() {
+                                let resp =
+                                    self.thumb_response(ui, &latest_id, 0, inner_w, false);
+                                if resp.clicked() {
+                                    drill = Some(s(&cunit, "id"));
+                                }
+                            }
+                            egui::Frame::NONE
+                                .inner_margin(egui::Margin {
+                                    left: 12,
+                                    right: 12,
+                                    top: 10,
+                                    bottom: 11,
+                                })
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(s(&cunit, "name"))
+                                                .size(13.0)
+                                                .strong(),
+                                        )
+                                        .truncate(),
+                                    );
+                                    if nested > 0 {
+                                        ui.add_space(4.0);
+                                        chip(
+                                            ui,
+                                            &format!("内含 {nested} 个子块"),
+                                            palette_color(ACCENT_DEEP),
+                                            SEL_BG,
+                                        );
+                                    }
+                                    // .std-sub: the child's pages
+                                    // as a strip of mini bars
+                                    // under a dashed rule.
+                                    let pages = latest
+                                        .get("pages")
+                                        .and_then(Value::as_array)
+                                        .cloned()
+                                        .unwrap_or_default();
+                                    if !pages.is_empty() {
+                                        ui.add_space(8.0);
+                                        dashed_rule(ui);
+                                        ui.add_space(8.0);
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 5.0;
+                                            let shown_pages = pages.len().min(8);
+                                            let bar_w = ((inner_w - 24.0
+                                                - 5.0 * (shown_pages as f32 - 1.0))
+                                                / shown_pages as f32)
+                                                .max(28.0);
+                                            for (idx, page) in
+                                                pages.iter().take(shown_pages).enumerate()
+                                            {
+                                                egui::Frame::NONE
+                                                    .fill(palette_color(HOVER_BG))
+                                                    .stroke(egui::Stroke::new(
+                                                        1.0,
+                                                        palette_color(LINE_34),
+                                                    ))
+                                                    .corner_radius(8)
+                                                    .inner_margin(egui::Margin {
+                                                        left: 7,
+                                                        right: 7,
+                                                        top: 5,
+                                                        bottom: 5,
+                                                    })
+                                                    .show(ui, |ui| {
+                                                        ui.set_width(bar_w - 14.0);
+                                                        ui.add(
+                                                            egui::Label::new(
+                                                                egui::RichText::new(format!(
+                                                                    "{}. {}",
+                                                                    idx + 1,
+                                                                    s(page, "title")
+                                                                ))
+                                                                .size(11.0)
+                                                                .strong(),
+                                                            )
+                                                            .truncate(),
+                                                        );
+                                                    });
+                                            }
+                                            if pages.len() > shown_pages {
+                                                ui.label(
+                                                    egui::RichText::new("…")
+                                                        .size(11.0)
+                                                        .color(palette_color(TEXT_FAINT)),
+                                                );
+                                            }
+                                        });
+                                    }
+                                    ui.add_space(8.0);
+                                    // .show-actions .main: the
+                                    // accent drill action.
+                                    if ui
+                                        .add_sized(
+                                            egui::vec2(inner_w - 24.0, 30.0),
+                                            egui::Button::new(
+                                                egui::RichText::new("打开维护 · 点开下钻 →")
+                                                    .size(12.0)
+                                                    .color(egui::Color32::WHITE),
+                                            )
+                                            .fill(ACCENT)
+                                            .corner_radius(6),
+                                        )
+                                        .clicked()
+                                    {
+                                        drill = Some(s(&cunit, "id"));
+                                    }
+                                });
+                        });
+                    });
             }
         });
-        if let Some((unit_id, binding_id)) = unbind {
-            self.delete_page_binding(&unit_id, &binding_id);
-        }
-        if let Some(request) = request {
-            self.request_page_binding(request, &st.bindings);
+        ui.spacing_mut().item_spacing = saved_spacing;
+        if let Some(child_id) = drill {
+            if !child_id.is_empty() {
+                self.open_unit_detail(&child_id);
+            }
         }
     }
 
+    // ------------------------------------------------------------
+    // History (SPEC 六, histHtmlForBlk @2555): one section; the
+    // client's versions arrive grouped per rendition, so each
+    // rendition's line rides under a small subhead (declared
+    // grouping difference — the prototype's single line is the
+    // block's own semver line, the client's semvers are per
+    // rendition). Cards follow the final cascade: --panel fill,
+    // 1px --line border, radius 6, 10px padding. The in-use
+    // version (the clicked history version, else the rendition's
+    // latest — views unification ruling) takes the accent
+    // border and the accent bigver; a draft takes the amber
+    // border (the prototype's dashed .draftv — egui strokes
+    // have no dash, declared). The prototype's separate blue
+    // .selected state has no client counterpart: selecting a
+    // version IS putting it in use here. Its language chips
+    // (which translation hangs on which version) have no data
+    // behind them in the client model — not rendered (report).
+    // Card selection hot zones: the bigver chip, the thumbs and
+    // the caption (egui has no whole-card background click
+    // layer that leaves the head buttons live — declared).
+    // ------------------------------------------------------------
+    fn unit_history_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        st: &mut UnitState,
+        acts: &mut Vec<DetailAct>,
+    ) {
+        ui.add_space(20.0);
+        ui.label(egui::RichText::new("历史版本").strong().size(16.0));
+        ui.add_space(6.0);
+        let Some(rends) = st
+            .detail
+            .get("renditions")
+            .and_then(|r| r.as_array())
+            .cloned()
+        else {
+            return;
+        };
+        let unit = st.detail.get("unit").cloned().unwrap_or(json!({}));
+        for row in &rends {
+            let rend = row.get("rendition").cloned().unwrap_or(json!({}));
+            let rend_id = s(&rend, "id");
+            ui.label(
+                egui::RichText::new(format!("{} · {}", s(&rend, "form"), s(&rend, "lang")))
+                    .size(13.0)
+                    .color(palette_color(TEXT_WEAK)),
+            );
+            ui.add_space(4.0);
+            // The in-use version of this rendition: the user's
+            // history pick while it belongs here, else the
+            // rendition's latest (first non-recalled).
+            let cur_id = st
+                .selected_version
+                .clone()
+                .filter(|vid| {
+                    row.get("versions")
+                        .and_then(Value::as_array)
+                        .is_some_and(|vs| vs.iter().any(|v| s(v, "id") == *vid))
+                })
+                .or_else(|| latest_version(row).map(|v| s(&v, "id")))
+                .unwrap_or_default();
+            let Some(versions) = row.get("versions").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            let saved_spacing = ui.spacing().item_spacing;
+            ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
+            ui.horizontal_wrapped(|ui| {
+                for v in versions {
+                    let vid = s(v, "id");
+                    let is_draft = s(v, "status") == "draft";
+                    let is_recalled = s(v, "status") == "recalled";
+                    let is_cur = vid == cur_id;
+                    let stroke = if is_draft {
+                        egui::Stroke::new(1.0, palette_color(CHIP_ORANGE_FG))
+                    } else if is_cur {
+                        egui::Stroke::new(1.0, ACCENT)
+                    } else {
+                        egui::Stroke::new(1.0, palette_color(LINE_34))
+                    };
+                    egui::Frame::NONE
+                        .fill(palette_color(PANEL_BG))
+                        .stroke(stroke)
+                        .corner_radius(6)
+                        .inner_margin(egui::Margin::same(10))
+                        .show(ui, |ui| {
+                            ui.set_width(264.0);
+                            // .vh-card-head: bigver chip, status
+                            // badges, then the head actions.
+                            ui.horizontal_wrapped(|ui| {
+                                let ver_text = format!("v{}", s(v, "semver"));
+                                let ver_font = egui::FontId::new(
+                                    12.0,
+                                    egui::FontFamily::Proportional,
+                                );
+                                let ver_fg = if is_cur {
+                                    egui::Color32::WHITE
+                                } else {
+                                    palette_color(TEXT_MAIN)
+                                };
+                                let ver_bg = if is_cur {
+                                    ACCENT
+                                } else {
+                                    palette_color(PRESSED_BG)
+                                };
+                                let galley = ui
+                                    .painter()
+                                    .layout_no_wrap(ver_text, ver_font, ver_fg);
+                                let (rect, ver_resp) = ui.allocate_exact_size(
+                                    egui::vec2(galley.size().x + 16.0, 24.0),
+                                    egui::Sense::click(),
+                                );
+                                ui.painter().rect_filled(rect, 6.0, ver_bg);
+                                ui.painter().galley(
+                                    egui::pos2(
+                                        rect.min.x + 8.0,
+                                        rect.center().y - galley.size().y / 2.0,
+                                    ),
+                                    galley,
+                                    ver_fg,
+                                );
+                                if ver_resp.clicked() {
+                                    st.selected_version = Some(vid.clone());
+                                    st.selected_rendition = Some(rend_id.clone());
+                                    st.selected_page = None;
+                                    st.bind_pick = None;
+                                }
+                                if ver_resp.double_clicked() {
+                                    self.open_light(st, v, 0);
+                                }
+                                if is_draft {
+                                    chip(
+                                        ui,
+                                        "草稿",
+                                        palette_color(CHIP_ORANGE_FG),
+                                        CHIP_ORANGE_BG,
+                                    );
+                                }
+                                if is_recalled {
+                                    chip(ui, "已撤回", palette_color(ROSE), ROSE_SOFT_BG);
+                                }
+                                if is_draft {
+                                    // The prototype's draft
+                                    // actions (h.draft): publish
+                                    // it as the newest version,
+                                    // or drop it.
+                                    if vh_btn_primary(ui, "发布为最新版本").clicked() {
+                                        acts.push(DetailAct::PublishDraft(vid.clone()));
+                                    }
+                                    if vh_btn(ui, "放弃").clicked() {
+                                        acts.push(DetailAct::DropVersion(vid.clone()));
+                                    }
+                                }
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if vh_btn(ui, "下载片段").clicked() {
+                                            if let Ok(resp) = self.call_work(
+                                                "GET",
+                                                &format!("/v1/versions/{vid}/fragment"),
+                                                None,
+                                            ) {
+                                                if let Some(data) = resp
+                                                    .get("data_base64")
+                                                    .and_then(|x| x.as_str())
+                                                {
+                                                    if let (Ok(bytes), Some(path)) = (
+                                                        b64d(data),
+                                                        rfd::FileDialog::new()
+                                                            .set_file_name("fragment.pptx")
+                                                            .save_file(),
+                                                    ) {
+                                                        // Audit2 E-M10: the write result decides the message.
+                                                        self.msg = match std::fs::write(
+                                                            path, bytes,
+                                                        ) {
+                                                            Ok(()) => "已保存".into(),
+                                                            Err(e) => {
+                                                                format!("保存失败：{e}")
+                                                            }
+                                                        };
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if vh_btn(ui, "讲稿").clicked() {
+                                            let mut scripts: Vec<String> = v
+                                                .get("scripts")
+                                                .and_then(|x| x.as_array())
+                                                .map(|arr| {
+                                                    arr.iter()
+                                                        .map(|t| {
+                                                            t.as_str().unwrap_or("").to_string()
+                                                        })
+                                                        .collect()
+                                                })
+                                                .unwrap_or_default();
+                                            let pages = i(v, "page_count") as usize;
+                                            while scripts.len() < pages {
+                                                scripts.push(String::new());
+                                            }
+                                            st.scripts_edit = scripts;
+                                            st.scripts_for = Some(vid.clone());
+                                        }
+                                        if !is_recalled && vh_btn(ui, "撤回").clicked() {
+                                            let _ = self.call_work(
+                                                "POST",
+                                                &format!("/v1/versions/{vid}/recall"),
+                                                None,
+                                            );
+                                            self.reload_unit_detail(&st.unit_id.clone());
+                                        }
+                                        if !is_recalled && vh_btn(ui, "编辑页面").clicked() {
+                                            self.open_page_editor(&unit, v, 0);
+                                        }
+                                    },
+                                );
+                            });
+                            ui.add_space(9.0);
+                            // .vh-thumbs: click selects the
+                            // version (views unification ruling:
+                            // the wall above and the bottom-bar
+                            // views follow the pick); double-click
+                            // opens the light view at that page.
+                            ui.horizontal_wrapped(|ui| {
+                                let page_count = i(v, "page_count").max(0) as usize;
+                                for p in 0..page_count {
+                                    let thumb =
+                                        self.thumb_response(ui, &vid, p, 120.0, false);
+                                    if thumb.clicked() {
+                                        st.selected_version = Some(vid.clone());
+                                        st.selected_rendition = Some(rend_id.clone());
+                                        st.selected_page = None;
+                                        st.bind_pick = None;
+                                    }
+                                    if thumb.double_clicked() {
+                                        self.open_light(st, v, p);
+                                    }
+                                }
+                            });
+                            ui.add_space(8.0);
+                            // .vh-caption: meta line, then the
+                            // revision note.
+                            let meta = ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!(
+                                        "{} · {}",
+                                        s(v, "author"),
+                                        fmt_time(i(v, "created_ms"))
+                                    ))
+                                    .size(11.5)
+                                    .color(palette_color(TEXT_FAINT)),
+                                )
+                                .sense(egui::Sense::click()),
+                            );
+                            if meta.clicked() {
+                                st.selected_version = Some(vid.clone());
+                                st.selected_rendition = Some(rend_id.clone());
+                                st.selected_page = None;
+                                st.bind_pick = None;
+                            }
+                            if !s(v, "note").is_empty() {
+                                ui.label(
+                                    egui::RichText::new(s(v, "note"))
+                                        .size(11.5)
+                                        .color(palette_color(TEXT_FAINT)),
+                                );
+                            }
+                        });
+                }
+            });
+            ui.spacing_mut().item_spacing = saved_spacing;
+            ui.add_space(8.0);
+        }
+    }
+}
+
+/// The history card head's button form (prototype: .btn at the
+/// card-head size — min-height 24, 12px text, 0/10 padding).
+fn vh_btn(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(
+            egui::RichText::new(label)
+                .size(12.0)
+                .color(palette_color(TEXT_MAIN)),
+        )
+        .fill(palette_color(HOVER_BG))
+        .stroke(egui::Stroke::new(1.0, palette_color(FIELD_BORDER)))
+        .corner_radius(6)
+        .min_size(egui::vec2(0.0, 24.0)),
+    )
+}
+
+fn vh_btn_primary(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(
+            egui::RichText::new(label)
+                .size(12.0)
+                .color(egui::Color32::WHITE),
+        )
+        .fill(ACCENT)
+        .corner_radius(6)
+        .min_size(egui::vec2(0.0, 24.0)),
+    )
+}
+
+impl App {
     fn request_page_binding(&mut self, request: PageBindingRequest, bindings: &[Value]) {
         if exact_binding(bindings, &request).is_some() {
             self.msg = "页面已经绑定".into();
@@ -551,7 +1621,8 @@ impl App {
                 && s(&binding, "to_version_id") == request.to_version_id;
             let occupied = s(&binding, "from_version_id") != request.from_version_id
                 && s(&binding, "to_version_id") == request.to_version_id
-                && i(&binding, "to_slot") == request.to_slot;
+                && i(&binding, "to_slot") == request.to_slot
+                && s(&binding, "kind") != "missing";
             if same_source_target || occupied {
                 replaced.push(binding);
             }
@@ -608,16 +1679,72 @@ impl App {
     }
 
     fn delete_page_binding(&mut self, unit_id: &str, binding_id: &str) {
+        self.delete_page_binding_msg(unit_id, binding_id, "已解除页面绑定");
+    }
+
+    fn delete_page_binding_msg(&mut self, unit_id: &str, binding_id: &str, ok_msg: &str) {
         match self.call_work(
             "POST",
             &format!("/v1/units/{unit_id}/page-bindings/{binding_id}/delete"),
             None,
         ) {
             Ok(_) => {
-                self.msg = "已解除页面绑定".into();
+                self.msg = ok_msg.into();
                 self.reload_unit_detail(unit_id);
             }
             Err(error) => self.msg = format!("解绑失败：{error}"),
+        }
+    }
+
+    /// 标缺译 / 无对应页： replace whatever this page had toward
+    /// the target version (a real binding or an older mark) with
+    /// one kind = "missing" row (to_slot = -1; core stores it as
+    /// the mark, see Store::add_page_binding). Unmarking is just
+    /// deleting that row.
+    fn apply_missing_mark(
+        &mut self,
+        unit_id: &str,
+        from_version_id: &str,
+        from_slot: i64,
+        to_version_id: &str,
+    ) {
+        let Ok(bindings) = self.call_work(
+            "GET",
+            &format!("/v1/units/{unit_id}/page-bindings"),
+            None,
+        ) else {
+            return;
+        };
+        let rows = bindings["bindings"].as_array().cloned().unwrap_or_default();
+        for binding in &rows {
+            if s(binding, "from_version_id") == from_version_id
+                && i(binding, "from_slot") == from_slot
+                && s(binding, "to_version_id") == to_version_id
+            {
+                let id = s(binding, "id");
+                let _ = self.call_work(
+                    "POST",
+                    &format!("/v1/units/{unit_id}/page-bindings/{id}/delete"),
+                    None,
+                );
+            }
+        }
+        match self.call_work(
+            "POST",
+            &format!("/v1/units/{unit_id}/page-bindings"),
+            Some(json!({
+                "from_version_id": from_version_id,
+                "from_slot": from_slot,
+                "to_version_id": to_version_id,
+                "to_slot": -1,
+                "kind": "missing",
+            })),
+        ) {
+            Ok(_) => {
+                self.msg = "已标缺译".into();
+                self.reload_unit_detail(unit_id);
+            }
+            Err(e) => self.msg = format!("标缺译失败：{e}"),
         }
     }
 
@@ -952,5 +2079,33 @@ mod tests {
             s(&occupied_binding(&bindings, &request).unwrap(), "id"),
             "b"
         );
+    }
+
+    #[test]
+    fn missing_marks_are_not_bindings() {
+        // A kind = "missing" row (to_slot = -1) must never read
+        // as an exact or occupying binding, and page_bind_state
+        // must surface it as the mark it is.
+        let bindings = vec![json!({
+            "id": "m",
+            "from_version_id": "v-zh",
+            "from_slot": 0,
+            "to_version_id": "v-en",
+            "to_slot": -1,
+            "kind": "missing"
+        })];
+        let request = PageBindingRequest {
+            unit_id: "u".into(),
+            from_version_id: "v-zh".into(),
+            from_slot: 0,
+            to_version_id: "v-en".into(),
+            to_slot: 0,
+        };
+        assert!(exact_binding(&bindings, &request).is_none());
+        assert!(occupied_binding(&bindings, &request).is_none());
+        assert!(matches!(
+            page_bind_state(&bindings, "v-zh", 0, "v-en"),
+            PageBindState::Missing(_)
+        ));
     }
 }
