@@ -458,28 +458,6 @@ enum DetailAct {
 }
 
 impl App {
-    pub(super) fn open_light(&mut self, st: &mut UnitState, version: &Value, slot: usize) {
-        let page_count = i(version, "page_count").max(0) as usize;
-        if page_count == 0 || slot >= page_count {
-            return;
-        }
-        let unit_id = st.unit_id.clone();
-        let version_id = s(version, "id");
-        let bindings = st.bindings.clone();
-        let targets = binding_targets(&st.detail, &version_id);
-        st.selected_page = Some(slot);
-        st.bind_pick = None;
-        self.overlays
-            .retain(|overlay| !matches!(overlay, Overlay::Light(_)));
-        self.overlays.push(Overlay::Light(LightState {
-            unit_id,
-            version: version.clone(),
-            slot,
-            bindings,
-            targets,
-            target_index: 0,
-        }));
-    }
 
     /// The prototype's bind language set for the thumb bar and
     /// the panel (bindLangs @2730): the content languages minus
@@ -1745,7 +1723,7 @@ impl App {
                                         // real candidates, height
                                         // following the wrapped text
                                         // （差 28).
-                                        let painter = ui.painter();
+                                        let painter = ui.painter().clone();
                                         let wrap_w = (card_w - 20.0).max(40.0);
                                         let g1 = painter.layout(
                                             format!(
@@ -1899,7 +1877,7 @@ impl App {
         // (DIFFERENCES 差 28): both lines are laid out with
         // wrapping at the inner width and the card is as tall
         // as they need, never a fixed 58 with overflow.
-        let painter = ui.painter();
+        let painter = ui.painter().clone();
         let wrap_w = (card_w - 20.0).max(40.0);
         let line1 = format!("第 {} 页 · {}", ci + 1, page_title(&target.version, ci));
         let g1 = painter.layout(
