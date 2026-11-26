@@ -897,7 +897,24 @@ impl App {
             .and_then(|r| r.get("latest"))
             .cloned()
             .unwrap_or(Value::Null);
-        ui.horizontal_wrapped(|ui| {
+        // HD1 (visual pass 2026-11-26): the prototype's head
+        // group is a baseline-aligned flex row with 12px gaps
+        // (renderDetail @2589: the inner group carries
+        // align-items:baseline; the hint is one text node —
+        // intro · 当前 vX · 跟随最新/锁定版本 — and the status
+        // badges ride the same line). egui has no baseline
+        // layout; bottom-of-line-box alignment is the closest
+        // faithful form (for the 20px title against the 13px
+        // hint it lands within ~2px of the shared baseline,
+        // where the old centered wrapped row visibly floated
+        // the hint high). The hint segments therefore sit in
+        // an inner zero-spacing row keeping their textual
+        // " · " joins, and the 12px group gap applies between
+        // title, hint cluster and badges.
+        ui.with_layout(
+            egui::Layout::left_to_right(egui::Align::BOTTOM).with_main_wrap(true),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 12.0;
             if matches!(&st.meta_edit, Some((MetaField::Name, _))) {
                 self.meta_edit_ui(ui, st, MetaField::Name);
             } else {
@@ -912,6 +929,8 @@ impl App {
                     st.meta_edit_focus = true;
                 }
             }
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
             let mut hint_has_intro = false;
             if matches!(&st.meta_edit, Some((MetaField::Description, _))) {
                 hint_has_intro = true;
@@ -962,6 +981,7 @@ impl App {
                 .size(13.0)
                 .color(palette_color(TEXT_FAINT)),
             );
+            });
             // Status badges (prototype .h-badges, right after the
             // hint): derived server/core-side from the unit's
             // rendition state and shipped on the payload — ok
@@ -1121,21 +1141,12 @@ impl App {
                 });
         let mut thumb_rects: Vec<(usize, egui::Rect)> = Vec::new();
         let mut cell_rects: Vec<(usize, egui::Rect)> = Vec::new();
-        if draggable {
-            let hint = match s(&shown.version, "status").as_str() {
-                "draft" => Some("草稿 · 拖动页卡可调整页序"),
-                "working" => Some("未定号草稿 · 拖动页卡可调整页序"),
-                _ => None,
-            };
-            if let Some(hint) = hint {
-                ui.label(
-                    egui::RichText::new(hint)
-                        .size(11.5)
-                        .color(palette_color(TEXT_FAINT)),
-                );
-                ui.add_space(2.0);
-            }
-        }
+        // T1 (visual pass 2026-11-26): the prototype has NO
+        // hint line above the wall — the section title is
+        // followed directly by the thumb grid (renderDetail
+        // @2597 concatenation). The draft/working drag hint
+        // that stood here is removed; the drag itself is
+        // unchanged (seam + ghost still teach it in motion).
         let avail = ui.available_width();
         let cols = (((avail + 12.0) / (230.0 + 12.0)).floor() as usize).max(1);
         let cell_w = (avail - 12.0 * (cols as f32 - 1.0)) / cols as f32;
@@ -1146,18 +1157,33 @@ impl App {
                 for slot in row_start..(row_start + cols).min(page_count) {
                     let frame_resp = egui::Frame::NONE
                         .fill(palette_color(PANEL_BG))
-                        .stroke(egui::Stroke::new(2.0, palette_color(LINE_34)))
+                        // T3 (visual pass 2026-11-26): a selected
+                        // cell's frame turns accent — the width
+                        // stays the retained constant 2px
+                        // (.thumb-frame), only the color moves
+                        // (user ruling 2026-11-26: state changes
+                        // color, never geometry).
+                        .stroke(egui::Stroke::new(
+                            2.0,
+                            if st.selected_page == Some(slot) {
+                                ACCENT
+                            } else {
+                                palette_color(LINE_34)
+                            },
+                        ))
                         .corner_radius(6)
                         .inner_margin(egui::Margin::same(0))
                         .show(ui, |ui| {
                             ui.vertical(|ui| {
                                 ui.set_width(inner_w);
-                                let response = self.thumb_response(
+                                let response = self.thumb_response_art(
                                     ui,
                                     &version_id,
                                     slot,
                                     inner_w,
                                     st.selected_page == Some(slot),
+                                    &format!("{} / {}", slot + 1, page_count),
+                                    &page_title(&shown.version, slot),
                                 );
                                 thumb_rects.push((slot, response.rect));
                                 if picking {
@@ -2019,12 +2045,18 @@ impl App {
                             ui.vertical(|ui| {
                                 ui.set_width(inner_w);
                                 if !latest_id.is_empty() {
-                                    let resp = self.thumb_response(
+                                    // T2: the cover's no-image
+                                    // form is the slide-art
+                                    // placeholder titled with
+                                    // the child's name.
+                                    let resp = self.thumb_response_art(
                                         ui,
                                         &latest_id,
                                         0,
                                         inner_w,
                                         false,
+                                        "",
+                                        &s(&cunit, "name"),
                                     );
                                     if resp.clicked() {
                                         st.kid_sel = Some(child_id.clone());
@@ -2128,6 +2160,7 @@ impl App {
                                                 egui::Button::new(
                                                     egui::RichText::new("打开维护 · 点开下钻 →")
                                                         .size(12.0)
+                                                        .strong()
                                                         .color(egui::Color32::WHITE),
                                                 )
                                                 .fill(ACCENT)
@@ -2298,21 +2331,43 @@ impl App {
             let w = ((avail - 12.0 * (c as f32 - 1.0)) / c as f32).min(300.0);
             (c, w)
         };
+        // H2 (visual pass 2026-11-26): measured heights are
+        // only valid at the card width they were taken at.
+        if (card_w - st.hist_card_w).abs() > 0.5 {
+            st.hist_card_h.clear();
+            st.hist_card_w = card_w;
+        }
         let mut card_rects: Vec<(String, egui::Rect)> = Vec::new();
         let mut hot_rects: Vec<egui::Rect> = Vec::new();
         for row_start in (0..keys.len()).step_by(cols) {
+            let row_keys = &keys[row_start..(row_start + cols).min(keys.len())];
+            // The row's stretch target: the tallest NATURAL
+            // card height measured last frame (0 = unmeasured,
+            // cards render naturally and are measured now).
+            let row_target = row_keys
+                .iter()
+                .filter_map(|k| st.hist_card_h.get(k))
+                .fold(0.0f32, |a, &h| a.max(h));
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = 12.0;
-                for key in &keys[row_start..(row_start + cols).min(keys.len())] {
+                for key in row_keys {
                     let (rect, hots) = if key == "working" {
-                        self.hist_working_card_ui(ui, st, &ctx, card_w, acts)
+                        self.hist_working_card_ui(ui, st, &ctx, card_w, row_target, acts)
                     } else {
                         let version = versions
                             .iter()
                             .find(|v| s(v, "id") == *key)
                             .cloned()
                             .unwrap_or(Value::Null);
-                        self.hist_version_card_ui(ui, st, &ctx, &version, card_w, acts)
+                        self.hist_version_card_ui(
+                            ui,
+                            st,
+                            &ctx,
+                            &version,
+                            card_w,
+                            row_target,
+                            acts,
+                        )
                     };
                     card_rects.push((key.clone(), rect));
                     hot_rects.extend(hots);
@@ -2334,9 +2389,14 @@ impl App {
         st: &mut UnitState,
         ctx: &HistCtx,
         card_w: f32,
+        row_target: f32,
         acts: &mut Vec<DetailAct>,
     ) -> (egui::Rect, Vec<egui::Rect>) {
         let mut hots: Vec<egui::Rect> = Vec::new();
+        // H2: pad to the row's stretch target by the amount
+        // this card's natural height falls short of it.
+        let own_natural = st.hist_card_h.get("working").copied().unwrap_or(0.0);
+        let pad = (row_target - own_natural).max(0.0);
         let src = ctx
             .row
             .working
@@ -2370,7 +2430,7 @@ impl App {
                 // then the publish action (or its input state).
                 ui.horizontal(|ui| {
                     self.bigver_chip(ui, "未定号", false);
-                    chip(ui, "草稿", palette_color(CHIP_ORANGE_FG), CHIP_ORANGE_BG);
+                    vh_badge(ui, "草稿", palette_color(CHIP_ORANGE_FG), CHIP_ORANGE_BG);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if st.draft_pub.as_ref().is_some_and(|(k, _, _)| k == "working") {
                             if vh_btn(ui, "取消").clicked() {
@@ -2465,7 +2525,17 @@ impl App {
                         .size(11.5)
                         .color(palette_color(TEXT_FAINT)),
                 );
+                // H2: absorb the stretch pad at the card's
+                // foot — the box grows, the content stays
+                // top-aligned (flex stretch semantics).
+                if pad > 0.0 {
+                    ui.add_space(pad);
+                }
             });
+        st.hist_card_h.insert(
+            "working".to_string(),
+            frame_resp.response.rect.height() - pad,
+        );
         (frame_resp.response.rect, hots)
     }
 
@@ -2477,6 +2547,7 @@ impl App {
         ctx: &HistCtx,
         version: &Value,
         card_w: f32,
+        row_target: f32,
         acts: &mut Vec<DetailAct>,
     ) -> (egui::Rect, Vec<egui::Rect>) {
         let mut hots: Vec<egui::Rect> = Vec::new();
@@ -2488,14 +2559,32 @@ impl App {
         let is_using = ctx.using_id.as_deref() == Some(vid.as_str());
         let selected = st.selected_version.as_deref() == Some(vid.as_str());
         let inner_w = card_w - 20.0;
-        let stroke = if is_rejected {
-            egui::Stroke::new(1.0, palette_color(ROSE))
+        // H2: the stretch pad for this card (see the working
+        // card's note).
+        let own_natural = st.hist_card_h.get(&vid).copied().unwrap_or(0.0);
+        let pad = (row_target - own_natural).max(0.0);
+        // H5 (visual pass 2026-11-26): draft and rejected
+        // cards carry the prototype's DASHED border (.draftv
+        // amber / .pubrej rose). The color priority is the
+        // one this card already had (rejected > draft >
+        // using/selected > line); a dashed card's frame
+        // stroke goes transparent — the same 1px geometry —
+        // and the dashes are painted over the frame rect
+        // after the frame closes.
+        let dashed = is_draft || is_rejected;
+        let border_color = if is_rejected {
+            palette_color(ROSE)
         } else if is_draft {
-            egui::Stroke::new(1.0, palette_color(CHIP_ORANGE_FG))
+            palette_color(CHIP_ORANGE_FG)
         } else if is_using || selected {
-            egui::Stroke::new(1.0, ACCENT)
+            ACCENT
         } else {
-            egui::Stroke::new(1.0, palette_color(LINE_34))
+            palette_color(LINE_34)
+        };
+        let stroke = if dashed {
+            egui::Stroke::new(1.0, egui::Color32::TRANSPARENT)
+        } else {
+            egui::Stroke::new(1.0, border_color)
         };
         let frame_resp = egui::Frame::NONE
             .fill(palette_color(PANEL_BG))
@@ -2556,8 +2645,10 @@ impl App {
                         v
                     };
                     let show_langs = !is_draft && !ctx.langs.is_empty();
+                    // Badge budget at the H4 head form
+                    // (12px text, 0/10 padding ≈ 62px each).
                     let head_used = 92.0
-                        + badges.len() as f32 * 52.0
+                        + badges.len() as f32 * 62.0
                         + if show_langs {
                             ctx.langs.len() as f32 * 86.0
                         } else {
@@ -2565,10 +2656,10 @@ impl App {
                         }
                         + 130.0;
                     let hide_langs = head_used > inner_w;
-                    let hide_badges = hide_langs && (92.0 + 130.0 + badges.len() as f32 * 52.0 > inner_w);
+                    let hide_badges = hide_langs && (92.0 + 130.0 + badges.len() as f32 * 62.0 > inner_w);
                     if !hide_badges {
                         for (text, fg, bg) in &badges {
-                            chip(ui, text, *fg, *bg);
+                            vh_badge(ui, text, *fg, *bg);
                         }
                     }
                     if show_langs && !hide_langs {
@@ -2591,8 +2682,12 @@ impl App {
                                     palette_color(HOVER_BG),
                                 ),
                             };
+                            // G1: the language chip's
+                            // prototype weight is 800
+                            // (.lang-chip) — strong is the
+                            // client's approximation tier.
                             let btn = egui::Button::new(
-                                egui::RichText::new(label).size(11.0).color(fg),
+                                egui::RichText::new(label).size(11.0).strong().color(fg),
                             )
                             .fill(bg)
                             .stroke(egui::Stroke::NONE)
@@ -2737,7 +2832,21 @@ impl App {
                         .color(palette_color(ROSE)),
                     );
                 }
+                // H2: absorb the stretch pad at the foot.
+                if pad > 0.0 {
+                    ui.add_space(pad);
+                }
             });
+        if dashed {
+            dashed_card_border(
+                ui.painter(),
+                frame_resp.response.rect,
+                6.0,
+                border_color,
+            );
+        }
+        st.hist_card_h
+            .insert(vid, frame_resp.response.rect.height() - pad);
         (frame_resp.response.rect, hots)
     }
 
@@ -2774,12 +2883,18 @@ impl App {
         );
     }
 
-    /// A history card's thumbnail strip (.vh-thumbs): every
-    /// page at an equal flexible width, a {i} / {n} chip over
-    /// the slide's top-left, and a foot line (desc left, version
-    /// right — the working card's foot is 草稿 alone). A single
-    /// click selects the thumbnail and its card; a double-click
-    /// opens #406 at that page.
+    /// A history card's thumbnail strip (.vh-thumbs): the
+    /// prototype's flex-wrap row — thumbs flex at a 120px
+    /// floor and wrap (H1, visual pass 2026-11-26) — and a
+    /// foot line under each (desc left, version right; the
+    /// working card's foot is 草稿 alone). There is NO page
+    /// pill over the thumb (H3): the prototype's {i} / {n}
+    /// is slide-art text, and over a real rendered thumbnail
+    /// the prototype form carries nothing — the black chip
+    /// that stood here is removed; the fraction survives in
+    /// the no-thumbnail art placeholder's eyebrow (T2). A
+    /// single click selects the thumbnail and its card; a
+    /// double-click opens #406 at that page.
     #[allow(clippy::too_many_arguments)]
     fn hist_thumbs_ui(
         &mut self,
@@ -2797,83 +2912,85 @@ impl App {
             return;
         }
         ui.add_space(9.0);
-        let n = page_count as f32;
-        let thumb_w = (inner_w - 6.0 * (n - 1.0)) / n;
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            for p in 0..page_count {
-                ui.vertical(|ui| {
-                    ui.set_width(thumb_w);
-                    let thumb_sel = st.hist_thumb_sel.as_ref().is_some_and(|(k, idx)| {
-                        k == card_key && *idx == p
-                    });
-                    let resp =
-                        self.thumb_response(ui, thumb_version_id, p, thumb_w, thumb_sel);
-                    hots.push(resp.rect);
-                    // .k chip over the slide's top-left.
-                    let k_text = format!("{} / {}", p + 1, page_count);
-                    let galley = ui.painter().layout_no_wrap(
-                        k_text,
-                        egui::FontId::new(10.0, egui::FontFamily::Proportional),
-                        egui::Color32::WHITE,
-                    );
-                    let k_rect = egui::Rect::from_min_size(
-                        resp.rect.min + egui::vec2(5.0, 5.0),
-                        galley.size() + egui::vec2(8.0, 3.0),
-                    );
-                    ui.painter()
-                        .rect_filled(k_rect, 4.0, egui::Color32::from_black_alpha(140));
-                    ui.painter().galley(
-                        k_rect.min + egui::vec2(4.0, 1.5),
-                        galley,
-                        egui::Color32::WHITE,
-                    );
-                    if resp.clicked() {
-                        st.hist_thumb_sel = Some((card_key.to_string(), p));
-                        st.selected_version = Some(thumb_version_id.to_string());
-                        st.selected_page = None;
-                        st.bind_pick = None;
-                    }
-                    if resp.double_clicked() {
-                        let v = version.clone();
-                        self.open_light(st, &v, p);
-                    }
-                    // .foot: desc left (truncated), version
-                    // right; the working card's foot is 草稿.
-                    ui.horizontal(|ui| {
-                        if working_card {
-                            ui.label(
-                                egui::RichText::new("草稿")
-                                    .size(10.5)
-                                    .color(palette_color(TEXT_FAINT)),
-                            );
-                        } else {
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(page_desc(version, p))
-                                        .size(10.5)
-                                        .color(palette_color(TEXT_FAINT)),
-                                )
-                                .truncate(),
-                            );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "v{}",
-                                            s(version, "semver")
-                                        ))
-                                        .size(10.5)
-                                        .color(palette_color(TEXT_FAINT)),
-                                    );
-                                },
-                            );
-                        }
-                    });
-                });
+        // H1: as many per row as fit at >=120px (+6 gap);
+        // each row's thumbs then share the row width equally
+        // (flex-grow), so a wrapped lone thumb spans the row.
+        let per_row = (((inner_w + 6.0) / 126.0).floor() as usize)
+            .max(1)
+            .min(page_count);
+        for row_start in (0..page_count).step_by(per_row) {
+            if row_start > 0 {
+                ui.add_space(6.0);
             }
-        });
+            let row_end = (row_start + per_row).min(page_count);
+            let row_len = (row_end - row_start) as f32;
+            let thumb_w = (inner_w - 6.0 * (row_len - 1.0)) / row_len;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                for p in row_start..row_end {
+                    ui.vertical(|ui| {
+                        ui.set_width(thumb_w);
+                        let thumb_sel =
+                            st.hist_thumb_sel.as_ref().is_some_and(|(k, idx)| {
+                                k == card_key && *idx == p
+                            });
+                        let resp = self.thumb_response_art(
+                            ui,
+                            thumb_version_id,
+                            p,
+                            thumb_w,
+                            thumb_sel,
+                            &format!("{} / {}", p + 1, page_count),
+                            &page_title(version, p),
+                        );
+                        hots.push(resp.rect);
+                        if resp.clicked() {
+                            st.hist_thumb_sel = Some((card_key.to_string(), p));
+                            st.selected_version = Some(thumb_version_id.to_string());
+                            st.selected_page = None;
+                            st.bind_pick = None;
+                        }
+                        if resp.double_clicked() {
+                            let v = version.clone();
+                            self.open_light(st, &v, p);
+                        }
+                        // .foot: desc left (truncated), version
+                        // right; the working card's foot is 草稿.
+                        ui.horizontal(|ui| {
+                            if working_card {
+                                ui.label(
+                                    egui::RichText::new("草稿")
+                                        .size(10.5)
+                                        .color(palette_color(TEXT_FAINT)),
+                                );
+                            } else {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(page_desc(version, p))
+                                            .size(10.5)
+                                            .color(palette_color(TEXT_FAINT)),
+                                    )
+                                    .truncate(),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "v{}",
+                                                s(version, "semver")
+                                            ))
+                                            .size(10.5)
+                                            .color(palette_color(TEXT_FAINT)),
+                                        );
+                                    },
+                                );
+                            }
+                        });
+                    });
+                }
+            });
+        }
     }
 
     /// History card pointer resolution: background clicks
@@ -3120,13 +3237,119 @@ impl App {
     }
 }
 
+/// The history card head's badge form (H4, visual pass
+/// 2026-11-26): the prototype's `.vh-card-head .badge` over
+/// the final `.badge` cascade — 24px tall, 0/10 padding,
+/// radius 6, 12px text at the badge weight 700. The generic
+/// `chip` is the plain `.badge` form (20px, 11px) and stays
+/// untouched for its other surfaces; this head form is
+/// local to #101. The weight rides RichText::strong, the
+/// client's standing approximation for the >=600 tier (G1).
+fn vh_badge(ui: &mut egui::Ui, text: &str, fg: egui::Color32, bg: egui::Color32) {
+    egui::Frame::NONE
+        .fill(palette_color(bg))
+        .corner_radius(6)
+        .inner_margin(egui::Margin {
+            left: 10,
+            right: 10,
+            top: 0,
+            bottom: 0,
+        })
+        .show(ui, |ui| {
+            ui.set_min_height(24.0);
+            ui.add(egui::Label::new(
+                egui::RichText::new(text).size(12.0).strong().color(fg),
+            ));
+        });
+}
+
+/// Hand-drawn dashed rounded-rect border (H5, visual pass
+/// 2026-11-26): the prototype's draftv / pubrej history
+/// cards carry a DASHED border (amber / rose). egui frame
+/// strokes cannot dash, so a dashed card's frame keeps a
+/// transparent 1px stroke (identical geometry) and the
+/// dashes are painted over its rect afterwards —
+/// dashed_rule's segment technique carried around a
+/// rounded path (5px on, 3.5px off).
+fn dashed_card_border(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    radius: f32,
+    color: egui::Color32,
+) {
+    let rect = rect.shrink(0.5);
+    let rad = radius.min(rect.width() / 2.0).min(rect.height() / 2.0);
+    let (min, max) = (rect.min, rect.max);
+    let mut path: Vec<egui::Pos2> = Vec::new();
+    // Clockwise from the top edge's left end: straight,
+    // corner arc, straight, … closing back at the start.
+    path.push(egui::pos2(min.x + rad, min.y));
+    path.push(egui::pos2(max.x - rad, min.y));
+    let corners = [
+        (
+            egui::pos2(max.x - rad, min.y + rad),
+            -std::f32::consts::FRAC_PI_2,
+        ),
+        (egui::pos2(max.x - rad, max.y - rad), 0.0),
+        (
+            egui::pos2(min.x + rad, max.y - rad),
+            std::f32::consts::FRAC_PI_2,
+        ),
+        (egui::pos2(min.x + rad, min.y + rad), std::f32::consts::PI),
+    ];
+    let straights = [
+        egui::pos2(max.x, max.y - rad),
+        egui::pos2(min.x + rad, max.y),
+        egui::pos2(min.x, min.y + rad),
+        egui::pos2(min.x + rad, min.y),
+    ];
+    for (idx, (c, a0)) in corners.iter().enumerate() {
+        for k in 1..=6 {
+            let a = a0 + (k as f32) * (std::f32::consts::FRAC_PI_2 / 6.0);
+            path.push(*c + egui::vec2(rad * a.cos(), rad * a.sin()));
+        }
+        path.push(straights[idx]);
+    }
+    let stroke = egui::Stroke::new(1.0, color);
+    let period = 8.5f32;
+    let mut phase = 0.0f32;
+    for w in 0..path.len() {
+        let a = path[w];
+        let b = path[(w + 1) % path.len()];
+        let seg = b - a;
+        let len = seg.length();
+        if len <= 0.0 {
+            continue;
+        }
+        let dir = seg / len;
+        let mut t = 0.0f32;
+        while t < len {
+            let cyc = (phase + t) % period;
+            let step = if cyc < 5.0 {
+                (5.0 - cyc).min(len - t)
+            } else {
+                (period - cyc).min(len - t)
+            };
+            if cyc < 5.0 && step > 0.0 {
+                painter.line_segment([a + dir * t, a + dir * (t + step)], stroke);
+            }
+            t += step.max(0.01);
+        }
+        phase = (phase + len) % period;
+    }
+}
+
 /// The history card head's button form (prototype: .btn at the
 /// card-head size — min-height 24, 12px text, 0/10 padding).
+/// The label carries .strong: the prototype's .btn weight is
+/// 600 (final cascade) and strong is the client's standing
+/// approximation for that tier (G1, visual pass 2026-11-26).
 fn vh_btn(ui: &mut egui::Ui, label: &str) -> egui::Response {
     ui.add(
         egui::Button::new(
             egui::RichText::new(label)
                 .size(12.0)
+                .strong()
                 .color(palette_color(TEXT_MAIN)),
         )
         .fill(palette_color(HOVER_BG))
@@ -3141,6 +3364,7 @@ fn vh_btn_primary(ui: &mut egui::Ui, label: &str) -> egui::Response {
         egui::Button::new(
             egui::RichText::new(label)
                 .size(12.0)
+                .strong()
                 .color(egui::Color32::WHITE),
         )
         .fill(ACCENT)
@@ -3549,12 +3773,22 @@ impl App {
                                             |ui| {
                                                 ui.set_width(side_width - 2.0);
                                                 ui.spacing_mut().item_spacing.y = 0.0;
-                                                let response = self.thumb_response(
+                                                // T2: candidate
+                                                // covers take the
+                                                // slide-art
+                                                // placeholder too.
+                                                let response = self.thumb_response_art(
                                                     ui,
                                                     &target_id,
                                                     slot,
                                                     side_width - 2.0,
                                                     false,
+                                                    &format!(
+                                                        "{} / {}",
+                                                        slot + 1,
+                                                        pages
+                                                    ),
+                                                    &page_title(&target.version, slot),
                                                 );
                                                 egui::Frame::NONE
                                                     .inner_margin(egui::Margin {

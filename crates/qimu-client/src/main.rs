@@ -1873,6 +1873,17 @@ struct UnitState {
     vh_last_click: Option<(String, f64)>,
     /// The selected history thumbnail: (version key, page).
     hist_thumb_sel: Option<(String, usize)>,
+    /// History card row equalization (visual pass 2026-11-26,
+    /// H2): last measured NATURAL outer height per card key
+    /// ("working" or a version id) at `hist_card_w` card width.
+    /// The prototype's .vh-list is align-items:stretch; egui
+    /// has no stretch, so each row pads its cards to the row's
+    /// tallest natural height measured on the previous frame
+    /// (the FlowMetrics measured-height precedent).
+    hist_card_h: std::collections::HashMap<String, f32>,
+    /// The card width `hist_card_h` was measured at; a width
+    /// change invalidates the measurements.
+    hist_card_w: f32,
     scripts_for: Option<String>, // version id whose 讲稿 is being edited
     scripts_edit: Vec<String>,
     translate_to: String,
@@ -1910,6 +1921,8 @@ impl UnitState {
             vh_drag: None,
             vh_last_click: None,
             hist_thumb_sel: None,
+            hist_card_h: std::collections::HashMap::new(),
+            hist_card_w: 0.0,
             scripts_for: None,
             scripts_edit: Vec::new(),
             translate_to: String::new(),
@@ -13587,6 +13600,47 @@ impl App {
         width: f32,
         current: bool,
     ) -> egui::Response {
+        self.thumb_response_impl(ui, version_id, page, width, current, None)
+    }
+
+    /// thumb_response with the slide-art placeholder (visual
+    /// pass 2026-11-26, T2): while a page has no rendered
+    /// thumbnail yet, the prototype never shows a bare flat
+    /// block — its thumbs ARE slide art (kicker + title over a
+    /// tinted ground, the form `slide_cover` already paints
+    /// for card covers). #101's wall / history / kid-cover
+    /// call sites pass the page's kicker and title; every
+    /// other caller keeps the plain fill through
+    /// thumb_response.
+    fn thumb_response_art(
+        &mut self,
+        ui: &mut egui::Ui,
+        version_id: &str,
+        page: usize,
+        width: f32,
+        current: bool,
+        eyebrow: &str,
+        title: &str,
+    ) -> egui::Response {
+        self.thumb_response_impl(
+            ui,
+            version_id,
+            page,
+            width,
+            current,
+            Some((eyebrow, title)),
+        )
+    }
+
+    fn thumb_response_impl(
+        &mut self,
+        ui: &mut egui::Ui,
+        version_id: &str,
+        page: usize,
+        width: f32,
+        current: bool,
+        art: Option<(&str, &str)>,
+    ) -> egui::Response {
         let h = width * 9.0 / 16.0;
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, h), egui::Sense::click());
         if let Some(tex) = self.thumb(version_id, page) {
@@ -13596,6 +13650,37 @@ impl App {
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 egui::Color32::WHITE,
             );
+        } else if let Some((eyebrow, title)) = art {
+            // Slide-art placeholder, painted in slide_cover's
+            // language (same ground, same 8px inset, eyebrow
+            // over title) so a wall of not-yet-rendered pages
+            // reads as art, not as flat gray blocks.
+            let painter = ui.painter();
+            painter.rect_filled(rect, 0.0, palette_color(HOVER_BG));
+            let inner = rect.shrink(8.0);
+            let mut title_y = inner.min.y;
+            if !eyebrow.is_empty() {
+                let g = painter.layout_no_wrap(
+                    eyebrow.to_string(),
+                    egui::FontId::new(9.0, egui::FontFamily::Proportional),
+                    palette_color(TEXT_FAINT),
+                );
+                painter.galley(inner.min, g, palette_color(TEXT_FAINT));
+                title_y += 14.0;
+            }
+            if !title.is_empty() {
+                let g = painter.layout(
+                    title.to_string(),
+                    egui::FontId::new(12.0, egui::FontFamily::Proportional),
+                    palette_color(TEXT_MAIN),
+                    inner.width(),
+                );
+                painter.galley(
+                    egui::pos2(inner.min.x, title_y),
+                    g,
+                    palette_color(TEXT_MAIN),
+                );
+            }
         } else {
             ui.painter().rect_filled(rect, 0.0, palette_color(HOVER_BG));
         }
