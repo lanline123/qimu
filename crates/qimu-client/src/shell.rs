@@ -62,6 +62,7 @@ impl App {
     }
 
     pub(super) fn navigate_to(&mut self, page: Page) {
+        self.overlays.retain(|o| !matches!(o, Overlay::Light(_)));
         self.page = page;
         self.deep_source = None;
         self.review.jump_source = None;
@@ -627,58 +628,39 @@ impl App {
         } else if self.page == Page::Content {
             match self.content.stack.top() {
                 ContentFrame::Unit(st) => {
-                    // The version the pages wall is showing
-                    // (unit_pages_ui's rule): the clicked
-                    // history version when one is selected,
-                    // else the selected rendition's latest —
-                    // versions arrive semver-desc, so a
-                    // rendition's first version is its latest.
-                    let versions = super::content_detail::unit_versions(&st.detail);
-                    let first = versions.first();
-                    let rendition = st
-                        .selected_rendition
-                        .as_ref()
-                        .filter(|id| versions.iter().any(|v| &v.rendition_id == *id))
-                        .cloned()
-                        .or_else(|| first.map(|v| v.rendition_id.clone()));
-                    let latest = rendition.as_ref().and_then(|rid| {
-                        versions.iter().find(|v| &v.rendition_id == rid)
-                    });
-                    let picked = st.selected_version.as_ref().and_then(|vid| {
-                        versions.iter().find(|v| {
-                            rendition.as_ref() == Some(&v.rendition_id)
-                                && s(&v.version, "id") == *vid
-                        })
-                    });
-                    let target = picked.or(latest);
-                    target.and_then(|t| {
-                        let page_count = i(&t.version, "page_count");
-                        if page_count < 1 {
-                            return None;
-                        }
-                        let unit = st.detail.get("unit");
-                        let name = unit.map(|u| s(u, "name")).unwrap_or_default();
-                        // A picked history version names itself
-                        // in the show title, so what is playing
-                        // is never mistaken for the latest.
-                        let title = if picked.is_some()
-                            && latest.is_some_and(|l| {
-                                s(&l.version, "id") != s(&t.version, "id")
+                    super::content_detail::resolve_unit_bar_version(st).and_then(
+                        |(t, non_latest)| {
+                            let page_count = i(&t.version, "page_count");
+                            if page_count < 1 {
+                                return None;
+                            }
+                            let unit = st.detail.get("unit");
+                            let name = unit.map(|u| s(u, "name")).unwrap_or_default();
+                            // A picked history version or working draft names itself
+                            // in the show title, so what is playing is never
+                            // mistaken for the latest published version.
+                            let title = if non_latest {
+                                let ver_tag = if s(&t.version, "status") == "working"
+                                    || s(&t.version, "semver").is_empty()
+                                {
+                                    "草稿".to_string()
+                                } else {
+                                    format!("v{}", s(&t.version, "semver"))
+                                };
+                                format!("{name} · {ver_tag}")
+                            } else {
+                                name
+                            };
+                            Some(BarViewTarget::Unit {
+                                title,
+                                version: t.version,
+                                from: st
+                                    .selected_page
+                                    .unwrap_or(0)
+                                    .min(page_count as usize - 1),
                             })
-                        {
-                            format!("{name} · v{}", s(&t.version, "semver"))
-                        } else {
-                            name
-                        };
-                        Some(BarViewTarget::Unit {
-                            title,
-                            version: t.version.clone(),
-                            from: st
-                                .selected_page
-                                .unwrap_or(0)
-                                .min(page_count as usize - 1),
-                        })
-                    })
+                        },
+                    )
                 }
                 _ => None,
             }
@@ -718,7 +700,14 @@ impl App {
                     };
                     (targets, w.multi.clone())
                 }
-                _ => (Vec::new(), Vec::new()),
+                ContentFrame::Unit(st) => {
+                    let targets = if st.unit_id.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![st.unit_id.clone()]
+                    };
+                    (targets, Vec::new())
+                }
             }
         } else {
             (Vec::new(), Vec::new())
@@ -731,7 +720,9 @@ impl App {
         // current version runs to more than one page. A
         // multi-selection of two or more, a single-page block,
         // or a block with no readable version all grey it.
-        let ungroup_target: Option<String> = if wall_targets.len() == 1 {
+        let ungroup_target: Option<String> = if matches!(self.content.stack.top(), ContentFrame::Wall(_))
+            && wall_targets.len() == 1
+        {
             let uid = wall_targets[0].clone();
             match self.unit_latest_page_count(&uid) {
                 Some(n) if n > 1 => Some(uid),
@@ -786,7 +777,7 @@ impl App {
         {
             self.deckbar_back();
         }
-        if self.page == Page::Content && matches!(self.overlays.last(), Some(Overlay::Light(_))) {
+        if self.page == Page::Content && self.content_light_open() {
             if ChromeIcons
                 .tool(ui, ChromeIcon::Doc, "编辑这一页", true, false, true)
                 .clicked()
@@ -1087,8 +1078,13 @@ impl App {
             // succeeded (audit N3): a gated or partial failure
             // keeps the user's selection context.
             if self.clip_copy_units(&wall_targets, true) {
-                if let ContentFrame::Wall(w) = self.content.stack.top_mut() {
-                    w.multi.clear();
+                match self.content.stack.top_mut() {
+                    ContentFrame::Wall(w) => {
+                        w.multi.clear();
+                    }
+                    ContentFrame::Unit(st) => {
+                        st.closed = true;
+                    }
                 }
             }
         }
@@ -1509,8 +1505,10 @@ impl App {
                     // 关闭当前整页视图 — the close still lands
                     // back on the detail frame (T4).
                     "关闭当前整页视图"
-                } else {
+                } else if self.content.stack.depth() > 2 {
                     "返回上一层"
+                } else {
+                    "退回内容长卷"
                 }),
                 ContentFrame::Wall(_) => Some("回主页"),
             },
@@ -1566,8 +1564,12 @@ impl App {
                 }
             }
             Page::Content => {
-                if self.content_light_open() {
-                    self.overlays.pop();
+                if let Some(pos) = self
+                    .overlays
+                    .iter()
+                    .rposition(|o| matches!(o, Overlay::Light(_)))
+                {
+                    self.overlays.remove(pos);
                 } else if let ContentFrame::Unit(st) = self.content.stack.top_mut() {
                     // Pop only — the breadcrumb return in
                     // unit_detail does the same. Mutations made
@@ -1828,6 +1830,8 @@ impl App {
                 || st.vh_press.is_some()
                 || st.vh_drag.is_some()
                 || st.bind_pick.is_some()
+                || st.renum_edit.is_some()
+                || st.meta_edit.is_some()
             {
                 return true;
             }
@@ -1970,16 +1974,13 @@ impl App {
                         return Vec::new();
                     }
                     let name = s(&unit, "name");
-                    if let Some(vid) = &st.selected_version {
-                        let label = super::content_detail::unit_versions(&st.detail)
-                            .into_iter()
-                            .find(|v| s(&v.version, "id") == *vid)
-                            .map(|v| format!("{name} · v{}", s(&v.version, "semver")))
-                            .unwrap_or_else(|| format!("{name} · 历史版本"));
+                    if let Some((vid, ver_label)) =
+                        super::content_detail::selected_version_delete_target(st)
+                    {
                         return vec![DelTarget {
                             kind: "version",
-                            id: vid.clone(),
-                            label,
+                            id: vid,
+                            label: format!("{name} · {ver_label}"),
                         }];
                     }
                     vec![DelTarget {
@@ -2143,8 +2144,11 @@ impl App {
                 "version" => {
                     version_gone = true;
                     if let ContentFrame::Unit(st) = self.content.stack.top_mut() {
-                        if st.selected_version.as_deref() == Some(t.id.as_str()) {
+                        if st.selected_version.as_deref() == Some(t.id.as_str())
+                            || st.selected_working_card
+                        {
                             st.selected_version = None;
+                            st.selected_working_card = false;
                             st.selected_page = None;
                             st.bind_pick = None;
                             st.bind_panel = None;

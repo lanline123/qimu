@@ -135,6 +135,70 @@ pub fn render_edit_preview(pptx_bytes: &[u8], page: usize) -> Result<Vec<u8>, St
     Ok(png)
 }
 
+/// Render ONE slide from `frag_bytes` at full stage pixel resolution
+/// (`target_px_w` clamped to `[1280, 2560]`) directly from the PPTX
+/// document without reading or writing the `0.75x` thumbnail cache.
+/// Returns `(width, height, premultiplied_rgba)` ready for GPU upload.
+pub fn render_stage_image(
+    frag_bytes: &[u8],
+    page: usize,
+    target_px_w: u32,
+) -> Option<(u32, u32, Vec<u8>)> {
+    let doc = open(frag_bytes).ok()?;
+    if page >= doc.slides.len() {
+        return None;
+    }
+    let sw = doc.slide_size.width.max(1.0);
+    let sh = doc.slide_size.height.max(1.0);
+    let w_px = target_px_w.clamp(1280, 2560);
+    let h_px = ((w_px as f64 * sh / sw).round() as u32).max(1);
+    let scale = w_px as f64 / sw;
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get().min(8) as u16)
+        .unwrap_or(4);
+    let opts = deckcraft_render::RenderOpts {
+        scale,
+        size: Some((w_px, h_px)),
+        threads,
+        ..Default::default()
+    };
+    let img = deckcraft_render::render_slide(&doc, page, &opts);
+    let expected = (img.width as usize)
+        .checked_mul(img.height as usize)?
+        .checked_mul(4)?;
+    if img.width == 0 || img.height == 0 || img.pixels.len() != expected {
+        return None;
+    }
+    Some((img.width, img.height, img.pixels))
+}
+
+/// Resolve one real high-resolution stage page from the local library
+/// (entity package, lazy whole-deck backing, or version fragment) —
+/// never returning a low-resolution thumbnail.
+pub fn local_stage_image(
+    local: &crate::local_store::LocalStore,
+    version_id: &str,
+    page: usize,
+    target_px_w: u32,
+) -> Option<(u32, u32, Vec<u8>)> {
+    if let Some(page_id) = local.version_page_id(version_id, page) {
+        if let Some(bytes) = local.page_package_bytes(&page_id) {
+            if let Some(img) = render_stage_image(&bytes, 0, target_px_w) {
+                return Some(img);
+            }
+        }
+        if let Some((deck_hash, index)) = local.lazy_backing_for_page(&page_id) {
+            if let Some(deck) = local.file_bytes(&deck_hash) {
+                if let Some(img) = render_stage_image(&deck, index, target_px_w) {
+                    return Some(img);
+                }
+            }
+        }
+    }
+    let frag = local.version_fragment(version_id)?;
+    render_stage_image(&frag, page, target_px_w)
+}
+
 /// Resolve one thumbnail page for a version in the local library.
 /// Since the staged-import line (⑤) the disk cache is keyed by
 /// PAGE ENTITY id, not by version: a page that appears in a new

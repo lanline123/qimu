@@ -240,6 +240,32 @@ impl App {
                             .size(11.5)
                             .color(palette_color(TEXT_WEAK)),
                     );
+                    if !self.my_contacts.is_empty() {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                egui::RichText::new(tr("常用联系人："))
+                                    .size(11.0)
+                                    .color(palette_color(TEXT_WEAK)),
+                            );
+                            for name in &self.my_contacts {
+                                let matched = state.contacts.iter().find(|c| {
+                                    s(c, "display_name") == *name || s(c, "username") == *name
+                                });
+                                let selected = matched
+                                    .map(|c| s(c, "id") == state.target)
+                                    .unwrap_or(false);
+                                if ui.selectable_label(selected, name).clicked() {
+                                    if let Some(c) = matched {
+                                        state.target = s(c, "id");
+                                    } else {
+                                        state.search = name.clone();
+                                        state.reload_contacts = true;
+                                    }
+                                }
+                            }
+                        });
+                        ui.add_space(4.0);
+                    }
                     egui::ScrollArea::vertical()
                         .id_salt("share-contacts")
                         .max_height(190.0)

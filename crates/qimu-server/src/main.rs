@@ -708,9 +708,69 @@ async fn disable_user(
     if user.role != "super" {
         return Err(forbidden());
     }
+    if id == user.id && req.disabled {
+        return Err(bad("不能停用当前登录的超级管理员账号"));
+    }
     let store = st.store.lock().unwrap();
     store.set_user_disabled(&id, req.disabled).map_err(bad)?;
     Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct RenameDeptReq {
+    name: String,
+}
+
+async fn rename_dept(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<RenameDeptReq>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    if user.role == "member" {
+        return Err(forbidden());
+    }
+    let store = st.store.lock().unwrap();
+    if user.role == "dept_admin" {
+        let own = user.dept_id.as_deref().ok_or_else(forbidden)?;
+        if !store.dept_within(&id, own).map_err(bad)? {
+            return Err(forbidden());
+        }
+    }
+    store.rename_department(&id, &req.name).map_err(bad)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct UpdateUserOrgReq {
+    dept_id: Option<String>,
+    role: String,
+}
+
+async fn update_user_org(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateUserOrgReq>,
+) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    if user.role != "super" {
+        return Err(forbidden());
+    }
+    if id == user.id && req.role != "super" {
+        return Err(bad("不能降级当前正在操作的超级管理员自身角色"));
+    }
+    let dept_opt = req
+        .dept_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let store = st.store.lock().unwrap();
+    let updated = store
+        .update_user_org(&id, dept_opt, &req.role)
+        .map_err(bad)?;
+    Ok(Json(json!(updated)))
 }
 
 async fn groups(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
@@ -1451,20 +1511,29 @@ async fn get_ai_status(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
 
 async fn get_cache_policy(State(st): State<St>) -> Api<Value> {
     // Anonymous-readable (user ruling 2026-11-23): the value is a
-    // device policy (allowed / max_mb) the client applies to its
+    // device policy (allowed / mode / max_mb) the client applies to its
     // local offline cache; it carries no user data. Writing it
     // stays super-only (put_cache_policy below).
     let store = st.store.lock().unwrap();
     let raw = store.get_setting("cache_policy").map_err(bad)?;
-    let policy: Value = raw
+    let mut policy: Value = raw
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| json!({ "allowed": true, "max_mb": 500 }));
+        .unwrap_or_else(|| json!({ "allowed": true, "mode": "allow", "max_mb": 500 }));
+    if policy.get("mode").and_then(|v| v.as_str()).is_none() {
+        let allowed = policy
+            .get("allowed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        policy["mode"] = json!(if allowed { "allow" } else { "forbid" });
+    }
     Ok(Json(policy))
 }
 
 #[derive(Deserialize)]
 struct CachePolicyReq {
     allowed: bool,
+    #[serde(default)]
+    mode: Option<String>,
     max_mb: i64,
 }
 
@@ -1483,11 +1552,28 @@ async fn put_cache_policy(
     if !(0..=102_400).contains(&req.max_mb) {
         return Err(bad("缓存上限超出允许范围（0–102400 MB）"));
     }
+    let mode = match req.mode.as_deref() {
+        Some("allow" | "manual" | "forbid") => req.mode.clone().unwrap(),
+        Some(other) => return Err(bad(format!("未知缓存模式：{other}"))),
+        None => {
+            if req.allowed {
+                "allow".to_string()
+            } else {
+                "forbid".to_string()
+            }
+        }
+    };
+    let effective_allowed = req.allowed && mode != "forbid";
     let store = st.store.lock().unwrap();
     store
         .set_setting(
             "cache_policy",
-            &json!({ "allowed": req.allowed, "max_mb": req.max_mb }).to_string(),
+            &json!({
+                "allowed": effective_allowed,
+                "mode": mode,
+                "max_mb": req.max_mb
+            })
+            .to_string(),
         )
         .map_err(bad)?;
     Ok(Json(json!({ "ok": true })))
@@ -1495,10 +1581,9 @@ async fn put_cache_policy(
 
 /// Pending-submission retention (user ruling 2026-11-25, item
 /// 11): how many days a staged package waits for review before
-/// the sweep expires it. Super-only on both sides, like the AI
-/// settings — the only reader is the super's settings face, and
-/// the value steers a destructive sweep, so it is not a public
-/// policy the way cache-policy is.
+/// the sweep expires it, plus global self-maintenance policy
+/// switches (`self_maint_enabled`, `default_publish_mode`,
+/// `minor_edit_mode`). Super-only on both sides.
 async fn get_submission_settings(
     State(st): State<St>,
     headers: HeaderMap,
@@ -1509,12 +1594,41 @@ async fn get_submission_settings(
     }
     let store = st.store.lock().unwrap();
     let days = store.submission_pending_ttl_days().map_err(bad)?;
-    Ok(Json(json!({ "pending_ttl_days": days })))
+    let self_maint_enabled = store
+        .get_setting("self_maint_enabled")
+        .ok()
+        .flatten()
+        .map(|v| v != "false" && v != "0")
+        .unwrap_or(true);
+    let default_publish_mode = store
+        .get_setting("default_publish_mode")
+        .ok()
+        .flatten()
+        .filter(|v| v == "auto" || v == "review")
+        .unwrap_or_else(|| "review".to_string());
+    let minor_edit_mode = store
+        .get_setting("minor_edit_mode")
+        .ok()
+        .flatten()
+        .filter(|v| v == "direct" || v == "follow")
+        .unwrap_or_else(|| "follow".to_string());
+    Ok(Json(json!({
+        "pending_ttl_days": days,
+        "self_maint_enabled": self_maint_enabled,
+        "default_publish_mode": default_publish_mode,
+        "minor_edit_mode": minor_edit_mode,
+    })))
 }
 
 #[derive(Deserialize)]
 struct SubmissionSettingsReq {
     pending_ttl_days: i64,
+    #[serde(default)]
+    self_maint_enabled: Option<bool>,
+    #[serde(default)]
+    default_publish_mode: Option<String>,
+    #[serde(default)]
+    minor_edit_mode: Option<String>,
 }
 
 async fn put_submission_settings(
@@ -1534,6 +1648,16 @@ async fn put_submission_settings(
             "待审保留天数超出允许范围（0–3650 天，0 表示永不过期）",
         ));
     }
+    if let Some(m) = req.default_publish_mode.as_deref() {
+        if !matches!(m, "review" | "auto") {
+            return Err(bad(format!("未知公开方式：{m}")));
+        }
+    }
+    if let Some(m) = req.minor_edit_mode.as_deref() {
+        if !matches!(m, "follow" | "direct") {
+            return Err(bad(format!("未知非实质修改策略：{m}")));
+        }
+    }
     let store = st.store.lock().unwrap();
     store
         .set_setting(
@@ -1541,7 +1665,72 @@ async fn put_submission_settings(
             &req.pending_ttl_days.to_string(),
         )
         .map_err(bad)?;
+    if let Some(enabled) = req.self_maint_enabled {
+        store
+            .set_setting("self_maint_enabled", if enabled { "true" } else { "false" })
+            .map_err(bad)?;
+    }
+    if let Some(m) = &req.default_publish_mode {
+        store.set_setting("default_publish_mode", m).map_err(bad)?;
+    }
+    if let Some(m) = &req.minor_edit_mode {
+        store.set_setting("minor_edit_mode", m).map_err(bad)?;
+    }
     Ok(Json(json!({ "ok": true })))
+}
+
+async fn get_admin_backup(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    if user.role != "super" {
+        return Err(forbidden());
+    }
+    let store = st.store.lock().unwrap();
+    let last_at_ms = store
+        .get_setting("last_backup_ms")
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+    let last_path = store
+        .get_setting("last_backup_path")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let last_files = store
+        .get_setting("last_backup_files")
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    Ok(Json(json!({
+        "host_name": machine_name(),
+        "data_dir": st.data_dir.display().to_string(),
+        "last_at_ms": last_at_ms,
+        "last_path": last_path,
+        "last_files": last_files,
+    })))
+}
+
+async fn post_admin_backup(State(st): State<St>, headers: HeaderMap) -> Api<Value> {
+    let user = auth(&st, &headers)?;
+    if user.role != "super" {
+        return Err(forbidden());
+    }
+    let ts = qimu_core::auth::now_ms();
+    let dest = st.data_dir.join("backups").join(format!("backup-{ts}"));
+    let store = st.store.lock().unwrap();
+    let files = store.backup_to(&dest).map_err(bad)?;
+    let path_str = dest.display().to_string();
+    let _ = store.set_setting("last_backup_ms", &ts.to_string());
+    let _ = store.set_setting("last_backup_path", &path_str);
+    let _ = store.set_setting("last_backup_files", &files.to_string());
+    Ok(Json(json!({
+        "ok": true,
+        "host_name": machine_name(),
+        "at_ms": ts,
+        "path": path_str,
+        "files": files,
+    })))
 }
 
 // ---------------- folders ----------------
@@ -2278,13 +2467,11 @@ async fn recall_version(
 #[derive(Deserialize)]
 struct PublishDraftReq {
     note: Option<String>,
+    bump: Option<String>,
 }
 
-/// POST /v1/versions/:id/publish-draft — the #101 history card's
-/// 「发布为最新版本」: flip a draft version to normal. Only drafts
-/// qualify; anything else is a client error, not a silent no-op.
-/// The card's inline publish input may carry a note, which then
-/// replaces the draft's stored one.
+/// POST /v1/versions/:id/publish-draft — publish a numbered
+/// draft above the current normal head using the selected segment.
 async fn publish_draft_version(
     State(st): State<St>,
     headers: HeaderMap,
@@ -2301,11 +2488,14 @@ async fn publish_draft_version(
     let unit = store.get_unit(&rend.unit_id).map_err(bad)?;
     drop(store);
     need_cap(&st, &user, &unit.group_id, "publish")?;
-    let note = body
-        .and_then(|Json(req)| req.note)
-        .filter(|n| !n.trim().is_empty());
+    let (note, bump) = body
+        .map(|Json(req)| (req.note, req.bump))
+        .unwrap_or((None, None));
+    let note = note.filter(|n| !n.trim().is_empty());
     let store = st.store.lock().unwrap();
-    let ver = store.publish_draft(&id, note.as_deref()).map_err(bad)?;
+    let ver = store
+        .publish_draft(&id, note.as_deref(), &user.display_name, bump.as_deref())
+        .map_err(bad)?;
     Ok(Json(json!({ "version": ver })))
 }
 
@@ -2322,6 +2512,7 @@ fn version_unit(
 #[derive(Deserialize)]
 struct PublishNoteReq {
     note: Option<String>,
+    bump: Option<String>,
 }
 
 /// POST /v1/renditions/:id/seed-working — birth (or fetch) the
@@ -2346,8 +2537,7 @@ async fn seed_working(
 }
 
 /// POST /v1/versions/:id/publish-working — publish the
-/// unnumbered working draft: its own row takes the next minor
-/// number and turns normal.
+/// unnumbered working draft with the selected version segment.
 async fn publish_working(
     State(st): State<St>,
     headers: HeaderMap,
@@ -2360,12 +2550,13 @@ async fn publish_working(
         version_unit(&store, &id)?
     };
     need_cap(&st, &user, &unit.group_id, "publish")?;
-    let note = body
-        .and_then(|Json(req)| req.note)
-        .unwrap_or_default();
+    let (note, bump) = body
+        .map(|Json(req)| (req.note, req.bump))
+        .unwrap_or((None, None));
+    let note = note.unwrap_or_default();
     let store = st.store.lock().unwrap();
     let ver = store
-        .publish_working_draft(&id, &note, &user.display_name)
+        .publish_working_draft(&id, &note, &user.display_name, bump.as_deref())
         .map_err(bad)?;
     Ok(Json(json!({ "version": ver })))
 }
@@ -2531,8 +2722,8 @@ struct LineOrderReq {
     version_ids: Vec<String>,
 }
 
-/// POST /v1/units/:id/line-order — write the rendition line's
-/// user-arranged display order (history-card drag).
+/// POST /v1/units/:id/line-order — reorder the rendition line and
+/// reassign its version numbers to match the new positions.
 async fn set_line_order(
     State(st): State<St>,
     headers: HeaderMap,
@@ -2546,10 +2737,20 @@ async fn set_line_order(
     };
     need_cap(&st, &user, &unit.group_id, "publish")?;
     let store = st.store.lock().unwrap();
-    store
-        .set_version_line_order(&req.rendition_id, &req.version_ids)
+    let rendition = store.get_rendition(&req.rendition_id).map_err(bad)?;
+    if rendition.unit_id != id {
+        return Err(bad("版本线不属于当前内容块"));
+    }
+    let shifts = store
+        .reorder_versions_recorded(&req.rendition_id, &req.version_ids, &user.display_name)
         .map_err(bad)?;
-    Ok(Json(json!({ "ok": true })))
+    Ok(Json(json!({
+        "ok": true,
+        "shifts": shifts
+            .into_iter()
+            .map(|(id, from, to)| json!({ "id": id, "from": from, "to": to }))
+            .collect::<Vec<_>>(),
+    })))
 }
 
 #[derive(Deserialize)]
@@ -6762,12 +6963,18 @@ async fn main() {
         .route("/v1/me", get(me))
         .route("/v1/me/password", post(change_password))
         .route("/v1/admin/shutdown", post(admin_shutdown))
+        .route(
+            "/v1/admin/backup",
+            get(get_admin_backup).post(post_admin_backup),
+        )
         .route("/v1/me/profile", axum::routing::put(put_profile))
         .route("/v1/org", get(org))
         .route("/v1/org/contacts", get(org_contacts))
         .route("/v1/org/departments", post(create_dept))
+        .route("/v1/org/departments/:id/rename", post(rename_dept))
         .route("/v1/org/users", post(create_user))
         .route("/v1/org/users/:id/disable", post(disable_user))
+        .route("/v1/org/users/:id/update", post(update_user_org))
         .route("/v1/groups", get(groups).post(create_group))
         .route("/v1/grants", get(grants).post(add_grant))
         .route(

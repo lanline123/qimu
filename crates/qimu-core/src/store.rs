@@ -62,6 +62,15 @@ fn db_err(e: rusqlite::Error) -> String {
     "数据库操作失败".to_string()
 }
 
+fn parse_increment(value: &str) -> SResult<crate::semver::Increment> {
+    match value {
+        "major" => Ok(crate::semver::Increment::Major),
+        "minor" => Ok(crate::semver::Increment::Minor),
+        "patch" => Ok(crate::semver::Increment::Patch),
+        _ => Err("未知的发布版本类型".into()),
+    }
+}
+
 /// A real Argon2 hash of a throwaway password, computed once per
 /// process, so `login_with_ip` can spend the same verification
 /// cost on unknown usernames as on wrong passwords (audit M7
@@ -2208,6 +2217,45 @@ impl Store {
         Ok(())
     }
 
+    /// Reassign a user's department and/or system role (super-only).
+    pub fn update_user_org(
+        &self,
+        id: &str,
+        dept_id: Option<&str>,
+        role: &str,
+    ) -> SResult<UserRec> {
+        if !matches!(role, "super" | "dept_admin" | "member") {
+            return Err(format!("未知角色：{role}"));
+        }
+        if let Some(d) = dept_id {
+            if !self.list_departments()?.iter().any(|x| x.id == d) {
+                return Err("目标部门不存在".into());
+            }
+        }
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE users SET dept_id=?2, role=?3 WHERE id=?1",
+                params![id, dept_id, role],
+            )
+            .map_err(db_err)?;
+        if changed == 0 {
+            return Err("账号不存在".into());
+        }
+        self.conn
+            .execute("DELETE FROM user_depts WHERE user_id=?1", params![id])
+            .map_err(db_err)?;
+        if let Some(d) = dept_id {
+            self.conn
+                .execute(
+                    "INSERT OR IGNORE INTO user_depts(user_id, dept_id) VALUES(?1,?2)",
+                    params![id, d],
+                )
+                .map_err(db_err)?;
+        }
+        self.user_by_id(id)
+    }
+
     pub fn user_dept_ids(&self, user_id: &str) -> SResult<Vec<String>> {
         let mut stmt = self
             .conn
@@ -2236,6 +2284,24 @@ impl Store {
             name: name.into(),
             parent_id: parent_id.map(|s| s.to_string()),
         })
+    }
+
+    pub fn rename_department(&self, id: &str, name: &str) -> SResult<()> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err("部门名称不能为空".into());
+        }
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE departments SET name=?2 WHERE id=?1",
+                params![id, trimmed],
+            )
+            .map_err(db_err)?;
+        if changed == 0 {
+            return Err("部门不存在".into());
+        }
+        Ok(())
     }
 
     pub fn list_departments(&self) -> SResult<Vec<DeptRec>> {
@@ -4137,17 +4203,15 @@ impl Store {
     }
 
     /// Publish the unnumbered working draft: the SAME row takes
-    /// a number (minor bump of the current published head, per
-    /// the prototype's default 定号段 — the segment picker is
-    /// gone from the page, the mechanism stays minor) and turns
-    /// normal. An empty note takes the prototype's default text
-    /// with the count of pages the draft added over the
-    /// published head.
+    /// the selected number and turns normal. An empty note takes
+    /// the prototype's default text with the count of pages the
+    /// draft added over the published head.
     pub fn publish_working_draft(
         &self,
         version_id: &str,
         note: &str,
         author: &str,
+        bump: Option<&str>,
     ) -> SResult<VersionRec> {
         let ver = self.get_version(version_id)?;
         if ver.status != "working" {
@@ -4166,6 +4230,10 @@ impl Store {
             }
             None => ver.pages.len(),
         };
+        let inc = match bump {
+            Some(value) => parse_increment(value)?,
+            None => crate::semver::Increment::Minor,
+        };
         let base_sv = head_normal
             .map(|v| v.semver.clone())
             .or_else(|| {
@@ -4174,21 +4242,14 @@ impl Store {
                     .find(|v| v.status != "working")
                     .map(|v| v.semver.clone())
             })
-            .and_then(|s| SemVer::parse(&s).ok());
-        let mut cand = match base_sv {
-            Some(sv) => sv.bumped(crate::semver::Increment::Minor),
-            None => SemVer {
-                major: 0,
-                minor: 1,
-                patch: 0,
-            },
-        };
+            .and_then(|s| SemVer::parse(&s).ok())
+            .unwrap_or(SemVer::new(0, 0, 0));
+        let mut cand = base_sv.bumped(inc);
         // The candidate must be free across ALL rows of the
-        // rendition (a numbered draft may already hold it);
-        // keep minor-bumping, the prototype cascade's guard.
+        // rendition (a numbered draft may already hold it).
         let mut guard = 0;
         while self.check_semver_free(&rend_id, cand, None).is_err() {
-            cand = cand.bumped(crate::semver::Increment::Minor);
+            cand = cand.bumped(inc);
             guard += 1;
             if guard > 10000 {
                 return Err("版本号分配失败".into());
@@ -4219,25 +4280,85 @@ impl Store {
         self.get_version(version_id)
     }
 
-    /// Publish a NUMBERED draft, optionally replacing its note
-    /// (the #101 draft card's inline publish input). Without a
-    /// note this is exactly the old publish-draft flip.
-    pub fn publish_draft(&self, version_id: &str, note: Option<&str>) -> SResult<VersionRec> {
+    /// Publish a numbered draft. Old callers omit `bump` and keep
+    /// the preallocated number; the #101 dialog always selects a
+    /// segment and publishes above the current normal head.
+    pub fn publish_draft(
+        &self,
+        version_id: &str,
+        note: Option<&str>,
+        author: &str,
+        bump: Option<&str>,
+    ) -> SResult<VersionRec> {
         let ver = self.get_version(version_id)?;
         if ver.status != "draft" {
             return Err("只有草稿版本可以发布".into());
         }
-        match note {
-            Some(n) => {
-                self.conn
-                    .execute(
-                        "UPDATE versions SET status='normal', note=?2 WHERE id=?1",
-                        params![version_id, n],
-                    )
-                    .map_err(db_err)?;
+        let Some(bump) = bump else {
+            match note {
+                Some(n) => {
+                    self.conn
+                        .execute(
+                            "UPDATE versions SET status='normal', note=?2 WHERE id=?1",
+                            params![version_id, n],
+                        )
+                        .map_err(db_err)?;
+                }
+                None => self.set_version_status(version_id, "normal")?,
             }
-            None => self.set_version_status(version_id, "normal")?,
+            return self.get_version(version_id);
+        };
+        let inc = parse_increment(bump)?;
+        let rend_id = ver.rendition_id.clone();
+        let versions = self.list_versions(&rend_id)?;
+        let base = versions
+            .iter()
+            .find(|v| v.status == "normal")
+            .map(|v| v.semver.clone())
+            .unwrap_or_else(|| ver.semver.clone());
+        let mut cand = SemVer::parse(&base)
+            .map_err(|_| "当前版本编号无效".to_string())?
+            .bumped(inc);
+        let mut guard = 0;
+        while self.check_semver_free(&rend_id, cand, Some(version_id)).is_err() {
+            cand = cand.bumped(inc);
+            guard += 1;
+            if guard > 10000 {
+                return Err("版本号分配失败".into());
+            }
         }
+        let note_final = note
+            .map(|n| n.trim().to_string())
+            .unwrap_or_else(|| ver.note.clone());
+        let line_pos = self.birth_line_pos(&rend_id)?;
+        let tx = self.conn.unchecked_transaction().map_err(db_err)?;
+        tx.execute(
+            "UPDATE versions SET semver=?2, major=?3, minor=?4, patch=?5, status='normal', note=?6, line_pos=?7 WHERE id=?1",
+            params![
+                version_id,
+                cand.to_string(),
+                semver_part(cand.major),
+                semver_part(cand.minor),
+                semver_part(cand.patch),
+                note_final,
+                line_pos
+            ],
+        )
+        .map_err(db_err)?;
+        tx.execute(
+            "INSERT INTO version_renumbers(id, version_id, from_semver, to_semver, reason, by, at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                new_id("rnm"),
+                version_id,
+                ver.semver,
+                cand.to_string(),
+                "草稿发布时选择版本类型",
+                author,
+                now_ms()
+            ],
+        )
+        .map_err(db_err)?;
+        tx.commit().map_err(db_err)?;
         self.get_version(version_id)
     }
 
@@ -4408,6 +4529,94 @@ impl Store {
                 .map_err(db_err)?;
         }
         Ok(())
+    }
+
+    /// Reorder numbered versions and reassign the existing semver
+    /// pool in descending display order. IDs and content stay put;
+    /// every changed number is recorded in the renumber ledger.
+    pub fn reorder_versions_recorded(
+        &self,
+        rendition_id: &str,
+        version_ids: &[String],
+        author: &str,
+    ) -> SResult<Vec<(String, String, String)>> {
+        let current = self.version_line_order(rendition_id)?;
+        if version_ids.len() != current.len()
+            || !current.iter().all(|v| version_ids.contains(&v.id))
+        {
+            return Err("版本线顺序与当前版本不一致，请刷新后重试".into());
+        }
+        if current
+            .iter()
+            .zip(version_ids)
+            .all(|(version, id)| version.id == *id)
+        {
+            return Ok(Vec::new());
+        }
+        let mut pool: Vec<SemVer> = current
+            .iter()
+            .map(|v| SemVer::parse(&v.semver))
+            .collect::<Result<_, _>>()?;
+        pool.sort_by(|a, b| b.cmp(a));
+        let mut plan = Vec::new();
+        for (id, to) in version_ids.iter().zip(pool) {
+            let from = current
+                .iter()
+                .find(|v| &v.id == id)
+                .map(|v| SemVer::parse(&v.semver))
+                .ok_or_else(|| "版本线编号无效".to_string())??;
+            if from != to {
+                plan.push((id.clone(), from, to));
+            }
+        }
+        let tx = self.conn.unchecked_transaction().map_err(db_err)?;
+        for (idx, (id, from, _)) in plan.iter().enumerate() {
+            let tmp_major = i64::MIN + idx as i64;
+            tx.execute(
+                "UPDATE versions SET semver=?2, major=?3 WHERE id=?1",
+                params![id, format!("{tmp_major}.{}.{}", from.minor, from.patch), tmp_major],
+            )
+            .map_err(db_err)?;
+        }
+        let at = now_ms();
+        for (id, from, to) in &plan {
+            tx.execute(
+                "UPDATE versions SET semver=?2, major=?3, minor=?4, patch=?5 WHERE id=?1",
+                params![
+                    id,
+                    to.to_string(),
+                    semver_part(to.major),
+                    semver_part(to.minor),
+                    semver_part(to.patch)
+                ],
+            )
+            .map_err(db_err)?;
+            tx.execute(
+                "INSERT INTO version_renumbers(id, version_id, from_semver, to_semver, reason, by, at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    new_id("rnm"),
+                    id,
+                    from.to_string(),
+                    to.to_string(),
+                    "拖拽版本线后按位置重新编号",
+                    author,
+                    at
+                ],
+            )
+            .map_err(db_err)?;
+        }
+        for (pos, id) in version_ids.iter().enumerate() {
+            tx.execute(
+                "UPDATE versions SET line_pos=?2 WHERE id=?1 AND rendition_id=?3",
+                params![id, pos as i64, rendition_id],
+            )
+            .map_err(db_err)?;
+        }
+        tx.commit().map_err(db_err)?;
+        Ok(plan
+            .into_iter()
+            .map(|(id, from, to)| (id, from.to_string(), to.to_string()))
+            .collect())
     }
 
     /// Renumber with a ledger record (the governance 改号）.
@@ -9624,6 +9833,47 @@ impl Store {
         Ok(())
     }
 
+    /// Create a consistent snapshot backup of `qimu.db` (via `VACUUM INTO`)
+    /// plus all files in `files/` under `dest_dir`. Returns the number of
+    /// copied files from `files/`.
+    pub fn backup_to(&self, dest_dir: &Path) -> SResult<usize> {
+        std::fs::create_dir_all(dest_dir).map_err(|e| format!("创建备份目录失败：{e}"))?;
+        let dest_db = dest_dir.join("qimu.db");
+        if dest_db.exists() {
+            std::fs::remove_file(&dest_db).map_err(|e| format!("清理旧备份数据库失败：{e}"))?;
+        }
+        self.conn
+            .execute(
+                "VACUUM INTO ?1",
+                params![dest_db.to_string_lossy().as_ref()],
+            )
+            .map_err(db_err)?;
+
+        fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<usize> {
+            if !src.exists() {
+                return Ok(0);
+            }
+            std::fs::create_dir_all(dst)?;
+            let mut count = 0;
+            for entry in std::fs::read_dir(src)? {
+                let entry = entry?;
+                let ty = entry.file_type()?;
+                let to = dst.join(entry.file_name());
+                if ty.is_dir() {
+                    count += copy_dir_recursive(&entry.path(), &to)?;
+                } else if ty.is_file() {
+                    std::fs::copy(entry.path(), &to)?;
+                    count += 1;
+                }
+            }
+            Ok(count)
+        }
+
+        let files_src = self.root.join("files");
+        let files_dst = dest_dir.join("files");
+        copy_dir_recursive(&files_src, &files_dst).map_err(|e| format!("复制内容文件失败：{e}"))
+    }
+
     /// First-run seed: super admin + one default content group + top folders.
     pub fn ensure_seed(&self, admin_password: &str) -> SResult<()> {
         if self.user_count()? > 0 {
@@ -9642,5 +9892,120 @@ impl Store {
         )?;
         let _ = g;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod version_management_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn store() -> (Store, PathBuf) {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "qimu-version-management-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store::open(&root).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "INSERT INTO renditions(id, unit_id, form, lang) VALUES('r1', 'u1', '标准版', 'zh');",
+            )
+            .unwrap();
+        (store, root)
+    }
+
+    fn insert_version(store: &Store, id: &str, rendition_id: &str, semver: &str, status: &str) {
+        let parts = SemVer::parse(semver)
+            .ok()
+            .map(|parsed| {
+                (
+                    semver_part(parsed.major),
+                    semver_part(parsed.minor),
+                    semver_part(parsed.patch),
+                )
+            })
+            .unwrap_or((-1, 0, 0));
+        store
+            .conn
+            .execute(
+                "INSERT INTO versions(id, rendition_id, semver, major, minor, patch, basis_revision, author, note, created_ms, fragment_hash, page_count, pages_json, status) VALUES(?1,?2,?3,?4,?5,?6,1,'tester','original',1,'',0,'[]',?7)",
+                params![id, rendition_id, semver, parts.0, parts.1, parts.2, status],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn working_publish_uses_selected_segment_and_removes_the_draft() {
+        for (bump, expected) in [
+            ("major", "3.0.0"),
+            ("minor", "2.4.0"),
+            ("patch", "2.3.5"),
+        ] {
+            let (store, root) = store();
+            insert_version(&store, "head", "r1", "2.3.4", "normal");
+            insert_version(&store, "working", "r1", "", "working");
+            let published = store
+                .publish_working_draft("working", "", "tester", Some(bump))
+                .unwrap();
+            assert_eq!(published.id, "working");
+            assert_eq!(published.semver, expected);
+            assert_eq!(published.status, "normal");
+            assert!(store.working_version("r1").unwrap().is_none());
+            drop(store);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn numbered_draft_publishes_above_the_normal_head() {
+        let (store, root) = store();
+        insert_version(&store, "head", "r1", "2.3.4", "normal");
+        insert_version(&store, "draft", "r1", "9.0.0", "draft");
+        let published = store
+            .publish_draft("draft", Some(""), "tester", Some("patch"))
+            .unwrap();
+        assert_eq!(published.id, "draft");
+        assert_eq!(published.semver, "2.3.5");
+        assert_eq!(published.status, "normal");
+        let ledger = store.list_renumbers("draft").unwrap();
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger[0].from_semver, "9.0.0");
+        assert_eq!(ledger[0].to_semver, "2.3.5");
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn drag_reassigns_numbers_without_changing_version_identity() {
+        let (store, root) = store();
+        insert_version(&store, "a", "r1", "3.0.0", "normal");
+        insert_version(&store, "b", "r1", "2.0.0", "normal");
+        insert_version(&store, "c", "r1", "1.0.0", "normal");
+        let order = vec!["b".to_string(), "c".to_string(), "a".to_string()];
+        let shifts = store
+            .reorder_versions_recorded("r1", &order, "tester")
+            .unwrap();
+        assert_eq!(shifts.len(), 3);
+        let line = store.version_line_order("r1").unwrap();
+        assert_eq!(
+            line.iter()
+                .map(|version| (version.id.as_str(), version.semver.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("b", "3.0.0"), ("c", "2.0.0"), ("a", "1.0.0")]
+        );
+        assert_eq!(store.get_version("a").unwrap().note, "original");
+        assert_eq!(store.list_renumbers("a").unwrap().len(), 1);
+        assert!(store
+            .reorder_versions_recorded("r1", &["a".to_string()], "tester")
+            .is_err());
+        assert_eq!(store.version_line_order("r1").unwrap().len(), 3);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

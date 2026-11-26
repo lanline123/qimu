@@ -1868,6 +1868,13 @@ impl LocalStore {
         )
     }
 
+    /// Snapshot the local library database (`VACUUM INTO`) and all files
+    /// under `files/` into `dest`.
+    pub fn backup_to(&self, dest: &std::path::Path) -> Result<usize, String> {
+        let store = self.lock_timed("backup_to");
+        store.backup_to(dest)
+    }
+
     /// The index detail the REST `GET /v1/indexes/{id}` returns for
     /// a named session — `{index, branches, tags, head,
     /// resolved_entries}` — assembled from the local store (the
@@ -2324,7 +2331,13 @@ impl LocalStore {
                         .get("note")
                         .and_then(|v| v.as_str())
                         .filter(|n| !n.trim().is_empty());
-                    let ver = store.publish_draft(id, note)?;
+                    let bump = body.get("bump").and_then(|v| v.as_str());
+                    let ver = store.publish_draft(
+                        id,
+                        note,
+                        &self.owner.display_name,
+                        bump,
+                    )?;
                     Ok(json!({
                         "version": serde_json::to_value(&ver).unwrap_or(Value::Null),
                     }))
@@ -2341,10 +2354,12 @@ impl LocalStore {
                         .get("note")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
+                    let bump = body.get("bump").and_then(|v| v.as_str());
                     let ver = store.publish_working_draft(
                         id,
                         note,
                         &self.owner.display_name,
+                        bump,
                     )?;
                     Ok(json!({
                         "version": serde_json::to_value(&ver).unwrap_or(Value::Null),
@@ -2479,8 +2494,24 @@ impl LocalStore {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    store.set_version_line_order(rendition_id, &version_ids)?;
-                    Ok(json!({ "ok": true }))
+                    let rendition = store
+                        .get_rendition(rendition_id)
+                        .map_err(|_| NOT_FOUND.to_string())?;
+                    if rendition.unit_id != *id {
+                        return Err("版本线不属于当前内容块".to_string());
+                    }
+                    let shifts = store.reorder_versions_recorded(
+                        rendition_id,
+                        &version_ids,
+                        &self.owner.display_name,
+                    )?;
+                    Ok(json!({
+                        "ok": true,
+                        "shifts": shifts
+                            .into_iter()
+                            .map(|(id, from, to)| json!({ "id": id, "from": from, "to": to }))
+                            .collect::<Vec<_>>(),
+                    }))
                 }
                 ("POST", ["v1", "versions", id, "reorder-pages"]) => {
                     // #101 wall drag reorder, governed (server

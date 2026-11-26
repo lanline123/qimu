@@ -195,6 +195,82 @@ pub(super) fn unit_versions(detail: &Value) -> Vec<UnitVersion> {
         .collect()
 }
 
+/// Resolve which rendition version is active for the bottom-bar play /
+/// view actions when #101 is open:
+/// - selected working card -> `row.working.or(row.latest)`
+/// - selected numbered card -> that version in the active rendition
+/// - default (wall head) -> `row.working.or(row.latest)`
+/// Returns `(version_obj, show_version_tag_in_title)`.
+pub(super) fn resolve_unit_bar_version(st: &UnitState) -> Option<(UnitVersion, bool)> {
+    let rows = rendition_rows(&st.detail);
+    let row = st
+        .selected_rendition
+        .as_ref()
+        .and_then(|id| rows.iter().find(|r| &r.rendition_id == id))
+        .or_else(|| rows.first())?;
+    let latest_id = row.latest.as_ref().map(|v| s(v, "id")).unwrap_or_default();
+    let (version, non_latest) = if st.selected_working_card {
+        let v = row.working.clone().or_else(|| row.latest.clone())?;
+        let differs = row.working.is_some() && s(&v, "id") != latest_id;
+        (v, differs)
+    } else if let Some(vid) = &st.selected_version {
+        let v = row
+            .working
+            .iter()
+            .chain(row.versions.iter())
+            .find(|v| s(v, "id") == *vid)
+            .cloned()
+            .or_else(|| row.working.clone())
+            .or_else(|| row.latest.clone())?;
+        let differs = s(&v, "id") != latest_id;
+        (v, differs)
+    } else {
+        let v = row.working.clone().or_else(|| row.latest.clone())?;
+        let differs = row.working.is_some() && s(&v, "id") != latest_id;
+        (v, differs)
+    };
+    Some((
+        UnitVersion {
+            rendition_id: row.rendition_id.clone(),
+            form: row.form.clone(),
+            lang: row.lang.clone(),
+            version,
+        },
+        non_latest,
+    ))
+}
+
+/// Resolve the selected history version (or live working draft) as a
+/// delete target for the bottom-bar trash button.
+pub(super) fn selected_version_delete_target(st: &UnitState) -> Option<(String, String)> {
+    let rows = rendition_rows(&st.detail);
+    let row = st
+        .selected_rendition
+        .as_ref()
+        .and_then(|id| rows.iter().find(|r| &r.rendition_id == id))
+        .or_else(|| rows.first())?;
+    if st.selected_working_card {
+        let w = row.working.as_ref()?;
+        let id = s(w, "id");
+        if id.is_empty() {
+            return None;
+        }
+        return Some((id, "未定号草稿".to_string()));
+    }
+    let vid = st.selected_version.as_ref()?;
+    let ver = row
+        .working
+        .iter()
+        .chain(row.versions.iter())
+        .find(|v| s(v, "id") == *vid)?;
+    let label = if s(ver, "status") == "working" || s(ver, "semver").is_empty() {
+        "未定号草稿".to_string()
+    } else {
+        format!("v{}", s(ver, "semver"))
+    };
+    Some((vid.clone(), label))
+}
+
 /// The rendition's working head as the payload assembly
 /// resolved it (core latest_version): the first version that
 /// is neither recalled, rejected nor the working draft.
@@ -383,7 +459,7 @@ fn added_pages(version: &Value, head: Option<&Value>) -> usize {
 /// The draw closures borrow the thumbnail cache through `self`,
 /// so every store-touching follow-up is collected and executed
 /// after the section has been drawn.
-enum DetailAct {
+pub(crate) enum DetailAct {
     Bind(PageBindingRequest),
     Unbind {
         binding_id: String,
@@ -400,6 +476,7 @@ enum DetailAct {
         note: String,
         added: usize,
         semver: String,
+        bump: String,
     },
     /// The unnumbered working card's publish. `working_id` is
     /// the live working row when one exists; without one the
@@ -412,7 +489,9 @@ enum DetailAct {
         head_is_draft: bool,
         note: String,
         added: usize,
+        bump: String,
     },
+    OpenDraftPublish(DraftPublishState),
     /// 定号插入： the working draft dropped onto a version card.
     InsertWorkingAt {
         working_id: Option<String>,
@@ -448,12 +527,10 @@ enum DetailAct {
         state: &'static str,
         toast: String,
     },
-    /// History-card drag: write the line's display order.
+    /// History-card drag: reorder the line and renumber it.
     ReorderLine {
         rendition_id: String,
         version_ids: Vec<String>,
-        moved_semver: String,
-        moved_to: usize,
     },
 }
 
@@ -535,7 +612,7 @@ impl App {
         }));
     }
 
-    fn run_detail_act(&mut self, unit_id: &str, bindings: &[Value], act: DetailAct) {
+    pub(crate) fn run_detail_act(&mut self, unit_id: &str, bindings: &[Value], act: DetailAct) {
         match act {
             DetailAct::Bind(request) => {
                 self.request_page_binding(request, bindings);
@@ -555,20 +632,22 @@ impl App {
                 note,
                 added,
                 semver,
+                bump,
             } => {
                 match self.call_work(
                     "POST",
                     &format!("/v1/versions/{version_id}/publish-draft"),
-                    Some(json!({ "note": note })),
+                    Some(json!({ "note": note, "bump": bump })),
                 ) {
                     Ok(resp) => {
-                        // The numbered draft's own handler toast
-                        // (prototype @3901): the published
-                        // version and its total page count.
-                        let pages = resp
-                            .get("version")
-                            .map(|v| i(v, "page_count"))
-                            .unwrap_or(0);
+                        let published = resp.get("version").cloned().unwrap_or(Value::Null);
+                        let published_semver = s(&published, "semver");
+                        let semver = if published_semver.is_empty() {
+                            semver
+                        } else {
+                            published_semver
+                        };
+                        let pages = i(&published, "page_count");
                         self.msg = format!(
                             "草稿已发布为正式最新版本 {}（{} 页）。",
                             semver, pages
@@ -580,6 +659,11 @@ impl App {
                     Err(e) => self.msg = format!("发布草稿失败：{e}"),
                 }
             }
+            DetailAct::OpenDraftPublish(state) => {
+                self.overlays
+                    .retain(|overlay| !matches!(overlay, Overlay::DraftPublish(_)));
+                self.overlays.push(Overlay::DraftPublish(state));
+            }
             DetailAct::PublishWorking {
                 working_id,
                 rendition_id,
@@ -587,6 +671,7 @@ impl App {
                 head_is_draft,
                 note,
                 added,
+                bump,
             } => {
                 // Resolve the mirror state first: no working
                 // row + a draft head publishes through the
@@ -598,7 +683,7 @@ impl App {
                         match self.call_work(
                             "POST",
                             &format!("/v1/versions/{head_id}/publish-draft"),
-                            Some(json!({ "note": note })),
+                            Some(json!({ "note": note, "bump": bump })),
                         ) {
                             Ok(resp) => {
                                 // Mirror state: the published thing
@@ -649,7 +734,7 @@ impl App {
                 match self.call_work(
                     "POST",
                     &format!("/v1/versions/{wid}/publish-working"),
-                    Some(json!({ "note": note })),
+                    Some(json!({ "note": note, "bump": bump })),
                 ) {
                     Ok(resp) => {
                         let semver = resp
@@ -850,8 +935,6 @@ impl App {
             DetailAct::ReorderLine {
                 rendition_id,
                 version_ids,
-                moved_semver,
-                moved_to,
             } => {
                 match self.call_work(
                     "POST",
@@ -862,12 +945,9 @@ impl App {
                     })),
                 ) {
                     Ok(_) => {
-                        self.msg = format!(
-                            "版本「{}」已移到第 {} 位。",
-                            moved_semver,
-                            moved_to + 1
-                        );
+                        self.msg = "版本排序完成，版本号已同步调整。".into();
                         self.reload_unit_detail(unit_id);
+                        self.changed(Change::Units);
                     }
                     Err(e) => self.msg = format!("版本排序失败：{e}"),
                 }
@@ -889,14 +969,17 @@ impl App {
     // prototype's default form, 跟随最新.
     // ------------------------------------------------------------
     pub(super) fn unit_header_ui(&mut self, ui: &mut egui::Ui, st: &mut UnitState, unit: &Value) {
-        let head_latest = st
-            .detail
-            .get("renditions")
-            .and_then(|r| r.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|r| r.get("latest"))
-            .cloned()
+        let rows = rendition_rows(&st.detail);
+        let active_row = st
+            .selected_rendition
+            .as_ref()
+            .and_then(|id| rows.iter().find(|r| &r.rendition_id == id))
+            .or_else(|| rows.first());
+        let head_ver = active_row
+            .and_then(|r| r.latest.clone().or_else(|| r.working.clone()))
             .unwrap_or(Value::Null);
+        let missing_lang = active_row
+            .is_some_and(|r| r.lang != "zh" && r.latest.is_none() && r.working.is_none());
         // HD1 (visual pass 2026-11-26): the prototype's head
         // group is a baseline-aligned flex row with 12px gaps
         // (renderDetail @2589: the inner group carries
@@ -911,101 +994,131 @@ impl App {
         // an inner zero-spacing row keeping their textual
         // " · " joins, and the 12px group gap applies between
         // title, hint cluster and badges.
-        ui.with_layout(
+        // Use a bounded initial row height (28px) instead of `with_layout`
+        // over the whole remaining viewport height: `Align::BOTTOM` inside
+        // an unbounded `max_rect` places the header at the bottom edge of
+        // the window and collapses the ScrollArea below it to 0px height.
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), 28.0),
             egui::Layout::left_to_right(egui::Align::BOTTOM).with_main_wrap(true),
             |ui| {
                 ui.spacing_mut().item_spacing.x = 12.0;
-            if matches!(&st.meta_edit, Some((MetaField::Name, _))) {
-                self.meta_edit_ui(ui, st, MetaField::Name);
-            } else {
-                let title = ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(s(unit, "name")).size(20.0).strong(),
-                    )
-                    .sense(egui::Sense::click()),
-                );
-                if title.double_clicked() {
-                    st.meta_edit = Some((MetaField::Name, s(unit, "name")));
-                    st.meta_edit_focus = true;
+                if matches!(&st.meta_edit, Some((MetaField::Name, _))) {
+                    self.meta_edit_ui(ui, st, MetaField::Name);
+                } else {
+                    let title = ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(s(unit, "name")).size(20.0).strong(),
+                        )
+                        .wrap()
+                        .sense(egui::Sense::click()),
+                    );
+                    if title.double_clicked() {
+                        st.meta_edit = Some((MetaField::Name, s(unit, "name")));
+                        st.meta_edit_focus = true;
+                    }
                 }
-            }
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
-            let mut hint_has_intro = false;
-            if matches!(&st.meta_edit, Some((MetaField::Description, _))) {
-                hint_has_intro = true;
-                self.meta_edit_ui(ui, st, MetaField::Description);
-            } else if !s(unit, "description").is_empty() {
-                hint_has_intro = true;
-                let intro = ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(s(unit, "description"))
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    let mut hint_has_intro = false;
+                    if matches!(&st.meta_edit, Some((MetaField::Description, _))) {
+                        hint_has_intro = true;
+                        self.meta_edit_ui(ui, st, MetaField::Description);
+                    } else if !s(unit, "description").is_empty() {
+                        hint_has_intro = true;
+                        let intro = ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(s(unit, "description"))
+                                    .size(13.0)
+                                    .color(palette_color(TEXT_FAINT)),
+                            )
+                            .sense(egui::Sense::click()),
+                        );
+                        if intro.double_clicked() {
+                            st.meta_edit =
+                                Some((MetaField::Description, s(unit, "description")));
+                            st.meta_edit_focus = true;
+                        }
+                    }
+                    let head_semver = s(&head_ver, "semver");
+                    let head_ver_label = if !head_semver.is_empty() {
+                        Some(format!("当前 v{head_semver}"))
+                    } else if s(&head_ver, "status") == "working" {
+                        Some("当前 草稿".to_string())
+                    } else {
+                        None
+                    };
+                    if let Some(ver_txt) = &head_ver_label {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{}{}",
+                                if hint_has_intro { " · " } else { "" },
+                                ver_txt
+                            ))
                             .size(13.0)
                             .color(palette_color(TEXT_FAINT)),
-                    )
-                    .sense(egui::Sense::click()),
-                );
-                if intro.double_clicked() {
-                    st.meta_edit = Some((MetaField::Description, s(unit, "description")));
-                    st.meta_edit_focus = true;
-                }
-            }
-            let head_semver = s(&head_latest, "semver");
-            if !head_semver.is_empty() {
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{}当前 v{}",
-                        if hint_has_intro { " · " } else { "" },
-                        head_semver
-                    ))
-                    .size(13.0)
-                    .color(palette_color(TEXT_FAINT)),
-                );
-            }
-            let policy_text = match &st.entry_policy {
-                Some(EntryPolicyView::Locked { semver }) if !semver.is_empty() => {
-                    format!("锁定版本 v{semver}")
-                }
-                Some(EntryPolicyView::Locked { .. }) => "锁定版本".to_string(),
-                _ => "跟随最新".to_string(),
-            };
-            ui.label(
-                egui::RichText::new(format!(
-                    "{}{policy_text}",
-                    if hint_has_intro || !head_semver.is_empty() {
-                        " · "
-                    } else {
-                        ""
+                        );
                     }
-                ))
-                .size(13.0)
-                .color(palette_color(TEXT_FAINT)),
-            );
-            });
-            // Status badges (prototype .h-badges, right after the
-            // hint): derived server/core-side from the unit's
-            // rendition state and shipped on the payload — ok
-            // badges take the info form, warn badges the warn
-            // form. The 编辑中 badge has no state source in the
-            // client and is not fabricated (REPORT).
-            if let Some(badges) = st
-                .detail
-                .get("status_badges")
-                .and_then(Value::as_array)
-            {
-                for badge in badges {
-                    let text = s(badge, "text");
-                    if text.is_empty() {
-                        continue;
-                    }
-                    if s(badge, "kind") == "warn" {
-                        chip(ui, &text, palette_color(CHIP_ORANGE_FG), CHIP_ORANGE_BG);
-                    } else {
-                        chip(ui, &text, palette_color(ACCENT_DEEP), CHIP_BLUE_BG);
+                    let policy_text = match &st.entry_policy {
+                        Some(EntryPolicyView::Locked { semver }) if !semver.is_empty() => {
+                            format!("锁定版本 v{semver}")
+                        }
+                        Some(EntryPolicyView::Locked { .. }) => "锁定版本".to_string(),
+                        _ => "跟随最新".to_string(),
+                    };
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{}{policy_text}",
+                            if hint_has_intro || head_ver_label.is_some() {
+                                " · "
+                            } else {
+                                ""
+                            }
+                        ))
+                        .size(13.0)
+                        .color(palette_color(TEXT_FAINT)),
+                    );
+                });
+                // Status badges (prototype .h-badges, right after the
+                // hint): derived server/core-side from the unit's
+                // rendition state and shipped on the payload — ok
+                // badges take the info form, warn badges the warn
+                // form. The 编辑中 badge has no state source in the
+                // client and is not fabricated (REPORT).
+                if let Some(badges) = st
+                    .detail
+                    .get("status_badges")
+                    .and_then(Value::as_array)
+                {
+                    for badge in badges {
+                        let text = s(badge, "text");
+                        if text.is_empty() {
+                            continue;
+                        }
+                        if s(badge, "kind") == "warn" {
+                            chip(ui, &text, palette_color(CHIP_ORANGE_FG), CHIP_ORANGE_BG);
+                        } else {
+                            chip(ui, &text, palette_color(ACCENT_DEEP), CHIP_BLUE_BG);
+                        }
                     }
                 }
-            }
-        });
+            },
+        );
+        if missing_lang {
+            ui.add_space(10.0);
+            egui::Frame::NONE
+                .fill(palette_color(CHIP_ORANGE_BG))
+                .stroke(egui::Stroke::new(1.0, palette_color(CHIP_ORANGE_FG)))
+                .corner_radius(6)
+                .inner_margin(egui::Margin::symmetric(12, 10))
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new("缺译 · 此条目尚无对应语言版")
+                            .size(13.0)
+                            .strong(),
+                    );
+                });
+        }
     }
 
     // ------------------------------------------------------------
@@ -1111,9 +1224,12 @@ impl App {
                     if let Some(next) = segmented(ui, &label_refs, active, SegStyle::Soft) {
                         st.selected_rendition = Some(rows[next].rendition_id.clone());
                         st.selected_version = None;
+                        st.selected_working_card = false;
                         st.selected_page = None;
                         st.bind_pick = None;
                         st.bind_panel = None;
+                        st.thumb_cell_h.clear();
+                        st.hist_card_h.clear();
                     }
                 });
             }
@@ -1151,18 +1267,25 @@ impl App {
         let cols = (((avail + 12.0) / (230.0 + 12.0)).floor() as usize).max(1);
         let cell_w = (avail - 12.0 * (cols as f32 - 1.0)) / cols as f32;
         let inner_w = (cell_w - 4.0).max(120.0);
+        if (inner_w - st.thumb_cell_w).abs() > 0.5 {
+            st.thumb_cell_h.clear();
+            st.thumb_cell_w = inner_w;
+        }
         for row_start in (0..page_count).step_by(cols) {
+            let row_end = (row_start + cols).min(page_count);
+            let row_target = (row_start..row_end)
+                .filter_map(|slot| st.thumb_cell_h.get(&slot))
+                .fold(0.0f32, |a, &h| a.max(h));
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = 12.0;
-                for slot in row_start..(row_start + cols).min(page_count) {
+                for slot in row_start..row_end {
+                    let own_natural = st.thumb_cell_h.get(&slot).copied().unwrap_or(0.0);
+                    let pad = (row_target - own_natural).max(0.0);
                     let frame_resp = egui::Frame::NONE
                         .fill(palette_color(PANEL_BG))
-                        // T3 (visual pass 2026-11-26): a selected
-                        // cell's frame turns accent — the width
-                        // stays the retained constant 2px
-                        // (.thumb-frame), only the color moves
-                        // (user ruling 2026-11-26: state changes
-                        // color, never geometry).
+                        // Outer .thumb-frame turns accent when selected;
+                        // thumb_response_art keeps `current = false` so no
+                        // inner duplicate border is painted inside it.
                         .stroke(egui::Stroke::new(
                             2.0,
                             if st.selected_page == Some(slot) {
@@ -1181,7 +1304,7 @@ impl App {
                                     &version_id,
                                     slot,
                                     inner_w,
-                                    st.selected_page == Some(slot),
+                                    false,
                                     &format!("{} / {}", slot + 1, page_count),
                                     &page_title(&shown.version, slot),
                                 );
@@ -1211,49 +1334,52 @@ impl App {
                                     }
                                 }
                                 // .tb: 8 top / 10 sides / 10 bottom.
-                                // The bind bar stays rendered while
-                                // picking (SPEC §4); its chips are
-                                // inert then.
+                                // Wrap chips cleanly within inner_w - 20.
+                                let tb_w = (inner_w - 20.0).max(20.0);
                                 ui.add_space(8.0);
-                                ui.horizontal(|ui| {
-                                    ui.add_space(10.0);
-                                    self.bind_bar_ui(
-                                        ui, st, shown, slot, &targets, &lang_codes, acts,
-                                        picking,
-                                    );
-                                });
-                                // .tb-desc: the page's 说明 (d),
-                                // carried on the version's page
-                                // rows since the R3 data line. An
-                                // empty 说明 renders NOTHING — the
-                                // prototype's empty inline element
-                                // adds no height (DIFFERENCES
-                                // 差 40).
-                                let desc = page_desc(&shown.version, slot);
-                                if !desc.is_empty() {
-                                    ui.horizontal(|ui| {
-                                        ui.add_space(10.0);
-                                        ui.label(
-                                            egui::RichText::new(desc)
-                                                .size(12.0)
-                                                .color(palette_color(TEXT_FAINT)),
-                                        );
+                                egui::Frame::NONE
+                                    .inner_margin(egui::Margin::symmetric(10, 0))
+                                    .show(ui, |ui| {
+                                        ui.set_width(tb_w);
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.spacing_mut().item_spacing = egui::vec2(5.0, 5.0);
+                                            self.bind_bar_ui(
+                                                ui,
+                                                st,
+                                                shown,
+                                                slot,
+                                                &targets,
+                                                &lang_codes,
+                                                acts,
+                                                picking,
+                                            );
+                                        });
+                                        let desc = page_desc(&shown.version, slot);
+                                        if !desc.is_empty() {
+                                            ui.add_space(4.0);
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(desc)
+                                                        .size(12.0)
+                                                        .color(palette_color(TEXT_FAINT)),
+                                                )
+                                                .wrap(),
+                                            );
+                                        }
                                     });
-                                }
-                                ui.add_space(10.0);
+                                ui.add_space(10.0 + pad);
                             });
                         });
+                    st.thumb_cell_h
+                        .insert(slot, frame_resp.response.rect.height() - pad);
                     cell_rects.push((slot, frame_resp.response.rect));
                     if picking {
-                        // .thumb-grid.picking: a 2px dashed accent
-                        // outline per cell — egui strokes have no
-                        // dash, so the outline is solid (declared).
-                        let rect = frame_resp.response.rect.expand(2.0);
-                        ui.painter().rect_stroke(
-                            rect,
-                            8.0,
-                            egui::Stroke::new(2.0, ACCENT),
-                            egui::StrokeKind::Outside,
+                        // .thumb-grid.picking: a 2px dashed accent outline per cell.
+                        dashed_card_border(
+                            ui.painter(),
+                            frame_resp.response.rect.expand(2.0),
+                            6.0,
+                            ACCENT,
                         );
                     }
                 }
@@ -1507,7 +1633,7 @@ impl App {
             .is_some_and(|p| p.page == slot);
         let pill = egui::Button::new(
             egui::RichText::new("绑定")
-                .size(11.5)
+                .size(11.0)
                 .strong()
                 .color(if panel_here {
                     egui::Color32::WHITE
@@ -1526,7 +1652,7 @@ impl App {
             egui::Stroke::new(1.0, palette_color(LINE_34))
         })
         .corner_radius(6)
-        .min_size(egui::vec2(0.0, 28.0));
+        .min_size(egui::vec2(0.0, 24.0));
         if ui.add(pill).clicked() && !picking {
             if panel_here {
                 st.bind_panel = None;
@@ -2008,11 +2134,23 @@ impl App {
         let cols = (((avail + 12.0) / (230.0 + 12.0)).floor() as usize).max(1);
         let cell_w = ((avail - 12.0 * (cols as f32 - 1.0)) / cols as f32).max(170.0);
         let inner_w = (cell_w - 2.0).max(120.0);
+        if (inner_w - st.kid_card_w).abs() > 0.5 {
+            st.kid_card_h.clear();
+            st.kid_card_w = inner_w;
+        }
         let mut drill: Option<String> = None;
         for row_start in (0..children.len()).step_by(cols) {
+            let row_slice = &children[row_start..(row_start + cols).min(children.len())];
+            let row_target = row_slice
+                .iter()
+                .filter_map(|child| {
+                    let cid = child.get("unit").map(|u| s(u, "id")).unwrap_or_default();
+                    st.kid_card_h.get(&cid)
+                })
+                .fold(0.0f32, |a, &h| a.max(h));
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = 12.0;
-                for child in &children[row_start..(row_start + cols).min(children.len())] {
+                for child in row_slice {
                     let cunit = child.get("unit").cloned().unwrap_or(Value::Null);
                     let child_id = s(&cunit, "id");
                     let latest = child
@@ -2029,6 +2167,9 @@ impl App {
                         .map(|a| a.len())
                         .unwrap_or(0);
                     let selected = st.kid_sel.as_deref() == Some(child_id.as_str());
+                    let own_natural = st.kid_card_h.get(&child_id).copied().unwrap_or(0.0);
+                    let pad = (row_target - own_natural).max(0.0);
+                    let mut action_rect = egui::Rect::NOTHING;
                     let frame_resp = egui::Frame::NONE
                         .fill(palette_color(PANEL_BG))
                         .stroke(egui::Stroke::new(
@@ -2044,26 +2185,20 @@ impl App {
                         .show(ui, |ui| {
                             ui.vertical(|ui| {
                                 ui.set_width(inner_w);
-                                if !latest_id.is_empty() {
-                                    // T2: the cover's no-image
-                                    // form is the slide-art
-                                    // placeholder titled with
-                                    // the child's name.
-                                    let resp = self.thumb_response_art(
-                                        ui,
-                                        &latest_id,
-                                        0,
-                                        inner_w,
-                                        false,
-                                        "",
-                                        &s(&cunit, "name"),
-                                    );
-                                    if resp.clicked() {
-                                        st.kid_sel = Some(child_id.clone());
-                                    }
-                                    if resp.double_clicked() {
-                                        drill = Some(child_id.clone());
-                                    }
+                                let resp = self.thumb_response_art(
+                                    ui,
+                                    &latest_id,
+                                    0,
+                                    inner_w,
+                                    false,
+                                    "",
+                                    &s(&cunit, "name"),
+                                );
+                                if resp.clicked() {
+                                    st.kid_sel = Some(child_id.clone());
+                                }
+                                if resp.double_clicked() {
+                                    drill = Some(child_id.clone());
                                 }
                                 egui::Frame::NONE
                                     .inner_margin(egui::Margin {
@@ -2098,11 +2233,10 @@ impl App {
                                                 );
                                             });
                                         }
-                                        // .std-sub: ALL of the
-                                        // child's pages as a strip
-                                        // of mini bars under a
-                                        // dashed rule, at equal
-                                        // flexible widths.
+                                        // .std-sub: ALL of the child's
+                                        // pages as wrapped mini bars under
+                                        // a dashed rule with a minimum width
+                                        // floor so multi-page blocks stay readable.
                                         let pages = latest
                                             .get("pages")
                                             .and_then(Value::as_array)
@@ -2112,74 +2246,98 @@ impl App {
                                             ui.add_space(8.0);
                                             dashed_rule(ui);
                                             ui.add_space(8.0);
-                                            ui.horizontal(|ui| {
-                                                ui.spacing_mut().item_spacing.x = 5.0;
-                                                let bar_w = (inner_w - 24.0
-                                                    - 5.0 * (pages.len() as f32 - 1.0))
-                                                    / pages.len() as f32;
-                                                for (idx, page) in pages.iter().enumerate() {
-                                                    egui::Frame::NONE
-                                                        .fill(palette_color(HOVER_BG))
-                                                        .stroke(egui::Stroke::new(
-                                                            1.0,
-                                                            palette_color(LINE_34),
-                                                        ))
-                                                        .corner_radius(8)
-                                                        .inner_margin(egui::Margin {
-                                                            left: 7,
-                                                            right: 7,
-                                                            top: 5,
-                                                            bottom: 5,
-                                                        })
-                                                        .show(ui, |ui| {
-                                                            ui.set_width((bar_w - 14.0).max(0.0));
-                                                            ui.add(
-                                                                egui::Label::new(
-                                                                    egui::RichText::new(
-                                                                        format!(
-                                                                            "{}. {}",
-                                                                            idx + 1,
-                                                                            s(page, "title")
-                                                                        ),
-                                                                    )
-                                                                    .size(11.0)
-                                                                    .strong(),
-                                                                )
-                                                                .truncate(),
-                                                            );
-                                                        });
+                                            let strip_w = (inner_w - 24.0).max(60.0);
+                                            let per_row = (((strip_w + 5.0) / (72.0 + 5.0))
+                                                .floor()
+                                                as usize)
+                                                .max(1)
+                                                .min(pages.len());
+                                            for sub_start in (0..pages.len()).step_by(per_row) {
+                                                if sub_start > 0 {
+                                                    ui.add_space(5.0);
                                                 }
-                                            });
+                                                let sub_end = (sub_start + per_row).min(pages.len());
+                                                let sub_len = (sub_end - sub_start) as f32;
+                                                let bar_w =
+                                                    (strip_w - 5.0 * (sub_len - 1.0)) / sub_len;
+                                                ui.horizontal(|ui| {
+                                                    ui.spacing_mut().item_spacing.x = 5.0;
+                                                    for (idx, page) in
+                                                        pages[sub_start..sub_end].iter().enumerate()
+                                                    {
+                                                        let page_no = sub_start + idx + 1;
+                                                        egui::Frame::NONE
+                                                            .fill(palette_color(HOVER_BG))
+                                                            .stroke(egui::Stroke::new(
+                                                                1.0,
+                                                                palette_color(LINE_34),
+                                                            ))
+                                                            .corner_radius(8)
+                                                            .inner_margin(egui::Margin {
+                                                                left: 7,
+                                                                right: 7,
+                                                                top: 5,
+                                                                bottom: 5,
+                                                            })
+                                                            .show(ui, |ui| {
+                                                                ui.set_width(
+                                                                    (bar_w - 14.0).max(0.0),
+                                                                );
+                                                                ui.add(
+                                                                    egui::Label::new(
+                                                                        egui::RichText::new(
+                                                                            format!(
+                                                                                "{}. {}",
+                                                                                page_no,
+                                                                                s(page, "title")
+                                                                            ),
+                                                                        )
+                                                                        .size(11.0)
+                                                                        .strong(),
+                                                                    )
+                                                                    .truncate(),
+                                                                );
+                                                            });
+                                                    }
+                                                });
+                                            }
                                         }
-                                        ui.add_space(8.0);
-                                        // .show-actions .main: the
-                                        // accent drill action.
-                                        if ui
-                                            .add_sized(
-                                                egui::vec2(inner_w - 24.0, 30.0),
-                                                egui::Button::new(
-                                                    egui::RichText::new("打开维护 · 点开下钻 →")
-                                                        .size(12.0)
-                                                        .strong()
-                                                        .color(egui::Color32::WHITE),
-                                                )
-                                                .fill(ACCENT)
-                                                .corner_radius(6),
+                                        ui.add_space(8.0 + pad);
+                                        let btn_resp = ui.add_sized(
+                                            egui::vec2(inner_w - 24.0, 30.0),
+                                            egui::Button::new(
+                                                egui::RichText::new("打开维护 · 点开下钻 →")
+                                                    .size(12.0)
+                                                    .strong()
+                                                    .color(egui::Color32::WHITE),
                                             )
-                                            .clicked()
-                                        {
+                                            .fill(ACCENT)
+                                            .corner_radius(6),
+                                        );
+                                        action_rect = btn_resp.rect;
+                                        if btn_resp.clicked() {
                                             drill = Some(child_id.clone());
                                         }
                                     });
                             });
                         });
+                    st.kid_card_h
+                        .insert(child_id.clone(), frame_resp.response.rect.height() - pad);
+                    if ui.input(|i| i.pointer.primary_clicked()) {
+                        if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                            if frame_resp.response.rect.contains(pos) && !action_rect.contains(pos)
+                            {
+                                st.kid_sel = Some(child_id.clone());
+                            }
+                        }
+                    }
                 }
             });
             ui.add_space(12.0);
         }
         if let Some(child_id) = drill {
             if !child_id.is_empty() {
-                self.open_unit_detail(&child_id);
+                self.push_unit_detail(&child_id);
             }
         }
     }
@@ -2267,7 +2425,7 @@ impl App {
         acts: &mut Vec<DetailAct>,
     ) {
         ui.add_space(20.0);
-        ui.label(egui::RichText::new("历史版本").strong().size(16.0));
+        ui.label(egui::RichText::new("版本管理").strong().size(16.0));
         ui.add_space(4.0);
         let rows = rendition_rows(&st.detail);
         let Some(row) = rows
@@ -2316,9 +2474,15 @@ impl App {
                 .to_string(),
             row,
         };
+        if ctx.row.working.is_none() {
+            st.selected_working_card = false;
+        }
         let versions = display_versions(&ctx.row);
-        // Card list: the working card always leads.
-        let mut keys: Vec<String> = vec!["working".to_string()];
+        let mut keys: Vec<String> = if ctx.row.working.is_some() {
+            vec!["working".to_string()]
+        } else {
+            Vec::new()
+        };
         keys.extend(versions.iter().map(|v| s(v, "id")));
         // Geometry: repeat(auto-fill, minmax(248px, 1fr)) with
         // a 300px cap; at most 640px wide the cards go full
@@ -2337,22 +2501,30 @@ impl App {
             st.hist_card_h.clear();
             st.hist_card_w = card_w;
         }
+        // Uniform card height (user ruling 2026-11-27): the
+        // prototype's .vh-list is align-items:stretch, but a
+        // per-row max re-lays-out every card whenever the row
+        // composition changes — publishing the draft removes its
+        // card and the remaining cards jump to a new height. Use
+        // ONE sticky max across the whole line: every card is the
+        // same height, and the target never shrinks when the
+        // draft card leaves (its measured height stays as the
+        // floor). 0 = nothing measured yet, so cards render
+        // naturally and are measured on this pass.
+        let target_h = st
+            .hist_card_h
+            .values()
+            .cloned()
+            .fold(0.0f32, f32::max);
         let mut card_rects: Vec<(String, egui::Rect)> = Vec::new();
         let mut hot_rects: Vec<egui::Rect> = Vec::new();
         for row_start in (0..keys.len()).step_by(cols) {
             let row_keys = &keys[row_start..(row_start + cols).min(keys.len())];
-            // The row's stretch target: the tallest NATURAL
-            // card height measured last frame (0 = unmeasured,
-            // cards render naturally and are measured now).
-            let row_target = row_keys
-                .iter()
-                .filter_map(|k| st.hist_card_h.get(k))
-                .fold(0.0f32, |a, &h| a.max(h));
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = 12.0;
                 for key in row_keys {
                     let (rect, hots) = if key == "working" {
-                        self.hist_working_card_ui(ui, st, &ctx, card_w, row_target, acts)
+                        self.hist_working_card_ui(ui, st, &ctx, card_w, target_h, acts)
                     } else {
                         let version = versions
                             .iter()
@@ -2365,7 +2537,7 @@ impl App {
                             &ctx,
                             &version,
                             card_w,
-                            row_target,
+                            target_h,
                             acts,
                         )
                     };
@@ -2378,160 +2550,128 @@ impl App {
         self.hist_drag_resolve(ui, st, &ctx, &versions, &card_rects, &hot_rects, acts);
     }
 
-    /// The unnumbered working-draft card (SPEC §10.8): always
-    /// present at the line's head. Its pages are the working
-    /// row's when one exists, else the working head's (the
-    /// mirror state). Publish goes through the inline input;
-    /// the card is draggable onto a version card （定号插入）.
+    /// The unnumbered working-draft card. It exists only while
+    /// the rendition has a real working row; publishing opens the
+    /// version-type dialog instead of expanding the card.
     fn hist_working_card_ui(
         &mut self,
         ui: &mut egui::Ui,
         st: &mut UnitState,
         ctx: &HistCtx,
         card_w: f32,
-        row_target: f32,
+        target_h: f32,
         acts: &mut Vec<DetailAct>,
     ) -> (egui::Rect, Vec<egui::Rect>) {
         let mut hots: Vec<egui::Rect> = Vec::new();
-        // H2: pad to the row's stretch target by the amount
-        // this card's natural height falls short of it.
+        // H2: pad to the line's uniform stretch target by the
+        // amount this card's natural height falls short of it.
         let own_natural = st.hist_card_h.get("working").copied().unwrap_or(0.0);
-        let pad = (row_target - own_natural).max(0.0);
-        let src = ctx
-            .row
-            .working
-            .clone()
-            .or_else(|| ctx.row.latest.clone());
-        let effective_id = ctx
-            .row
-            .working
+        let pad = (target_h - own_natural).max(0.0);
+        let Some(src) = ctx.row.working.clone() else {
+            return (egui::Rect::NOTHING, hots);
+        };
+        let added = added_pages(&src, ctx.head_normal.as_ref());
+        let base_semver = ctx
+            .head_normal
             .as_ref()
-            .map(|w| s(w, "id"))
-            .or_else(|| ctx.row.latest.as_ref().map(|v| s(v, "id")))
+            .map(|v| s(v, "semver"))
+            .or_else(|| {
+                ctx.row
+                    .versions
+                    .iter()
+                    .find(|v| s(v, "status") != "working")
+                    .map(|v| s(v, "semver"))
+            })
             .unwrap_or_default();
-        let selected = st.selected_version.as_deref() == Some(effective_id.as_str())
-            && !effective_id.is_empty();
-        let inner_w = card_w - 20.0;
+        let selected = st.selected_working_card;
+        let inner_w = (card_w - 22.0).max(160.0);
+        // User ruling 2026-11-27: the outer frame keeps the
+        // default line colour; the selected card's accent ring is
+        // painted below.
         let frame_resp = egui::Frame::NONE
             .fill(palette_color(PANEL_BG))
-            .stroke(egui::Stroke::new(
-                1.0,
-                if selected {
-                    ACCENT
-                } else {
-                    palette_color(CHIP_ORANGE_FG)
-                },
-            ))
+            .stroke(egui::Stroke::new(1.0, palette_color(LINE_34)))
             .corner_radius(6)
             .inner_margin(egui::Margin::same(10))
             .show(ui, |ui| {
-                ui.set_width(inner_w);
-                // Head: bigver 未定号， warn 草稿 badge, spacer,
-                // then the publish action (or its input state).
-                ui.horizontal(|ui| {
-                    self.bigver_chip(ui, "未定号", false);
-                    vh_badge(ui, "草稿", palette_color(CHIP_ORANGE_FG), CHIP_ORANGE_BG);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if st.draft_pub.as_ref().is_some_and(|(k, _, _)| k == "working") {
-                            if vh_btn(ui, "取消").clicked() {
-                                st.draft_pub = None;
-                            }
-                            let pub_resp = vh_btn_primary(ui, "发布");
-                            hots.push(pub_resp.rect);
-                            if pub_resp.clicked() {
-                                let note = st
-                                    .draft_pub
-                                    .as_ref()
-                                    .map(|(_, n, _)| n.trim().to_string())
-                                    .unwrap_or_default();
-                                let added = src
-                                    .as_ref()
-                                    .map(|v| {
-                                        added_pages(v, ctx.head_normal.as_ref())
-                                    })
-                                    .unwrap_or(0);
-                                let note = if note.is_empty() {
-                                    format!("草稿发布为正式最新版本（新增 {} 页）", added)
-                                } else {
-                                    note
-                                };
-                                acts.push(DetailAct::PublishWorking {
-                                    working_id: ctx.row.working.as_ref().map(|w| s(w, "id")),
-                                    rendition_id: ctx.row.rendition_id.clone(),
-                                    head_id: ctx
-                                        .row
-                                        .latest
-                                        .as_ref()
-                                        .map(|v| s(v, "id"))
-                                        .unwrap_or_default(),
-                                    head_is_draft: ctx
-                                        .row
-                                        .latest
-                                        .as_ref()
-                                        .is_some_and(|v| s(v, "status") == "draft"),
-                                    note,
-                                    added,
-                                });
-                                st.draft_pub = None;
-                            }
-                            if let Some((_, text, focus)) = &mut st.draft_pub {
-                                let resp = ui.add(
-                                    egui::TextEdit::singleline(text)
-                                        .hint_text("修订说明（可留空）")
-                                        .desired_width(150.0),
-                                );
-                                hots.push(resp.rect);
-                                if *focus {
-                                    resp.request_focus();
-                                    *focus = false;
+                ui.vertical(|ui| {
+                    ui.set_width(inner_w);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.spacing_mut().button_padding = egui::vec2(10.0, 2.0);
+                        self.bigver_chip(ui, "未定号", false);
+                        vh_badge(ui, "草稿", palette_color(CHIP_ORANGE_FG), CHIP_ORANGE_BG);
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                let pub_resp = vh_btn_primary(ui, "发布");
+                                hots.push(pub_resp.rect);
+                                if pub_resp.clicked() {
+                                    acts.push(DetailAct::OpenDraftPublish(DraftPublishState {
+                                        unit_id: st.unit_id.clone(),
+                                        kind: DraftPublishKind::Working {
+                                            working_id: Some(s(&src, "id")),
+                                            rendition_id: ctx.row.rendition_id.clone(),
+                                            head_id: ctx
+                                                .row
+                                                .latest
+                                                .as_ref()
+                                                .map(|v| s(v, "id"))
+                                                .unwrap_or_default(),
+                                            head_is_draft: ctx
+                                                .row
+                                                .latest
+                                                .as_ref()
+                                                .is_some_and(|v| s(v, "status") == "draft"),
+                                            added,
+                                        },
+                                        base_semver: base_semver.clone(),
+                                        bump: 1,
+                                        note: String::new(),
+                                        focus: true,
+                                    }));
                                 }
-                            }
-                        } else {
-                            let pub_resp = vh_btn_primary(ui, "发布");
-                            hots.push(pub_resp.rect);
-                            if pub_resp.clicked() {
-                                st.draft_pub =
-                                    Some(("working".to_string(), String::new(), true));
-                            }
-                        }
+                            },
+                        );
                     });
-                });
-                // Thumbs: the working page set; foot is 草稿 only.
-                if let Some(srcv) = &src {
-                    self.hist_thumbs_ui(
-                        ui,
-                        st,
-                        "working",
-                        srcv,
-                        &s(srcv, "id"),
-                        inner_w,
-                        true,
-                        &mut hots,
-                    );
-                }
+                // Thumbs: the working page set.
+                self.hist_thumbs_ui(
+                    ui,
+                    st,
+                    "working",
+                    &src,
+                    &s(&src, "id"),
+                    inner_w,
+                    true,
+                    ctx.row.working.as_ref().map(|w| s(w, "id")),
+                    &mut hots,
+                );
                 ui.add_space(8.0);
                 let meta = if ctx.my_name.is_empty() {
                     "刚刚 · 我".to_string()
                 } else {
                     format!("刚刚 · 我（{}）", ctx.my_name)
                 };
-                ui.label(
-                    egui::RichText::new(meta)
-                        .size(11.5)
-                        .color(palette_color(TEXT_FAINT)),
-                );
-                ui.label(
-                    egui::RichText::new("未定号草稿")
-                        .size(11.5)
-                        .color(palette_color(TEXT_FAINT)),
-                );
+                vh_caption_line(ui, &meta, palette_color(TEXT_FAINT));
+                ui.add_space(2.0);
+                vh_caption_line(ui, "未定号草稿", palette_color(TEXT_FAINT));
                 // H2: absorb the stretch pad at the card's
                 // foot — the box grows, the content stays
                 // top-aligned (flex stretch semantics).
                 if pad > 0.0 {
                     ui.add_space(pad);
                 }
+                });
             });
+        if selected {
+            ui.painter().rect_stroke(
+                frame_resp.response.rect,
+                6.0,
+                egui::Stroke::new(2.0, palette_color(ACCENT_DEEP)),
+                egui::StrokeKind::Outside,
+            );
+        }
         st.hist_card_h.insert(
             "working".to_string(),
             frame_resp.response.rect.height() - pad,
@@ -2547,7 +2687,7 @@ impl App {
         ctx: &HistCtx,
         version: &Value,
         card_w: f32,
-        row_target: f32,
+        target_h: f32,
         acts: &mut Vec<DetailAct>,
     ) -> (egui::Rect, Vec<egui::Rect>) {
         let mut hots: Vec<egui::Rect> = Vec::new();
@@ -2556,50 +2696,62 @@ impl App {
         let is_draft = status == "draft";
         let is_rejected = status == "rejected";
         let is_recalled = status == "recalled";
+        let is_cur = ctx.head_normal.as_ref().is_some_and(|h| s(h, "id") == vid);
         let is_using = ctx.using_id.as_deref() == Some(vid.as_str());
-        let selected = st.selected_version.as_deref() == Some(vid.as_str());
-        let inner_w = card_w - 20.0;
+        let selected =
+            !st.selected_working_card && st.selected_version.as_deref() == Some(vid.as_str());
+        let inner_w = (card_w - 22.0).max(160.0);
         // H2: the stretch pad for this card (see the working
         // card's note).
         let own_natural = st.hist_card_h.get(&vid).copied().unwrap_or(0.0);
-        let pad = (row_target - own_natural).max(0.0);
-        // H5 (visual pass 2026-11-26): draft and rejected
-        // cards carry the prototype's DASHED border (.draftv
-        // amber / .pubrej rose). The color priority is the
-        // one this card already had (rejected > draft >
-        // using/selected > line); a dashed card's frame
-        // stroke goes transparent — the same 1px geometry —
-        // and the dashes are painted over the frame rect
-        // after the frame closes.
-        let dashed = is_draft || is_rejected;
-        let border_color = if is_rejected {
-            palette_color(ROSE)
-        } else if is_draft {
-            palette_color(CHIP_ORANGE_FG)
-        } else if is_using || selected {
-            ACCENT
-        } else {
-            palette_color(LINE_34)
-        };
-        let stroke = if dashed {
-            egui::Stroke::new(1.0, egui::Color32::TRANSPARENT)
-        } else {
-            egui::Stroke::new(1.0, border_color)
-        };
+        let pad = (target_h - own_natural).max(0.0);
+        // User ruling 2026-11-27: the outer frame keeps the
+        // default line colour for every card; draft / rejected
+        // no longer carry their amber / rose dashed frames. Only
+        // the selected card gets the accent ring, painted below.
+        let border_color = palette_color(LINE_34);
+        let stroke = egui::Stroke::new(1.0, border_color);
         let frame_resp = egui::Frame::NONE
             .fill(palette_color(PANEL_BG))
             .stroke(stroke)
             .corner_radius(6)
             .inner_margin(egui::Margin::same(10))
             .show(ui, |ui| {
-                ui.set_width(inner_w);
-                // ---- head (one line, segments hide under
+                ui.vertical(|ui| {
+                    ui.set_width(inner_w);
+                    // ---- head (one line, segments hide under
                 // pressure: languages first, then badges) ----
                 let editing_renum = st
                     .renum_edit
                     .as_ref()
                     .is_some_and(|(id, _)| *id == vid);
+                let semver_label = format!("v{}", s(version, "semver"));
+                let bigver_w = {
+                    let g = ui.painter().layout_no_wrap(
+                        semver_label.clone(),
+                        egui::FontId::new(12.0, egui::FontFamily::Monospace),
+                        palette_color(TEXT_MAIN),
+                    );
+                    g.size().x + 16.0
+                };
+                let right_w = {
+                    let mut w = 0.0f32;
+                    if ctx.is_super && !is_draft && !is_recalled {
+                        w += 48.0;
+                    }
+                    if is_draft {
+                        w += 118.0 + 48.0 + 6.0;
+                    } else if !is_recalled && !is_rejected {
+                        w += 48.0;
+                    }
+                    if ctx.is_super && !is_draft && !is_recalled && !is_rejected {
+                        w += 6.0;
+                    }
+                    w
+                };
                 ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.spacing_mut().button_padding = egui::vec2(10.0, 2.0);
                     if editing_renum {
                         if let Some((_, text)) = &mut st.renum_edit {
                             let resp = ui.add(
@@ -2628,9 +2780,9 @@ impl App {
                             }
                         }
                     } else {
-                        self.bigver_chip(ui, &format!("v{}", s(version, "semver")), is_using);
+                        self.bigver_chip(ui, &semver_label, is_cur);
                     }
-                    // Width budget for the hide ladder.
+                    // Width budget for the hide ladder using actual chip & button sizes.
                     let badges: Vec<(&str, egui::Color32, egui::Color32)> = {
                         let mut v = Vec::new();
                         if is_draft {
@@ -2645,96 +2797,120 @@ impl App {
                         v
                     };
                     let show_langs = !is_draft && !ctx.langs.is_empty();
-                    // Badge budget at the H4 head form
-                    // (12px text, 0/10 padding ≈ 62px each).
-                    let head_used = 92.0
-                        + badges.len() as f32 * 62.0
-                        + if show_langs {
-                            ctx.langs.len() as f32 * 86.0
-                        } else {
-                            0.0
-                        }
-                        + 130.0;
-                    let hide_langs = head_used > inner_w;
-                    let hide_badges = hide_langs && (92.0 + 130.0 + badges.len() as f32 * 62.0 > inner_w);
+                    let badges_w = badges.len() as f32 * 56.0;
+                    let langs_w = if show_langs {
+                        ctx.langs.len() as f32 * 36.0
+                    } else {
+                        0.0
+                    };
+                    let head_left_w = if editing_renum { 96.0 } else { bigver_w };
+                    let gap_pad = if right_w > 0.0 { 12.0 } else { 4.0 };
+                    let hide_langs = head_left_w + badges_w + langs_w + right_w + gap_pad > inner_w;
+                    let hide_badges = hide_langs && (head_left_w + badges_w + right_w + gap_pad > inner_w);
                     if !hide_badges {
                         for (text, fg, bg) in &badges {
                             vh_badge(ui, text, *fg, *bg);
                         }
                     }
                     if show_langs && !hide_langs {
-                        for lang in &ctx.langs {
-                            let state = hist_lang_state(ctx, &st.detail, version, lang);
-                            let (label, fg, bg) = match state {
-                                "synced" => (
-                                    format!("{} · 已同步", lang_display_name(lang)),
-                                    palette_color(ACCENT_DEEP),
-                                    SEL_BG,
-                                ),
-                                "stale" => (
-                                    format!("{} · 待更新", lang_display_name(lang)),
-                                    palette_color(CHIP_ORANGE_FG),
-                                    CHIP_ORANGE_BG,
-                                ),
-                                _ => (
-                                    format!("{} · 缺译", lang_display_name(lang)),
-                                    palette_color(TEXT_FAINT),
-                                    palette_color(HOVER_BG),
-                                ),
-                            };
-                            // G1: the language chip's
-                            // prototype weight is 800
-                            // (.lang-chip) — strong is the
-                            // client's approximation tier.
-                            let btn = egui::Button::new(
-                                egui::RichText::new(label).size(11.0).strong().color(fg),
-                            )
-                            .fill(bg)
-                            .stroke(egui::Stroke::NONE)
-                            .corner_radius(6)
-                            .min_size(egui::vec2(0.0, 22.0));
-                            let resp = ui.add(btn);
-                            hots.push(resp.rect);
-                            if resp.clicked() {
-                                let (next, toast) = match state {
-                                    "missing" => (
-                                        "synced",
-                                        format!(
-                                            "{}译文已挂到 {}。",
-                                            lang_display_name(lang),
-                                            s(version, "semver")
-                                        ),
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            ui.spacing_mut().button_padding = egui::vec2(6.0, 2.0);
+                            for lang in &ctx.langs {
+                                let state = hist_lang_state(ctx, &st.detail, version, lang);
+                                let (fill, stroke, fg) = match state {
+                                    "synced" => (
+                                        ACCENT,
+                                        egui::Stroke::new(1.0, ACCENT),
+                                        egui::Color32::WHITE,
                                     ),
                                     "stale" => (
-                                        "synced",
-                                        format!(
-                                            "{}译文已更新到 {}。",
-                                            lang_display_name(lang),
-                                            s(version, "semver")
-                                        ),
+                                        egui::Color32::TRANSPARENT,
+                                        egui::Stroke::NONE,
+                                        palette_color(CHIP_ORANGE_FG),
                                     ),
                                     _ => (
-                                        "missing",
-                                        format!(
-                                            "已解除 {} 的{}绑定。",
-                                            s(version, "semver"),
-                                            lang_display_name(lang)
-                                        ),
+                                        palette_color(HOVER_BG),
+                                        egui::Stroke::new(1.0, palette_color(FIELD_BORDER)),
+                                        palette_color(TEXT_FAINT),
                                     ),
                                 };
-                                acts.push(DetailAct::LangMount {
-                                    version_id: vid.clone(),
-                                    lang: lang.clone(),
-                                    state: next,
-                                    toast,
-                                });
+                                let tip = match state {
+                                    "synced" => format!(
+                                        "{} · 已挂译文到该版 · 点击解除",
+                                        lang_display_name(lang)
+                                    ),
+                                    "stale" => format!(
+                                        "{} · 译文落后于该版 · 点击更新到该版",
+                                        lang_display_name(lang)
+                                    ),
+                                    _ => format!(
+                                        "{} · 该版未挂译文 · 点击挂上（基于该版）",
+                                        lang_display_name(lang)
+                                    ),
+                                };
+                                let btn = egui::Button::new(
+                                    egui::RichText::new(lang.to_uppercase())
+                                        .size(10.0)
+                                        .strong()
+                                        .color(fg),
+                                )
+                                .fill(fill)
+                                .stroke(stroke)
+                                .corner_radius(6)
+                                .min_size(egui::vec2(32.0, 24.0));
+                                let resp = ui.add(btn).on_hover_text(tip);
+                                if state == "stale" {
+                                    dashed_card_border(
+                                        ui.painter(),
+                                        resp.rect,
+                                        6.0,
+                                        palette_color(CHIP_ORANGE_FG),
+                                    );
+                                }
+                                hots.push(resp.rect);
+                                if resp.clicked() {
+                                    let (next, toast) = match state {
+                                        "missing" => (
+                                            "synced",
+                                            format!(
+                                                "{}译文已挂到 {}。",
+                                                lang_display_name(lang),
+                                                s(version, "semver")
+                                            ),
+                                        ),
+                                        "stale" => (
+                                            "synced",
+                                            format!(
+                                                "{}译文已更新到 {}。",
+                                                lang_display_name(lang),
+                                                s(version, "semver")
+                                            ),
+                                        ),
+                                        _ => (
+                                            "missing",
+                                            format!(
+                                                "已解除 {} 的{}绑定。",
+                                                s(version, "semver"),
+                                                lang_display_name(lang)
+                                            ),
+                                        ),
+                                    };
+                                    acts.push(DetailAct::LangMount {
+                                        version_id: vid.clone(),
+                                        lang: lang.clone(),
+                                        state: next,
+                                        toast,
+                                    });
+                                }
                             }
-                        }
+                        });
                     }
                     // Right group: [primary/default actions]
                     // then 改号 at the right edge (added first
                     // in right-to-left order).
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
                         if ctx.is_super && !is_draft && !is_recalled {
                             let resp = vh_btn(ui, "改号");
                             hots.push(resp.rect);
@@ -2755,16 +2931,23 @@ impl App {
                             if pub_resp.clicked() {
                                 let added =
                                     added_pages(version, ctx.head_normal.as_ref());
-                                let note = format!(
-                                    "草稿发布为正式最新版本（新增 {} 页）",
-                                    added
-                                );
-                                acts.push(DetailAct::PublishDraft {
-                                    version_id: vid.clone(),
-                                    note,
-                                    added,
-                                    semver: s(version, "semver"),
-                                });
+                                let base_semver = ctx
+                                    .head_normal
+                                    .as_ref()
+                                    .map(|v| s(v, "semver"))
+                                    .filter(|v| !v.is_empty())
+                                    .unwrap_or_else(|| s(version, "semver"));
+                                acts.push(DetailAct::OpenDraftPublish(DraftPublishState {
+                                    unit_id: st.unit_id.clone(),
+                                    kind: DraftPublishKind::Numbered {
+                                        version_id: vid.clone(),
+                                        added,
+                                    },
+                                    base_semver,
+                                    bump: 1,
+                                    note: String::new(),
+                                    focus: true,
+                                }));
                             }
                         } else if !is_recalled && !is_rejected {
                             if is_using {
@@ -2800,49 +2983,50 @@ impl App {
                     &vid,
                     inner_w,
                     false,
+                    Some(vid.clone()),
                     &mut hots,
                 );
                 // ---- caption ----
                 ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new(format!(
+                vh_caption_line(
+                    ui,
+                    &format!(
                         "{} · {}",
                         fmt_time(i(version, "created_ms")),
                         s(version, "author")
-                    ))
-                    .size(11.5)
-                    .color(palette_color(TEXT_FAINT)),
+                    ),
+                    palette_color(TEXT_FAINT),
                 );
-                if !s(version, "note").is_empty() {
-                    ui.label(
-                        egui::RichText::new(s(version, "note"))
-                            .size(11.5)
-                            .color(palette_color(TEXT_FAINT)),
-                    );
-                }
+                // Always reserve the second caption line (the draft
+                // card's reference height), even when the version
+                // carries no revision note.
+                ui.add_space(2.0);
+                vh_caption_line(ui, &s(version, "note"), palette_color(TEXT_FAINT));
                 if is_rejected && !s(version, "pub_reason").is_empty() {
-                    ui.label(
-                        egui::RichText::new(format!(
+                    ui.add_space(2.0);
+                    vh_caption_line(
+                        ui,
+                        &format!(
                             "未通过理由：{}（{} · {}）",
                             s(version, "pub_reason"),
                             s(version, "pub_by"),
                             fmt_time(i(version, "pub_at"))
-                        ))
-                        .size(11.5)
-                        .color(palette_color(ROSE)),
+                        ),
+                        palette_color(ROSE),
                     );
                 }
                 // H2: absorb the stretch pad at the foot.
                 if pad > 0.0 {
                     ui.add_space(pad);
                 }
+                });
             });
-        if dashed {
-            dashed_card_border(
-                ui.painter(),
+        if selected {
+            ui.painter().rect_stroke(
                 frame_resp.response.rect,
                 6.0,
-                border_color,
+                egui::Stroke::new(2.0, palette_color(ACCENT_DEEP)),
+                egui::StrokeKind::Outside,
             );
         }
         st.hist_card_h
@@ -2905,6 +3089,7 @@ impl App {
         thumb_version_id: &str,
         inner_w: f32,
         working_card: bool,
+        select_version_id: Option<String>,
         hots: &mut Vec<egui::Rect>,
     ) {
         let page_count = i(version, "page_count").max(0) as usize;
@@ -2928,66 +3113,46 @@ impl App {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 for p in row_start..row_end {
-                    ui.vertical(|ui| {
-                        ui.set_width(thumb_w);
-                        let thumb_sel =
-                            st.hist_thumb_sel.as_ref().is_some_and(|(k, idx)| {
-                                k == card_key && *idx == p
-                            });
-                        let resp = self.thumb_response_art(
-                            ui,
-                            thumb_version_id,
-                            p,
-                            thumb_w,
-                            thumb_sel,
-                            &format!("{} / {}", p + 1, page_count),
-                            &page_title(version, p),
-                        );
-                        hots.push(resp.rect);
-                        if resp.clicked() {
-                            st.hist_thumb_sel = Some((card_key.to_string(), p));
-                            st.selected_version = Some(thumb_version_id.to_string());
-                            st.selected_page = None;
-                            st.bind_pick = None;
-                        }
-                        if resp.double_clicked() {
-                            let v = version.clone();
-                            self.open_light(st, &v, p);
-                        }
-                        // .foot: desc left (truncated), version
-                        // right; the working card's foot is 草稿.
-                        ui.horizontal(|ui| {
-                            if working_card {
-                                ui.label(
-                                    egui::RichText::new("草稿")
-                                        .size(10.5)
-                                        .color(palette_color(TEXT_FAINT)),
-                                );
+                    let thumb_sel = st
+                        .hist_thumb_sel
+                        .as_ref()
+                        .is_some_and(|(k, idx)| k == card_key && *idx == p);
+                    let thumb_inner_w = (thumb_w - 3.0).max(60.0);
+                    let frame_resp = egui::Frame::NONE
+                        .fill(palette_color(PANEL_BG))
+                        .stroke(egui::Stroke::new(
+                            1.5,
+                            if thumb_sel {
+                                ACCENT
                             } else {
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(page_desc(version, p))
-                                            .size(10.5)
-                                            .color(palette_color(TEXT_FAINT)),
-                                    )
-                                    .truncate(),
-                                );
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        ui.label(
-                                            egui::RichText::new(format!(
-                                                "v{}",
-                                                s(version, "semver")
-                                            ))
-                                            .size(10.5)
-                                            .color(palette_color(TEXT_FAINT)),
-                                        );
-                                    },
-                                );
+                                palette_color(LINE_34)
+                            },
+                        ))
+                        .corner_radius(6)
+                        .inner_margin(egui::Margin::same(0))
+                        .show(ui, |ui| {
+                            let resp = self.thumb_response_art(
+                                ui,
+                                thumb_version_id,
+                                p,
+                                thumb_inner_w,
+                                false,
+                                &format!("{} / {}", p + 1, page_count),
+                                &page_title(version, p),
+                            );
+                            if resp.clicked() {
+                                st.hist_thumb_sel = Some((card_key.to_string(), p));
+                                st.selected_working_card = working_card;
+                                st.selected_version = select_version_id.clone();
+                                st.selected_page = None;
+                                st.bind_pick = None;
+                            }
+                            if resp.double_clicked() {
+                                let v = version.clone();
+                                self.open_light(st, &v, p);
                             }
                         });
-                    });
+                    hots.push(frame_resp.response.rect);
                 }
             });
         }
@@ -3047,16 +3212,13 @@ impl App {
                 .find(|(k, r)| *k != drag_key && r.contains(pos));
             if let Some((tkey, trect)) = target {
                 if drag_key == "working" {
-                    ui.painter().rect_stroke(
+                    ui.painter()
+                        .rect_filled(*trect, 6.0, palette_color(CHIP_ORANGE_BG));
+                    dashed_card_border(
+                        ui.painter(),
                         *trect,
                         6.0,
-                        egui::Stroke::new(1.5, ACCENT),
-                        egui::StrokeKind::Inside,
-                    );
-                    ui.painter().rect_filled(
-                        *trect,
-                        6.0,
-                        egui::Color32::from_rgba_unmultiplied(0x2F, 0x6B, 0xF5, 18),
+                        palette_color(CHIP_ORANGE_FG),
                     );
                     let _ = tkey;
                 } else {
@@ -3152,16 +3314,9 @@ impl App {
                                 .enumerate()
                                 .any(|(n, id)| versions.get(n).is_none_or(|v| s(v, "id") != *id));
                             if changed {
-                                let moved_semver = versions
-                                    .iter()
-                                    .find(|v| s(v, "id") == drag_key)
-                                    .map(|v| s(v, "semver"))
-                                    .unwrap_or_default();
                                 acts.push(DetailAct::ReorderLine {
                                     rendition_id: ctx.row.rendition_id.clone(),
                                     version_ids: order,
-                                    moved_semver,
-                                    moved_to: at,
                                 });
                             }
                         }
@@ -3176,23 +3331,16 @@ impl App {
                         card_rects.iter().find(|(k, _)| *k == key)
                     {
                         if rect.contains(pos) && !in_hot(pos) {
-                            // Select: the version this card
-                            // stands for (the working card
-                            // selects its effective version).
-                            let effective = if key == "working" {
-                                ctx.row
-                                    .working
-                                    .as_ref()
-                                    .map(|w| s(w, "id"))
-                                    .or_else(|| {
-                                        ctx.row.latest.as_ref().map(|v| s(v, "id"))
-                                    })
-                                    .unwrap_or_default()
+                            // Select: the version this card stands for
+                            // (working card keeps its own selection flag
+                            // so mirror-state never double-highlights latest).
+                            if key == "working" {
+                                st.selected_working_card = true;
+                                st.selected_version =
+                                    ctx.row.working.as_ref().map(|w| s(w, "id"));
                             } else {
-                                key.clone()
-                            };
-                            if !effective.is_empty() {
-                                st.selected_version = Some(effective);
+                                st.selected_working_card = false;
+                                st.selected_version = Some(key.clone());
                             }
                             st.selected_page = None;
                             st.bind_pick = None;
@@ -3246,21 +3394,39 @@ impl App {
 /// local to #101. The weight rides RichText::strong, the
 /// client's standing approximation for the >=600 tier (G1).
 fn vh_badge(ui: &mut egui::Ui, text: &str, fg: egui::Color32, bg: egui::Color32) {
-    egui::Frame::NONE
-        .fill(palette_color(bg))
-        .corner_radius(6)
-        .inner_margin(egui::Margin {
-            left: 10,
-            right: 10,
-            top: 0,
-            bottom: 0,
-        })
-        .show(ui, |ui| {
-            ui.set_min_height(24.0);
-            ui.add(egui::Label::new(
-                egui::RichText::new(text).size(12.0).strong().color(fg),
-            ));
-        });
+    let font = egui::FontId::new(12.0, egui::FontFamily::Proportional);
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font, fg);
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(galley.size().x + 20.0, 24.0),
+        egui::Sense::hover(),
+    );
+    ui.painter().rect_filled(rect, 6.0, palette_color(bg));
+    ui.painter().galley(
+        egui::pos2(rect.min.x + 10.0, rect.center().y - galley.size().y / 2.0),
+        galley,
+        fg,
+    );
+}
+
+/// One history-card caption line at the card's 11.5px faint
+/// weight. The line is allocated at a FIXED line height, so the
+/// caption block has the same height on every card — the draft
+/// card's two-line caption (time · author, then 未定号草稿) is
+/// the reference (user ruling 2026-11-27: the card labels'
+/// heights were inconsistent). The number of wrapped lines is
+/// taken from the laid-out galley so long revision notes still
+/// reserve their own lines.
+fn vh_caption_line(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
+    let font = egui::FontId::new(11.5, egui::FontFamily::Proportional);
+    let w = ui.available_width();
+    let galley = ui.painter().layout(text.to_string(), font, color, w);
+    let lines = galley.lines().count().max(1);
+    let line_h = 15.5;
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(w, line_h * lines as f32),
+        egui::Sense::hover(),
+    );
+    ui.painter().galley(rect.min, galley, color);
 }
 
 /// Hand-drawn dashed rounded-rect border (H5, visual pass
@@ -3609,12 +3775,153 @@ impl App {
         }
     }
 
-    pub(super) fn light_ui(
+    /// Render #406 stage slide (.big-slide): full-resolution real page
+    /// rendered directly from the PPTX package (never reuses thumbnails).
+    /// Returns true when the stage was double-clicked to launch live show.
+    fn light_stage_ui(
         &mut self,
         ui: &mut egui::Ui,
-        screen: egui::Rect,
-        mut light: LightState,
-    ) -> Option<Overlay> {
+        version: &Value,
+        slot: usize,
+        width: f32,
+        eyebrow: &str,
+        version_tag: &str,
+    ) -> bool {
+        let h = width * 9.0 / 16.0;
+        let version_id = s(version, "id");
+        let target_px = (width * ui.ctx().pixels_per_point()).round().max(1280.0) as u32;
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, h), egui::Sense::click());
+        let state = self.stage_slide(&version_id, slot, target_px);
+        match state {
+            ThumbState::Ready(tex) => {
+                ui.painter().rect_filled(rect, 6.0, palette_color(PANEL_BG));
+                let inner = rect.shrink(1.0);
+                let ts = tex.size_vec2();
+                let draw_rect = if ts.x > 0.0 && ts.y > 0.0 {
+                    let scale = (inner.width() / ts.x).min(inner.height() / ts.y);
+                    egui::Rect::from_center_size(inner.center(), ts * scale)
+                } else {
+                    inner
+                };
+                ui.painter().image(
+                    tex.id(),
+                    draw_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+                ui.painter().rect_stroke(
+                    rect,
+                    6.0,
+                    egui::Stroke::new(1.0, palette_color(LINE_34)),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            ThumbState::Loading => {
+                let painter = ui.painter();
+                painter.rect_filled(rect, 6.0, palette_color(HOVER_BG));
+                painter.rect_stroke(
+                    rect,
+                    6.0,
+                    egui::Stroke::new(1.0, palette_color(LINE_34)),
+                    egui::StrokeKind::Inside,
+                );
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "正在渲染真实页面…",
+                    egui::FontId::new(13.5, egui::FontFamily::Proportional),
+                    palette_color(TEXT_WEAK),
+                );
+            }
+            ThumbState::Failed(_) => {
+                let painter = ui.painter();
+                painter.rect_filled(rect, 6.0, palette_color(HOVER_BG));
+                painter.rect_stroke(
+                    rect,
+                    6.0,
+                    egui::Stroke::new(1.0, palette_color(LINE_34)),
+                    egui::StrokeKind::Inside,
+                );
+                let inner = rect.shrink(24.0);
+                let clip = painter.with_clip_rect(inner);
+                let mut y = inner.min.y;
+                if !eyebrow.is_empty() {
+                    let g = clip.layout_no_wrap(
+                        eyebrow.to_string(),
+                        egui::FontId::new(12.0, egui::FontFamily::Proportional),
+                        palette_color(TEXT_FAINT),
+                    );
+                    y += g.size().y + 8.0;
+                    clip.galley(inner.min, g, palette_color(TEXT_FAINT));
+                }
+                let title = page_title(version, slot);
+                if !title.is_empty() {
+                    let title_size = (width * 0.032).clamp(20.0, 32.0);
+                    let g = clip.layout(
+                        title,
+                        egui::FontId::new(title_size, egui::FontFamily::Proportional),
+                        palette_color(TEXT_MAIN),
+                        inner.width(),
+                    );
+                    let g_h = g.size().y;
+                    clip.galley(egui::pos2(inner.min.x, y), g, palette_color(TEXT_MAIN));
+                    y += g_h + 10.0;
+                }
+                let desc = page_desc(version, slot);
+                if !desc.is_empty() && y < inner.max.y - 36.0 {
+                    let g = clip.layout(
+                        desc.clone(),
+                        egui::FontId::new(14.5, egui::FontFamily::Proportional),
+                        palette_color(TEXT_WEAK),
+                        inner.width(),
+                    );
+                    clip.galley(egui::pos2(inner.min.x, y), g, palette_color(TEXT_WEAK));
+                }
+                let foot_h = 24.0;
+                let rule_y = inner.max.y - foot_h - 8.0;
+                if rule_y > inner.min.y + 40.0 {
+                    painter.line_segment(
+                        [
+                            egui::pos2(inner.min.x, rule_y),
+                            egui::pos2(inner.max.x, rule_y),
+                        ],
+                        egui::Stroke::new(1.0, palette_color(LINE_34)),
+                    );
+                }
+                let foot_left = if desc.is_empty() {
+                    format!("第 {} 页", slot + 1)
+                } else {
+                    desc
+                };
+                let fl = clip.layout_no_wrap(
+                    foot_left,
+                    egui::FontId::new(12.0, egui::FontFamily::Proportional),
+                    palette_color(TEXT_FAINT),
+                );
+                clip.galley(
+                    egui::pos2(inner.min.x, inner.max.y - fl.size().y),
+                    fl,
+                    palette_color(TEXT_FAINT),
+                );
+                if !version_tag.is_empty() {
+                    let fr = clip.layout_no_wrap(
+                        version_tag.to_string(),
+                        egui::FontId::new(12.0, egui::FontFamily::Proportional),
+                        palette_color(TEXT_FAINT),
+                    );
+                    clip.galley(
+                        egui::pos2(inner.max.x - fr.size().x, inner.max.y - fr.size().y),
+                        fr,
+                        palette_color(TEXT_FAINT),
+                    );
+                }
+            }
+        }
+        resp.on_hover_text("真实页面预览 · ←/→ 翻页 · 双击进入放映")
+            .double_clicked()
+    }
+
+    pub(super) fn light_ui(&mut self, ui: &mut egui::Ui, mut light: LightState) -> Option<Overlay> {
         let mut request = None;
         let mut unbind = None;
         let mut start_pick = false;
@@ -3623,55 +3930,185 @@ impl App {
         } else {
             light.target_index = light.target_index.min(light.targets.len() - 1);
         }
-        let preview_screen = egui::Rect::from_min_size(
-            screen.min,
-            egui::vec2(screen.width(), (screen.height() - 46.0).max(1.0)),
-        );
-        egui::Area::new(egui::Id::new("content_light"))
-            .fixed_pos(preview_screen.min)
-            .order(egui::Order::Foreground)
-            .show(ui.ctx(), |ui| {
-                egui::Frame::NONE
-                    .fill(palette_color(PANEL_BG))
+
+        // Keyboard page navigation (←/→, PageUp/PageDown) matching #406 slide flips.
+        if !ui.ctx().egui_wants_keyboard_input() {
+            let page_count = i(&light.version, "page_count").max(0) as usize;
+            if page_count > 1 {
+                let prev = ui.input(|inp| {
+                    inp.key_pressed(egui::Key::ArrowLeft) || inp.key_pressed(egui::Key::PageUp)
+                });
+                let next = ui.input(|inp| {
+                    inp.key_pressed(egui::Key::ArrowRight) || inp.key_pressed(egui::Key::PageDown)
+                });
+                if prev {
+                    light.slot = if light.slot == 0 {
+                        page_count - 1
+                    } else {
+                        light.slot - 1
+                    };
+                    if let ContentFrame::Unit(st) = self.content.stack.top_mut() {
+                        st.selected_page = Some(light.slot);
+                    }
+                } else if next {
+                    light.slot = (light.slot + 1) % page_count;
+                    if let ContentFrame::Unit(st) = self.content.stack.top_mut() {
+                        st.selected_page = Some(light.slot);
+                    }
+                }
+            }
+        }
+
+        // Resolve version eyebrow, version-policy footer, and optional Chinese original (#lbOrig).
+        let ver_id = s(&light.version, "id");
+        let page_count = i(&light.version, "page_count").max(1) as usize;
+        let (unit_name, cur_lang, version_tag, zh_orig) =
+            if let ContentFrame::Unit(st) = self.content.stack.top() {
+                let uname = st
+                    .detail
+                    .get("unit")
+                    .map(|u| s(u, "name"))
+                    .unwrap_or_default();
+                let rows = rendition_rows(&st.detail);
+                let cur_row = rows.iter().find(|r| {
+                    r.working.as_ref().is_some_and(|w| s(w, "id") == ver_id)
+                        || r.versions.iter().any(|v| s(v, "id") == ver_id)
+                });
+                let lang = cur_row
+                    .map(|r| r.lang.clone())
+                    .unwrap_or_else(|| "zh".to_string());
+                let semver = s(&light.version, "semver");
+                let ver_txt = if semver.is_empty() {
+                    "草稿".to_string()
+                } else {
+                    format!("v{semver}")
+                };
+                let policy_txt = match &st.entry_policy {
+                    Some(EntryPolicyView::Locked { .. }) => "锁定版本",
+                    _ => "跟随最新",
+                };
+                let tag = format!("{ver_txt} · {policy_txt}");
+                let orig = if lang != "zh" {
+                    rows.iter()
+                        .find(|r| r.lang == "zh")
+                        .and_then(|zr| zr.working.as_ref().or(zr.latest.as_ref()))
+                        .and_then(|zv| {
+                            let zvid = s(zv, "id");
+                            let zpages = i(zv, "page_count").max(0) as usize;
+                            if zpages == 0 {
+                                return None;
+                            }
+                            let mapped_slot = light
+                                .bindings
+                                .iter()
+                                .find(|b| {
+                                    s(b, "from_version_id") == zvid
+                                        && s(b, "to_version_id") == ver_id
+                                        && i(b, "to_slot") == light.slot as i64
+                                        && s(b, "kind") != "missing"
+                                })
+                                .map(|b| i(b, "from_slot").max(0) as usize)
+                                .unwrap_or(light.slot)
+                                .min(zpages - 1);
+                            let zsem = s(zv, "semver");
+                            let zlabel = if zsem.is_empty() {
+                                "草稿".to_string()
+                            } else {
+                                format!("v{zsem}")
+                            };
+                            Some((
+                                page_title(zv, mapped_slot),
+                                page_desc(zv, mapped_slot),
+                                page_note(zv, mapped_slot),
+                                zlabel,
+                            ))
+                        })
+                } else {
+                    None
+                };
+                (uname, lang, tag, orig)
+            } else {
+                (String::new(), "zh".to_string(), String::new(), None)
+            };
+
+        let eyebrow = if cur_lang != "zh" {
+            format!(
+                "{} · {} / {} · {}",
+                unit_name,
+                light.slot + 1,
+                page_count,
+                cur_lang.to_uppercase()
+            )
+        } else if unit_name.is_empty() {
+            format!("{} / {}", light.slot + 1, page_count)
+        } else {
+            format!("{} · {} / {}", unit_name, light.slot + 1, page_count)
+        };
+
+        let mut launch_present = false;
+
+        // Render inside CentralPanel (.sheetpage #lightDlg inside #pageHost):
+        // top bar, 268px left sidebar, and 46px bottom bar remain visible.
+        egui::Frame::NONE
+            .fill(palette_color(APP_BG))
+            .inner_margin(egui::Margin {
+                left: 22,
+                right: 22,
+                top: 16,
+                bottom: 16,
+            })
+            .show(ui, |ui| {
+                let avail_w = ui.available_width();
+                let avail_h = ui.available_height();
+                let side_width = 300.0;
+                let left_width = (avail_w - 14.0 - side_width).max(260.0);
+                let stage_width = left_width
+                    .min(((avail_h - 140.0).max(220.0)) * 16.0 / 9.0)
+                    .max(260.0);
+                let stage_px = (stage_width * ui.ctx().pixels_per_point())
+                    .round()
+                    .max(1280.0) as u32;
+                if light.slot + 1 < page_count {
+                    let _ = self.stage_slide(&ver_id, light.slot + 1, stage_px);
+                }
+                if light.slot > 0 {
+                    let _ = self.stage_slide(&ver_id, light.slot - 1, stage_px);
+                }
+
+                egui::ScrollArea::vertical()
+                    .id_salt("light_406_body")
                     .show(ui, |ui| {
-                        ui.set_min_size(preview_screen.size());
-                        // Prototype .lb-layout (lightDlg): the
-                        // detail shell pads 22px at the sides and
-                        // 16px at the top, the two columns sit
-                        // 14px apart, and the sidebar is a fixed
-                        // 300px (.lb-side — the prototype's final
-                        // effective value, SPEC 差 35 corrected).
-                        // The stage takes the remaining width,
-                        // capped so the slide never outgrows the
-                        // viewport height (SPEC 差 34): the stage
-                        // column is at most (screen height − 240)
-                        // tall at 16:9.
-                        let side_width = 300.0;
-                        let left_width = (screen.width() - 22.0 - 14.0 - side_width - 22.0)
-                            .max(260.0)
-                            .min(((screen.height() - 240.0).max(200.0)) * 16.0 / 9.0);
                         ui.horizontal_top(|ui| {
-                            ui.add_space(22.0);
+                            ui.spacing_mut().item_spacing.x = 14.0;
+                            // ---- Left: .lb-main (stage + .note-box + optional .orig-box) ----
                             ui.vertical(|ui| {
                                 ui.set_width(left_width);
-                                ui.add_space(16.0);
-                                let image_width = left_width;
-                                ui.with_layout(
-                                    egui::Layout::top_down(egui::Align::Center),
-                                    |ui| {
-                                        self.thumb_ui(
+                                if stage_width < left_width {
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(((left_width - stage_width) / 2.0).max(0.0));
+                                        if self.light_stage_ui(
                                             ui,
-                                            &s(&light.version, "id"),
+                                            &light.version,
                                             light.slot,
-                                            image_width,
-                                        );
-                                    },
-                                );
+                                            stage_width,
+                                            &eyebrow,
+                                            &version_tag,
+                                        ) {
+                                            launch_present = true;
+                                        }
+                                    });
+                                } else if self.light_stage_ui(
+                                    ui,
+                                    &light.version,
+                                    light.slot,
+                                    stage_width,
+                                    &eyebrow,
+                                    &version_tag,
+                                ) {
+                                    launch_present = true;
+                                }
                                 ui.add_space(10.0);
-                                // Prototype .note-box: --panel2
-                                // fill, 12px radius, 12/14 padding,
-                                // 10px below the stage (inline
-                                // margin in the lightDlg markup).
+                                // Prototype .note-box: --panel2 fill, 12px radius, 12/14 padding.
                                 egui::Frame::NONE
                                     .fill(palette_color(HOVER_BG))
                                     .corner_radius(12)
@@ -3682,182 +4119,199 @@ impl App {
                                         bottom: 12,
                                     })
                                     .show(ui, |ui| {
-                                        ui.set_width(left_width - 28.0);
-                                        ui.label(
-                                            egui::RichText::new("这一页的备注（讲稿）").strong(),
-                                        );
-                                        let note = page_note(&light.version, light.slot);
-                                        // Prototype note-box: an
-                                        // empty note reads as a
-                                        // sentence, not a dash
-                                        // (drill re-audit R4).
-                                        ui.label(if note.is_empty() {
-                                            "这一页暂无备注。"
-                                        } else {
-                                            &note
+                                        ui.vertical(|ui| {
+                                            ui.set_width((left_width - 28.0).max(120.0));
+                                            ui.label(
+                                                egui::RichText::new("这一页的备注（讲稿）")
+                                                    .size(13.5)
+                                                    .strong(),
+                                            );
+                                            ui.add_space(4.0);
+                                            let note = page_note(&light.version, light.slot);
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(if note.is_empty() {
+                                                        "这一页暂无备注。"
+                                                    } else {
+                                                        &note
+                                                    })
+                                                    .size(13.5)
+                                                    .color(palette_color(TEXT_WEAK)),
+                                                )
+                                                .wrap(),
+                                            );
                                         });
                                     });
+                                if let Some((zt, zd, zn, zver)) = &zh_orig {
+                                    ui.add_space(10.0);
+                                    egui::Frame::NONE
+                                        .fill(palette_color(PANEL_BG))
+                                        .stroke(egui::Stroke::new(1.0, palette_color(LINE_34)))
+                                        .corner_radius(6)
+                                        .inner_margin(egui::Margin::symmetric(12, 10))
+                                        .show(ui, |ui| {
+                                            ui.vertical(|ui| {
+                                                ui.set_width((left_width - 26.0).max(120.0));
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "中文原文对照（中文 {zver}）"
+                                                    ))
+                                                    .size(12.5)
+                                                    .strong(),
+                                                );
+                                                ui.add_space(4.0);
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(format!(
+                                                            "中文原题：{zt}"
+                                                        ))
+                                                        .size(12.5)
+                                                        .color(palette_color(TEXT_WEAK)),
+                                                    )
+                                                    .wrap(),
+                                                );
+                                                if !zd.is_empty() {
+                                                    ui.add(
+                                                        egui::Label::new(
+                                                            egui::RichText::new(format!(
+                                                                "中文说明：{zd}"
+                                                            ))
+                                                            .size(12.5)
+                                                            .color(palette_color(TEXT_FAINT)),
+                                                        )
+                                                        .wrap(),
+                                                    );
+                                                }
+                                                if !zn.is_empty() {
+                                                    ui.add(
+                                                        egui::Label::new(
+                                                            egui::RichText::new(format!(
+                                                                "中文讲稿：{zn}"
+                                                            ))
+                                                            .size(12.5)
+                                                            .color(palette_color(TEXT_FAINT)),
+                                                        )
+                                                        .wrap(),
+                                                    );
+                                                }
+                                            });
+                                        });
+                                }
                             });
-                            ui.add_space(14.0);
-                            egui::ScrollArea::vertical()
-                                .max_height(preview_screen.height() - 32.0)
-                                .show(ui, |ui| {
-                                    ui.set_width(side_width);
-                                    ui.add_space(16.0);
-                                    // Prototype .lb-side: a plain
-                                    // column on the page ground —
-                                    // no filled panel. Language
-                                    // head, candidate standard
-                                    // cards, then the full-width
-                                    // bind button.
-                                    if light.targets.is_empty() {
-                                        ui.label(
-                                            egui::RichText::new("暂无其他语言版本").weak(),
-                                        );
-                                        return;
+
+                            // ---- Right: .lb-side (fixed 300px, direct on APP_BG) ----
+                            ui.vertical(|ui| {
+                                ui.set_width(side_width);
+                                if light.targets.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new("暂无其他语言版本")
+                                            .size(13.0)
+                                            .color(palette_color(TEXT_FAINT)),
+                                    );
+                                    return;
+                                }
+                                let target = light.targets[light.target_index].clone();
+                                if light.targets.len() > 1 {
+                                    let labels: Vec<String> = light
+                                        .targets
+                                        .iter()
+                                        .map(|t| lang_display_name(&t.lang))
+                                        .collect();
+                                    let label_refs: Vec<&str> =
+                                        labels.iter().map(|s| s.as_str()).collect();
+                                    if let Some(next) = segmented(
+                                        ui,
+                                        &label_refs,
+                                        light.target_index,
+                                        SegStyle::Soft,
+                                    ) {
+                                        light.target_index = next;
                                     }
-                                    let target = light.targets[light.target_index].clone();
+                                } else {
                                     ui.label(
                                         egui::RichText::new(lang_display_name(&target.lang))
                                             .strong()
-                                            .size(15.0),
+                                            .size(14.5),
                                     );
-                                    if light.targets.len() > 1 {
-                                        ui.horizontal_wrapped(|ui| {
-                                            for (index, t) in
-                                                light.targets.iter().enumerate()
-                                            {
-                                                if ui
-                                                    .selectable_label(
-                                                        light.target_index == index,
-                                                        t.lang.to_uppercase(),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    light.target_index = index;
-                                                }
-                                            }
-                                        });
+                                }
+                                ui.add_space(6.0);
+                                let target = light.targets[light.target_index].clone();
+                                let target_id = s(&target.version, "id");
+                                let pages = i(&target.version, "page_count").max(0) as usize;
+                                for slot in 0..pages {
+                                    if slot > 0 {
+                                        ui.add_space(6.0);
                                     }
-                                    ui.add_space(8.0);
-                                    let target_id = s(&target.version, "id");
-                                    let pages = i(&target.version, "page_count").max(0) as usize;
-                                    for slot in 0..pages {
-                                        let candidate = PageBindingRequest {
-                                            unit_id: light.unit_id.clone(),
-                                            from_version_id: s(&light.version, "id"),
-                                            from_slot: light.slot as i64,
-                                            to_version_id: target_id.clone(),
-                                            to_slot: slot as i64,
-                                        };
-                                        let exact = exact_binding(&light.bindings, &candidate);
-                                        let occupied =
-                                            occupied_binding(&light.bindings, &candidate);
-                                        // Prototype: the candidates
-                                        // are standard cards (the
-                                        // wall's own component),
-                                        // stacked at the sidebar's
-                                        // full width; the bound one
-                                        // takes the selected accent
-                                        // border and a × that
-                                        // unbinds (the prototype's
-                                        // cover-corner × sits at
-                                        // the title row's right end
-                                        // here — declared).
-                                        let clicked = standard_card_v(
-                                            ui,
-                                            exact.is_some(),
-                                            None,
-                                            true,
-                                            CardVariant::Normal,
-                                            |ui| {
-                                                ui.set_width(side_width - 2.0);
-                                                ui.spacing_mut().item_spacing.y = 0.0;
-                                                // T2: candidate
-                                                // covers take the
-                                                // slide-art
-                                                // placeholder too.
-                                                let response = self.thumb_response_art(
-                                                    ui,
-                                                    &target_id,
-                                                    slot,
-                                                    side_width - 2.0,
-                                                    false,
-                                                    &format!(
-                                                        "{} / {}",
-                                                        slot + 1,
-                                                        pages
-                                                    ),
-                                                    &page_title(&target.version, slot),
-                                                );
-                                                egui::Frame::NONE
-                                                    .inner_margin(egui::Margin {
-                                                        left: 12,
-                                                        right: 12,
-                                                        top: 11,
-                                                        bottom: 12,
-                                                    })
-                                                    .show(ui, |ui| {
-                                                        ui.horizontal(|ui| {
-                                                            ui.add(
-                                                                egui::Label::new(
-                                                                    egui::RichText::new(
-                                                                        page_title(
-                                                                            &target.version,
-                                                                            slot,
-                                                                        ),
-                                                                    )
-                                                                    .strong()
-                                                                    .size(13.0),
-                                                                )
-                                                                .truncate(),
-                                                            );
-                                                            if exact.is_some() {
-                                                                ui.with_layout(
-                                                                    egui::Layout::right_to_left(
-                                                                        egui::Align::Center,
-                                                                    ),
-                                                                    |ui| {
-                                                                        if ui
-                                                                            .small_button("×")
-                                                                            .on_hover_text(
-                                                                                "解除绑定",
-                                                                            )
-                                                                            .clicked()
-                                                                        {
-                                                                            unbind =
-                                                                                exact.clone();
-                                                                        }
-                                                                    },
-                                                                );
-                                                            }
-                                                        });
-                                                        // Badges row (prototype
-                                                        // stdCard badges): the
-                                                        // candidate page's 说明
-                                                        // as an info badge
-                                                        // (audit R3 — the data
-                                                        // rides the version's
-                                                        // page rows since the
-                                                        // R3 data line; a page
-                                                        // without one shows no
-                                                        // badge), then the
-                                                        // occupied badge.
+                                    let candidate = PageBindingRequest {
+                                        unit_id: light.unit_id.clone(),
+                                        from_version_id: s(&light.version, "id"),
+                                        from_slot: light.slot as i64,
+                                        to_version_id: target_id.clone(),
+                                        to_slot: slot as i64,
+                                    };
+                                    let exact = exact_binding(&light.bindings, &candidate);
+                                    let occupied = occupied_binding(&light.bindings, &candidate);
+                                    let mut cover_rect = egui::Rect::NOTHING;
+                                    let mut unbind_rect = egui::Rect::NOTHING;
+                                    let card_resp = standard_card_v(
+                                        ui,
+                                        exact.is_some(),
+                                        None,
+                                        true,
+                                        CardVariant::Normal,
+                                        |ui| {
+                                            ui.set_width(side_width - 2.0);
+                                            ui.spacing_mut().item_spacing.y = 0.0;
+                                            let cover_resp = self.thumb_response_art(
+                                                ui,
+                                                &target_id,
+                                                slot,
+                                                side_width - 2.0,
+                                                false,
+                                                &format!(
+                                                    "{} · {} / {}",
+                                                    lang_display_name(&target.lang),
+                                                    slot + 1,
+                                                    pages
+                                                ),
+                                                &page_title(&target.version, slot),
+                                            );
+                                            cover_rect = cover_resp.rect;
+                                            egui::Frame::NONE
+                                                .inner_margin(egui::Margin {
+                                                    left: 12,
+                                                    right: 12,
+                                                    top: 10,
+                                                    bottom: 10,
+                                                })
+                                                .show(ui, |ui| {
+                                                    ui.vertical(|ui| {
+                                                        ui.set_width(side_width - 26.0);
+                                                        ui.add(
+                                                            egui::Label::new(
+                                                                egui::RichText::new(page_title(
+                                                                    &target.version,
+                                                                    slot,
+                                                                ))
+                                                                .strong()
+                                                                .size(13.0),
+                                                            )
+                                                            .truncate(),
+                                                        );
                                                         let cand_desc =
                                                             page_desc(&target.version, slot);
                                                         if !cand_desc.is_empty()
                                                             || occupied.is_some()
                                                         {
+                                                            ui.add_space(6.0);
                                                             ui.horizontal_wrapped(|ui| {
+                                                                ui.spacing_mut().item_spacing =
+                                                                    egui::vec2(5.0, 4.0);
                                                                 if !cand_desc.is_empty() {
                                                                     chip(
                                                                         ui,
-                                                                        &desc_line(
-                                                                            &cand_desc, 26,
-                                                                        ),
-                                                                        palette_color(
-                                                                            ACCENT_DEEP,
-                                                                        ),
+                                                                        &desc_line(&cand_desc, 26),
+                                                                        palette_color(ACCENT_DEEP),
                                                                         CHIP_BLUE_BG,
                                                                     );
                                                                 }
@@ -3874,47 +4328,107 @@ impl App {
                                                             });
                                                         }
                                                     });
-                                                response.clicked()
-                                            },
-                                        )
-                                        .inner;
-                                        if clicked && exact.is_none() {
-                                            request = Some(candidate);
+                                                });
+                                        },
+                                    );
+                                    let card_rect = card_resp.response.rect;
+                                    // Top-right corner × button on bound cards (.cache-corner > .cache-ic).
+                                    if exact.is_some() && cover_rect.is_positive() {
+                                        let btn_rect = egui::Rect::from_min_size(
+                                            egui::pos2(
+                                                cover_rect.max.x - 6.0 - 26.0,
+                                                cover_rect.min.y + 6.0,
+                                            ),
+                                            egui::vec2(26.0, 26.0),
+                                        );
+                                        unbind_rect = btn_rect;
+                                        let u_resp = ui.interact(
+                                            btn_rect,
+                                            ui.scope_id().with(("lb_unbind", &target_id, slot)),
+                                            egui::Sense::click(),
+                                        );
+                                        let bg = if u_resp.hovered() {
+                                            egui::Color32::from_rgba_unmultiplied(8, 10, 9, 210)
+                                        } else {
+                                            egui::Color32::from_rgba_unmultiplied(8, 10, 9, 150)
+                                        };
+                                        ui.painter().rect(
+                                            btn_rect,
+                                            6.0,
+                                            bg,
+                                            egui::Stroke::new(
+                                                1.0,
+                                                egui::Color32::from_rgba_unmultiplied(
+                                                    255, 255, 255, 80,
+                                                ),
+                                            ),
+                                            egui::StrokeKind::Inside,
+                                        );
+                                        ui.painter().text(
+                                            btn_rect.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            "×",
+                                            egui::FontId::proportional(14.0),
+                                            egui::Color32::WHITE,
+                                        );
+                                        if u_resp.clicked() {
+                                            unbind = exact.clone();
                                         }
-                                        ui.add_space(8.0);
+                                        let _ = u_resp
+                                            .on_hover_text("解除绑定")
+                                            .on_hover_cursor(egui::CursorIcon::PointingHand);
                                     }
-                                    ui.add_space(2.0);
-                                    // Prototype #lbGoBind: primary,
-                                    // the sidebar's full width.
-                                    if ui
-                                        .add_sized(
-                                            egui::vec2(side_width, 28.0),
-                                            egui::Button::new(
-                                                egui::RichText::new(tr("绑定"))
-                                                    .size(12.5)
-                                                    .color(egui::Color32::WHITE),
-                                            )
-                                            .fill(ACCENT)
-                                            .corner_radius(6),
-                                        )
-                                        .clicked()
+                                    // Whole-card click binds (unless click landed on ×).
+                                    if card_rect.is_positive()
+                                        && ui.input(|inp| inp.pointer.primary_clicked())
                                     {
-                                        start_pick = true;
+                                        if let Some(pos) =
+                                            ui.input(|inp| inp.pointer.interact_pos())
+                                        {
+                                            if card_rect.contains(pos)
+                                                && !unbind_rect.contains(pos)
+                                                && exact.is_none()
+                                            {
+                                                request = Some(candidate);
+                                            }
+                                        }
                                     }
-                                });
+                                }
+                                ui.add_space(10.0);
+                                // Prototype #lbGoBind: primary full-width button.
+                                if ui
+                                    .add_sized(
+                                        egui::vec2(side_width, 30.0),
+                                        egui::Button::new(
+                                            egui::RichText::new(tr("绑定"))
+                                                .size(12.5)
+                                                .strong()
+                                                .color(egui::Color32::WHITE),
+                                        )
+                                        .fill(ACCENT)
+                                        .corner_radius(6),
+                                    )
+                                    .clicked()
+                                {
+                                    start_pick = true;
+                                }
+                            });
                         });
                     });
             });
+
         if let Some(binding) = unbind {
             self.delete_page_binding(&light.unit_id, &s(&binding, "id"));
             if let ContentFrame::Unit(st) = self.content.stack.top() {
                 light.bindings = st.bindings.clone();
+                light.targets = binding_targets(&st.detail, &s(&light.version, "id"));
             }
         }
         if let Some(request) = request {
             self.request_page_binding(request, &light.bindings);
             if let ContentFrame::Unit(st) = self.content.stack.top() {
                 light.bindings = st.bindings.clone();
+                light.targets = binding_targets(&st.detail, &s(&light.version, "id"));
             }
         }
         if start_pick {
@@ -3932,6 +4446,9 @@ impl App {
             }
             self.msg = format!("为第 {} 页挑对应页——单击缩略图完成绑定", light.slot + 1);
             return None;
+        }
+        if launch_present {
+            self.present_unit_version(&unit_name, &light.version, DcMode::Play, light.slot);
         }
         Some(Overlay::Light(light))
     }
@@ -4016,5 +4533,122 @@ mod tests {
             page_bind_state(&bindings, "v-zh", 0, "v-en"),
             PageBindState::Missing(_)
         ));
+    }
+
+    #[test]
+    fn header_does_not_collapse_scroll_area_below() {
+        let ctx = egui::Context::default();
+        let mut header_rect = egui::Rect::NOTHING;
+        let mut scroll_avail = egui::Vec2::ZERO;
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(1200.0, 800.0),
+                )),
+                ..Default::default()
+            },
+            |ctx_ui| {
+                egui::CentralPanel::default().show(ctx_ui, |ui| {
+                    header_rect = ui
+                        .allocate_ui_with_layout(
+                            egui::vec2(ui.available_width(), 28.0),
+                            egui::Layout::left_to_right(egui::Align::BOTTOM).with_main_wrap(true),
+                            |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(
+                                            "A complete infrastructure framework supporting battery circularity.",
+                                        )
+                                        .size(20.0)
+                                        .strong(),
+                                    )
+                                    .wrap(),
+                                );
+                                ui.horizontal(|ui| {
+                                    ui.label("当前 v1.0.0 · 跟随最新");
+                                });
+                            },
+                        )
+                        .response
+                        .rect;
+                    scroll_avail = ui.available_size();
+                });
+            },
+        );
+        out.textures_delta.clear();
+        eprintln!("header_rect={header_rect:?}, scroll_avail={scroll_avail:?}");
+        assert!(header_rect.max.y < 140.0, "header_rect={header_rect:?}");
+        assert!(scroll_avail.y > 600.0, "scroll_avail={scroll_avail:?}");
+    }
+
+    #[test]
+    fn history_card_stacks_head_thumbs_caption_vertically() {
+        let ctx = egui::Context::default();
+        let mut card_rect = egui::Rect::NOTHING;
+        let mut head_rect = egui::Rect::NOTHING;
+        let mut thumbs_rect = egui::Rect::NOTHING;
+        let mut caption_rect = egui::Rect::NOTHING;
+        let card_w = 280.0f32;
+        let inner_w = card_w - 22.0;
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(1200.0, 800.0),
+                )),
+                ..Default::default()
+            },
+            |ctx_ui| {
+                egui::CentralPanel::default().show(ctx_ui, |ui| {
+                    ui.horizontal_top(|ui| {
+                        card_rect = egui::Frame::NONE
+                            .stroke(egui::Stroke::new(1.0, egui::Color32::GRAY))
+                            .inner_margin(egui::Margin::same(10))
+                            .show(ui, |ui| {
+                                ui.vertical(|ui| {
+                                    ui.set_width(inner_w);
+                                    head_rect = ui
+                                        .horizontal(|ui| {
+                                            ui.label("v1.0.0");
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    let _ = ui.button("使用");
+                                                },
+                                            );
+                                        })
+                                        .response
+                                        .rect;
+                                    ui.add_space(9.0);
+                                    thumbs_rect = ui
+                                        .horizontal(|ui| {
+                                            ui.allocate_exact_size(
+                                                egui::vec2(inner_w, inner_w * 9.0 / 16.0),
+                                                egui::Sense::hover(),
+                                            );
+                                        })
+                                        .response
+                                        .rect;
+                                    ui.add_space(8.0);
+                                    caption_rect = ui.label("2026-11-26 · 超级管理员").rect;
+                                });
+                            })
+                            .response
+                            .rect;
+                    });
+                });
+            },
+        );
+        out.textures_delta.clear();
+        assert!(card_rect.width() <= card_w + 1.0, "card_rect={card_rect:?}");
+        assert!(
+            head_rect.max.y < thumbs_rect.min.y,
+            "head={head_rect:?}, thumbs={thumbs_rect:?}"
+        );
+        assert!(
+            thumbs_rect.max.y < caption_rect.min.y,
+            "thumbs={thumbs_rect:?}, caption={caption_rect:?}"
+        );
     }
 }

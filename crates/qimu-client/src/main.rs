@@ -14,6 +14,7 @@ mod index_lineage;
 mod page_editor;
 mod prototype_dialogs;
 mod server_menu;
+mod settings_ui;
 mod shell;
 mod workspace_controls;
 
@@ -27,7 +28,8 @@ use prototype_dialogs::{PullDialogState, PushDialogState, ShareDialogState};
 
 use chrome_icons::{ChromeIcon, ChromeIcons};
 use content_detail::{
-    binding_targets, BindPanelState, LightState, PageBindingPick, PageBindingRequest,
+    binding_targets, BindPanelState, DetailAct, LightState, PageBindingPick,
+    PageBindingRequest,
 };
 use index_controls::{IndexMoreAction, IndexOverviewControls, IndexScope};
 use index_lineage::IndexGraphs;
@@ -1332,6 +1334,23 @@ fn load_plaza_item_folders() -> std::collections::HashMap<String, String> {
     out
 }
 
+fn load_cache_auto() -> bool {
+    client_settings()["auto_cache"].as_bool().unwrap_or(false)
+}
+
+fn load_my_contacts() -> Vec<String> {
+    client_settings()["my_contacts"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::trim))
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// One JSON-lines control connection to a DeckCraft instance.
 struct DcControl {
     reader: std::io::BufReader<std::net::TcpStream>,
@@ -1841,6 +1860,11 @@ struct UnitState {
     /// rendition chips; survives detail reloads (reload mutates
     /// the frame in place).
     selected_version: Option<String>,
+    /// True when the user selected the unnumbered working card
+    /// directly (needed when `row.working` is absent and the
+    /// card mirrors `row.latest` so clicking it does not also
+    /// highlight the numbered `latest` card).
+    selected_working_card: bool,
     selected_page: Option<usize>,
     /// #101 wall page drag (mirrors DeckState's N4 fields):
     /// the slot the pointer press started on and where it
@@ -1863,11 +1887,6 @@ struct UnitState {
     /// click only selects it; the drill is the main button or
     /// a cover double-click).
     kid_sel: Option<String>,
-    /// History publish inline input (prototype .vh-msg-in):
-    /// (card key, note text, wants focus) while a draft card's
-    /// publish input is open. The card key is the version id
-    /// for a numbered draft, or the working card's key.
-    draft_pub: Option<(String, String, bool)>,
     /// History renumber inline edit (super admin): (version
     /// id, text) while a card's bigver is being edited.
     renum_edit: Option<(String, String)>,
@@ -1894,6 +1913,12 @@ struct UnitState {
     /// The card width `hist_card_h` was measured at; a width
     /// change invalidates the measurements.
     hist_card_w: f32,
+    /// Wall thumbnail cell height equalization per row.
+    thumb_cell_h: std::collections::HashMap<usize, f32>,
+    thumb_cell_w: f32,
+    /// Embedded child card height equalization per row.
+    kid_card_h: std::collections::HashMap<String, f32>,
+    kid_card_w: f32,
     scripts_for: Option<String>, // version id whose 讲稿 is being edited
     scripts_edit: Vec<String>,
     translate_to: String,
@@ -1916,6 +1941,7 @@ impl UnitState {
             bindings: Vec::new(),
             selected_rendition: None,
             selected_version: None,
+            selected_working_card: false,
             selected_page: None,
             page_press: None,
             page_drag: None,
@@ -1924,7 +1950,6 @@ impl UnitState {
             meta_edit: None,
             meta_edit_focus: false,
             kid_sel: None,
-            draft_pub: None,
             renum_edit: None,
             renum_focus: false,
             vh_press: None,
@@ -1933,6 +1958,10 @@ impl UnitState {
             hist_thumb_sel: None,
             hist_card_h: std::collections::HashMap::new(),
             hist_card_w: 0.0,
+            thumb_cell_h: std::collections::HashMap::new(),
+            thumb_cell_w: 0.0,
+            kid_card_h: std::collections::HashMap::new(),
+            kid_card_w: 0.0,
             scripts_for: None,
             scripts_edit: Vec::new(),
             translate_to: String::new(),
@@ -1977,6 +2006,7 @@ enum IndexDetailAction {
         branch: String,
         commit: Option<String>,
     },
+    OpenUnit(String),
     Export(&'static str),
     Commit(Vec<Value>, &'static str),
     Insert(usize),
@@ -1984,11 +2014,12 @@ enum IndexDetailAction {
     SwitchVersion(usize, String, String, bool),
 }
 
-/// 概览帧状态：卡片墙的选中索引（单选高亮）。
+/// 概览帧状态：卡片墙的选中索引（单选高亮）与每组展开的历史开关。
 #[derive(Default)]
 struct OverviewState {
     selected: Option<String>,
     graphs: Option<Result<IndexGraphs, String>>,
+    hist_open: std::collections::HashSet<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2059,7 +2090,7 @@ impl IndexDetailState {
 
 /// 新建索引帧状态（整页单帧呈现）。表单随帧销毁（旧实现跨次
 /// 保留 new_name/new_group 的泄漏在此收敛，见 REPORT §3.5）。
-#[derive(Default)]
+#[derive(Clone)]
 struct CreateState {
     new_name: String,
     new_group: String,
@@ -2069,12 +2100,32 @@ struct CreateState {
     /// default home, 未分类 (the create call sends folder_id
     /// None and the index lands folder-less).
     folder: Option<String>,
+    /// Index visibility scope API value (`company` | `parent_org` |
+    /// `dept_sub` | `dept` | `private`), aligned with prototype/spec §5.6.
+    scope: String,
+    /// Filter text for narrowing the content block pick list.
+    unit_filter: String,
     /// unit_id, rendition_id, checked
     pick: Vec<(String, String, bool)>,
     /// Set by 取消/创建成功；the dispatcher pops.
     closed: bool,
     /// 创建成功后要打开的新索引 id（分发器在弹帧后执行）。
     open_after: Option<String>,
+}
+
+impl Default for CreateState {
+    fn default() -> Self {
+        Self {
+            new_name: String::new(),
+            new_group: String::new(),
+            folder: None,
+            scope: "company".into(),
+            unit_filter: String::new(),
+            pick: Vec::new(),
+            closed: false,
+            open_after: None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -2086,23 +2137,50 @@ struct SettingsState {
     ai_key: String,
     ai_has_key: bool,
     ai_loaded: bool,
-    /// Pending-submission retention days (server setting,
-    /// super-only section 「投稿设置」); loaded on first open.
+    /// Pending-submission retention days & global self-maintenance policy
+    /// (server setting, super-only section 「高级功能与备份」); loaded on first open.
     sub_ttl_days: i64,
     sub_ttl_loaded: bool,
+    pub_self_maint: bool,
+    pub_default_mode: String,
+    pub_minor_mode: String,
     glossary_text: String,
+    glossary_src: String,
+    glossary_dst: String,
     profile: BTreeMap<String, String>,
     company: BTreeMap<String, String>,
+    company_mat_name: String,
+    company_mat_note: String,
     languages_text: String,
+    lang_input: String,
     dept_name: String,
+    dept_rename: String,
+    org_sel_dept: Option<String>,
     user_name: String,
     user_display: String,
     user_password: String,
+    user_dept_pick: String,
+    user_role_pick: String,
+    edit_user_id: String,
+    edit_user_dept: String,
+    edit_user_role: String,
     group_name: String,
+    grants_loaded: bool,
     grant_group: String,
     grant_subject_type: String,
     grant_subject_id: String,
     grant_capability: String,
+    pw_old: String,
+    pw_new: String,
+    pw_new2: String,
+    pw_status: String,
+    contact_input: String,
+    contact_picker_open: bool,
+    org_contacts: Vec<Value>,
+    org_contacts_loaded: bool,
+    local_backup_note: String,
+    server_backup_info: Option<Value>,
+    server_backup_loaded: bool,
 }
 
 /// === Drill-down navigation stack (PageHost, prototype A9) =======
@@ -3339,6 +3417,8 @@ enum Overlay {
     PickTemplate(PickTemplateState),
     Confirm(ConfirmState),
     DeckInfo(DeckInfoState),
+    InsertOrder(InsertOrderState),
+    DraftPublish(DraftPublishState),
 }
 
 /// sdInfo (bottom bar, T5 ruling 2026-11-24): a read-only
@@ -3353,6 +3433,29 @@ struct DeckInfoState {
     version: String,
     submitter: String,
     scope: String,
+}
+
+pub(crate) enum DraftPublishKind {
+    Working {
+        working_id: Option<String>,
+        rendition_id: String,
+        head_id: String,
+        head_is_draft: bool,
+        added: usize,
+    },
+    Numbered {
+        version_id: String,
+        added: usize,
+    },
+}
+
+pub(crate) struct DraftPublishState {
+    unit_id: String,
+    kind: DraftPublishKind,
+    base_semver: String,
+    bump: usize,
+    note: String,
+    focus: bool,
 }
 
 struct ConfirmState {
@@ -4025,6 +4128,8 @@ struct App {
     team_create_open: bool,
     team_member_pick: String,
     cache_entries: Vec<Value>,
+    cache_auto: bool,
+    my_contacts: Vec<String>,
     /// PPT clipboard sidecar meta (see `load_clip_meta`); None while
     /// the clipboard is empty. The fragment bytes stay on disk.
     ppt_clip: Option<Value>,
@@ -4041,9 +4146,12 @@ struct App {
     screenshot_path: Option<String>,
     screenshot_done: bool,
     thumbs: std::collections::HashMap<String, ThumbState>,
+    stage_slides: std::collections::HashMap<String, ThumbState>,
     icon_tex: std::collections::HashMap<&'static str, egui::TextureHandle>,
     thumb_tx: std::sync::mpsc::Sender<(String, Option<Vec<u8>>)>,
     thumb_rx: std::sync::mpsc::Receiver<(String, Option<Vec<u8>>)>,
+    stage_tx: std::sync::mpsc::Sender<(String, Option<(u32, u32, Vec<u8>)>)>,
+    stage_rx: std::sync::mpsc::Receiver<(String, Option<(u32, u32, Vec<u8>)>)>,
     att_cache: std::collections::HashMap<String, Vec<Value>>,
     pdf_view: Option<PdfView>,
     pdf_tx: std::sync::mpsc::Sender<(
@@ -4427,7 +4535,118 @@ enum PickState {
     Insert {
         index_name: String,
         at: usize,
+        selected: Vec<InsertPick>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InsertPick {
+    unit_id: String,
+    rendition_id: String,
+    version_id: String,
+}
+
+#[derive(Clone)]
+struct InsertOrderCard {
+    id: u64,
+    pick: InsertPick,
+}
+
+#[derive(Clone)]
+struct InsertOrderState {
+    cards: Vec<InsertOrderCard>,
+    selected: Option<u64>,
+    clipboard: Vec<InsertPick>,
+    next_id: u64,
+}
+
+impl InsertOrderState {
+    fn new(picks: Vec<InsertPick>) -> Self {
+        let cards: Vec<InsertOrderCard> = picks
+            .into_iter()
+            .enumerate()
+            .map(|(id, pick)| InsertOrderCard {
+                id: id as u64,
+                pick,
+            })
+            .collect();
+        let next_id = cards.len() as u64;
+        Self {
+            cards,
+            selected: None,
+            clipboard: Vec::new(),
+            next_id,
+        }
+    }
+
+    fn selected_pick(&self) -> Option<&InsertPick> {
+        self.cards
+            .iter()
+            .find(|card| Some(card.id) == self.selected)
+            .map(|card| &card.pick)
+    }
+
+    fn copy(&mut self) {
+        if let Some(pick) = self.selected_pick().cloned() {
+            self.clipboard = vec![pick];
+        }
+    }
+
+    fn cut(&mut self) {
+        let Some(id) = self.selected else {
+            return;
+        };
+        if let Some(pos) = self.cards.iter().position(|card| card.id == id) {
+            self.clipboard = vec![self.cards.remove(pos).pick];
+            self.selected = None;
+        }
+    }
+
+    fn paste(&mut self) {
+        if self.clipboard.is_empty() {
+            return;
+        }
+        let at = self
+            .selected
+            .and_then(|id| self.cards.iter().position(|card| card.id == id))
+            .map_or(self.cards.len(), |pos| pos + 1);
+        let picks = self.clipboard.clone();
+        let mut at = at;
+        let mut first = None;
+        for pick in picks {
+            let id = self.next_id;
+            self.next_id += 1;
+            first.get_or_insert(id);
+            self.cards.insert(at, InsertOrderCard { id, pick });
+            at += 1;
+        }
+        self.selected = first;
+    }
+
+    fn move_card(&mut self, dragged: u64, before: usize) {
+        let Some(from) = self.cards.iter().position(|card| card.id == dragged) else {
+            return;
+        };
+        let card = self.cards.remove(from);
+        let to = if from < before { before - 1 } else { before };
+        self.cards.insert(to.min(self.cards.len()), card);
+        self.selected = Some(dragged);
+    }
+
+    fn picks(&self) -> Vec<InsertPick> {
+        self.cards.iter().map(|card| card.pick.clone()).collect()
+    }
+}
+
+#[derive(Clone)]
+struct InsertOrderDrag(u64);
+
+fn toggle_insert_pick(selected: &mut Vec<InsertPick>, pick: InsertPick) {
+    if selected.iter().any(|item| item.unit_id == pick.unit_id) {
+        selected.retain(|item| item.unit_id != pick.unit_id);
+    } else {
+        selected.push(pick);
+    }
 }
 
 /// Inline folder-tree editing (right-click menu): rename an existing
@@ -5301,6 +5520,7 @@ impl App {
         let (local, local_open_error) = local_store::LocalStore::open_library();
         let local = local.map(std::sync::Arc::new);
         let (thumb_tx, thumb_rx) = std::sync::mpsc::channel();
+        let (stage_tx, stage_rx) = std::sync::mpsc::channel();
         let (pdf_tx, pdf_rx) = std::sync::mpsc::channel();
         let (upd_tx, upd_rx) = std::sync::mpsc::channel();
         let (translate_tx, translate_rx) = std::sync::mpsc::channel();
@@ -5386,8 +5606,10 @@ impl App {
             team_create_open: false,
             team_member_pick: String::new(),
             cache_entries: load_cache_index(),
+            cache_auto: load_cache_auto(),
+            my_contacts: load_my_contacts(),
             ppt_clip: load_clip_meta(),
-            cache_policy: json!({ "allowed": true, "max_mb": 500 }),
+            cache_policy: json!({ "allowed": true, "mode": "allow", "max_mb": 500 }),
             index_covers: std::collections::HashMap::new(),
             index_tags: std::collections::HashMap::new(),
             index_search_tags: BTreeMap::new(),
@@ -5400,15 +5622,22 @@ impl App {
                 grant_capability: "view".into(),
                 sub_ttl_days:
                     qimu_core::store::Store::SUBMISSION_TTL_DEFAULT_DAYS,
+                pub_self_maint: true,
+                pub_default_mode: "review".into(),
+                pub_minor_mode: "follow".into(),
+                user_role_pick: "member".into(),
                 ..Default::default()
             },
             frames: 0,
             screenshot_path: std::env::var("QIMU_SCREENSHOT").ok(),
             screenshot_done: false,
             thumbs: std::collections::HashMap::new(),
+            stage_slides: std::collections::HashMap::new(),
             icon_tex: std::collections::HashMap::new(),
             thumb_tx,
             thumb_rx,
+            stage_tx,
+            stage_rx,
             att_cache: std::collections::HashMap::new(),
             pdf_view: None,
             pdf_tx,
@@ -5700,6 +5929,7 @@ impl App {
                             app.pick = Some(PickState::Insert {
                                 index_name: app.current_index_name(),
                                 at,
+                                selected: Vec::new(),
                             });
                             app.content.stack.pop_to(0);
                             app.page = Page::Content;
@@ -6545,8 +6775,13 @@ impl App {
         // (the section navigation position itself is kept).
         self.settings.profile.clear();
         self.settings.company.clear();
+        self.settings.company_mat_name.clear();
+        self.settings.company_mat_note.clear();
         self.settings.languages_text.clear();
+        self.settings.lang_input.clear();
         self.settings.glossary_text.clear();
+        self.settings.glossary_src.clear();
+        self.settings.glossary_dst.clear();
         self.settings.ai_provider.clear();
         self.settings.ai_endpoint.clear();
         self.settings.ai_model.clear();
@@ -6554,15 +6789,35 @@ impl App {
         self.settings.ai_has_key = false;
         self.settings.ai_loaded = false;
         self.settings.sub_ttl_loaded = false;
+        self.settings.pub_self_maint = true;
+        self.settings.pub_default_mode = "review".into();
+        self.settings.pub_minor_mode = "follow".into();
         self.settings.dept_name.clear();
+        self.settings.dept_rename.clear();
+        self.settings.org_sel_dept = None;
         self.settings.user_name.clear();
         self.settings.user_display.clear();
         self.settings.user_password.clear();
+        self.settings.user_dept_pick.clear();
+        self.settings.user_role_pick = "member".into();
+        self.settings.edit_user_id.clear();
+        self.settings.edit_user_dept.clear();
+        self.settings.edit_user_role.clear();
         self.settings.group_name.clear();
+        self.settings.grants_loaded = false;
         self.settings.grant_group.clear();
-        self.settings.grant_subject_type.clear();
+        self.settings.grant_subject_type = "dept".into();
         self.settings.grant_subject_id.clear();
-        self.settings.grant_capability.clear();
+        self.settings.grant_capability = "view".into();
+        self.settings.pw_old.clear();
+        self.settings.pw_new.clear();
+        self.settings.pw_new2.clear();
+        self.settings.pw_status.clear();
+        self.settings.contact_picker_open = false;
+        self.settings.org_contacts.clear();
+        self.settings.org_contacts_loaded = false;
+        self.settings.server_backup_info = None;
+        self.settings.server_backup_loaded = false;
         // Org data proper.
         self.org = json!({});
         self.grants.clear();
@@ -6582,6 +6837,8 @@ impl App {
         self.new_team_name.clear();
         self.team_member_pick.clear();
         self.my_id.clear();
+        self.thumbs.clear();
+        self.stage_slides.clear();
         // Review face: processed records and any open detail
         // frame (its deck is an org submission's source index).
         self.review = ReviewState::new();
@@ -8113,6 +8370,16 @@ impl App {
     }
 
     fn open_unit_detail(&mut self, unit_id: &str) {
+        self.open_unit_detail_with_stack(unit_id, false);
+    }
+
+    /// Drill into an embedded child unit without clearing the parent
+    /// #101 frame so the bottom bar back button / Esc returns step by step.
+    fn push_unit_detail(&mut self, unit_id: &str) {
+        self.open_unit_detail_with_stack(unit_id, true);
+    }
+
+    fn open_unit_detail_with_stack(&mut self, unit_id: &str, push: bool) {
         // Lazy import: an unsplit page is unusable — every entry
         // that would open it (wall, home, search, history…) lands
         // here, so the guard lives here: the click just boosts
@@ -8130,9 +8397,16 @@ impl App {
             self.say("该页正在导入成块，完成后再打开");
             return;
         }
-        // The wall ring follows the open block, as selected_unit did.
-        if let ContentFrame::Wall(w) = self.content.stack.root_mut() {
-            w.selected = Some(unit_id.to_string());
+        if push
+            && matches!(self.content.stack.top(), ContentFrame::Unit(st) if st.unit_id == unit_id)
+        {
+            return;
+        }
+        // The wall ring follows the open block when entered from top level.
+        if !push {
+            if let ContentFrame::Wall(w) = self.content.stack.root_mut() {
+                w.selected = Some(unit_id.to_string());
+            }
         }
         match self.call_work("GET", &format!("/v1/units/{unit_id}"), None) {
             Ok(v) => {
@@ -8162,9 +8436,9 @@ impl App {
                     .ok()
                     .and_then(|b| b.get("bindings").and_then(|x| x.as_array()).cloned())
                     .unwrap_or_default();
-                // Opening replaces the drill-down, as the single
-                // detail slot did: reset to the wall, then push.
-                self.content.stack.pop_to(0);
+                if !push {
+                    self.content.stack.pop_to(0);
+                }
                 self.content.stack.push(ContentFrame::Unit(st));
             }
             Err(e) => self.msg = format!("打开失败：{e}"),
@@ -8222,6 +8496,7 @@ impl App {
     /// pop the content stack back to the wall and clear the wall
     /// selection, exactly what the old field pair did.
     fn close_unit_detail(&mut self) {
+        self.overlays.retain(|o| !matches!(o, Overlay::Light(_)));
         self.content.stack.pop_to(0);
         if let ContentFrame::Wall(w) = self.content.stack.root_mut() {
             w.selected = None;
@@ -8759,6 +9034,8 @@ impl App {
             return;
         };
         let mut confirm = false;
+        let mut insert = false;
+        let mut order = false;
         let mut cancel = false;
         egui::Frame::NONE
             .fill(palette_color(CHIP_BLUE_BG))
@@ -8776,10 +9053,15 @@ impl App {
                                 .size(13.0),
                             );
                         }
-                        PickState::Insert { index_name, at } => {
+                        PickState::Insert {
+                            index_name,
+                            at,
+                            selected,
+                        } => {
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "为索引「{index_name}」插入条目 · 插入到第 {at} 条之后，点内容块的「插入」即生效"
+                                    "为索引「{index_name}」插入条目 · 已选 {} 项 · 插入到第 {at} 条之后",
+                                    selected.len()
                                 ))
                                 .strong()
                                 .size(13.0),
@@ -8790,24 +9072,43 @@ impl App {
                         if ui.button("取消").clicked() {
                             cancel = true;
                         }
-                        if matches!(pick, PickState::Pages { .. })
-                            && ui
-                                .add_enabled(
-                                    matches!(
-                                        &pick,
-                                        PickState::Pages { sel, .. }
-                                            if sel.iter().any(|b| *b)
-                                    ),
-                                    egui::Button::new(
-                                        egui::RichText::new("确认选页")
-                                            .color(egui::Color32::WHITE),
+                        match &pick {
+                            PickState::Pages { sel, .. } => {
+                                if ui
+                                    .add_enabled(
+                                        sel.iter().any(|b| *b),
+                                        egui::Button::new(
+                                            egui::RichText::new("确认选页")
+                                                .color(egui::Color32::WHITE),
+                                        )
+                                        .fill(ACCENT)
+                                        .corner_radius(6),
                                     )
-                                    .fill(ACCENT)
-                                    .corner_radius(6),
-                                )
-                                .clicked()
-                        {
-                            confirm = true;
+                                    .clicked()
+                                {
+                                    confirm = true;
+                                }
+                            }
+                            PickState::Insert { selected, .. } => {
+                                let enabled = !selected.is_empty();
+                                if ui
+                                    .add_enabled(
+                                        enabled,
+                                        egui::Button::new(
+                                            egui::RichText::new("插入")
+                                                .color(egui::Color32::WHITE),
+                                        )
+                                        .fill(ACCENT)
+                                        .corner_radius(6),
+                                    )
+                                    .clicked()
+                                {
+                                    insert = true;
+                                }
+                                if ui.add_enabled(enabled, egui::Button::new("调整顺序")).clicked() {
+                                    order = true;
+                                }
+                            }
                         }
                     });
                 });
@@ -8815,8 +9116,11 @@ impl App {
         ui.add_space(10.0);
         if cancel {
             self.cancel_pick();
-        }
-        if confirm {
+        } else if insert {
+            self.confirm_insert_pick();
+        } else if order {
+            self.open_insert_order();
+        } else if confirm {
             self.confirm_pick_pages();
         }
     }
@@ -8912,47 +9216,85 @@ impl App {
         self.commit_entries(es, "摘录选页");
     }
 
-    /// Insert-mode pick: the clicked block joins the index at the
-    /// recorded position with its recommended rendition (first one with
-    /// a latest version), following latest.
-    fn insert_pick_unit(&mut self, item: &Value) {
-        let Some(PickState::Insert { at, .. }) = self.pick.clone() else {
-            return;
-        };
+    fn insert_pick_for_item(&self, item: &Value) -> Option<InsertPick> {
         let unit = item.get("unit").cloned().unwrap_or(json!({}));
-        let uid = s(&unit, "id");
-        // Lazy import: an unsplit page can never enter an index
-        // (the card hides its insert button too; this is the
-        // belt-and-braces guard for the same rule).
-        if let Some((pid, idx)) = self.lazy_unit_page.get(&uid).cloned() {
-            self.lazy_boost(&pid, idx);
-            return;
+        let unit_id = s(&unit, "id");
+        if unit_id.is_empty() || self.lazy_unit_page.contains_key(&unit_id) {
+            return None;
         }
-        let rid = item
+        let rendition = item
             .get("renditions")
             .and_then(|r| r.as_array())
             .and_then(|arr| {
                 arr.iter()
                     .find(|r| r.get("latest").map(|l| l.is_object()).unwrap_or(false))
-                    .map(|r| s(&r.get("rendition").cloned().unwrap_or(json!({})), "id"))
+            })?;
+        let rendition_id = s(&rendition.get("rendition").cloned().unwrap_or(json!({})), "id");
+        let version_id = s(&rendition.get("latest").cloned().unwrap_or(json!({})), "id");
+        (!unit_id.is_empty() && !rendition_id.is_empty() && !version_id.is_empty())
+            .then_some(InsertPick {
+                unit_id,
+                rendition_id,
+                version_id,
             })
-            .unwrap_or_default();
-        if rid.is_empty() {
+    }
+
+    fn insert_pick_selected(&self, unit_id: &str) -> bool {
+        matches!(
+            &self.pick,
+            Some(PickState::Insert { selected, .. })
+                if selected.iter().any(|pick| pick.unit_id == unit_id)
+        )
+    }
+
+    fn toggle_insert_pick_item(&mut self, item: &Value) {
+        if !matches!(self.pick, Some(PickState::Insert { .. })) {
+            return;
+        }
+        let Some(pick) = self.insert_pick_for_item(item) else {
             self.msg = "该内容块暂无可用版本".into();
+            return;
+        };
+        if let Some(PickState::Insert { selected, .. }) = &mut self.pick {
+            toggle_insert_pick(selected, pick);
+        }
+    }
+
+    fn open_insert_order(&mut self) {
+        let Some(PickState::Insert { selected, .. }) = &self.pick else {
+            return;
+        };
+        if selected.is_empty() {
+            self.msg = "请先选择要插入的内容块".into();
+            return;
+        }
+        self.overlays
+            .push(Overlay::InsertOrder(InsertOrderState::new(selected.clone())));
+    }
+
+    fn confirm_insert_pick(&mut self) {
+        let Some(PickState::Insert { at, selected, .. }) = self.pick.clone() else {
+            return;
+        };
+        if selected.is_empty() {
+            self.msg = "请先选择要插入的内容块".into();
             return;
         }
         let mut es = self.current_entries();
-        let at = at.min(es.len());
-        es.insert(
-            at,
-            json!({
-                "unit_id": uid,
-                "rendition_id": rid,
-                "policy": "follow_latest",
-                "locked_semver": Value::Null,
-                "excerpt_slots": Value::Null,
-            }),
-        );
+        let mut at = at.min(es.len());
+        for pick in selected {
+            es.insert(
+                at,
+                json!({
+                    "unit_id": pick.unit_id,
+                    "rendition_id": pick.rendition_id,
+                    "policy": "follow_latest",
+                    "locked_semver": Value::Null,
+                    "excerpt_slots": Value::Null,
+                }),
+            );
+            at += 1;
+        }
         self.pick = None;
         self.page = Page::Index;
         self.commit_entries(es, "插入条目");
@@ -10757,191 +11099,6 @@ impl App {
         }
     }
 
-    fn st_nav_body(&mut self, ui: &mut egui::Ui) {
-        let sections = self.settings_sections();
-        if self.settings.section >= sections.len() {
-            self.settings.section = 0;
-        }
-        let current = sections[self.settings.section];
-        // Sidebar morphology (prototype settings sidebar): a
-        // 「设置分区」 heading over the sections grouped by
-        // ownership — 本机 vs 服务器与组织 (local-first P4; the
-        // prototype's categories predate the local-first split) —
-        // every row carrying its icon, and the approval row showing
-        // the live pending count. The prototype renders a second
-        // 「设置目录」 TOC with the same anchors; in this
-        // section-switch layout the nav itself is the directory,
-        // so the two lists are rendered as one.
-        ui.label(
-            egui::RichText::new(tr("设置分区"))
-                .size(13.0)
-                .strong()
-                .color(palette_color(TEXT_MAIN)),
-        );
-        ui.add_space(4.0);
-        let groups: &[(&str, &[(&str, ChromeIcon)])] = &[
-            (
-                "本机",
-                &[
-                    ("离线缓存", ChromeIcon::Download),
-                    ("演示偏好", ChromeIcon::Presenter),
-                ],
-            ),
-            (
-                "服务器与组织",
-                &[
-                    ("服务器", ChromeIcon::Globe),
-                    ("个人资料", ChromeIcon::Clipboard),
-                    ("我的提交", ChromeIcon::Clipboard),
-                    ("组织管理", ChromeIcon::Lineage),
-                    ("内容组与授权", ChromeIcon::Directory),
-                    ("审批队列", ChromeIcon::Active),
-                    ("投稿设置", ChromeIcon::Clipboard),
-                    ("公司公共资料", ChromeIcon::Home),
-                    ("内容语言", ChromeIcon::All),
-                    ("AI 翻译", ChromeIcon::Split),
-                    ("离线缓存策略", ChromeIcon::Download),
-                ],
-            ),
-        ];
-        for (caption, items) in groups {
-            let visible: Vec<(&str, ChromeIcon)> = items
-                .iter()
-                .copied()
-                .filter(|(name, _)| sections.iter().any(|x| *x == *name))
-                .collect();
-            if visible.is_empty() {
-                continue;
-            }
-            if !caption.is_empty() {
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new(tr(caption))
-                        .size(12.0)
-                        .color(palette_color(TEXT_WEAK)),
-                );
-            }
-            for (name, icon) in visible {
-                let resp = tree_row(ui, current == name, 0.0, Some(icon), tr(name), 12.5);
-                if name == "审批队列" {
-                    let pending = self.showroom_pending.len() + self.submissions_pending.len();
-                    // Pending count (prototype .set-toc .cnt, L969):
-                    // plain text, muted at rest, amber only when warn
-                    // (prototype renderSetToc, L5537: warn = qn > 0;
-                    // .cnt.warn{color:var(--amber)}, L970). No filled
-                    // pill. Always rendered (muted "0" at rest, the
-                    // merged nav follows the TOC form).
-                    let warn = pending > 0;
-                    let fg = if warn {
-                        palette_color(CHIP_ORANGE_FG)
-                    } else {
-                        palette_color(TEXT_WEAK)
-                    };
-                    let font = egui::FontId::new(10.5, egui::FontFamily::Proportional);
-                    let galley = ui.painter().layout_no_wrap(pending.to_string(), font, fg);
-                    let w = galley.size().x + 10.0;
-                    let rect = egui::Rect::from_min_size(
-                        egui::pos2(resp.rect.max.x - w - 8.0, resp.rect.center().y - 8.0),
-                        egui::vec2(w, 16.0),
-                    );
-                    ui.painter().galley(
-                        egui::pos2(
-                            rect.center().x - galley.size().x / 2.0,
-                            rect.center().y - galley.size().y / 2.0,
-                        ),
-                        galley,
-                        fg,
-                    );
-                }
-                if resp.clicked() {
-                    if let Some(pos) = sections.iter().position(|x| *x == name) {
-                        self.settings.section = pos;
-                    }
-                }
-            }
-        }
-        // Org fold (prototype settings sidebar): the company org
-        // tree under a collapsible header with the member count.
-        // Its rows and add buttons land on the 组织管理 section,
-        // where the real department/account forms live — the fold
-        // is a shortcut into that section, not a second form.
-        if sections.iter().any(|x| *x == "组织管理") {
-            let depts = self
-                .org
-                .get("departments")
-                .and_then(|d| d.as_array())
-                .cloned()
-                .unwrap_or_default();
-            let user_count = self
-                .org
-                .get("users")
-                .and_then(|u| u.as_array())
-                .map_or(0, |a| a.len());
-            let mut jump_org = false;
-            ui.add_space(10.0);
-            egui::CollapsingHeader::new(
-                egui::RichText::new(format!("{} · {} 人", tr("公司组织架构"), user_count))
-                    .size(12.5),
-            )
-            .default_open(false)
-            .show(ui, |ui| {
-                if depts.is_empty() {
-                    ui.label(
-                        egui::RichText::new(tr("暂无部门"))
-                            .size(12.0)
-                            .color(palette_color(TEXT_WEAK)),
-                    );
-                }
-                for d in &depts {
-                    if tree_row(
-                        ui,
-                        false,
-                        0.0,
-                        Some(ChromeIcon::Directory),
-                        &s(d, "name"),
-                        12.5,
-                    )
-                    .clicked()
-                    {
-                        jump_org = true;
-                    }
-                }
-                ui.add_space(4.0);
-                let add_sub = egui::Button::new(
-                    egui::RichText::new(tr("＋ 在所选部门下新建子部门"))
-                        .size(12.5)
-                        .color(egui::Color32::WHITE),
-                )
-                .fill(ACCENT)
-                .corner_radius(6);
-                if ui
-                    .add_sized([ui.available_width(), 30.0], add_sub)
-                    .clicked()
-                {
-                    jump_org = true;
-                }
-                let add_root = egui::Button::new(
-                    egui::RichText::new(tr("＋ 新建一级部门"))
-                        .size(12.5)
-                        .color(palette_color(TEXT_MAIN)),
-                )
-                .fill(palette_color(HOVER_BG))
-                .corner_radius(6);
-                if ui
-                    .add_sized([ui.available_width(), 30.0], add_root)
-                    .clicked()
-                {
-                    jump_org = true;
-                }
-            });
-            if jump_org {
-                if let Some(pos) = sections.iter().position(|x| *x == "组织管理") {
-                    self.settings.section = pos;
-                }
-            }
-        }
-    }
-
     fn trash_nav_body(&mut self, ui: &mut egui::Ui) {
         // Sidebar (user rulings 2026-11-24): a 目录 header at the
         // top, then the three sections as folder rows — 演示 /
@@ -12706,41 +12863,6 @@ impl App {
 }
 
 impl App {
-    /// Settings sections visible to the current role — sections a
-    /// role may not see are not rendered at all (§7.9).
-    fn settings_sections(&self) -> Vec<&'static str> {
-        if self.user.is_none() {
-            // No named identity (logged out, anonymous guest, or
-            // standalone — the local library needs no identity):
-            // only the local sections plus the server connection
-            // entry. Identity-bound sections appear after login,
-            // per role, as before.
-            return vec!["服务器", "离线缓存", "演示偏好"];
-        }
-        let role = self.role();
-        let mut sections: Vec<&str> = vec!["服务器", "个人资料", "我的提交"];
-        if role != "member" {
-            sections.push("组织管理");
-        }
-        if role == "super" {
-            sections.extend([
-                "审批队列",
-                "投稿设置",
-                "内容组与授权",
-                "公司公共资料",
-                "内容语言",
-                "AI 翻译",
-                "离线缓存策略",
-            ]);
-        } else {
-            // The cache path is a local per-user setting; the admin
-            // policy section above stays super-only.
-            sections.push("离线缓存");
-        }
-        sections.push("演示偏好");
-        sections
-    }
-
     /// Set the status message AND re-stamp the toast, even when
     /// the text is identical to the previous message (audit L4):
     /// repeated actions with the same outcome wording (save,
@@ -12995,6 +13117,23 @@ impl eframe::App for App {
                 })
                 .unwrap_or_else(|| ThumbState::Failed(std::time::Instant::now()));
             self.thumbs.insert(key, state);
+            ctx.request_repaint();
+        }
+        // Collect finished #406 high-resolution stage renders.
+        while let Ok((key, rgba)) = self.stage_rx.try_recv() {
+            let state = rgba
+                .map(|(w, h, pixels)| {
+                    let ci = egui::ColorImage::from_rgba_premultiplied(
+                        [w as usize, h as usize],
+                        &pixels,
+                    );
+                    ThumbState::Ready(ctx.load_texture(&key, ci, egui::TextureOptions::LINEAR))
+                })
+                .unwrap_or_else(|| ThumbState::Failed(std::time::Instant::now()));
+            if self.stage_slides.len() >= 24 {
+                self.stage_slides.clear();
+            }
+            self.stage_slides.insert(key, state);
             ctx.request_repaint();
         }
         // Collect finished PDF page renders for the attachment preview.
@@ -13494,6 +13633,87 @@ impl App {
         }
     }
 
+    /// Full-resolution real slide stage texture for #406 (never reuses
+    /// the 0.75x thumbnail cache). Renders directly from the PPTX package
+    /// in a background worker at `target_px_w` (bucketed to 256px steps).
+    fn stage_slide(
+        &mut self,
+        version_id: &str,
+        page: usize,
+        target_px_w: u32,
+    ) -> ThumbState {
+        if version_id.is_empty() {
+            return ThumbState::Failed(std::time::Instant::now());
+        }
+        let bucket_px = (target_px_w.div_ceil(256) * 256).clamp(1280, 2560);
+        let key = format!("stage:{version_id}:{page}:{bucket_px}");
+        match self.stage_slides.get(&key) {
+            Some(ThumbState::Ready(t)) => ThumbState::Ready(t.clone()),
+            Some(ThumbState::Loading) => ThumbState::Loading,
+            Some(ThumbState::Failed(at)) if at.elapsed() < std::time::Duration::from_secs(30) => {
+                ThumbState::Failed(*at)
+            }
+            _ => {
+                self.stage_slides.insert(key.clone(), ThumbState::Loading);
+                let (server, token, tx) = (
+                    self.server.clone(),
+                    self.token.clone(),
+                    self.stage_tx.clone(),
+                );
+                let local = self.local.clone();
+                let bundle = self.cache_bundle_block(version_id);
+                let version_id = version_id.to_string();
+                let ctx = self.egui_ctx.clone();
+                std::thread::spawn(move || {
+                    let work = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                        || -> Option<(u32, u32, Vec<u8>)> {
+                            if let Some(local) = &local {
+                                if let Some(img) = local_render::local_stage_image(
+                                    local,
+                                    &version_id,
+                                    page,
+                                    bucket_px,
+                                ) {
+                                    return Some(img);
+                                }
+                            }
+                            if let Some((frag_file, _thumb_dir)) = &bundle {
+                                let frag = cache_key().and_then(|ck| {
+                                    std::fs::read(frag_file)
+                                        .ok()
+                                        .and_then(|data| decrypt_bytes(&ck, &data))
+                                });
+                                if let Some(frag) = frag {
+                                    if let Some(img) = local_render::render_stage_image(
+                                        &frag,
+                                        page,
+                                        bucket_px,
+                                    ) {
+                                        return Some(img);
+                                    }
+                                }
+                            }
+                            let url = format!("{server}/v1/versions/{version_id}/fragment");
+                            let mut req = thumb_agent().get(&url);
+                            if let Some(t) = &token {
+                                req = req.set("Authorization", &format!("Bearer {t}"));
+                            }
+                            let resp = req.call().ok()?.into_json::<Value>().ok()?;
+                            let data_b64 = resp.get("data_base64").and_then(|x| x.as_str())?;
+                            let frag = b64d(data_b64).ok()?;
+                            local_render::render_stage_image(&frag, page, bucket_px)
+                        },
+                    ));
+                    let _ = tx.send((key, work.unwrap_or(None)));
+                    if let Some(ctx) = ctx {
+                        ctx.request_repaint();
+                    }
+                });
+                ThumbState::Loading
+            }
+        }
+    }
+
     fn thumb_ui(&mut self, ui: &mut egui::Ui, version_id: &str, page: usize, width: f32) {
         let h = width * 9.0 / 16.0;
         if let Some(tex) = self.thumb(version_id, page) {
@@ -13679,28 +13899,47 @@ impl App {
             let painter = ui.painter();
             painter.rect_filled(rect, 0.0, palette_color(HOVER_BG));
             let inner = rect.shrink(8.0);
+            let text_painter = painter.with_clip_rect(inner);
             let mut title_y = inner.min.y;
+            let mut title_bottom = title_y;
             if !eyebrow.is_empty() {
-                let g = painter.layout_no_wrap(
+                let g = text_painter.layout_no_wrap(
                     eyebrow.to_string(),
                     egui::FontId::new(9.0, egui::FontFamily::Proportional),
                     palette_color(TEXT_FAINT),
                 );
-                painter.galley(inner.min, g, palette_color(TEXT_FAINT));
+                text_painter.galley(inner.min, g, palette_color(TEXT_FAINT));
                 title_y += 14.0;
+                title_bottom = title_y;
             }
             if !title.is_empty() {
-                let g = painter.layout(
+                let g = text_painter.layout(
                     title.to_string(),
                     egui::FontId::new(12.0, egui::FontFamily::Proportional),
                     palette_color(TEXT_MAIN),
                     inner.width(),
                 );
-                painter.galley(
+                title_bottom = title_y + g.size().y;
+                text_painter.galley(
                     egui::pos2(inner.min.x, title_y),
                     g,
                     palette_color(TEXT_MAIN),
                 );
+            }
+            if rect.height() >= 72.0 {
+                let line_y = (rect.max.y - 24.0).max(title_bottom + 8.0);
+                if line_y < rect.max.y - 10.0 {
+                    painter.line_segment(
+                        [
+                            egui::pos2(inner.min.x, line_y),
+                            egui::pos2(inner.max.x, line_y),
+                        ],
+                        egui::Stroke::new(
+                            1.5,
+                            palette_color(TEXT_FAINT).gamma_multiply(0.35),
+                        ),
+                    );
+                }
             }
         } else {
             ui.painter().rect_filled(rect, 0.0, palette_color(HOVER_BG));
@@ -19218,6 +19457,32 @@ impl App {
         let closed = match &mut frame {
             ContentFrame::Unit(st) => {
                 self.rendering_unit = Some(st.unit_id.clone());
+                if let Some(light_pos) = self
+                    .overlays
+                    .iter()
+                    .rposition(|o| matches!(o, Overlay::Light(_)))
+                {
+                    let modal_above = light_pos + 1 < self.overlays.len();
+                    let light_unit = st.unit_id.clone();
+                    // Keep the Unit frame back on the stack while light_ui
+                    // runs so light_ui and binding callbacks can inspect it.
+                    self.content.stack.replace_top(frame);
+                    if let Overlay::Light(light) = self.overlays.remove(light_pos) {
+                        let next = ui
+                            .add_enabled_ui(!modal_above, |ui| self.light_ui(ui, light))
+                            .inner;
+                        if let Some(back) = next {
+                            let at = light_pos.min(self.overlays.len());
+                            self.overlays.insert(at, back);
+                        }
+                    }
+                    self.rendering_unit = None;
+                    let _ = light_unit;
+                    if let Some(unit_id) = self.pending_unit_reload.take() {
+                        self.reload_unit_detail(&unit_id);
+                    }
+                    return;
+                }
                 body_frame().show(ui, |ui| {
                     if self.pick.is_some() {
                         self.pick_bar(ui);
@@ -19228,6 +19493,7 @@ impl App {
                 st.closed
             }
             ContentFrame::Wall(w) => {
+                self.overlays.retain(|o| !matches!(o, Overlay::Light(_)));
                 if self.content.cache_open && self.pick.is_none() {
                     // The cache view replaces the wall this
                     // frame, so a scroll intent registered from
@@ -20655,7 +20921,11 @@ impl App {
                 title: &title,
                 cover: &cover,
                 selected: !unsplit
-                    && (w.selected.as_deref() == Some(uid.as_str()) || w.multi.contains(&uid)),
+                    && if matches!(self.pick, Some(PickState::Insert { .. })) {
+                        self.insert_pick_selected(&uid)
+                    } else {
+                        w.selected.as_deref() == Some(uid.as_str()) || w.multi.contains(&uid)
+                    },
                 scope: None,
                 variant: if !my_name.is_empty() && s(&unit, "maintainer") == my_name {
                     CardVariant::Mine
@@ -20711,20 +20981,24 @@ impl App {
                 });
                 if !unsplit && matches!(app.pick, Some(PickState::Insert { .. })) {
                     ui.add_space(8.0);
-                    if ui
-                        .add_sized(
-                            [72.0, 28.0],
-                            egui::Button::new(
-                                egui::RichText::new("插入")
-                                    .size(13.0)
-                                    .color(egui::Color32::WHITE),
-                            )
-                            .fill(ACCENT)
-                            .corner_radius(6),
-                        )
-                        .clicked()
-                    {
-                        app.insert_pick_unit(item);
+                    if let Some(PickState::Insert { selected, .. }) = &app.pick {
+                        if let Some(order) = selected
+                            .iter()
+                            .position(|pick| pick.unit_id == uid)
+                        {
+                            chip(
+                                ui,
+                                &format!("第 {} 个插入", order + 1),
+                                palette_color(CHIP_GREEN_FG),
+                                CHIP_GREEN_BG,
+                            );
+                        } else {
+                            ui.label(
+                                egui::RichText::new("单击选择 · 再点取消")
+                                    .small()
+                                    .color(palette_color(TEXT_WEAK)),
+                            );
+                        }
                     }
                 }
             },
@@ -20847,6 +21121,8 @@ impl App {
             }
         } else if import_locked && (click.clicked() || click.double_clicked()) {
             self.say("该页正在导入成块，完成后再操作");
+        } else if matches!(self.pick, Some(PickState::Insert { .. })) && click.clicked() {
+            self.toggle_insert_pick_item(item);
         } else if click.double_clicked() {
             if self.pick.is_none() {
                 self.open_unit_detail(&uid);
@@ -21289,24 +21565,9 @@ impl App {
         }
         let detail = st.detail.clone();
         let unit = detail.get("unit").cloned().unwrap_or(json!({}));
-        // Breadcrumb (drill-down standard): 页面 › block name, the
-        // root crumb being the way back — this frame was the last
-        // one without a crumb bar, headed by a plain back button.
-        let unit_name = s(&unit, "name");
-        if crumb_bar(ui, &[tr("页面"), &unit_name]) == Some(0) {
-            // Back to the wall: pop only, no refresh. The wall
-            // list is kept current by the phase-1 change events
-            // the detail's own mutations fire (rename / bind /
-            // publish mark Change::Units, consumed at the frame
-            // point); with no mutation there is nothing to
-            // re-read. The unconditional refresh_all that used
-            // to sit here (full four-table re-read + the whole
-            // org sweep on the UI thread) was the #101 → wall
-            // return lag reported 2026-11-25.
-            st.closed = true;
-            return;
-        }
-        ui.add_space(6.0);
+        // Prototype #101 removes the top breadcrumb/back row and starts
+        // directly with the unit header; back navigation rides on the
+        // bottom bar back button and Esc (stack pop one level at a time).
         self.unit_header_ui(ui, st, &unit);
 
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -21374,15 +21635,7 @@ impl App {
                 ui.add_space(6.0);
             }
             self.unit_101_body(ui, st);
-            // The prototype's #101 body ends with the history
-            // zone: the AI-translation section, the per-page
-            // script editor and the file-publish section that
-            // used to render below it are not part of this page
-            // (rebuild2, see the line's REPORT §四 for where
-            // each lives now). Attachments stay: they are not
-            // one of the three moved-out sections.
         });
-        self.attachments_ui(ui, "unit", &st.unit_id.clone());
     }
 }
 
@@ -22382,6 +22635,12 @@ impl App {
                 Some(Overlay::DeckInfo(_)) => {
                     self.overlays.pop();
                 }
+                Some(Overlay::InsertOrder(_)) => {
+                    self.overlays.pop();
+                }
+                Some(Overlay::DraftPublish(_)) => {
+                    self.overlays.pop();
+                }
                 None => {}
             }
         }
@@ -22500,8 +22759,429 @@ impl App {
             Overlay::DeckInfo(st) => self.deck_info_ui(ui, st),
             Overlay::PickTemplate(t) => self.pick_template_ui(ui, t),
             Overlay::PageEdit(pe) => self.page_edit_ui(ui, screen, pe),
-            Overlay::Light(light) => self.light_ui(ui, screen, light),
+            Overlay::Light(light) => (self.page == Page::Content
+                && matches!(self.content.stack.top(), ContentFrame::Unit(_)))
+            .then_some(Overlay::Light(light)),
             Overlay::Present(p) => self.present_ui(ui, screen, p),
+            Overlay::InsertOrder(state) => self.insert_order_ui(ui, screen, state),
+            Overlay::DraftPublish(state) => self.draft_publish_ui(ui, state),
+        }
+    }
+
+    fn draft_publish_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        mut state: DraftPublishState,
+    ) -> Option<Overlay> {
+        let mut open = true;
+        let mut confirmed = false;
+        let mut close = false;
+        let preview = qimu_core::SemVer::parse(&state.base_semver)
+            .ok()
+            .map(|base| {
+                let inc = match state.bump {
+                    0 => qimu_core::Increment::Major,
+                    1 => qimu_core::Increment::Minor,
+                    _ => qimu_core::Increment::Patch,
+                };
+                base.bumped(inc).to_string()
+            })
+            .unwrap_or_else(|| "发布时自动分配".to_string());
+        egui::Window::new("发布草稿")
+            .open(&mut open)
+            .title_bar(false)
+            .frame(dlg_frame())
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ui.ctx(), |ui| {
+                ui.set_width(400.0);
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("发布草稿")
+                            .strong()
+                            .size(19.0)
+                            .color(palette_color(TEXT_MAIN)),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                        if dlg_close_x(ui) {
+                            close = true;
+                        }
+                    });
+                });
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new("选择发布类型")
+                        .size(13.5)
+                        .color(palette_color(TEXT_MAIN)),
+                );
+                ui.add_space(6.0);
+                if let Some(selected) = segmented(
+                    ui,
+                    &["大版本", "中版本", "小版本"],
+                    state.bump,
+                    SegStyle::Soft,
+                ) {
+                    state.bump = selected;
+                }
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(format!("发布后版本：v{preview}"))
+                        .strong()
+                        .size(13.5)
+                        .color(palette_color(ACCENT_DEEP)),
+                );
+                ui.add_space(12.0);
+                ui.label(
+                    egui::RichText::new("修订说明")
+                        .size(13.5)
+                        .color(palette_color(TEXT_MAIN)),
+                );
+                ui.add_space(6.0);
+                let response = ui.add(
+                    egui::TextEdit::multiline(&mut state.note)
+                        .hint_text("填写本次修订内容（可留空）")
+                        .desired_rows(3)
+                        .desired_width(400.0),
+                );
+                if state.focus {
+                    response.request_focus();
+                    state.focus = false;
+                }
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        if btn_primary(ui, "确认发布").clicked() {
+                            confirmed = true;
+                        }
+                        if btn_weak(ui, "取消").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            });
+        if confirmed {
+            let bump = match state.bump {
+                0 => "major",
+                1 => "minor",
+                _ => "patch",
+            };
+            let bindings = match self.content.stack.top() {
+                ContentFrame::Unit(st) if st.unit_id == state.unit_id => st.bindings.clone(),
+                _ => Vec::new(),
+            };
+            let note = state.note.trim().to_string();
+            let act = match state.kind {
+                DraftPublishKind::Working {
+                    working_id,
+                    rendition_id,
+                    head_id,
+                    head_is_draft,
+                    added,
+                } => DetailAct::PublishWorking {
+                    working_id,
+                    rendition_id,
+                    head_id,
+                    head_is_draft,
+                    note,
+                    added,
+                    bump: bump.to_string(),
+                },
+                DraftPublishKind::Numbered { version_id, added } => DetailAct::PublishDraft {
+                    version_id,
+                    note,
+                    added,
+                    semver: state.base_semver,
+                    bump: bump.to_string(),
+                },
+            };
+            self.run_detail_act(&state.unit_id, &bindings, act);
+            return None;
+        }
+        if !open || close {
+            return None;
+        }
+        Some(Overlay::DraftPublish(state))
+    }
+
+    fn insert_order_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        screen: egui::Rect,
+        mut state: InsertOrderState,
+    ) -> Option<Overlay> {
+        let copy = ui.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::C));
+        let cut = ui.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::X));
+        let paste = ui.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::V));
+        if copy {
+            state.copy();
+        }
+        if cut {
+            state.cut();
+        }
+        if paste {
+            state.paste();
+        }
+
+        let mut open = true;
+        let mut confirmed = false;
+        let mut close = false;
+        let width = (screen.width() - 48.0).clamp(320.0, 900.0);
+        egui::Window::new("调整插入顺序")
+            .open(&mut open)
+            .title_bar(false)
+            .frame(dlg_frame())
+            .collapsible(false)
+            .resizable(true)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ui.ctx(), |ui| {
+                ui.set_width(width);
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width(width - 60.0);
+                        ui.label(
+                            egui::RichText::new("调整插入顺序")
+                                .strong()
+                                .size(19.0)
+                                .color(palette_color(TEXT_MAIN)),
+                        );
+                        ui.label(
+                            egui::RichText::new("拖拽卡片排序，或先选择一张卡片再剪切、复制、粘贴。")
+                                .size(12.0)
+                                .color(palette_color(TEXT_WEAK)),
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                        if dlg_close_x(ui) {
+                            close = true;
+                        }
+                    });
+                });
+                ui.add_space(10.0);
+                let has_selection = state.selected_pick().is_some();
+                ui.horizontal(|ui| {
+                    if btn_default_enabled(ui, has_selection, "剪切").clicked() {
+                        state.cut();
+                    }
+                    if btn_default_enabled(ui, has_selection, "复制").clicked() {
+                        state.copy();
+                    }
+                    if btn_default_enabled(ui, !state.clipboard.is_empty(), "粘贴").clicked() {
+                        state.paste();
+                    }
+                    ui.label(
+                        egui::RichText::new(format!("{} 项", state.cards.len()))
+                            .small()
+                            .color(palette_color(TEXT_WEAK)),
+                    );
+                });
+                ui.add_space(10.0);
+
+                let mut select = None;
+                let mut drop = None;
+                egui::ScrollArea::vertical()
+                    .id_salt("insert-order-cards")
+                    .max_height((screen.height() - 220.0).max(220.0))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if state.cards.is_empty() {
+                            ui.centered_and_justified(|ui| {
+                                ui.label(
+                                    egui::RichText::new("还没有卡片，可返回选择内容块。")
+                                        .color(palette_color(TEXT_WEAK)),
+                                );
+                            });
+                            return;
+                        }
+                        let gap = 12.0;
+                        let card_w = 184.0;
+                        let cols = ((ui.available_width() + gap) / (card_w + gap))
+                            .floor()
+                            .clamp(1.0, 4.0) as usize;
+                        let card_w = ((ui.available_width() - gap * (cols - 1) as f32) / cols as f32)
+                            .max(120.0);
+                        for row in state.cards.chunks(cols) {
+                            ui.horizontal_top(|ui| {
+                                for card in row {
+                                    let selected = Some(card.id) == state.selected;
+                                    let frame = if selected {
+                                        card_frame()
+                                            .inner_margin(8)
+                                            .stroke(egui::Stroke::new(1.0, ACCENT))
+                                    } else {
+                                        card_frame().inner_margin(8)
+                                    };
+                                    let outer = frame.show(ui, |ui| {
+                                        ui.set_width(card_w - 16.0);
+                                        let item = self
+                                            .units
+                                            .iter()
+                                            .find(|item| {
+                                                s(&item.get("unit").cloned().unwrap_or(json!({})), "id")
+                                                    == card.pick.unit_id
+                                            })
+                                            .cloned()
+                                            .unwrap_or_default();
+                                        let unit = item.get("unit").cloned().unwrap_or(json!({}));
+                                        let title = s(&unit, "name");
+                                        let title = if title.is_empty() {
+                                            card.pick.unit_id.as_str()
+                                        } else {
+                                            title.as_str()
+                                        };
+                                        let latest = item
+                                            .get("renditions")
+                                            .and_then(|r| r.as_array())
+                                            .and_then(|arr| {
+                                                arr.iter()
+                                                    .find(|r| {
+                                                        s(&r.get("rendition").cloned().unwrap_or(json!({})), "id")
+                                                            == card.pick.rendition_id
+                                                    })
+                                            })
+                                            .and_then(|r| r.get("latest"))
+                                            .cloned()
+                                            .unwrap_or(json!({}));
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "第 {} 项",
+                                                    state.cards.iter().position(|c| c.id == card.id).unwrap_or(0) + 1
+                                                ))
+                                                .strong()
+                                                .size(12.0)
+                                                .color(palette_color(TEXT_MAIN)),
+                                            );
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.label(
+                                                        egui::RichText::new("拖拽")
+                                                            .small()
+                                                            .color(palette_color(TEXT_WEAK)),
+                                                    );
+                                                },
+                                            );
+                                        });
+                                        ui.add_space(6.0);
+                                        self.thumb_ui(
+                                            ui,
+                                            &card.pick.version_id,
+                                            0,
+                                            card_w - 16.0,
+                                        );
+                                        ui.add_space(6.0);
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(title).strong().size(13.0),
+                                            )
+                                            .truncate(),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "v{} · {} 页",
+                                                s(&latest, "semver"),
+                                                i(&latest, "page_count")
+                                            ))
+                                            .small()
+                                            .color(palette_color(TEXT_WEAK)),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(if selected {
+                                                "已选中"
+                                            } else {
+                                                "单击选择"
+                                            })
+                                            .small()
+                                            .color(if selected {
+                                                ACCENT_DEEP
+                                            } else {
+                                                palette_color(TEXT_FAINT)
+                                            }),
+                                        );
+                                    });
+                                    let rect = outer.response.rect;
+                                    let response = ui.interact(
+                                        rect,
+                                        egui::Id::new(("insert-order-card", card.id)),
+                                        egui::Sense::click_and_drag(),
+                                    );
+                                    if response.clicked() {
+                                        select = Some(card.id);
+                                    }
+                                    if response.drag_started() {
+                                        egui::DragAndDrop::set_payload(
+                                            ui.ctx(),
+                                            InsertOrderDrag(card.id),
+                                        );
+                                    }
+                                    if response.contains_pointer()
+                                        && egui::DragAndDrop::has_payload_of_type::<InsertOrderDrag>(ui.ctx())
+                                    {
+                                        let before = ui
+                                            .input(|input| input.pointer.hover_pos())
+                                            .is_none_or(|pos| pos.y < rect.center().y);
+                                        let y = if before { rect.min.y } else { rect.max.y };
+                                        ui.painter().line_segment(
+                                            [egui::pos2(rect.min.x, y), egui::pos2(rect.max.x, y)],
+                                            egui::Stroke::new(2.0, ACCENT),
+                                        );
+                                        if let Some(dragged) = egui::DragAndDrop::take_payload::<InsertOrderDrag>(ui.ctx())
+                                        {
+                                            drop = Some((
+                                                dragged.0,
+                                                state.cards
+                                                    .iter()
+                                                    .position(|c| c.id == card.id)
+                                                    .unwrap_or(0)
+                                                    + usize::from(!before),
+                                            ));
+                                        }
+                                    }
+                                    ui.add_space(gap);
+                                }
+                            });
+                            ui.add_space(gap);
+                        }
+                    });
+                if let Some(id) = select {
+                    state.selected = Some(id);
+                }
+                if let Some((id, before)) = drop {
+                    state.move_card(id, before);
+                }
+                ui.add_space(12.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("确定")
+                                    .color(egui::Color32::WHITE),
+                            )
+                            .fill(ACCENT)
+                            .corner_radius(6)
+                            .min_size(egui::vec2(76.0, 30.0)),
+                        )
+                        .clicked()
+                    {
+                        confirmed = true;
+                    }
+                    if btn_weak(ui, "取消").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if confirmed {
+            if let Some(PickState::Insert { selected, .. }) = &mut self.pick {
+                *selected = state.picks();
+            }
+            None
+        } else if open && !close {
+            Some(Overlay::InsertOrder(state))
+        } else {
+            None
         }
     }
 
@@ -24798,6 +25478,11 @@ impl App {
                         }
                     }
                 }
+                Some(IndexDetailAction::OpenUnit(unit_id)) => {
+                    self.close_unit_detail();
+                    self.open_unit_detail(&unit_id);
+                    self.page = Page::Content;
+                }
                 Some(IndexDetailAction::Export(kind)) => {
                     if let IndexFrame::Detail(st) = self.index.stack.top() {
                         let index = st.detail.get("index").cloned().unwrap_or_default();
@@ -24811,6 +25496,7 @@ impl App {
                     self.pick = Some(PickState::Insert {
                         index_name: self.current_index_name(),
                         at,
+                        selected: Vec::new(),
                     });
                     self.close_unit_detail();
                     self.page = Page::Content;
@@ -24826,8 +25512,134 @@ impl App {
         }
     }
 
-    /// Index overview: standard cards for the indexes living in the
-    /// selected folder. Single click selects, double click opens.
+    /// Render a single index overview card and handle selection / double-click open.
+    fn render_index_overview_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        ov: &mut OverviewState,
+        x: &Value,
+        card_w: f32,
+        card_h: f32,
+        my_name: &str,
+    ) -> Option<String> {
+        let mut open = None;
+        let xid = s(x, "id");
+        let selected = ov.selected.as_deref() == Some(xid.as_str());
+        let scope = IndexScope::of(x);
+        let scope_color = scope.color();
+        let title = s(x, "name");
+        let cover = self.index_covers.get(&xid).cloned().unwrap_or_default();
+        let is_history = s(x, "lifecycle") == "history";
+        let resp = self.wall_card(
+            ui,
+            WallCard {
+                width: card_w,
+                min_height: card_h,
+                title: &title,
+                cover: &cover,
+                selected,
+                scope: Some(scope_color),
+                variant: if !my_name.is_empty() && s(x, "maintainer") == my_name {
+                    CardVariant::Mine
+                } else {
+                    CardVariant::Normal
+                },
+            },
+            |app, ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if let Some(tag) = app.index_tags.get(&xid) {
+                        chip(
+                            ui,
+                            &format!("V{tag}"),
+                            palette_color(ACCENT_DEEP),
+                            CHIP_BLUE_BG,
+                        );
+                    }
+                    let home = s(x, "folder_id");
+                    let is_main = !home.is_empty()
+                        && app.folders.iter().any(|f| {
+                            s(f, "id") == home && s(f, "main_index_id") == xid
+                        });
+                    if is_main {
+                        chip(
+                            ui,
+                            "主索引",
+                            palette_color(ACCENT_DEEP),
+                            CHIP_BLUE_BG,
+                        );
+                    }
+                    match s(x, "lifecycle").as_str() {
+                        "history" => chip(
+                            ui,
+                            "历史",
+                            palette_color(TEXT_WEAK),
+                            palette_color(CHIP_GRAY_BG),
+                        ),
+                        "void" => chip(
+                            ui,
+                            "已作废",
+                            palette_color(ROSE),
+                            ROSE_SOFT_BG,
+                        ),
+                        _ => {}
+                    }
+                    let meta = format!(
+                        "{} · {}",
+                        scope.label(),
+                        s(x, "maintainer")
+                    );
+                    ui.label(
+                        egui::RichText::new(meta)
+                            .size(10.5)
+                            .color(palette_color(TEXT_WEAK)),
+                    );
+                });
+            },
+        );
+        let rect = resp.response.rect;
+        if is_history {
+            ui.painter().rect_filled(
+                rect,
+                6.0,
+                palette_color(PANEL_BG).gamma_multiply(0.35),
+            );
+        }
+        let click = ui
+            .interact(
+                rect,
+                ui.scope_id().with(("idx_card", &xid)),
+                egui::Sense::click(),
+            )
+            .on_hover_text(format!(
+                "双击打开编辑 · {} · {} · {}",
+                s(x, "maintainer"),
+                scope.label(),
+                fmt_time(i(x, "created_ms"))
+            ));
+        let stroke = if !selected && (click.hovered() || click.has_focus()) {
+            Some(egui::Stroke::new(1.0, palette_color(FIELD_BORDER)))
+        } else {
+            None
+        };
+        if let Some(stroke) = stroke {
+            ui.painter().rect_stroke(
+                rect,
+                6.0,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+        if click.clicked() {
+            ov.selected = Some(xid.clone());
+        }
+        if click.double_clicked() {
+            open = Some(xid);
+        }
+        open
+    }
+
+    /// Index overview: folder-grouped standard cards + inline per-folder
+    /// history toggle + separated bottom `我的未公开` sink (spec §§5.5-5.6).
     fn index_overview(
         &mut self,
         ui: &mut egui::Ui,
@@ -24846,202 +25658,182 @@ impl App {
             ui.add_space(6.0);
         }
         ui.add_space(8.0);
-        let items: Vec<Value> = self
-            .indexes
-            .iter()
-            .filter(|x| self.folder_filter_ok(&filter, &s(x, "folder_id")))
-            .filter(|x| self.index.overview_controls.matches(x))
-            .cloned()
-            .collect();
-        if items.is_empty() {
-            ov.selected = None;
-            ui.label(egui::RichText::new(tr("当前筛选下没有索引")).color(palette_color(TEXT_WEAK)));
-            return None;
-        }
         if self.index.overview_controls.relationships {
+            let items: Vec<Value> = self
+                .indexes
+                .iter()
+                .filter(|x| self.folder_filter_ok(&filter, &s(x, "folder_id")))
+                .filter(|x| self.index.overview_controls.matches(x))
+                .cloned()
+                .collect();
+            if items.is_empty() {
+                ov.selected = None;
+                ui.label(egui::RichText::new(tr("当前筛选下没有索引")).color(palette_color(TEXT_WEAK)));
+                return None;
+            }
             self.index_overview_relationships(ui, ov, &items, action);
             return None;
         }
+        let scoped_items: Vec<Value> = self
+            .indexes
+            .iter()
+            .filter(|x| self.folder_filter_ok(&filter, &s(x, "folder_id")))
+            .filter(|x| self.index.overview_controls.matches_scope(x))
+            .cloned()
+            .collect();
         let my_name = self
             .user
             .as_ref()
             .map(|u| s(u, "display_name"))
             .unwrap_or_default();
+        let (sections, unpub) = index_controls::partition_overview_indexes(
+            &scoped_items,
+            &self.folders,
+            &self.index.overview_controls,
+            &ov.hist_open,
+            &my_name,
+        );
+        if sections.is_empty() && unpub.is_empty() {
+            ov.selected = None;
+            ui.label(egui::RichText::new(tr("当前筛选下没有索引")).color(palette_color(TEXT_WEAK)));
+            return None;
+        }
+        let active_only = self.index.overview_controls.is_active_only();
         let mut open = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
-            // Card grid (prototype .idx-grid): fluid columns,
-            // min 236px wide, 12px gaps.
             let avail = ui.available_width();
             let per_row = ((avail + 12.0) / 248.0).floor().max(1.0);
             let per_row_n = (per_row as usize).max(1);
             let outer_width = ((avail + 12.0) / per_row - 12.0).floor().max(3.0);
-            // egui frames include the border in their outer allocation.
             let card_w = outer_width - 2.0;
             let cover_h = card_w * 9.0 / 16.0;
-            let card_h = cover_h + 70.0;
-            let mut groups: Vec<(String, Vec<Value>)> = Vec::new();
-            for item in items {
-                let folder_id = s(&item, "folder_id");
-                let folder = if folder_id.is_empty() {
-                    "根目录".to_string()
-                } else {
-                    self.folders
-                        .iter()
-                        .find(|folder| s(folder, "id") == folder_id)
-                        .map(|folder| {
-                            let path = s(folder, "path");
-                            if path.is_empty() {
-                                s(folder, "name")
+            let card_h = cover_h + 74.0;
+            for (idx_sec, sec) in sections.into_iter().enumerate() {
+                if idx_sec > 0 {
+                    ui.add_space(6.0);
+                }
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(&sec.label)
+                            .strong()
+                            .size(13.5)
+                            .color(palette_color(TEXT_MAIN)),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("· {} 份", sec.active_count))
+                            .size(12.0)
+                            .color(palette_color(TEXT_WEAK)),
+                    );
+                    if active_only && sec.history_count > 0 {
+                        let expanded = ov.hist_open.contains(&sec.key);
+                        let label = if expanded {
+                            format!("历史（{}）· 收起", sec.history_count)
+                        } else {
+                            format!("历史（{}）", sec.history_count)
+                        };
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(label)
+                                        .size(11.5)
+                                        .color(palette_color(if expanded {
+                                            ACCENT_DEEP
+                                        } else {
+                                            TEXT_WEAK
+                                        })),
+                                )
+                                .fill(if expanded {
+                                    CHIP_BLUE_BG
+                                } else {
+                                    palette_color(CHIP_GRAY_BG)
+                                })
+                                .corner_radius(4),
+                            )
+                            .clicked()
+                        {
+                            if expanded {
+                                ov.hist_open.remove(&sec.key);
                             } else {
-                                path
+                                ov.hist_open.insert(sec.key.clone());
                             }
-                        })
-                        .unwrap_or_else(|| "未分类".into())
-                };
-                if let Some((_, group)) = groups.iter_mut().find(|(name, _)| *name == folder) {
-                    group.push(item);
-                } else {
-                    groups.push((folder, vec![item]));
-                }
-            }
-            let mut first_group = true;
-            for (_folder, mut group) in groups {
-                group.sort_by_key(|item| {
-                    let id = s(item, "id");
-                    let folder_id = s(item, "folder_id");
-                    !self.folders.iter().any(|folder| {
-                        s(folder, "id") == folder_id && s(folder, "main_index_id") == id
-                    })
+                        }
+                    }
                 });
-                if first_group {
-                    first_group = false;
-                } else {
-                    ui.add_space(10.0);
-                }
-                // Rows are chunked by hand, not left to a
-                // wrapping layout: the cards are Frames, and a
-                // Frame's exact-rect allocation never triggers
-                // the placer's wrap check — under
-                // `with_main_wrap(true)` they formed one endless
-                // row, the content wall's 2026-11-25 defect (see
-                // flow_grid_plain). `horizontal_top` keeps the
-                // Align::Min tops the wrapped layout promised.
-                for row in group.chunks(per_row_n) {
+                for row in sec.cards.chunks(per_row_n) {
                     ui.horizontal_top(|ui| {
                         for x in row {
-                            let x = x.clone();
-                            let xid = s(&x, "id");
-                            let selected = ov.selected.as_deref() == Some(xid.as_str());
-                            let scope_color = IndexScope::of(&x).color();
-                            let title = s(&x, "name");
-                            let cover = self.index_covers.get(&xid).cloned().unwrap_or_default();
-                            let resp = self.wall_card(
-                                ui,
-                                WallCard {
-                                    width: card_w,
-                                    min_height: card_h,
-                                    title: &title,
-                                    cover: &cover,
-                                    selected,
-                                    scope: Some(scope_color),
-                                    variant: if !my_name.is_empty()
-                                        && s(&x, "maintainer") == my_name
-                                    {
-                                        CardVariant::Mine
-                                    } else {
-                                        CardVariant::Normal
-                                    },
-                                },
-                                |app, ui| {
-                                    ui.horizontal(|ui| {
-                                        if let Some(tag) = app.index_tags.get(&xid) {
-                                            chip(
-                                                ui,
-                                                &format!("V{tag}"),
-                                                palette_color(ACCENT_DEEP),
-                                                CHIP_BLUE_BG,
-                                            );
-                                        }
-                                        // 主索引 capsule: this index is
-                                        // its home folder's designated
-                                        // main index (spec §3.10).
-                                        let home = s(&x, "folder_id");
-                                        let is_main = !home.is_empty()
-                                            && app.folders.iter().any(|f| {
-                                                s(f, "id") == home && s(f, "main_index_id") == xid
-                                            });
-                                        if is_main {
-                                            chip(
-                                                ui,
-                                                "主索引",
-                                                palette_color(ACCENT_DEEP),
-                                                CHIP_BLUE_BG,
-                                            );
-                                        }
-                                        match s(&x, "lifecycle").as_str() {
-                                            "history" => chip(
-                                                ui,
-                                                "历史",
-                                                palette_color(TEXT_WEAK),
-                                                palette_color(CHIP_GRAY_BG),
-                                            ),
-                                            "void" => chip(
-                                                ui,
-                                                "已作废",
-                                                palette_color(ROSE),
-                                                ROSE_SOFT_BG,
-                                            ),
-                                            _ => {}
-                                        }
-                                    });
-                                },
-                            );
-                            let rect = resp.response.rect;
-                            let click = ui
-                                .interact(
-                                    rect,
-                                    ui.scope_id().with(("idx_card", &xid)),
-                                    egui::Sense::click(),
-                                )
-                                .on_hover_text(format!(
-                                    "{} · {}",
-                                    s(&x, "maintainer"),
-                                    fmt_time(i(&x, "created_ms"))
-                                ));
-                            let stroke = if !selected && (click.hovered() || click.has_focus()) {
-                                Some(egui::Stroke::new(1.0, palette_color(FIELD_BORDER)))
-                            } else {
-                                None
-                            };
-                            if let Some(stroke) = stroke {
-                                ui.painter().rect_stroke(
-                                    rect,
-                                    6.0,
-                                    stroke,
-                                    egui::StrokeKind::Inside,
-                                );
-                            }
-                            if click.clicked() {
-                                ov.selected = Some(xid.clone());
-                            }
-                            if click.double_clicked() {
-                                open = Some(xid);
+                            if let Some(hit) = self
+                                .render_index_overview_card(ui, ov, x, card_w, card_h, &my_name)
+                            {
+                                open = Some(hit);
                             }
                         }
                     });
                 }
+                ui.add_space(4.0);
+            }
+            if !unpub.is_empty() {
                 ui.add_space(8.0);
+                egui::Frame::new()
+                    .fill(palette_color(CHIP_GRAY_BG))
+                    .stroke(egui::Stroke::new(1.0, palette_color(FIELD_BORDER)))
+                    .corner_radius(8)
+                    .inner_margin(egui::Margin::same(12))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("我的未公开")
+                                    .strong()
+                                    .size(13.5)
+                                    .color(palette_color(TEXT_MAIN)),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!("· {} 份（仅自己可见）", unpub.len()))
+                                    .size(12.0)
+                                    .color(palette_color(TEXT_WEAK)),
+                            );
+                        });
+                        ui.add_space(6.0);
+                        for row in unpub.chunks(per_row_n) {
+                            ui.horizontal_top(|ui| {
+                                for x in row {
+                                    if let Some(hit) = self.render_index_overview_card(
+                                        ui, ov, x, card_w, card_h, &my_name,
+                                    ) {
+                                        open = Some(hit);
+                                    }
+                                }
+                            });
+                        }
+                    });
             }
         });
         open
     }
 
     fn index_create(&mut self, ui: &mut egui::Ui, st: &mut CreateState) {
-        ui.heading("新建索引 · 选内容");
+        let selected_count = st.pick.iter().filter(|(_, _, on)| *on).count();
         ui.horizontal(|ui| {
+            ui.heading("新建索引 · 选内容");
+            ui.label(
+                egui::RichText::new(format!("已选 {selected_count} 个内容块"))
+                    .size(12.5)
+                    .color(palette_color(if selected_count > 0 {
+                        ACCENT_DEEP
+                    } else {
+                        TEXT_WEAK
+                    })),
+            );
+        });
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
             ui.label("名称");
-            ui.text_edit_singleline(&mut st.new_name);
+            ui.add(
+                egui::TextEdit::singleline(&mut st.new_name)
+                    .hint_text("输入索引名称")
+                    .desired_width(180.0),
+            );
             ui.label("内容组");
             egui::ComboBox::from_id_salt("new_index_group")
                 .selected_text(self.group_name(&st.new_group.clone()))
@@ -25050,10 +25842,48 @@ impl App {
                         ui.selectable_value(&mut st.new_group, s(&g, "id"), s(&g, "name"));
                     }
                 });
+            ui.label("归属目录");
+            let folder_label = st
+                .folder
+                .as_deref()
+                .map(|fid| {
+                    let p = index_controls::resolve_folder_path(&self.folders, fid);
+                    if p.is_empty() {
+                        "未分类".into()
+                    } else {
+                        p
+                    }
+                })
+                .unwrap_or_else(|| "未分类".into());
+            egui::ComboBox::from_id_salt("new_index_folder")
+                .selected_text(folder_label)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut st.folder, None, "未分类");
+                    for f in self
+                        .folders
+                        .iter()
+                        .filter(|f| s(*f, "scope") == "index")
+                        .cloned()
+                        .collect::<Vec<_>>()
+                    {
+                        let fid = s(&f, "id");
+                        let label = index_controls::resolve_folder_path(&self.folders, &fid);
+                        ui.selectable_value(&mut st.folder, Some(fid), label);
+                    }
+                });
+            ui.label("公开范围");
+            let current_scope = index_controls::IndexScope::from_api(&st.scope);
+            egui::ComboBox::from_id_salt("new_index_scope")
+                .selected_text(current_scope.label())
+                .show_ui(ui, |ui| {
+                    for sc in index_controls::IndexScope::ALL {
+                        let api = sc.api_str().to_string();
+                        ui.selectable_value(&mut st.scope, api, sc.label());
+                    }
+                });
             if ui
                 .add_enabled(
-                    st.pick.iter().any(|(_, _, on)| *on)
-                        && !st.new_name.trim().is_empty(),
+                    selected_count > 0 && !st.new_name.trim().is_empty(),
                     egui::Button::new("创建索引"),
                 )
                 .clicked()
@@ -25070,10 +25900,10 @@ impl App {
                         "POST",
                         "/v1/indexes",
                         Some(json!({
-                            "name": st.new_name,
+                            "name": st.new_name.trim(),
                             "group_id": st.new_group,
                             "folder_id": st.folder,
-                            "scope": "company",
+                            "scope": st.scope,
                             "entries": entries,
                         })),
                     );
@@ -25091,27 +25921,51 @@ impl App {
                 st.closed = true;
             }
         });
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut st.unit_filter)
+                    .hint_text("筛选内容块名称 / 形态 / 语言")
+                    .desired_width(240.0),
+            );
+            if !st.unit_filter.is_empty() && ui.small_button("清除").clicked() {
+                st.unit_filter.clear();
+            }
+        });
         ui.separator();
+        let needle = st.unit_filter.trim().to_lowercase();
         let mut pick = st.pick.clone();
         egui::ScrollArea::vertical().show(ui, |ui| {
             for item in self.units.clone() {
                 let unit = item.get("unit").cloned().unwrap_or(json!({}));
+                let uname = s(&unit, "name");
+                let gname = self.group_name(&s(&unit, "group_id"));
                 if let Some(rends) = item.get("renditions").and_then(|r| r.as_array()) {
                     for r in rends {
                         let rend = r.get("rendition").cloned().unwrap_or(json!({}));
+                        let form = s(&rend, "form");
+                        let lang = s(&rend, "lang");
+                        if !needle.is_empty() {
+                            let hay = format!("{uname} {gname} {form} {lang}").to_lowercase();
+                            if !hay.contains(&needle) {
+                                continue;
+                            }
+                        }
                         if let Some(slot) = pick
                             .iter_mut()
                             .find(|(u, rr, _)| u == &s(&unit, "id") && rr == &s(&rend, "id"))
                         {
-                            ui.checkbox(
-                                &mut slot.2,
-                                format!(
-                                    "{} · {} · {}",
-                                    s(&unit, "name"),
-                                    s(&rend, "form"),
-                                    s(&rend, "lang")
-                                ),
-                            );
+                            let pages = r
+                                .get("latest")
+                                .and_then(|v| v.get("page_count"))
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(0);
+                            let row_label = if pages > 0 {
+                                format!("{uname} · {gname} · {form} · {lang} · {pages} 页")
+                            } else {
+                                format!("{uname} · {gname} · {form} · {lang}")
+                            };
+                            ui.checkbox(&mut slot.2, row_label);
                         }
                     }
                 }
@@ -25133,101 +25987,300 @@ impl App {
             .and_then(|b| b.as_array())
             .cloned()
             .unwrap_or_default();
-        ui.horizontal(|ui| {
-            ui.heading(s(&index, "name"));
-            ui.label(
-                egui::RichText::new(format!("· {}", s(&index, "maintainer")))
-                    .size(11.5)
-                    .color(palette_color(TEXT_WEAK)),
-            );
-        });
-        ui.add_space(2.0);
-        ui.horizontal_wrapped(|ui| {
-            ui.label(
-                egui::RichText::new("分支")
-                    .size(11.5)
-                    .color(palette_color(TEXT_WEAK)),
-            );
-            let current_branch = if st.branch.is_empty() {
-                "main"
-            } else {
-                &st.branch
-            };
-            let mut branch = current_branch.to_owned();
-            egui::ComboBox::from_id_salt("branch")
-                .width(96.0)
-                .selected_text(branch.clone())
-                .show_ui(ui, |ui| {
-                    for b in &branches {
-                        if let Some(bs) = b.as_str() {
-                            ui.selectable_value(&mut branch, bs.to_string(), bs);
-                        }
-                    }
-                });
-            if branch != current_branch {
-                *action = Some(IndexDetailAction::ChangeBranch(branch));
-                return;
-            }
-            let version = ui.add(
-                egui::TextEdit::singleline(&mut st.tag_name)
-                    .hint_text("新版本号")
-                    .desired_width(176.0)
-                    .margin(egui::vec2(10.0, 5.0)),
-            );
-            if std::mem::take(&mut st.focus_tag) {
-                version.request_focus();
-            }
-            let publish = ui
-                .add_enabled(
-                    !st.tag_name.trim().is_empty(),
-                    egui::Button::new(
-                        egui::RichText::new("发布版本")
-                            .size(13.0)
-                            .color(egui::Color32::WHITE),
-                    )
-                    .fill(ACCENT)
-                    .corner_radius(6)
-                    .min_size(egui::vec2(88.0, 30.0)),
-                )
-                .clicked();
-            let enter = (version.has_focus() || version.lost_focus())
-                && ui.input(|input| input.key_pressed(egui::Key::Enter));
-            if publish || (enter && !st.tag_name.trim().is_empty()) {
-                if !self.need_identity_local("发布版本") {
-                    // Anonymous session: the login popup is open;
-                    // the typed tag name stays for after the login.
-                } else {
-                    let id = st.index_id.clone();
-                    let r = self.call_work(
-                        "POST",
-                        &format!("/v1/indexes/{id}/tags"),
-                        Some(json!({ "branch": st.branch, "name": st.tag_name.trim() })),
+        let resolved = detail
+            .get("resolved_entries")
+            .and_then(|r| r.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let total_pages: i64 = resolved
+            .iter()
+            .map(|row| {
+                let entry = row.get("entry").cloned().unwrap_or(json!({}));
+                let ver = row.get("resolved").cloned().unwrap_or(Value::Null);
+                index_controls::entry_effective_pages(&entry, &ver)
+            })
+            .sum();
+        // 预计算共享数据
+        let folder_id = s(&index, "folder_id");
+        let folder_coord = if folder_id.is_empty() {
+            "未分类".to_string()
+        } else {
+            let p = index_controls::resolve_folder_path(&self.folders, &folder_id);
+            if p.is_empty() { "未分类".into() } else { p }
+        };
+        let scope = index_controls::IndexScope::of(&index);
+        let current_branch = if st.branch.is_empty() {
+            "main".to_string()
+        } else {
+            st.branch.clone()
+        };
+        // 派生点提示（仅非主线分支有分叉点）
+        let fork_hint = if current_branch == "main" {
+            "仓库主线 · 无分叉点".to_string()
+        } else {
+            format!("分叉点：{current_branch} 基于主线派生")
+        };
+        // 直接子分支（除当前分支外的所有分支）
+        let other_branches: Vec<&str> = branches
+            .iter()
+            .filter_map(|b| b.as_str())
+            .filter(|bs| *bs != current_branch)
+            .collect();
+
+        // ── 1. idx-backbar：索引名称 + 返回总览提示 | flex:1 | 5标签切换 ──────────
+        // 对应原型 HTML line 1729–1733，backbar 里不放分支/发布控件，这些在全局工具栏
+        egui::Frame::new()
+            .fill(palette_color(PANEL_BG))
+            .stroke(egui::Stroke::new(1.0, palette_color(FIELD_BORDER)))
+            .corner_radius(8)
+            .inner_margin(egui::Margin { left: 12, right: 12, top: 8, bottom: 8 })
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    // 索引名称（h1，双击可重命名）
+                    ui.label(
+                        egui::RichText::new(s(&index, "name"))
+                            .strong()
+                            .size(17.0)
+                            .color(palette_color(TEXT_MAIN)),
                     );
-                    match r {
-                        Ok(_) => {
-                            self.msg = "已发布".into();
-                            *action = Some(IndexDetailAction::Reload);
+                    // 返回总览提示 hint
+                    ui.label(
+                        egui::RichText::new("双击「索引」页签返回总览")
+                            .size(12.0)
+                            .color(palette_color(TEXT_FAINT)),
+                    );
+                    // flex:1 — 把右边的标签推到最右
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // 重选页面按钮（原型 #idxRePickBtn，仅有选中条目时启用）
+                        let has_sel = st.confirm_remove_entry.is_some();
+                        if ui
+                            .add_enabled(
+                                has_sel,
+                                egui::Button::new(
+                                    egui::RichText::new("重选页面").size(12.5),
+                                )
+                                .corner_radius(5),
+                            )
+                            .clicked()
+                        {
+                            // TODO: open re-pick dialog for selected entry
                         }
-                        Err(e) => self.msg = e,
+                        ui.add_space(6.0);
+                        // 5 标签切换（inline，不另起一行）
+                        // 注意：这里只渲染标签按钮行，不调用 index_detail_tabs
+                        // 以便与 backbar 在同一行内水平排列
+                        let tabs = [
+                            (IndexDetailView::Wall,     "条目图墙"),
+                            (IndexDetailView::Commits,  "提交图"),
+                            (IndexDetailView::Versions, "历史版本"),
+                            (IndexDetailView::Exports,  "导出记录"),
+                            (IndexDetailView::Lineage,  "派生关系"),
+                        ];
+                        // 右→左渲染，所以逆序
+                        for (view, label) in tabs.iter().rev() {
+                            let active = st.view == *view;
+                            let btn = egui::Button::new(
+                                egui::RichText::new(*label)
+                                    .size(12.5)
+                                    .color(if active {
+                                        egui::Color32::WHITE
+                                    } else {
+                                        palette_color(TEXT_WEAK)
+                                    }),
+                            )
+                            .fill(if active { ACCENT } else { egui::Color32::TRANSPARENT })
+                            .corner_radius(5)
+                            .min_size(egui::vec2(0.0, 26.0));
+                            if ui.add(btn).clicked() {
+                                st.view = *view;
+                            }
+                        }
+                    });
+                });
+            });
+        ui.add_space(8.0);
+
+        // ── 2. idx-coordbar：目录坐标 | ●范围 | 仓库 | 分支select | 派生点hint ───
+        // 对应原型 JS renderIdxCoord()，深色背景（CARD_BG 近似 --panel2）
+        egui::Frame::new()
+            .fill(palette_color(CARD_BG))
+            .stroke(egui::Stroke::new(1.0, palette_color(FIELD_BORDER)))
+            .corner_radius(6)
+            .inner_margin(egui::Margin { left: 12, right: 12, top: 8, bottom: 8 })
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    // 目录坐标
+                    ui.label(
+                        egui::RichText::new("目录坐标：")
+                            .size(13.5)
+                            .color(palette_color(TEXT_WEAK)),
+                    );
+                    ui.label(
+                        egui::RichText::new(&folder_coord)
+                            .size(13.5)
+                            .strong()
+                            .color(palette_color(TEXT_MAIN)),
+                    );
+                    // ● 范围色点 + 范围标签
+                    let (dot_rect, _) =
+                        ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                    ui.painter().circle_filled(dot_rect.center(), 5.0, scope.color());
+                    ui.label(
+                        egui::RichText::new(format!("公开范围：{}", scope.label()))
+                            .size(13.5)
+                            .color(palette_color(TEXT_MAIN)),
+                    );
+                    // 仓库名
+                    ui.label(
+                        egui::RichText::new("仓库：")
+                            .size(13.0)
+                            .color(palette_color(TEXT_WEAK)),
+                    );
+                    ui.label(
+                        egui::RichText::new(s(&index, "name"))
+                            .size(13.0)
+                            .strong()
+                            .color(palette_color(TEXT_MAIN)),
+                    );
+                    // 当前分支 select（ComboBox，原型用 <select>）
+                    ui.label(
+                        egui::RichText::new("当前分支：")
+                            .size(13.0)
+                            .color(palette_color(TEXT_WEAK)),
+                    );
+                    let mut branch = current_branch.clone();
+                    egui::ComboBox::from_id_salt("idx_coordbar_branch")
+                        .width(130.0)
+                        .selected_text(&branch)
+                        .show_ui(ui, |ui| {
+                            for b in &branches {
+                                if let Some(bs) = b.as_str() {
+                                    ui.selectable_value(&mut branch, bs.to_string(), bs);
+                                }
+                            }
+                        });
+                    if branch != current_branch {
+                        *action = Some(IndexDetailAction::ChangeBranch(branch));
+                        return;
                     }
-                }
-            }
-        });
-        ui.add_space(2.0);
+                    // 派生点 hint
+                    ui.label(
+                        egui::RichText::new(&fork_hint)
+                            .size(12.0)
+                            .color(palette_color(TEXT_FAINT))
+                            .italics(),
+                    );
+                    // 条目与页数（原型里在 renderIdxWall 中更新 #idxEntryCount/#idxTotalPages）
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "· {} 条目 · {} 页",
+                            resolved.len(),
+                            total_pages
+                        ))
+                        .size(13.0)
+                        .color(palette_color(ACCENT_DEEP)),
+                    );
+                });
+            });
+        ui.add_space(6.0);
+
+        // ── 3. idx-lineagebar：归属与谱系 | 分支·分叉点 | 直接分支chip | EN info | 制作英文版 ──
+        // 对应原型 JS renderIdxLineage()
+        egui::Frame::new()
+            .fill(palette_color(PANEL_BG))
+            .stroke(egui::Stroke::new(1.0, palette_color(FIELD_BORDER)))
+            .corner_radius(6)
+            .inner_margin(egui::Margin { left: 12, right: 12, top: 8, bottom: 8 })
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    // "归属与谱系" 粗体标签
+                    ui.label(
+                        egui::RichText::new("归属与谱系")
+                            .size(13.0)
+                            .strong()
+                            .color(palette_color(TEXT_MAIN)),
+                    );
+                    // 当前分支 · 分叉点
+                    ui.label(
+                        egui::RichText::new(format!("分支：{current_branch} · {fork_hint}"))
+                            .size(12.5)
+                            .color(palette_color(TEXT_WEAK)),
+                    );
+                    // 直接分支 chip 列表
+                    if !other_branches.is_empty() {
+                        ui.label(
+                            egui::RichText::new("直接分支：")
+                                .size(12.5)
+                                .color(palette_color(TEXT_WEAK)),
+                        );
+                        for bs in &other_branches {
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new(*bs)
+                                            .size(12.0)
+                                            .color(palette_color(TEXT_MAIN)),
+                                    )
+                                    .fill(palette_color(CHIP_GRAY_BG))
+                                    .corner_radius(5)
+                                    .min_size(egui::vec2(0.0, 28.0)),
+                                )
+                                .clicked()
+                            {
+                                *action =
+                                    Some(IndexDetailAction::ChangeBranch(bs.to_string()));
+                                return;
+                            }
+                        }
+                    }
+                    // 右端：EN 语言对应 + 制作英文版按钮
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("制作英文版")
+                                        .size(12.5)
+                                        .color(palette_color(ACCENT_DEEP)),
+                                )
+                                .fill(CHIP_BLUE_BG)
+                                .corner_radius(5)
+                                .min_size(egui::vec2(0.0, 28.0)),
+                            )
+                            .clicked()
+                        {
+                            st.more_action = Some(index_controls::IndexMoreAction::English(
+                                format!("{} · EN", s(&index, "name")),
+                            ));
+                        }
+                        // EN 对应信息（如果有）
+                        let en_name = s(&index, "en_name");
+                        if !en_name.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!("语言对应：{en_name}"))
+                                    .size(12.0)
+                                    .color(palette_color(TEXT_WEAK)),
+                            );
+                        }
+                    });
+                });
+            });
+        ui.add_space(8.0);
+
+        // ── 4. 次要操作条：导出 / 拉分支（原型 idxEdTools 更多菜单的次级功能）────
         ui.horizontal_wrapped(|ui| {
             ui.checkbox(&mut st.include_notes, "添加备注");
+            ui.separator();
             if text_action(ui, "导出（个人版）", palette_color(TEXT_MAIN), 13.0) {
                 *action = Some(IndexDetailAction::Export("personal"));
             }
             if text_action(ui, "导出（公用版）", palette_color(TEXT_MAIN), 13.0) {
                 *action = Some(IndexDetailAction::Export("company"));
             }
-            ui.add_space(24.0);
-            ui.add_space(24.0);
+            ui.add_space(16.0);
             ui.add(
                 egui::TextEdit::singleline(&mut st.new_branch)
                     .hint_text("新分支名")
-                    .desired_width(110.0)
+                    .desired_width(100.0)
                     .margin(egui::vec2(8.0, 2.0)),
             );
             if text_action_enabled(
@@ -25253,38 +26306,38 @@ impl App {
             }
         });
         ui.add_space(8.0);
-        self.index_detail_tabs(ui, st);
+        ui.separator();
+        ui.add_space(4.0);
+
+        // ── 5. 标签页内容区（标签按钮已内联在 backbar 中，这里只渲染内容）───────────────
         ui.add_space(10.0);
         if st.view != IndexDetailView::Wall {
             self.index_history_view(ui, st, action);
             return;
         }
         // entry tile wall: horizontal cards, one per row
-        let entries: Vec<Value> = detail
-            .get("resolved_entries")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
+        let entries: Vec<Value> = resolved
+            .iter()
             .filter_map(|row| row.get("entry").cloned())
             .collect();
-        // An armed remove confirmation whose entry is gone
-        // (list shrank under it) disarms instead of pointing
-        // at whatever entry now sits at that position.
         if let Some(p) = st.confirm_remove_entry {
             if p >= entries.len() {
                 st.confirm_remove_entry = None;
             }
         }
-        let resolved = detail
-            .get("resolved_entries")
-            .and_then(|r| r.as_array())
-            .cloned()
-            .unwrap_or_default();
+        let insert_bar = |ui: &mut egui::Ui, at: usize, action: &mut Option<IndexDetailAction>| {
+            ui.vertical_centered(|ui| {
+                if text_action(ui, "＋ 插入条目", palette_color(TEXT_WEAK), 13.0) {
+                    *action = Some(IndexDetailAction::Insert(at));
+                }
+            });
+        };
         egui::ScrollArea::vertical().id_salt(&st.index_id).show(ui, |ui| {
             let cover_width = if ui.available_width() >= 900.0 { 340.0 } else { 300.0 };
             let card_content_width = (ui.available_width() - 25.0).max(0.0);
             let thumb_gap = ui.spacing().item_spacing.x;
             let small_width = (cover_width - 2.0 * thumb_gap) / 3.0;
+            insert_bar(ui, 0, action);
             for (pos, re) in resolved.iter().enumerate() {
                 let entry = re.get("entry").cloned().unwrap_or(json!({}));
                 let ver = re.get("resolved").cloned().unwrap_or(Value::Null);
@@ -25292,13 +26345,10 @@ impl App {
                     .get("policy")
                     .map(|p| p.get("locked").is_some())
                     .unwrap_or(false);
-                if pos > 0 {
-                    ui.vertical_centered(|ui| {
-                        if text_action(ui, "＋ 插入条目", palette_color(TEXT_WEAK), 13.0) {
-                            *action = Some(IndexDetailAction::Insert(pos));
-                        }
-                    });
-                }
+                let eff_pages = index_controls::entry_effective_pages(&entry, &ver);
+                let rid = s(&entry, "rendition_id");
+                let versions = st.unit_versions.get(&rid).cloned().unwrap_or_default();
+                let newer = index_controls::entry_newer_version(&entry, &ver, &versions);
                 card_frame_square()
                     .inner_margin(egui::Margin {
                         left: 10,
@@ -25342,14 +26392,15 @@ impl App {
                                 );
                                 ui.label(
                                     egui::RichText::new(format!(
-                                        "{} · {} · {}",
+                                        "{} · {} · {} · {} 页",
                                         re.get("form").and_then(|x| x.as_str()).unwrap_or(""),
                                         re.get("lang").and_then(|x| x.as_str()).unwrap_or(""),
                                         if ver.is_object() {
                                             format!("v{}", s(&ver, "semver"))
                                         } else {
                                             "无版本".into()
-                                        }
+                                        },
+                                        eff_pages
                                     ))
                                     .size(11.5)
                                     .color(palette_color(TEXT_WEAK)),
@@ -25366,12 +26417,6 @@ impl App {
                                 .on_hover_text("从这个索引移除这个条目（内容块保留）")
                                 .clicked()
                             {
-                                // Prototype .del-pop (drill
-                                // re-audit N2): × only arms the
-                                // inline confirmation rendered
-                                // below the action row; the
-                                // removal commits from its
-                                // 确认删除 button.
                                 st.confirm_remove_entry = Some(pos);
                             }
                             if ui
@@ -25396,9 +26441,6 @@ impl App {
                                 return;
                             }
                             if ui.button("选页").clicked() {
-                                // page picking happens on the
-                                // content page (pick mode), not
-                                // inline in the card (James)
                                 let total = i(&ver, "page_count") as usize;
                                 let mut sel = vec![true; total];
                                 if let Some(slots) = entry
@@ -25412,7 +26454,30 @@ impl App {
                                 }
                                 *action = Some(IndexDetailAction::PickPages(pos, re.clone(), sel));
                             }
+                            let uid = s(&entry, "unit_id");
+                            if ui
+                                .add_enabled(!uid.is_empty(), egui::Button::new("页面维护"))
+                                .on_hover_text("跳到内容页编辑这个内容块")
+                                .clicked()
+                            {
+                                *action = Some(IndexDetailAction::OpenUnit(uid));
+                                return;
+                            }
                             if locked {
+                                if let Some((latest_id, latest_ver)) = newer {
+                                    if ui
+                                        .button(
+                                            egui::RichText::new(format!("更新到 v{latest_ver}"))
+                                                .color(palette_color(ACCENT_DEEP)),
+                                        )
+                                        .clicked()
+                                    {
+                                        *action = Some(IndexDetailAction::SwitchVersion(
+                                            pos, latest_id, latest_ver, true,
+                                        ));
+                                        return;
+                                    }
+                                }
                                 if ui
                                     .button(
                                         egui::RichText::new("解除锁定")
@@ -25447,15 +26512,6 @@ impl App {
                                 chip(ui, "跟随最新", palette_color(CHIP_GREEN_FG), CHIP_GREEN_BG);
                             }
                             });
-                            // Inline remove confirmation
-                            // (prototype .del-pop inrow, drill
-                            // re-audit N2): rendered in the card
-                            // directly under the action row while
-                            // armed; copy follows the prototype
-                            // verbatim. 取消 just disarms; only
-                            // 确认删除 commits the removal (the
-                            // commit itself is the same one the
-                            // × used to fire directly).
                             if st.confirm_remove_entry == Some(pos) {
                                 ui.add_space(4.0);
                                 let entry_name = re
@@ -25507,61 +26563,56 @@ impl App {
                                     chip(ui, "原版已删 · 已替代", palette_color(CHIP_ORANGE_FG), CHIP_ORANGE_BG);
                                 }
                             });
-                            // quick-switch strip: history versions, newest
-                            // first; last item opens the full-history popup
-                            if let Some(versions) = st.unit_versions
-                                .get(&s(&entry, "rendition_id"))
-                                .cloned()
-                            {
-                                if versions.len() > 1 {
-                                    let cur_id = if ver.is_object() {
-                                        s(&ver, "id")
-                                    } else {
-                                        String::new()
-                                    };
-                                    let latest_id = s(&versions[0], "id");
-                                    ui.horizontal_wrapped(|ui| {
-                                        for v in versions.iter().take(7) {
-                                            let vid = s(v, "id");
-                                            let is_cur = vid == cur_id;
-                                            ui.vertical(|ui| {
-                                                if self.thumb_button(ui, &vid, 0, 54.0, is_cur) {
-                                                    let is_latest = vid == latest_id;
-                                                    *action = Some(IndexDetailAction::SwitchVersion(
-                                                        pos, vid, s(v, "semver"), is_latest,
-                                                    ));
-                                                }
-                                                ui.label(
-                                                    egui::RichText::new(format!(
-                                                        "v{}",
-                                                        s(v, "semver")
-                                                    ))
-                                                    .size(10.5)
-                                                    .color(palette_color(if is_cur {
-                                                        ACCENT_DEEP
-                                                    } else {
-                                                        TEXT_WEAK
-                                                    })),
-                                                );
-                                            });
-                                        }
-                                        if ui.button("更多").clicked() {
-                                            let cur_index_id = match self.index.stack.top() {
-                                                IndexFrame::Detail(d) => d.index_id.clone(),
-                                                _ => String::new(),
-                                            };
-                                            self.overlays.push(Overlay::AllVersions {
-                                                entry_pos: pos,
-                                                index_id: cur_index_id,
-                                            });
-                                        }
-                                    });
-                                }
+                            if versions.len() > 1 {
+                                let cur_id = if ver.is_object() {
+                                    s(&ver, "id")
+                                } else {
+                                    String::new()
+                                };
+                                let latest_id = s(&versions[0], "id");
+                                ui.horizontal_wrapped(|ui| {
+                                    for v in versions.iter().take(7) {
+                                        let vid = s(v, "id");
+                                        let is_cur = vid == cur_id;
+                                        ui.vertical(|ui| {
+                                            if self.thumb_button(ui, &vid, 0, 54.0, is_cur) {
+                                                let is_latest = vid == latest_id;
+                                                *action = Some(IndexDetailAction::SwitchVersion(
+                                                    pos, vid, s(v, "semver"), is_latest,
+                                                ));
+                                            }
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "v{}",
+                                                    s(v, "semver")
+                                                ))
+                                                .size(10.5)
+                                                .color(palette_color(if is_cur {
+                                                    ACCENT_DEEP
+                                                } else {
+                                                    TEXT_WEAK
+                                                })),
+                                            );
+                                        });
+                                    }
+                                    if ui.button("更多").clicked() {
+                                        let cur_index_id = match self.index.stack.top() {
+                                            IndexFrame::Detail(d) => d.index_id.clone(),
+                                            _ => String::new(),
+                                        };
+                                        self.overlays.push(Overlay::AllVersions {
+                                            entry_pos: pos,
+                                            index_id: cur_index_id,
+                                        });
+                                    }
+                                });
                             }
                         });
                     });
                 });
-                ui.add_space(8.0);
+                ui.add_space(4.0);
+                insert_bar(ui, pos + 1, action);
+                ui.add_space(4.0);
             }
             let index_id = s(&index, "id");
             if !index_id.is_empty() {
@@ -26029,1082 +27080,6 @@ impl App {
             );
         }
     }
-
-    /// 缓存路径 (local setting; the admin cache policy lives elsewhere
-    /// and is not touched by this).
-    fn cache_path_ui(&mut self, ui: &mut egui::Ui) {
-        ui.label(
-            egui::RichText::new("缓存路径（本机设置）")
-                .strong()
-                .size(16.0)
-                .color(palette_color(TEXT_MAIN)),
-        );
-        ui.add_space(4.0);
-        ui.label(
-            egui::RichText::new(
-                "离线缓存的加密快照保存在这个目录，装在本机的所有账号共用；与管理员下发的缓存策略无关。",
-            )
-            .size(11.5)
-            .color(palette_color(TEXT_WEAK)),
-        );
-        ui.add_space(8.0);
-        let effective = cache_dir();
-        let total_bytes: u64 = dir_manifest(&effective).iter().map(|(_, n)| n).sum();
-        ui.label(
-            egui::RichText::new(format!(
-                "当前生效：{} · {} 条缓存 · {:.1} MB",
-                effective.display(),
-                self.cache_entries.len(),
-                total_bytes as f64 / 1_048_576.0
-            ))
-            .size(11.5)
-            .color(palette_color(TEXT_WEAK)),
-        );
-        let user_set = client_settings()
-            .get("cache_dir")
-            .and_then(|v| v.as_str())
-            .is_some_and(|s| !s.trim().is_empty());
-        if !user_set {
-            if let Some(p) = platform_cache_resolved() {
-                if p == effective {
-                    ui.label(
-                        egui::RichText::new(
-                            "未手动指定路径：当前使用平台默认位置（Windows 优先 D 盘、macOS 优先非系统卷）。",
-                        )
-                        .size(11.5)
-                        .color(palette_color(TEXT_WEAK)),
-                    );
-                }
-            }
-        }
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.add_sized(
-                [460.0, 30.0],
-                egui::TextEdit::singleline(&mut self.cache_dir_input),
-            );
-            if ui.button("保存路径").clicked() {
-                let p = std::path::PathBuf::from(self.cache_dir_input.trim());
-                if p.as_os_str().is_empty() {
-                    self.msg = "缓存路径不能为空".into();
-                } else {
-                    match std::fs::create_dir_all(&p) {
-                        Ok(()) => {
-                            save_client_settings(json!({ "cache_dir": p.to_string_lossy() }));
-                            self.cache_entries = load_cache_index();
-                            self.msg = "缓存路径已保存，新缓存将写入新目录".into();
-                        }
-                        Err(e) => self.msg = format!("缓存路径不可用：{e}"),
-                    }
-                }
-            }
-            if ui.button("恢复默认").clicked() {
-                save_client_settings(json!({ "cache_dir": Value::Null }));
-                self.cache_dir_input = default_cache_dir().to_string_lossy().into_owned();
-                self.cache_entries = load_cache_index();
-                self.msg = "缓存路径已恢复默认".into();
-            }
-        });
-        ui.add_space(12.0);
-        ui.label(
-            egui::RichText::new("本地库")
-                .strong()
-                .size(14.0)
-                .color(palette_color(TEXT_MAIN)),
-        );
-        ui.add_space(4.0);
-        let local_diag = match &self.local {
-            Some(local) => {
-                let (units, folders, indexes) = local.counts();
-                format!(
-                    "已打开：{} · 所有者 {} · 内容块 {} · 目录 {} · 索引 {}",
-                    local.root.display(),
-                    local.owner.display_name,
-                    units,
-                    folders,
-                    indexes
-                )
-            }
-            None => match &self.local_open_error {
-                Some(e) => format!(
-                    "本地库打开失败：{e}（库根 {}）",
-                    local_store::library_dir().display()
-                ),
-                None => format!(
-                    "本地库打开失败（原因见控制台日志）；库根解析为 {}",
-                    local_store::library_dir().display()
-                ),
-            },
-        };
-        ui.label(
-            egui::RichText::new(local_diag)
-                .size(11.5)
-                .color(palette_color(TEXT_WEAK)),
-        );
-        // 数据目录 (library-discovery line, 2026-11-25; P1
-        // rework): where the local library lives, per the
-        // bootstrap config. Saving a new directory only registers
-        // the move; the relocation runs at the next launch, before
-        // the library opens, with count verification — stated in
-        // the copy below.
-        ui.add_space(12.0);
-        ui.label(
-            egui::RichText::new("数据目录")
-                .strong()
-                .size(14.0)
-                .color(palette_color(TEXT_MAIN)),
-        );
-        ui.add_space(4.0);
-        ui.label(
-            egui::RichText::new(
-                "本地库（内容块、索引、页面与演示数据）存放的目录。改选新目录后，本次运行继续使用当前目录不受影响；软件会在下次启动时把当前库完整复制到新目录并核对内容，核对通过才切换，失败则继续使用当前目录并给出提示。新目录里已有其他启幕库时不会覆盖或合并，保存会被拒绝。",
-            )
-            .size(11.5)
-            .color(palette_color(TEXT_WEAK)),
-        );
-        ui.add_space(4.0);
-        let resolution = local_store::library_resolution();
-        let origin_note = match resolution.origin {
-            local_store::LibraryOrigin::Bootstrap => "来自配置文件",
-            local_store::LibraryOrigin::LegacySetting => "来自既有设置",
-            local_store::LibraryOrigin::Env => "来自环境变量 QIMU_DATA_DIR",
-            local_store::LibraryOrigin::Standard => "标准目录",
-            local_store::LibraryOrigin::Migrated => "本次启动由旧版库搬迁而来",
-            local_store::LibraryOrigin::FallbackSource => "旧库搬迁未成，暂按原目录使用",
-        };
-        let current_root = self
-            .local
-            .as_ref()
-            .map(|l| l.root.display().to_string())
-            .unwrap_or_else(|| resolution.dir.display().to_string());
-        ui.label(
-            egui::RichText::new(format!(
-                "当前生效：{}（{}）；配置文件：{}",
-                current_root,
-                origin_note,
-                local_store::bootstrap_path().display()
-            ))
-            .size(11.5)
-            .color(palette_color(TEXT_WEAK)),
-        );
-        if let Some(pend) = local_store::read_bootstrap().pending_relocate {
-            ui.label(
-                egui::RichText::new(format!(
-                    "已登记下次启动搬迁到：{}（重启软件后执行）",
-                    pend.to
-                ))
-                .size(11.5)
-                .color(palette_color(ACCENT_DEEP)),
-            );
-        }
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.add_sized(
-                [460.0, 30.0],
-                egui::TextEdit::singleline(&mut self.data_dir_input),
-            );
-            if ui.button("选择目录…").clicked() {
-                if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                    self.data_dir_input = p.to_string_lossy().into_owned();
-                }
-            }
-        });
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            if ui.button("保存并搬迁").clicked() {
-                let target = std::path::PathBuf::from(self.data_dir_input.trim());
-                if target.as_os_str().is_empty() {
-                    self.msg = "数据目录不能为空".into();
-                } else {
-                    self.apply_data_dir_change(target);
-                }
-            }
-            if ui.button("恢复默认目录").clicked() {
-                self.apply_data_dir_change(local_store::standard_library_dir());
-            }
-        });
-        // 旧库处置: the post-relocation source disposition policy,
-        // stored in the bootstrap config next to `data_dir`.
-        ui.add_space(12.0);
-        ui.label(
-            egui::RichText::new("旧库处置（升级搬迁后）")
-                .strong()
-                .size(14.0)
-                .color(palette_color(TEXT_MAIN)),
-        );
-        ui.add_space(4.0);
-        let policy = local_store::read_bootstrap().policy();
-        ui.horizontal(|ui| {
-            for (val, label) in [
-                (local_store::OldLibraryPolicy::Ask, "询问"),
-                (local_store::OldLibraryPolicy::Delete, "删除"),
-                (local_store::OldLibraryPolicy::Keep, "不删除"),
-            ] {
-                if ui.radio(policy == val, label).clicked() && policy != val {
-                    let mut b = local_store::read_bootstrap();
-                    b.old_library_policy = Some(val);
-                    local_store::write_bootstrap(&b);
-                    self.msg = format!("旧库处置已设为「{label}」");
-                }
-            }
-        });
-        ui.add_space(4.0);
-        ui.label(
-            egui::RichText::new(
-                "升级时旧库被搬到标准目录、且新库核对通过并启用之后，怎么处置原来的旧库：「询问」每次弹窗问你（默认）；「删除」直接删；「不删除」一直保留。搬迁未成功时旧库就是正在使用的库，任何设置下都不会删。",
-            )
-            .size(11.5)
-            .color(palette_color(TEXT_WEAK)),
-        );
-    }
-
-    /// Settings 「保存并搬迁」/「恢复默认目录」 for the data
-    /// directory (audit P1 rework): this only REGISTERS the move —
-    /// the target is validated by read-only probe and the intent
-    /// is stored in the bootstrap config; the relocation itself
-    /// runs at the next launch, inside library resolution, before
-    /// the store opens. Copying the *running* library (the old
-    /// behaviour) forked the session: the copy was taken from a
-    /// live database while this session kept writing to the old
-    /// directory, so everything done after the "move" vanished
-    /// from the user's view at the next launch. Deferred to
-    /// startup, the source is static, the counts check arbitrates
-    /// a complete copy, and this session is untouched.
-    fn apply_data_dir_change(&mut self, target: std::path::PathBuf) {
-        let current = self
-            .local
-            .as_ref()
-            .map(|l| l.root.clone())
-            .unwrap_or_else(local_store::library_dir);
-        if target == current {
-            self.say("所选目录就是当前数据目录，无需搬迁");
-            return;
-        }
-        if target.starts_with(&current) || current.starts_with(&target) {
-            self.say("新目录不能位于当前数据目录之内，也不能包含当前数据目录");
-            return;
-        }
-        if target.exists() && !target.is_dir() {
-            self.say("所选路径是一个文件，不能用作数据目录");
-            return;
-        }
-        if local_store::probe_library(&target)
-            .map(|c| c.has_content())
-            .unwrap_or(false)
-        {
-            self.say("新目录里已有另一个启幕库，不会覆盖或合并；请换一个空目录");
-            return;
-        }
-        let mut b = local_store::read_bootstrap();
-        b.pending_relocate = Some(local_store::PendingRelocate {
-            from: current.to_string_lossy().into_owned(),
-            to: target.to_string_lossy().into_owned(),
-        });
-        local_store::write_bootstrap(&b);
-        self.say(format!(
-            "已登记：下次启动时把数据目录从 {} 搬迁到 {}；搬迁在启动时执行并核对内容，失败则继续使用当前目录。本次运行不受影响",
-            current.display(),
-            target.display()
-        ));
-    }
-
-    /// Settings nav frame body: the section list, unchanged.
-    /// Settings content for the section selected in the sidebar.
-    fn st_main_body(&mut self, ui: &mut egui::Ui) {
-        // Board layout: left section nav, one section at a time on the
-        // right; sections a role may not see are not rendered at all.
-        let sections = self.settings_sections();
-        if self.settings.section >= sections.len() {
-            self.settings.section = 0;
-        }
-        let current = sections[self.settings.section];
-        egui::Frame::NONE
-            .fill(palette_color(APP_BG))
-            .inner_margin(egui::Margin {
-                left: 22,
-                right: 22,
-                top: 20,
-                bottom: 16,
-            })
-            .show(ui, |ui| {
-                ui.set_min_size(ui.available_size());
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.heading(tr(current));
-                    ui.add_space(14.0);
-                    match current {
-                        "服务器" => {
-                            self.settings_servers(ui);
-                        }
-                        "离线缓存" => {
-                            self.cache_path_ui(ui);
-                        }
-                        "演示偏好" => {
-                            // 放映打开方式 (ruling 2026-11-25): the
-                            // radio row follows the settings page's
-                            // existing 旧库处置 radio pattern; the
-                            // choice persists to client-settings.json
-                            // like the checkbox below it.
-                            ui.label(
-                                egui::RichText::new("放映打开方式")
-                                    .strong()
-                                    .size(14.0)
-                                    .color(palette_color(TEXT_MAIN)),
-                            );
-                            ui.add_space(4.0);
-                            ui.horizontal(|ui| {
-                                for (val, label) in [
-                                    (PresentEngine::Builtin, "内置放映"),
-                                    (PresentEngine::DeckCraft, "DeckCraft"),
-                                    (PresentEngine::PowerPoint, "PowerPoint"),
-                                ] {
-                                    if ui.radio(self.present_engine == val, label).clicked()
-                                        && self.present_engine != val
-                                    {
-                                        self.present_engine = val;
-                                        save_client_settings(
-                                            json!({ "present_engine": val.key() }),
-                                        );
-                                        self.msg = format!("放映打开方式已设为「{label}」");
-                                    }
-                                }
-                            });
-                            ui.add_space(4.0);
-                            ui.label(
-                                egui::RichText::new(
-                                    "播放、普通视图、演示者视图打开稿件时用哪种方式：「内置放映」在启幕内放映（默认）；「DeckCraft」用 DeckCraft 桌面应用打开；「PowerPoint」把稿件写到缓存目录并用 PowerPoint 打开，播放与演示者视图会自动开始放映。所选应用不可用时会明确提示，不会自动改用其他方式。",
-                                )
-                                .size(11.5)
-                                .color(palette_color(TEXT_WEAK)),
-                            );
-                            ui.add_space(12.0);
-                            if ui
-                                .checkbox(&mut self.dc_auto_quit, tr("放映结束自动关闭 DeckCraft"))
-                                .changed()
-                            {
-                                save_client_settings(
-                                    json!({ "deckcraft_auto_quit": self.dc_auto_quit }),
-                                );
-                            }
-                            // 撤回步数 (Ctrl+Z undo depth, user
-                            // ruling 2026-11-25): a device-local
-                            // preference next to the other
-                            // presentation prefs. Changing it takes
-                            // effect at once — shrinking truncates
-                            // the live stack's oldest entries,
-                            // growing never resurrects dropped
-                            // ones, and 0 turns undo off (the
-                            // stack is emptied and stays empty).
-                            ui.add_space(12.0);
-                            ui.label(
-                                egui::RichText::new("撤回步数")
-                                    .strong()
-                                    .size(14.0)
-                                    .color(palette_color(TEXT_MAIN)),
-                            );
-                            ui.add_space(4.0);
-                            ui.horizontal(|ui| {
-                                ui.label("Ctrl+Z 撤回 / Ctrl+Y 重做的操作步数");
-                                let resp = ui.add(
-                                    egui::DragValue::new(&mut self.undo_limit)
-                                        .range(0..=200),
-                                );
-                                ui.label("步");
-                                if resp.changed() {
-                                    save_client_settings(
-                                        json!({ "undo_limit": self.undo_limit }),
-                                    );
-                                    let limit = self.undo_limit.max(0) as usize;
-                                    while self.undo_stack.len() > limit {
-                                        self.undo_stack.remove(0);
-                                    }
-                                    while self.redo_stack.len() > limit {
-                                        self.redo_stack.remove(0);
-                                    }
-                                    self.msg = if self.undo_limit <= 0 {
-                                        "撤回已关闭".into()
-                                    } else {
-                                        format!("撤回步数已设为 {} 步", self.undo_limit)
-                                    };
-                                }
-                            });
-                            ui.add_space(4.0);
-                            ui.label(
-                                egui::RichText::new(
-                                    "移动、并入、删除、组合、粘贴与文件夹操作等可按 Ctrl+Z 逐步撤回，按 Ctrl+Y（或 Ctrl+Shift+Z）重做刚撤回的操作（仅限本机库内的操作，本次运行内有效）。重做步数与撤回共用此设置；设为 0 关闭撤回与重做；调小步数会立即丢弃最早的记录。",
-                                )
-                                .size(11.5)
-                                .color(palette_color(TEXT_WEAK)),
-                            );
-                        }
-                        "我的提交" => {
-                            self.my_submissions_body(ui);
-                        }
-                        "审批队列" => {
-                            self.review_queue_body(ui);
-                        }
-                        "投稿设置" => {
-                            // Server-side retention for pending
-                            // submissions (super only; the section
-                            // itself is super-gated). Loaded once
-                            // per account context, AI-settings
-                            // style; saving takes effect at the
-                            // server's next sweep (hourly at most).
-                            if !self.settings.sub_ttl_loaded {
-                                self.settings.sub_ttl_loaded = true;
-                                if let Ok(v) =
-                                    self.call("GET", "/v1/settings/submissions", None)
-                                {
-                                    if let Some(d) =
-                                        v.get("pending_ttl_days").and_then(|x| x.as_i64())
-                                    {
-                                        self.settings.sub_ttl_days = d;
-                                    }
-                                }
-                            }
-                            ui.label(
-                                egui::RichText::new("待审投稿保留天数")
-                                    .strong()
-                                    .size(16.0)
-                                    .color(palette_color(TEXT_MAIN)),
-                            );
-                            ui.add_space(8.0);
-                            ui.horizontal(|ui| {
-                                ui.label("保留天数");
-                                ui.add(
-                                    egui::DragValue::new(
-                                        &mut self.settings.sub_ttl_days,
-                                    )
-                                    .range(0..=3650),
-                                );
-                                ui.label("天");
-                                if ui.button("保存").clicked()
-                                    && self.require_org_online("保存投稿设置")
-                                {
-                                    match self.call(
-                                        "PUT",
-                                        "/v1/settings/submissions",
-                                        Some(json!({
-                                            "pending_ttl_days": self.settings.sub_ttl_days
-                                        })),
-                                    ) {
-                                        Ok(_) => self.msg = "投稿设置已保存".into(),
-                                        Err(e) => self.msg = e,
-                                    }
-                                }
-                            });
-                            ui.add_space(6.0);
-                            ui.label(
-                                egui::RichText::new(
-                                    "待审投稿超过保留天数仍未审批的，服务器会自动清理其暂存文件，提交记录标记为「已过期」（记录保留，提交人可重新提交）。设为 0 表示永不过期。修改在服务器下一次清扫（每小时一次及每次启动）时生效。",
-                                )
-                                .size(11.5)
-                                .color(palette_color(TEXT_WEAK)),
-                            );
-                        }
-                        "个人资料" => {
-                            // Board: label column + 380×34 fields on a 54
-                            // pitch, blue pill save under the field column,
-                            // personal-binding preview card on the right.
-                            let mut save_clicked = false;
-                            ui.horizontal_top(|ui| {
-                                egui::Grid::new("profile_grid")
-                                    .num_columns(2)
-                                    .spacing([16.0, 20.0])
-                                    .show(ui, |ui| {
-                                        for (key, label) in [
-                                            ("name", "姓名"),
-                                            ("title", "职务"),
-                                            ("english_name", "英文名"),
-                                            ("phone", "手机号"),
-                                            ("email", "邮箱"),
-                                            ("wechat", "微信二维码"),
-                                        ] {
-                                            ui.label(
-                                                egui::RichText::new(label)
-                                                    .size(13.0)
-                                                    .color(palette_color(TEXT_WEAK)),
-                                            );
-                                            let v = self
-                                                .settings
-                                                .profile
-                                                .entry(key.to_string())
-                                                .or_default();
-                                            ui.add_sized(
-                                                [380.0, 34.0],
-                                                egui::TextEdit::singleline(v)
-                                                    .margin(egui::vec2(10.0, 8.0)),
-                                            );
-                                            ui.end_row();
-                                        }
-                                        ui.label("");
-                                        if ui
-                                            .add(
-                                                egui::Button::new(
-                                                    egui::RichText::new("保存资料")
-                                                        .size(13.0)
-                                                        .color(egui::Color32::WHITE),
-                                                )
-                                                .fill(ACCENT)
-                                                .corner_radius(6)
-                                                .min_size(egui::vec2(120.0, 38.0)),
-                                            )
-                                            .clicked()
-                                        {
-                                            save_clicked = true;
-                                        }
-                                        ui.end_row();
-                                    });
-                                ui.add_space(64.0);
-                                ui.vertical(|ui| {
-                                    ui.label(
-                                        egui::RichText::new("个人绑定预览").strong().size(16.0),
-                                    );
-                                    ui.add_space(8.0);
-                                    let p = &self.settings.profile;
-                                    let get = |k: &str| p.get(k).cloned().unwrap_or_default();
-                                    let dname = self
-                                        .user
-                                        .as_ref()
-                                        .map(|u| s(u, "display_name"))
-                                        .unwrap_or_default();
-                                    let pname = if get("name").is_empty() {
-                                        dname
-                                    } else {
-                                        get("name")
-                                    };
-                                    egui::Frame::NONE
-                                        .fill(egui::Color32::WHITE)
-                                        .corner_radius(egui::CornerRadius::same(8))
-                                        .inner_margin(egui::Margin::same(14))
-                                        .show(ui, |ui| {
-                                            ui.set_min_size(egui::vec2(312.0, 163.0));
-                                            let (bar, _) = ui.allocate_exact_size(
-                                                egui::vec2(150.0, 8.0),
-                                                egui::Sense::hover(),
-                                            );
-                                            ui.painter().rect_filled(
-                                                bar,
-                                                0.0,
-                                                egui::Color32::from_rgb(0x1F, 0x38, 0x64),
-                                            );
-                                            ui.add_space(10.0);
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "汇报人：{} · {}",
-                                                    pname,
-                                                    get("title")
-                                                ))
-                                                .size(11.0)
-                                                .color(egui::Color32::from_rgb(0x33, 0x33, 0x33)),
-                                            );
-                                            ui.add_space(4.0);
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "{} · {}",
-                                                    get("phone"),
-                                                    get("email")
-                                                ))
-                                                .size(11.0)
-                                                .color(egui::Color32::from_rgb(0x66, 0x66, 0x66)),
-                                            );
-                                            ui.add_space(12.0);
-                                            let (img, _) = ui.allocate_exact_size(
-                                                egui::vec2(90.0, 60.0),
-                                                egui::Sense::hover(),
-                                            );
-                                            ui.painter().rect_filled(
-                                                img,
-                                                0.0,
-                                                egui::Color32::from_rgb(0xB8, 0xC4, 0xD4),
-                                            );
-                                        });
-                                });
-                            });
-                            if save_clicked {
-                                let fields: Value = json!(self.settings.profile);
-                                match self.call(
-                                    "PUT",
-                                    "/v1/me/profile",
-                                    Some(json!({ "fields": fields })),
-                                ) {
-                                    Ok(_) => self.msg = "已保存".into(),
-                                    Err(e) => self.msg = e,
-                                }
-                            }
-                        }
-                        "组织管理" => {
-                            let depts = self
-                                .org
-                                .get("departments")
-                                .and_then(|d| d.as_array())
-                                .cloned()
-                                .unwrap_or_default();
-                            for d in &depts {
-                                ui.label(format!("· {}", s(d, "name")));
-                            }
-                            ui.horizontal(|ui| {
-                                ui.label("新部门");
-                                ui.add_sized(
-                                    [240.0, 26.0],
-                                    egui::TextEdit::singleline(&mut self.settings.dept_name),
-                                );
-                                if ui
-                                    .add_enabled(
-                                        !self.settings.dept_name.is_empty(),
-                                        egui::Button::new("添加"),
-                                    )
-                                    .clicked()
-                                    && self.require_org_online("添加部门")
-                                {
-                                    match self.call(
-                                        "POST",
-                                        "/v1/org/departments",
-                                        Some(json!({ "name": self.settings.dept_name })),
-                                    ) {
-                                        Ok(_) => {
-                                            self.settings.dept_name.clear();
-                                            self.refresh_all();
-                                        }
-                                        Err(e) => self.msg = e,
-                                    }
-                                }
-                            });
-                            ui.add_space(10.0);
-                            let users = self
-                                .org
-                                .get("users")
-                                .and_then(|d| d.as_array())
-                                .cloned()
-                                .unwrap_or_default();
-                            for u in &users {
-                                ui.label(format!(
-                                    "{} · {} · {}",
-                                    s(u, "username"),
-                                    s(u, "display_name"),
-                                    s(u, "role")
-                                ));
-                            }
-                            ui.horizontal(|ui| {
-                                ui.label("新账号");
-                                ui.add_sized(
-                                    [150.0, 26.0],
-                                    egui::TextEdit::singleline(&mut self.settings.user_name),
-                                );
-                                ui.label("姓名");
-                                ui.add_sized(
-                                    [150.0, 26.0],
-                                    egui::TextEdit::singleline(&mut self.settings.user_display),
-                                );
-                                ui.label("密码");
-                                ui.add_sized(
-                                    [150.0, 26.0],
-                                    egui::TextEdit::singleline(&mut self.settings.user_password)
-                                        .password(true),
-                                );
-                                if ui
-                                    .add_enabled(
-                                        !self.settings.user_name.trim().is_empty()
-                                            && !self.settings.user_display.trim().is_empty()
-                                            && !self.settings.user_password.is_empty(),
-                                        egui::Button::new("创建账号"),
-                                    )
-                                    .clicked()
-                                    && self.require_org_online("创建账号")
-                                {
-                                    match self.call(
-                                        "POST",
-                                        "/v1/org/users",
-                                        Some(json!({
-                                            "username": self.settings.user_name,
-                                            "display_name": self.settings.user_display,
-                                            "password": self.settings.user_password,
-                                            "role": "member",
-                                        })),
-                                    ) {
-                                        Ok(_) => {
-                                            self.settings.user_name.clear();
-                                            self.refresh_all();
-                                        }
-                                        Err(e) => self.msg = e,
-                                    }
-                                }
-                            });
-                        }
-                        "内容组与授权" => {
-                            for g in self.groups.clone() {
-                                ui.label(format!("· {}", s(&g, "name")));
-                            }
-                            ui.horizontal(|ui| {
-                                ui.label("新内容组");
-                                ui.add_sized(
-                                    [240.0, 26.0],
-                                    egui::TextEdit::singleline(&mut self.settings.group_name),
-                                );
-                                if ui
-                                    .add_enabled(
-                                        !self.settings.group_name.is_empty(),
-                                        egui::Button::new("添加"),
-                                    )
-                                    .clicked()
-                                    && self.require_org_online("添加内容组")
-                                {
-                                    match self.call(
-                                        "POST",
-                                        "/v1/groups",
-                                        Some(json!({ "name": self.settings.group_name })),
-                                    ) {
-                                        Ok(_) => {
-                                            self.settings.group_name.clear();
-                                            self.refresh_all();
-                                        }
-                                        Err(e) => self.msg = e,
-                                    }
-                                }
-                            });
-                            ui.add_space(10.0);
-                            if ui.button("载入授权列表").clicked() {
-                                match self.call("GET", "/v1/grants", None) {
-                                    Ok(v) => {
-                                        self.grants = v
-                                            .get("grants")
-                                            .and_then(|g| g.as_array())
-                                            .cloned()
-                                            .unwrap_or_default()
-                                    }
-                                    Err(e) => self.msg = e,
-                                }
-                            }
-                            for g in self.grants.clone() {
-                                ui.label(format!(
-                                    "{} → {}:{} {}",
-                                    self.group_name(&s(&g, "group_id")),
-                                    s(&g, "subject_type"),
-                                    s(&g, "subject_id"),
-                                    s(&g, "capability")
-                                ));
-                            }
-                            ui.horizontal(|ui| {
-                                egui::ComboBox::from_id_salt("grant_group")
-                                    .selected_text(
-                                        self.group_name(&self.settings.grant_group.clone()),
-                                    )
-                                    .show_ui(ui, |ui| {
-                                        for g in self.groups.clone() {
-                                            ui.selectable_value(
-                                                &mut self.settings.grant_group,
-                                                s(&g, "id"),
-                                                s(&g, "name"),
-                                            );
-                                        }
-                                    });
-                                egui::ComboBox::from_id_salt("grant_st")
-                                    .selected_text(self.settings.grant_subject_type.clone())
-                                    .show_ui(ui, |ui| {
-                                        ui.selectable_value(
-                                            &mut self.settings.grant_subject_type,
-                                            "dept".into(),
-                                            "部门",
-                                        );
-                                        ui.selectable_value(
-                                            &mut self.settings.grant_subject_type,
-                                            "user".into(),
-                                            "个人",
-                                        );
-                                    });
-                                ui.text_edit_singleline(&mut self.settings.grant_subject_id);
-                                egui::ComboBox::from_id_salt("grant_cap")
-                                    .selected_text(self.settings.grant_capability.clone())
-                                    .show_ui(ui, |ui| {
-                                        for (v, l) in [
-                                            ("view", "查看"),
-                                            ("use", "使用"),
-                                            ("publish", "发布"),
-                                            ("manage", "管理"),
-                                        ] {
-                                            ui.selectable_value(
-                                                &mut self.settings.grant_capability,
-                                                v.into(),
-                                                l,
-                                            );
-                                        }
-                                    });
-                                if ui
-                                    .add_enabled(
-                                        !self.settings.grant_subject_id.trim().is_empty()
-                                            && !self.settings.grant_group.is_empty(),
-                                        egui::Button::new("添加授权"),
-                                    )
-                                    .clicked()
-                                    && self.require_org_online("添加授权")
-                                {
-                                    match self.call(
-                                        "POST",
-                                        "/v1/grants",
-                                        Some(json!({
-                                            "group_id": self.settings.grant_group,
-                                            "subject_type": self.settings.grant_subject_type,
-                                            "subject_id": self.settings.grant_subject_id,
-                                            "capability": self.settings.grant_capability,
-                                        })),
-                                    ) {
-                                        Ok(_) => self.msg = "已添加授权".into(),
-                                        Err(e) => self.msg = e,
-                                    }
-                                }
-                            });
-                        }
-                        "公司公共资料" => {
-                            egui::Grid::new("company_grid")
-                                .num_columns(2)
-                                .spacing([14.0, 10.0])
-                                .show(ui, |ui| {
-                                    for (key, label) in [
-                                        ("phone", "公司电话"),
-                                        ("website", "官网"),
-                                        ("address", "地址"),
-                                        ("gongzhonghao", "公众号"),
-                                    ] {
-                                        ui.label(label);
-                                        let v = self
-                                            .settings
-                                            .company
-                                            .entry(key.to_string())
-                                            .or_default();
-                                        ui.add_sized([300.0, 26.0], egui::TextEdit::singleline(v));
-                                        ui.end_row();
-                                    }
-                                });
-                            ui.add_space(12.0);
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        egui::RichText::new("保存公司资料")
-                                            .color(egui::Color32::WHITE),
-                                    )
-                                    .fill(ACCENT)
-                                    .corner_radius(6),
-                                )
-                                .clicked()
-                                && self.require_org_online("保存公司资料")
-                            {
-                                let fields: Value = json!(self.settings.company);
-                                match self.call(
-                                    "PUT",
-                                    "/v1/company-profile",
-                                    Some(json!({ "fields": fields })),
-                                ) {
-                                    Ok(_) => self.msg = "已保存".into(),
-                                    Err(e) => self.msg = e,
-                                }
-                            }
-                        }
-                        "内容语言" => {
-                            ui.horizontal(|ui| {
-                                ui.label("内容语言清单");
-                                ui.add_sized(
-                                    [300.0, 26.0],
-                                    egui::TextEdit::singleline(&mut self.settings.languages_text),
-                                );
-                                if ui.button("保存").clicked() && self.require_org_online("保存内容语言") {
-                                    let langs: Vec<String> = self
-                                        .settings
-                                        .languages_text
-                                        .split(',')
-                                        .map(|x| x.trim().to_string())
-                                        .filter(|x| !x.is_empty())
-                                        .collect();
-                                    match self.call(
-                                        "PUT",
-                                        "/v1/settings/languages",
-                                        Some(json!({ "languages": langs })),
-                                    ) {
-                                        Ok(_) => self.msg = "已保存".into(),
-                                        Err(e) => self.msg = e,
-                                    }
-                                }
-                            });
-                        }
-                        "AI 翻译" => {
-                            if !self.settings.ai_loaded {
-                                self.settings.ai_loaded = true;
-                                if let Ok(v) = self.call("GET", "/v1/settings/ai", None) {
-                                    self.settings.ai_provider = s(&v, "provider");
-                                    self.settings.ai_endpoint = s(&v, "endpoint");
-                                    self.settings.ai_model = s(&v, "model");
-                                    self.settings.ai_has_key =
-                                        v.get("has_key").and_then(|x| x.as_bool()).unwrap_or(false);
-                                }
-                                if let Ok(v) = self.call("GET", "/v1/settings/glossary", None) {
-                                    if let Some(pairs) = v.get("pairs").and_then(|x| x.as_array()) {
-                                        self.settings.glossary_text = pairs
-                                            .iter()
-                                            .map(|pr| format!("{}={}", s(pr, "src"), s(pr, "dst")))
-                                            .collect::<Vec<_>>()
-                                            .join("\n");
-                                    }
-                                }
-                            }
-                            egui::Grid::new("ai_grid")
-                                .num_columns(2)
-                                .spacing([14.0, 10.0])
-                                .show(ui, |ui| {
-                                    ui.label("提供方");
-                                    egui::ComboBox::from_id_salt("ai_provider")
-                                        .selected_text(self.settings.ai_provider.clone())
-                                        .show_ui(ui, |ui| {
-                                            ui.selectable_value(
-                                                &mut self.settings.ai_provider,
-                                                "stub".into(),
-                                                "stub（本地占位）",
-                                            );
-                                            ui.selectable_value(
-                                                &mut self.settings.ai_provider,
-                                                "openai-compat".into(),
-                                                "OpenAI 兼容接口",
-                                            );
-                                        });
-                                    ui.end_row();
-                                    ui.label("接口地址");
-                                    ui.add_sized(
-                                        [300.0, 26.0],
-                                        egui::TextEdit::singleline(&mut self.settings.ai_endpoint),
-                                    );
-                                    ui.end_row();
-                                    ui.label("模型");
-                                    ui.add_sized(
-                                        [300.0, 26.0],
-                                        egui::TextEdit::singleline(&mut self.settings.ai_model),
-                                    );
-                                    ui.end_row();
-                                    ui.label("API 密钥");
-                                    ui.add_sized(
-                                        [300.0, 26.0],
-                                        egui::TextEdit::singleline(&mut self.settings.ai_key)
-                                            .password(true),
-                                    );
-                                    ui.end_row();
-                                });
-                            ui.label(
-                                egui::RichText::new(if self.settings.ai_has_key {
-                                    "密钥：已设置（留空保存则不更换）"
-                                } else {
-                                    "密钥：未设置"
-                                })
-                                .small()
-                                .color(palette_color(TEXT_WEAK)),
-                            );
-                            ui.add_space(8.0);
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        egui::RichText::new("保存 AI 设置")
-                                            .color(egui::Color32::WHITE),
-                                    )
-                                    .fill(ACCENT)
-                                    .corner_radius(6),
-                                )
-                                .clicked()
-                                && self.require_org_online("保存 AI 设置")
-                            {
-                                let mut body = json!({
-                                    "provider": self.settings.ai_provider,
-                                    "endpoint": self.settings.ai_endpoint,
-                                    "model": self.settings.ai_model,
-                                });
-                                if !self.settings.ai_key.is_empty() {
-                                    body["api_key"] = json!(self.settings.ai_key);
-                                }
-                                match self.call("PUT", "/v1/settings/ai", Some(body)) {
-                                    Ok(_) => {
-                                        if !self.settings.ai_key.is_empty() {
-                                            self.settings.ai_has_key = true;
-                                            self.settings.ai_key.clear();
-                                        }
-                                        self.msg = "AI 设置已保存".into();
-                                    }
-                                    Err(e) => self.msg = e,
-                                }
-                            }
-                            ui.add_space(16.0);
-                            ui.label(egui::RichText::new("术语表（每行一条：源词=译词）").strong());
-                            ui.add_sized(
-                                [440.0, 120.0],
-                                egui::TextEdit::multiline(&mut self.settings.glossary_text),
-                            );
-                            ui.add_space(8.0);
-                            if ui.button("保存术语表").clicked() && self.require_org_online("保存术语表") {
-                                let pairs: Vec<Value> = self
-                                    .settings
-                                    .glossary_text
-                                    .lines()
-                                    .filter_map(|l| {
-                                        let (a, b) = l.split_once('=')?;
-                                        Some(json!({
-                                            "src": a.trim(),
-                                            "dst": b.trim(),
-                                        }))
-                                    })
-                                    .collect();
-                                match self.call(
-                                    "PUT",
-                                    "/v1/settings/glossary",
-                                    Some(json!({ "pairs": pairs })),
-                                ) {
-                                    Ok(_) => self.msg = "术语表已保存".into(),
-                                    Err(e) => self.msg = e,
-                                }
-                            }
-                        }
-                        "离线缓存策略" => {
-                            self.cache_path_ui(ui);
-                            ui.add_space(10.0);
-                            ui.separator();
-                            ui.add_space(10.0);
-                            ui.label(
-                                egui::RichText::new("管理员策略（服务器下发）")
-                                    .strong()
-                                    .size(16.0)
-                                    .color(palette_color(TEXT_MAIN)),
-                            );
-                            ui.add_space(8.0);
-                            let mut allowed = self
-                                .cache_policy
-                                .get("allowed")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(true);
-                            let mut max_mb = self
-                                .cache_policy
-                                .get("max_mb")
-                                .and_then(|v| v.as_i64())
-                                .unwrap_or(500);
-                            ui.horizontal(|ui| {
-                                ui.checkbox(&mut allowed, "允许离线缓存");
-                                ui.label("容量上限（MB）");
-                                ui.add(egui::DragValue::new(&mut max_mb).range(10..=100000));
-                                if ui.button("保存策略").clicked() && self.require_org_online("保存缓存策略") {
-                                    match self.call(
-                                        "PUT",
-                                        "/v1/settings/cache-policy",
-                                        Some(json!({
-                                            "allowed": allowed,
-                                            "max_mb": max_mb
-                                        })),
-                                    ) {
-                                        Ok(_) => {
-                                            self.cache_policy =
-                                                json!({ "allowed": allowed, "max_mb": max_mb });
-                                            self.msg = "缓存策略已保存".into();
-                                        }
-                                        Err(e) => self.msg = e,
-                                    }
-                                }
-                            });
-                        }
-                        _ => {}
-                    }
-                });
-            });
-    }
 }
 
 /// Append one line to the startup log under ~/.qimu (best effort: a
@@ -27305,6 +27280,57 @@ fn main() {
                 ))
                 .show();
         }
+    }
+}
+
+#[cfg(test)]
+mod insert_order_tests {
+    use super::*;
+
+    fn pick(unit_id: &str) -> InsertPick {
+        InsertPick {
+            unit_id: unit_id.into(),
+            rendition_id: format!("rendition-{unit_id}"),
+            version_id: format!("version-{unit_id}"),
+        }
+    }
+
+    #[test]
+    fn selection_keeps_click_order_and_deselects() {
+        let mut selected = Vec::new();
+        for id in ["a", "b", "a", "c"] {
+            toggle_insert_pick(&mut selected, pick(id));
+        }
+        assert_eq!(
+            selected,
+            vec![pick("b"), pick("c")],
+            "reselection must append, while cancellation removes only the clicked item"
+        );
+    }
+
+    #[test]
+    fn dragging_moves_a_card_before_the_target() {
+        let mut state = InsertOrderState::new(vec![pick("a"), pick("b"), pick("c")]);
+        state.move_card(0, 2);
+        assert_eq!(state.picks(), vec![pick("b"), pick("a"), pick("c")]);
+        state.move_card(2, 1);
+        assert_eq!(state.picks(), vec![pick("c"), pick("b"), pick("a")]);
+    }
+
+    #[test]
+    fn copy_paste_duplicates_and_cut_moves_the_selected_card() {
+        let mut state = InsertOrderState::new(vec![pick("a"), pick("b")]);
+        state.selected = Some(0);
+        state.copy();
+        state.paste();
+        assert_eq!(state.picks(), vec![pick("a"), pick("a"), pick("b")]);
+        let copied_id = state.selected.expect("pasted card selected");
+        state.cut();
+        assert_eq!(state.picks(), vec![pick("a"), pick("b")]);
+        assert_eq!(state.clipboard, vec![pick("a")]);
+        state.paste();
+        assert_eq!(state.picks(), vec![pick("a"), pick("a"), pick("b")]);
+        assert_ne!(state.selected, Some(copied_id));
     }
 }
 
