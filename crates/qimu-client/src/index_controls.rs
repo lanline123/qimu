@@ -161,6 +161,22 @@ impl App {
             self.page == Page::Index && matches!(self.index.stack.top(), IndexFrame::Detail(_));
         let overview =
             self.page == Page::Index && matches!(self.index.stack.top(), IndexFrame::Overview(_));
+        let push_target = if self.page == Page::Index {
+            match self.index.stack.top() {
+                IndexFrame::Detail(st) => {
+                    Some((st.index_id.clone(), s(&st.detail["index"], "name")))
+                }
+                IndexFrame::Overview(ov) => ov.selected.as_deref().and_then(|id| {
+                    self.indexes
+                        .iter()
+                        .find(|index| s(index, "id") == id)
+                        .map(|index| (id.to_string(), s(index, "name")))
+                }),
+                IndexFrame::Create(_) => None,
+            }
+        } else {
+            None
+        };
         let can_merge = editor
             && matches!(self.index.stack.top(), IndexFrame::Detail(st)
             if st.detail["branches"].as_array().is_some_and(|branches| branches.len() > 1));
@@ -195,7 +211,14 @@ impl App {
                 .tool(ui, ChromeIcon::Publish, "发布版本", editor, false, true)
                 .clicked();
             let push = icons
-                .tool(ui, ChromeIcon::Push, "提交到演示厅", editor, false, true)
+                .tool(
+                    ui,
+                    ChromeIcon::Push,
+                    "提交到演示厅",
+                    push_target.is_some(),
+                    false,
+                    true,
+                )
                 .clicked();
             if let IndexFrame::Detail(st) = self.index.stack.top_mut() {
                 if let Some(selected) = selected {
@@ -214,9 +237,9 @@ impl App {
                 if publish {
                     st.focus_tag = true;
                 }
-                if push {
-                    let id = st.index_id.clone();
-                    let title = s(&st.detail["index"], "name");
+            }
+            if push {
+                if let Some((id, title)) = push_target {
                     self.open_push_dialog(&id, &title);
                 }
             }
