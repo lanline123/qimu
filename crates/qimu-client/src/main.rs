@@ -3339,6 +3339,7 @@ enum Overlay {
     PickTemplate(PickTemplateState),
     Confirm(ConfirmState),
     DeckInfo(DeckInfoState),
+    InsertOrder(InsertOrderState),
 }
 
 /// sdInfo (bottom bar, T5 ruling 2026-11-24): a read-only
@@ -4427,7 +4428,115 @@ enum PickState {
     Insert {
         index_name: String,
         at: usize,
+        selected: Vec<InsertPick>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InsertPick {
+    unit_id: String,
+    rendition_id: String,
+    version_id: String,
+}
+
+#[derive(Clone)]
+struct InsertOrderCard {
+    id: u64,
+    pick: InsertPick,
+}
+
+#[derive(Clone)]
+struct InsertOrderState {
+    cards: Vec<InsertOrderCard>,
+    selected: Option<u64>,
+    clipboard: Vec<InsertPick>,
+    next_id: u64,
+}
+
+#[derive(Clone)]
+struct InsertOrderDrag(u64);
+
+impl InsertOrderState {
+    fn new(picks: Vec<InsertPick>) -> Self {
+        let cards: Vec<_> = picks
+            .into_iter()
+            .enumerate()
+            .map(|(id, pick)| InsertOrderCard {
+                id: id as u64,
+                pick,
+            })
+            .collect();
+        let next_id = cards.len() as u64;
+        Self {
+            cards,
+            selected: None,
+            clipboard: Vec::new(),
+            next_id,
+        }
+    }
+
+    fn selected_pick(&self) -> Option<InsertPick> {
+        let id = self.selected?;
+        self.cards
+            .iter()
+            .find(|card| card.id == id)
+            .map(|card| card.pick.clone())
+    }
+
+    fn copy(&mut self) {
+        if let Some(pick) = self.selected_pick() {
+            self.clipboard = vec![pick];
+        }
+    }
+
+    fn cut(&mut self) {
+        if let Some(pick) = self.selected_pick() {
+            self.clipboard = vec![pick];
+            self.cards.retain(|card| Some(card.id) != self.selected);
+            self.selected = None;
+        }
+    }
+
+    fn paste(&mut self) {
+        if self.clipboard.is_empty() {
+            return;
+        }
+        let mut at = self
+            .selected
+            .and_then(|id| self.cards.iter().position(|card| card.id == id))
+            .map(|pos| pos + 1)
+            .unwrap_or(self.cards.len());
+        let picks = self.clipboard.clone();
+        for pick in picks {
+            let id = self.next_id;
+            self.next_id += 1;
+            self.cards.insert(at, InsertOrderCard { id, pick });
+            self.selected = Some(id);
+            at += 1;
+        }
+    }
+
+    fn move_card(&mut self, dragged: u64, before: usize) {
+        let Some(from) = self.cards.iter().position(|card| card.id == dragged) else {
+            return;
+        };
+        let card = self.cards.remove(from);
+        let to = if from < before { before - 1 } else { before };
+        self.cards.insert(to.min(self.cards.len()), card);
+        self.selected = Some(dragged);
+    }
+
+    fn picks(&self) -> Vec<InsertPick> {
+        self.cards.iter().map(|card| card.pick.clone()).collect()
+    }
+}
+
+fn toggle_insert_pick(selected: &mut Vec<InsertPick>, pick: InsertPick) {
+    if selected.iter().any(|item| item.unit_id == pick.unit_id) {
+        selected.retain(|item| item.unit_id != pick.unit_id);
+    } else {
+        selected.push(pick);
+    }
 }
 
 /// Inline folder-tree editing (right-click menu): rename an existing
@@ -5700,6 +5809,7 @@ impl App {
                             app.pick = Some(PickState::Insert {
                                 index_name: app.current_index_name(),
                                 at,
+                                selected: Vec::new(),
                             });
                             app.content.stack.pop_to(0);
                             app.page = Page::Content;
@@ -8759,6 +8869,8 @@ impl App {
             return;
         };
         let mut confirm = false;
+        let mut insert = false;
+        let mut order = false;
         let mut cancel = false;
         egui::Frame::NONE
             .fill(palette_color(CHIP_BLUE_BG))
@@ -8776,10 +8888,15 @@ impl App {
                                 .size(13.0),
                             );
                         }
-                        PickState::Insert { index_name, at } => {
+                        PickState::Insert {
+                            index_name,
+                            at,
+                            selected,
+                        } => {
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "为索引「{index_name}」插入条目 · 插入到第 {at} 条之后，点内容块的「插入」即生效"
+                                    "为索引「{index_name}」插入条目 · 已选 {} 项 · 插入到第 {at} 条之后",
+                                    selected.len()
                                 ))
                                 .strong()
                                 .size(13.0),
@@ -8790,24 +8907,43 @@ impl App {
                         if ui.button("取消").clicked() {
                             cancel = true;
                         }
-                        if matches!(pick, PickState::Pages { .. })
-                            && ui
-                                .add_enabled(
-                                    matches!(
-                                        &pick,
-                                        PickState::Pages { sel, .. }
-                                            if sel.iter().any(|b| *b)
-                                    ),
-                                    egui::Button::new(
-                                        egui::RichText::new("确认选页")
-                                            .color(egui::Color32::WHITE),
+                        match &pick {
+                            PickState::Pages { sel, .. } => {
+                                if ui
+                                    .add_enabled(
+                                        sel.iter().any(|b| *b),
+                                        egui::Button::new(
+                                            egui::RichText::new("确认选页")
+                                                .color(egui::Color32::WHITE),
+                                        )
+                                        .fill(ACCENT)
+                                        .corner_radius(6),
                                     )
-                                    .fill(ACCENT)
-                                    .corner_radius(6),
-                                )
-                                .clicked()
-                        {
-                            confirm = true;
+                                    .clicked()
+                                {
+                                    confirm = true;
+                                }
+                            }
+                            PickState::Insert { selected, .. } => {
+                                let enabled = !selected.is_empty();
+                                if ui
+                                    .add_enabled(
+                                        enabled,
+                                        egui::Button::new(
+                                            egui::RichText::new("插入")
+                                                .color(egui::Color32::WHITE),
+                                        )
+                                        .fill(ACCENT)
+                                        .corner_radius(6),
+                                    )
+                                    .clicked()
+                                {
+                                    insert = true;
+                                }
+                                if ui.add_enabled(enabled, egui::Button::new("调整顺序")).clicked() {
+                                    order = true;
+                                }
+                            }
                         }
                     });
                 });
@@ -8815,8 +8951,11 @@ impl App {
         ui.add_space(10.0);
         if cancel {
             self.cancel_pick();
-        }
-        if confirm {
+        } else if insert {
+            self.confirm_insert_pick();
+        } else if order {
+            self.open_insert_order();
+        } else if confirm {
             self.confirm_pick_pages();
         }
     }
@@ -8912,47 +9051,85 @@ impl App {
         self.commit_entries(es, "摘录选页");
     }
 
-    /// Insert-mode pick: the clicked block joins the index at the
-    /// recorded position with its recommended rendition (first one with
-    /// a latest version), following latest.
-    fn insert_pick_unit(&mut self, item: &Value) {
-        let Some(PickState::Insert { at, .. }) = self.pick.clone() else {
-            return;
-        };
+    fn insert_pick_for_item(&self, item: &Value) -> Option<InsertPick> {
         let unit = item.get("unit").cloned().unwrap_or(json!({}));
-        let uid = s(&unit, "id");
-        // Lazy import: an unsplit page can never enter an index
-        // (the card hides its insert button too; this is the
-        // belt-and-braces guard for the same rule).
-        if let Some((pid, idx)) = self.lazy_unit_page.get(&uid).cloned() {
-            self.lazy_boost(&pid, idx);
-            return;
+        let unit_id = s(&unit, "id");
+        if unit_id.is_empty() || self.lazy_unit_page.contains_key(&unit_id) {
+            return None;
         }
-        let rid = item
+        let rendition = item
             .get("renditions")
             .and_then(|r| r.as_array())
             .and_then(|arr| {
                 arr.iter()
                     .find(|r| r.get("latest").map(|l| l.is_object()).unwrap_or(false))
-                    .map(|r| s(&r.get("rendition").cloned().unwrap_or(json!({})), "id"))
+            })?;
+        let rendition_id = s(&rendition.get("rendition").cloned().unwrap_or(json!({})), "id");
+        let version_id = s(&rendition.get("latest").cloned().unwrap_or(json!({})), "id");
+        (!unit_id.is_empty() && !rendition_id.is_empty() && !version_id.is_empty())
+            .then_some(InsertPick {
+                unit_id,
+                rendition_id,
+                version_id,
             })
-            .unwrap_or_default();
-        if rid.is_empty() {
+    }
+
+    fn insert_pick_selected(&self, unit_id: &str) -> bool {
+        matches!(
+            &self.pick,
+            Some(PickState::Insert { selected, .. })
+                if selected.iter().any(|pick| pick.unit_id == unit_id)
+        )
+    }
+
+    fn toggle_insert_pick_item(&mut self, item: &Value) {
+        if !matches!(self.pick, Some(PickState::Insert { .. })) {
+            return;
+        }
+        let Some(pick) = self.insert_pick_for_item(item) else {
             self.msg = "该内容块暂无可用版本".into();
+            return;
+        };
+        if let Some(PickState::Insert { selected, .. }) = &mut self.pick {
+            toggle_insert_pick(selected, pick);
+        }
+    }
+
+    fn open_insert_order(&mut self) {
+        let Some(PickState::Insert { selected, .. }) = &self.pick else {
+            return;
+        };
+        if selected.is_empty() {
+            self.msg = "请先选择要插入的内容块".into();
+            return;
+        }
+        self.overlays
+            .push(Overlay::InsertOrder(InsertOrderState::new(selected.clone())));
+    }
+
+    fn confirm_insert_pick(&mut self) {
+        let Some(PickState::Insert { at, selected, .. }) = self.pick.clone() else {
+            return;
+        };
+        if selected.is_empty() {
+            self.msg = "请先选择要插入的内容块".into();
             return;
         }
         let mut es = self.current_entries();
-        let at = at.min(es.len());
-        es.insert(
-            at,
-            json!({
-                "unit_id": uid,
-                "rendition_id": rid,
-                "policy": "follow_latest",
-                "locked_semver": Value::Null,
-                "excerpt_slots": Value::Null,
-            }),
-        );
+        let mut at = at.min(es.len());
+        for pick in selected {
+            es.insert(
+                at,
+                json!({
+                    "unit_id": pick.unit_id,
+                    "rendition_id": pick.rendition_id,
+                    "policy": "follow_latest",
+                    "locked_semver": Value::Null,
+                    "excerpt_slots": Value::Null,
+                }),
+            );
+            at += 1;
+        }
         self.pick = None;
         self.page = Page::Index;
         self.commit_entries(es, "插入条目");
@@ -20655,7 +20832,11 @@ impl App {
                 title: &title,
                 cover: &cover,
                 selected: !unsplit
-                    && (w.selected.as_deref() == Some(uid.as_str()) || w.multi.contains(&uid)),
+                    && if matches!(self.pick, Some(PickState::Insert { .. })) {
+                        self.insert_pick_selected(&uid)
+                    } else {
+                        w.selected.as_deref() == Some(uid.as_str()) || w.multi.contains(&uid)
+                    },
                 scope: None,
                 variant: if !my_name.is_empty() && s(&unit, "maintainer") == my_name {
                     CardVariant::Mine
@@ -20711,20 +20892,24 @@ impl App {
                 });
                 if !unsplit && matches!(app.pick, Some(PickState::Insert { .. })) {
                     ui.add_space(8.0);
-                    if ui
-                        .add_sized(
-                            [72.0, 28.0],
-                            egui::Button::new(
-                                egui::RichText::new("插入")
-                                    .size(13.0)
-                                    .color(egui::Color32::WHITE),
-                            )
-                            .fill(ACCENT)
-                            .corner_radius(6),
-                        )
-                        .clicked()
-                    {
-                        app.insert_pick_unit(item);
+                    if let Some(PickState::Insert { selected, .. }) = &app.pick {
+                        if let Some(order) = selected
+                            .iter()
+                            .position(|pick| pick.unit_id == uid)
+                        {
+                            chip(
+                                ui,
+                                &format!("第 {} 个插入", order + 1),
+                                palette_color(CHIP_GREEN_FG),
+                                CHIP_GREEN_BG,
+                            );
+                        } else {
+                            ui.label(
+                                egui::RichText::new("单击选择 · 再点取消")
+                                    .small()
+                                    .color(palette_color(TEXT_WEAK)),
+                            );
+                        }
                     }
                 }
             },
@@ -20847,6 +21032,8 @@ impl App {
             }
         } else if import_locked && (click.clicked() || click.double_clicked()) {
             self.say("该页正在导入成块，完成后再操作");
+        } else if matches!(self.pick, Some(PickState::Insert { .. })) && click.clicked() {
+            self.toggle_insert_pick_item(item);
         } else if click.double_clicked() {
             if self.pick.is_none() {
                 self.open_unit_detail(&uid);
@@ -22382,6 +22569,9 @@ impl App {
                 Some(Overlay::DeckInfo(_)) => {
                     self.overlays.pop();
                 }
+                Some(Overlay::InsertOrder(_)) => {
+                    self.overlays.pop();
+                }
                 None => {}
             }
         }
@@ -22498,10 +22688,285 @@ impl App {
                 }
             }
             Overlay::DeckInfo(st) => self.deck_info_ui(ui, st),
+            Overlay::InsertOrder(st) => self.insert_order_ui(ui, st),
             Overlay::PickTemplate(t) => self.pick_template_ui(ui, t),
             Overlay::PageEdit(pe) => self.page_edit_ui(ui, screen, pe),
             Overlay::Light(light) => self.light_ui(ui, screen, light),
             Overlay::Present(p) => self.present_ui(ui, screen, p),
+        }
+    }
+
+    fn insert_order_ui(&mut self, ui: &mut egui::Ui, mut state: InsertOrderState) -> Option<Overlay> {
+        let copy = ui.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::C));
+        let cut = ui.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::X));
+        let paste = ui.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::V));
+        if copy {
+            state.copy();
+        }
+        if cut {
+            state.cut();
+        }
+        if paste {
+            state.paste();
+        }
+
+        let mut open = true;
+        let mut confirmed = false;
+        let screen = ui.ctx().screen_rect();
+        let width = (screen.width() - 48.0).clamp(320.0, 900.0);
+        egui::Window::new("调整插入顺序")
+            .open(&mut open)
+            .title_bar(false)
+            .frame(dlg_frame())
+            .collapsible(false)
+            .resizable(true)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ui.ctx(), |ui| {
+                ui.set_width(width);
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width(width - 60.0);
+                        ui.label(
+                            egui::RichText::new("调整插入顺序")
+                                .strong()
+                                .size(19.0)
+                                .color(palette_color(TEXT_MAIN)),
+                        );
+                        ui.label(
+                            egui::RichText::new("拖拽卡片排序，或先选择一张卡片再剪切、复制、粘贴。")
+                                .size(12.0)
+                                .color(palette_color(TEXT_WEAK)),
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                        if dlg_close_x(ui) {
+                            open = false;
+                        }
+                    });
+                });
+                ui.add_space(10.0);
+                let has_selection = state.selected_pick().is_some();
+                ui.horizontal(|ui| {
+                    if btn_default_enabled(ui, has_selection, "剪切").clicked() {
+                        state.cut();
+                    }
+                    if btn_default_enabled(ui, has_selection, "复制").clicked() {
+                        state.copy();
+                    }
+                    if btn_default_enabled(ui, !state.clipboard.is_empty(), "粘贴").clicked() {
+                        state.paste();
+                    }
+                    ui.label(
+                        egui::RichText::new(format!("{} 项", state.cards.len()))
+                            .small()
+                            .color(palette_color(TEXT_WEAK)),
+                    );
+                });
+                ui.add_space(10.0);
+
+                let mut select = None;
+                let mut drop = None;
+                egui::ScrollArea::vertical()
+                    .id_salt("insert-order-cards")
+                    .max_height((screen.height() - 220.0).max(220.0))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if state.cards.is_empty() {
+                            ui.centered_and_justified(|ui| {
+                                ui.label(
+                                    egui::RichText::new("还没有卡片，可返回选择内容块。")
+                                        .color(palette_color(TEXT_WEAK)),
+                                );
+                            });
+                            return;
+                        }
+                        let gap = 12.0;
+                        let card_w = 184.0;
+                        let cols = ((ui.available_width() + gap) / (card_w + gap))
+                            .floor()
+                            .clamp(1.0, 4.0) as usize;
+                        let card_w = ((ui.available_width() - gap * (cols - 1) as f32) / cols as f32)
+                            .max(120.0);
+                        for row in state.cards.chunks(cols) {
+                            ui.horizontal_top(|ui| {
+                                for card in row {
+                                    let selected = Some(card.id) == state.selected;
+                                    let frame = if selected {
+                                        card_frame()
+                                            .inner_margin(8)
+                                            .stroke(egui::Stroke::new(1.0, ACCENT))
+                                    } else {
+                                        card_frame().inner_margin(8)
+                                    };
+                                    let outer = frame.show(ui, |ui| {
+                                        ui.set_width(card_w - 16.0);
+                                        let item = self
+                                            .units
+                                            .iter()
+                                            .find(|item| {
+                                                s(&item.get("unit").cloned().unwrap_or(json!({})), "id")
+                                                    == card.pick.unit_id
+                                            })
+                                            .cloned()
+                                            .unwrap_or_default();
+                                        let unit = item.get("unit").cloned().unwrap_or(json!({}));
+                                        let title = s(&unit, "name");
+                                        let title = if title.is_empty() {
+                                            card.pick.unit_id.as_str()
+                                        } else {
+                                            title.as_str()
+                                        };
+                                        let latest = item
+                                            .get("renditions")
+                                            .and_then(|r| r.as_array())
+                                            .and_then(|arr| {
+                                                arr.iter()
+                                                    .find(|r| {
+                                                        s(&r.get("rendition").cloned().unwrap_or(json!({})), "id")
+                                                            == card.pick.rendition_id
+                                                    })
+                                            })
+                                            .and_then(|r| r.get("latest"))
+                                            .cloned()
+                                            .unwrap_or(json!({}));
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "第 {} 项",
+                                                    state.cards.iter().position(|c| c.id == card.id).unwrap_or(0) + 1
+                                                ))
+                                                .strong()
+                                                .size(12.0)
+                                                .color(palette_color(TEXT_MAIN)),
+                                            );
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.label(
+                                                        egui::RichText::new("拖拽")
+                                                            .small()
+                                                            .color(palette_color(TEXT_WEAK)),
+                                                    );
+                                                },
+                                            );
+                                        });
+                                        ui.add_space(6.0);
+                                        self.thumb_ui(
+                                            ui,
+                                            &card.pick.version_id,
+                                            0,
+                                            card_w - 16.0,
+                                        );
+                                        ui.add_space(6.0);
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(title).strong().size(13.0),
+                                            )
+                                            .truncate(),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "v{} · {} 页",
+                                                s(&latest, "semver"),
+                                                i(&latest, "page_count")
+                                            ))
+                                            .small()
+                                            .color(palette_color(TEXT_WEAK)),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(if selected {
+                                                "已选中"
+                                            } else {
+                                                "单击选择"
+                                            })
+                                            .small()
+                                            .color(if selected {
+                                                ACCENT_DEEP
+                                            } else {
+                                                palette_color(TEXT_FAINT)
+                                            }),
+                                        );
+                                    });
+                                    let rect = outer.response.rect;
+                                    let response = ui.interact(
+                                        rect,
+                                        egui::Id::new(("insert-order-card", card.id)),
+                                        egui::Sense::click_and_drag(),
+                                    );
+                                    if response.clicked() {
+                                        select = Some(card.id);
+                                    }
+                                    if response.drag_started() {
+                                        egui::DragAndDrop::set_payload(
+                                            ui.ctx(),
+                                            InsertOrderDrag(card.id),
+                                        );
+                                    }
+                                    if response.contains_pointer()
+                                        && egui::DragAndDrop::has_payload_of_type::<InsertOrderDrag>(ui.ctx())
+                                    {
+                                        let before = ui
+                                            .input(|input| input.pointer.hover_pos())
+                                            .is_none_or(|pos| pos.y < rect.center().y);
+                                        let y = if before { rect.min.y } else { rect.max.y };
+                                        ui.painter().line_segment(
+                                            [egui::pos2(rect.min.x, y), egui::pos2(rect.max.x, y)],
+                                            egui::Stroke::new(2.0, ACCENT),
+                                        );
+                                        if let Some(dragged) = egui::DragAndDrop::take_payload::<InsertOrderDrag>(ui.ctx())
+                                        {
+                                            drop = Some((
+                                                dragged.0,
+                                                state.cards
+                                                    .iter()
+                                                    .position(|c| c.id == card.id)
+                                                    .unwrap_or(0)
+                                                    + usize::from(!before),
+                                            ));
+                                        }
+                                    }
+                                    ui.add_space(gap);
+                                }
+                            });
+                            ui.add_space(gap);
+                        }
+                    });
+                if let Some(id) = select {
+                    state.selected = Some(id);
+                }
+                if let Some((id, before)) = drop {
+                    state.move_card(id, before);
+                }
+                ui.add_space(12.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("确定")
+                                    .color(egui::Color32::WHITE),
+                            )
+                            .fill(ACCENT)
+                            .corner_radius(6)
+                            .min_size(egui::vec2(76.0, 30.0)),
+                        )
+                        .clicked()
+                    {
+                        confirmed = true;
+                    }
+                    if btn_weak(ui, "取消").clicked() {
+                        open = false;
+                    }
+                });
+            });
+        if confirmed {
+            if let Some(PickState::Insert { selected, .. }) = &mut self.pick {
+                *selected = state.picks();
+            }
+            None
+        } else if open {
+            Some(Overlay::InsertOrder(state))
+        } else {
+            None
         }
     }
 
@@ -24811,6 +25276,7 @@ impl App {
                     self.pick = Some(PickState::Insert {
                         index_name: self.current_index_name(),
                         at,
+                        selected: Vec::new(),
                     });
                     self.close_unit_detail();
                     self.page = Page::Content;
@@ -27305,6 +27771,57 @@ fn main() {
                 ))
                 .show();
         }
+    }
+}
+
+#[cfg(test)]
+mod insert_order_tests {
+    use super::*;
+
+    fn pick(unit_id: &str) -> InsertPick {
+        InsertPick {
+            unit_id: unit_id.into(),
+            rendition_id: format!("rendition-{unit_id}"),
+            version_id: format!("version-{unit_id}"),
+        }
+    }
+
+    #[test]
+    fn selection_keeps_click_order_and_deselects() {
+        let mut selected = Vec::new();
+        for id in ["a", "b", "a", "c"] {
+            toggle_insert_pick(&mut selected, pick(id));
+        }
+        assert_eq!(
+            selected,
+            vec![pick("b"), pick("c")],
+            "reselection must append, while cancellation removes only the clicked item"
+        );
+    }
+
+    #[test]
+    fn dragging_moves_a_card_before_the_target() {
+        let mut state = InsertOrderState::new(vec![pick("a"), pick("b"), pick("c")]);
+        state.move_card(0, 2);
+        assert_eq!(state.picks(), vec![pick("b"), pick("a"), pick("c")]);
+        state.move_card(2, 1);
+        assert_eq!(state.picks(), vec![pick("c"), pick("b"), pick("a")]);
+    }
+
+    #[test]
+    fn copy_paste_duplicates_and_cut_moves_the_selected_card() {
+        let mut state = InsertOrderState::new(vec![pick("a"), pick("b")]);
+        state.selected = Some(0);
+        state.copy();
+        state.paste();
+        assert_eq!(state.picks(), vec![pick("a"), pick("a"), pick("b")]);
+        let copied_id = state.selected.expect("pasted card selected");
+        state.cut();
+        assert_eq!(state.picks(), vec![pick("a"), pick("b")]);
+        assert_eq!(state.clipboard, vec![pick("a")]);
+        state.paste();
+        assert_eq!(state.picks(), vec![pick("a"), pick("a"), pick("b")]);
+        assert_ne!(state.selected, Some(copied_id));
     }
 }
 
