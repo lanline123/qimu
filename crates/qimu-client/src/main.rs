@@ -1581,6 +1581,19 @@ enum Page {
 /// on push, destroyed on pop).
 struct ContentState {
     folder_filter: Option<String>,
+    /// One-shot scroll intent for the content wall, registered
+    /// by exactly one action: a sidebar folder click made while
+    /// the wall itself is the visible frame (see ct_nav_body).
+    /// `Some(None)` = scroll to the top (the 全部 row);
+    /// `Some(Some(id))` = scroll to that folder's block. The
+    /// wall takes it in the same frame it was registered (the
+    /// sidebar renders before the body), so it can never
+    /// survive into a drill-down return, a page re-entry or
+    /// any other later render — those change the selection
+    /// only and never scroll (user ruling 2026-11-26,
+    /// direction B: scrolling is event-driven, never derived
+    /// from a selection difference).
+    scroll_intent: Option<Option<String>>,
     import_group: String,
     /// Content page mode: the local-cache management view
     /// (prototype #6b) replaces the wall while this is set.
@@ -1592,6 +1605,7 @@ impl Default for ContentState {
     fn default() -> Self {
         Self {
             folder_filter: None,
+            scroll_intent: None,
             import_group: String::new(),
             cache_open: false,
             stack: NavStack::new(ContentFrame::Wall(WallState::default())),
@@ -1649,10 +1663,6 @@ struct WallState {
     flow_edit: Option<FlowEdit>,
     /// Focus request for the flow header editor's first frame.
     flow_edit_focus: bool,
-    /// The sidebar folder selection this wall was last scrolled
-    /// to (outer None = never positioned). In the folder-flow
-    /// view the selection is a scroll anchor, never a filter.
-    flow_anchor: Option<Option<String>>,
     /// Measured layout heights for the folder-flow
     /// virtualization (see FlowMetrics).
     flow_metrics: FlowMetrics,
@@ -10703,10 +10713,21 @@ impl App {
         self.sr_folder_header(ui, "content");
         let mut selected = self.content.folder_filter.clone();
         self.folder_tree(ui, &mut selected, false, "content");
-        if self.content.folder_filter != selected
-            && self.pick.is_none()
-            && self.content.stack.depth() > 1
-        {
+        let changed = self.content.folder_filter != selected;
+        if changed && self.content.stack.depth() == 1 {
+            // The wall itself is the visible frame and the user
+            // just clicked a sidebar folder: the one action
+            // allowed to scroll the wall (user ruling
+            // 2026-11-26, direction B). Register the one-shot
+            // intent; content_wall takes it later in this same
+            // frame (the sidebar renders before the body).
+            self.content.scroll_intent = Some(selected.clone());
+        }
+        if changed && self.pick.is_none() && self.content.stack.depth() > 1 {
+            // A folder click inside a drill-down pops back to
+            // the wall and changes the selection, but registers
+            // no scroll intent — the wall keeps the position it
+            // had when the drill-down was opened.
             self.close_unit_detail();
         }
         self.content.folder_filter = selected;
@@ -19208,6 +19229,13 @@ impl App {
             }
             ContentFrame::Wall(w) => {
                 if self.content.cache_open && self.pick.is_none() {
+                    // The cache view replaces the wall this
+                    // frame, so a scroll intent registered from
+                    // the sidebar has nowhere to land: drop it
+                    // rather than letting it fire when the wall
+                    // comes back (direction B: only the click
+                    // made while the wall shows may scroll it).
+                    self.content.scroll_intent = None;
                     self.content_cache_body(ui);
                 } else {
                     self.content_wall(ui, w);
@@ -19429,12 +19457,19 @@ impl App {
                     let unit_folder = |it: &Value| -> String {
                         s(&it.get("unit").cloned().unwrap_or(json!({})), "folder_id")
                     };
-                    // Scroll anchoring: position only when the
-                    // sidebar selection changed since the wall was
-                    // last positioned for it.
-                    let want_anchor = self.content.folder_filter.clone();
-                    let do_scroll = w.flow_anchor.as_ref() != Some(&want_anchor);
-                    if do_scroll && want_anchor.is_none() {
+                    // Scroll positioning is event-driven (user
+                    // ruling 2026-11-26, direction B): take the
+                    // one-shot intent a sidebar folder click
+                    // registered while this wall was showing, and
+                    // act on it exactly once. Every other change
+                    // of `folder_filter` — drill-down returns,
+                    // page re-entry resets, deep-jump presets,
+                    // folder-delete drains — reaches this render
+                    // with no intent pending and leaves the
+                    // scroll position exactly where the user
+                    // left it.
+                    let scroll_intent = self.content.scroll_intent.take();
+                    if matches!(scroll_intent, Some(None)) {
                         ui.scroll_to_cursor(Some(egui::Align::TOP));
                     }
                     // Folder-flow virtualization (2026-11-25): once
@@ -19489,8 +19524,10 @@ impl App {
                         // drag starts at its header (registered
                         // after the block's grid, below).
                         let block_top = ui.cursor().min.y;
-                        let is_anchor =
-                            do_scroll && want_anchor.as_deref() == Some(fid.as_str());
+                        let is_anchor = matches!(
+                            &scroll_intent,
+                            Some(Some(want)) if want == &fid
+                        );
                         let editing_this =
                             matches!(&w.flow_edit, Some(e) if e.folder_id == fid);
                         // On the virtualized path a header fully
@@ -19759,9 +19796,6 @@ impl App {
                                 egui::pos2(clip.max.x, ui.cursor().min.y),
                             ),
                         ));
-                    }
-                    if do_scroll {
-                        w.flow_anchor = Some(want_anchor);
                     }
                 });
             // Card drag: resolve the drop against this frame's

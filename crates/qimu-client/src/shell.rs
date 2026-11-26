@@ -85,6 +85,10 @@ impl App {
             }
             Page::Content => {
                 self.content.folder_filter = None;
+                // Navigation never carries a pending wall
+                // scroll: the reset above changes the selection
+                // only (user ruling 2026-11-26, direction B).
+                self.content.scroll_intent = None;
             }
             _ => {}
         }
