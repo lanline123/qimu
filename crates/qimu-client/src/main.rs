@@ -26051,21 +26051,10 @@ impl App {
                     );
                     // flex:1 — 把右边的标签推到最右
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // 重选页面按钮（原型 #idxRePickBtn，仅有选中条目时启用）
-                        let has_sel = st.confirm_remove_entry.is_some();
-                        if ui
-                            .add_enabled(
-                                has_sel,
-                                egui::Button::new(
-                                    egui::RichText::new("重选页面").size(12.5),
-                                )
-                                .corner_radius(5),
-                            )
-                            .clicked()
-                        {
-                            // TODO: open re-pick dialog for selected entry
-                        }
-                        ui.add_space(6.0);
+                        // 「重选页面」（原型 #idxRePickBtn）暂不渲染：此前版本是死按钮——
+                        // 启用条件误写成删除确认态、点击体是空 TODO，从未生效。真重选需先有
+                        // 选中条目态 + 经 PickState::Insert / confirm_insert_pick 的替换流程，
+                        // 另立一项再做，不在此处留一个点不动的按钮。
                         // 5 标签切换（inline，不另起一行）
                         // 注意：这里只渲染标签按钮行，不调用 index_detail_tabs
                         // 以便与 backbar 在同一行内水平排列
@@ -27329,7 +27318,9 @@ mod insert_order_tests {
         assert_eq!(state.picks(), vec![pick("a"), pick("b")]);
         assert_eq!(state.clipboard, vec![pick("a")]);
         state.paste();
-        assert_eq!(state.picks(), vec![pick("a"), pick("a"), pick("b")]);
+        // Cut clears the selection, so paste appends at the end ([a, b, a]);
+        // it does not return the card to its cut position.
+        assert_eq!(state.picks(), vec![pick("a"), pick("b"), pick("a")]);
         assert_ne!(state.selected, Some(copied_id));
     }
 }
