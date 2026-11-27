@@ -9411,7 +9411,7 @@ impl Store {
                 let cover = entries
                     .first()
                     .and_then(|e| self.resolve_entry_version(e).ok().flatten())
-                    .map(|v| v.id.0)
+                    .map(|v| v.id)
                     .unwrap_or_default();
                 serde_json::json!({
                     "id": id,
