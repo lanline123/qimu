@@ -885,14 +885,14 @@ impl App {
                                 (
                                     palette_color(msg_kind_soft(&kind)),
                                     egui::Stroke::new(
-                                        1.0,
+                                        1.5,
                                         palette_color(msg_kind_color(&kind)),
                                     ),
                                 )
                             } else {
                                 (
                                     palette_color(CARD_BG),
-                                    egui::Stroke::new(1.0, palette_color(CARD_BORDER)),
+                                    egui::Stroke::new(1.5, palette_color(CARD_BORDER)),
                                 )
                             };
                             let frame = egui::Frame::NONE

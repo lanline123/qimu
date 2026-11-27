@@ -1287,7 +1287,7 @@ impl App {
                         // thumb_response_art keeps `current = false` so no
                         // inner duplicate border is painted inside it.
                         .stroke(egui::Stroke::new(
-                            2.0,
+                            1.5,
                             if st.selected_page == Some(slot) {
                                 ACCENT
                             } else {
@@ -1380,6 +1380,7 @@ impl App {
                             frame_resp.response.rect.expand(2.0),
                             6.0,
                             ACCENT,
+                            1.0,
                         );
                     }
                 }
@@ -1908,12 +1909,12 @@ impl App {
                                         let (fill, stroke) = if resp.hovered() {
                                             (
                                                 palette_color(PANEL_BG),
-                                                egui::Stroke::new(2.0, ACCENT),
+                                                egui::Stroke::new(1.5, ACCENT),
                                             )
                                         } else {
                                             (
                                                 palette_color(PANEL_BG),
-                                                egui::Stroke::new(2.0, palette_color(LINE_34)),
+                                                egui::Stroke::new(1.5, palette_color(LINE_34)),
                                             )
                                         };
                                         painter.rect_filled(rect, 6.0, fill);
@@ -2062,13 +2063,13 @@ impl App {
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(card_w, card_h), egui::Sense::click());
         let hovered = resp.hovered();
         let (fill, stroke) = if is_cur {
-            (SEL_BG, egui::Stroke::new(2.0, ACCENT))
+            (SEL_BG, egui::Stroke::new(1.5, ACCENT))
         } else if hovered {
-            (palette_color(PANEL_BG), egui::Stroke::new(2.0, ACCENT))
+            (palette_color(PANEL_BG), egui::Stroke::new(1.5, ACCENT))
         } else {
             (
                 palette_color(PANEL_BG),
-                egui::Stroke::new(2.0, palette_color(LINE_34)),
+                egui::Stroke::new(1.5, palette_color(LINE_34)),
             )
         };
         painter.rect_filled(rect, 6.0, fill);
@@ -2112,8 +2113,10 @@ impl App {
     // row, a sub-page strip with ALL pages at equal flexible
     // widths, and the accent main action. Selection semantics
     // are the prototype's (SPEC §10.10's sibling rule): a single
-    // click on the cover or the card body only SELECTS (accent
-    // border + outer ring); the drill is the main button or a
+    // click on the cover or the card body only SELECTS (the
+    // frame's colour turns accent — colour only, no outer
+    // ring; user ruling 2026-11-27); the drill is the main
+    // button or a
     // cover double-click. Rows are chunked explicitly (the
     // Frame wrap finding).
     // ------------------------------------------------------------
@@ -2173,7 +2176,7 @@ impl App {
                     let frame_resp = egui::Frame::NONE
                         .fill(palette_color(PANEL_BG))
                         .stroke(egui::Stroke::new(
-                            1.0,
+                            1.5,
                             if selected {
                                 ACCENT
                             } else {
@@ -2585,12 +2588,22 @@ impl App {
             .unwrap_or_default();
         let selected = st.selected_working_card;
         let inner_w = (card_w - 22.0).max(160.0);
-        // User ruling 2026-11-27: the outer frame keeps the
-        // default line colour; the selected card's accent ring is
-        // painted below.
+        // Card border (user ruling 2026-11-27, superseding
+        // 2026-11-26): a constant 1.5px in every state — the
+        // selected card changes the frame's COLOUR only, and
+        // no outer ring is painted. The unnumbered working
+        // card is never dashed (the prototype's .newver is
+        // solid; dashes belong to numbered drafts / rejected).
         let frame_resp = egui::Frame::NONE
             .fill(palette_color(PANEL_BG))
-            .stroke(egui::Stroke::new(1.0, palette_color(LINE_34)))
+            .stroke(egui::Stroke::new(
+                1.5,
+                if selected {
+                    ACCENT
+                } else {
+                    palette_color(LINE_34)
+                },
+            ))
             .corner_radius(6)
             .inner_margin(egui::Margin::same(10))
             .show(ui, |ui| {
@@ -2664,14 +2677,6 @@ impl App {
                 }
                 });
             });
-        if selected {
-            ui.painter().rect_stroke(
-                frame_resp.response.rect,
-                6.0,
-                egui::Stroke::new(2.0, palette_color(ACCENT_DEEP)),
-                egui::StrokeKind::Outside,
-            );
-        }
         st.hist_card_h.insert(
             "working".to_string(),
             frame_resp.response.rect.height() - pad,
@@ -2705,12 +2710,28 @@ impl App {
         // card's note).
         let own_natural = st.hist_card_h.get(&vid).copied().unwrap_or(0.0);
         let pad = (target_h - own_natural).max(0.0);
-        // User ruling 2026-11-27: the outer frame keeps the
-        // default line colour for every card; draft / rejected
-        // no longer carry their amber / rose dashed frames. Only
-        // the selected card gets the accent ring, painted below.
-        let border_color = palette_color(LINE_34);
-        let stroke = egui::Stroke::new(1.0, border_color);
+        // Card border (user ruling 2026-11-27, superseding
+        // 2026-11-26): a constant 1.5px in every state; a
+        // state may change the border's COLOUR only, and no
+        // outer ring is painted. Numbered drafts wear the
+        // prototype's amber DASHED frame (.draftv) and
+        // rejected cards the rose dashed frame (.pubrej):
+        // a dashed card's frame stroke stays transparent at
+        // the same 1.5 width (identical geometry) and the
+        // dashes are painted over the rect below; a selected
+        // dashed card's dashes turn accent, like the solid
+        // cards' colour-only selection.
+        let dashed = is_draft || is_rejected;
+        let stroke = egui::Stroke::new(
+            1.5,
+            if dashed {
+                egui::Color32::TRANSPARENT
+            } else if selected {
+                ACCENT
+            } else {
+                palette_color(LINE_34)
+            },
+        );
         let frame_resp = egui::Frame::NONE
             .fill(palette_color(PANEL_BG))
             .stroke(stroke)
@@ -2866,6 +2887,7 @@ impl App {
                                         resp.rect,
                                         6.0,
                                         palette_color(CHIP_ORANGE_FG),
+                                        1.0,
                                     );
                                 }
                                 hots.push(resp.rect);
@@ -3021,12 +3043,20 @@ impl App {
                 }
                 });
             });
-        if selected {
-            ui.painter().rect_stroke(
+        if dashed {
+            let dash_color = if selected {
+                ACCENT
+            } else if is_draft {
+                palette_color(CHIP_ORANGE_FG)
+            } else {
+                palette_color(ROSE)
+            };
+            dashed_card_border(
+                ui.painter(),
                 frame_resp.response.rect,
                 6.0,
-                egui::Stroke::new(2.0, palette_color(ACCENT_DEEP)),
-                egui::StrokeKind::Outside,
+                dash_color,
+                1.5,
             );
         }
         st.hist_card_h
@@ -3219,6 +3249,7 @@ impl App {
                         *trect,
                         6.0,
                         palette_color(CHIP_ORANGE_FG),
+                        1.0,
                     );
                     let _ = tkey;
                 } else {
@@ -3433,17 +3464,22 @@ fn vh_caption_line(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
 /// 2026-11-26): the prototype's draftv / pubrej history
 /// cards carry a DASHED border (amber / rose). egui frame
 /// strokes cannot dash, so a dashed card's frame keeps a
-/// transparent 1px stroke (identical geometry) and the
-/// dashes are painted over its rect afterwards —
-/// dashed_rule's segment technique carried around a
-/// rounded path (5px on, 3.5px off).
+/// transparent stroke of the SAME width (identical
+/// geometry) and the dashes are painted over its rect
+/// afterwards — dashed_rule's segment technique carried
+/// around a rounded path (5px on, 3.5px off). `width` is
+/// the border width: history cards pass 1.5 (user ruling
+/// 2026-11-27: card borders are a constant 1.5px in every
+/// state); the chip / picking / drag-over outlines that
+/// also use this helper keep their 1.0.
 fn dashed_card_border(
     painter: &egui::Painter,
     rect: egui::Rect,
     radius: f32,
     color: egui::Color32,
+    width: f32,
 ) {
-    let rect = rect.shrink(0.5);
+    let rect = rect.shrink(width * 0.5);
     let rad = radius.min(rect.width() / 2.0).min(rect.height() / 2.0);
     let (min, max) = (rect.min, rect.max);
     let mut path: Vec<egui::Pos2> = Vec::new();
@@ -3476,7 +3512,7 @@ fn dashed_card_border(
         }
         path.push(straights[idx]);
     }
-    let stroke = egui::Stroke::new(1.0, color);
+    let stroke = egui::Stroke::new(width, color);
     let period = 8.5f32;
     let mut phase = 0.0f32;
     for w in 0..path.len() {

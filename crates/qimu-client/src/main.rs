@@ -405,7 +405,9 @@ fn dlg_close_x(ui: &mut egui::Ui) -> bool {
 }
 
 /// The one standard card: a raised dark surface over the --bg
-/// canvas, 1px --line hairline as the only finish, 6px radius
+/// canvas, a 1.5px --line hairline as the only finish (user
+/// ruling 2026-11-27: card borders are a constant 1.5px in
+/// every state), 6px radius
 /// (the final tightening layer puts .std-card and every panel-class
 /// surface at 6px), NO shadow (the final .std-card rule sets
 /// box-shadow:none) — cover-first layout. Inner margin follows the
@@ -413,7 +415,7 @@ fn dlg_close_x(ui: &mut egui::Ui) -> bool {
 fn card_frame() -> egui::Frame {
     egui::Frame::NONE
         .fill(palette_color(CARD_BG))
-        .stroke(egui::Stroke::new(1.0, palette_color(CARD_BORDER)))
+        .stroke(egui::Stroke::new(1.5, palette_color(CARD_BORDER)))
         .corner_radius(egui::CornerRadius::same(6))
         .inner_margin(egui::Margin {
             left: 12,
@@ -10595,8 +10597,9 @@ fn standard_card<R>(
 /// is the 「我维护」 fill (--mine-bg); `Rejected` is the rose
 /// frame a rejected card wears until it is opened. Stroke
 /// priority: selected > rejected > scope colour. Every state
-/// stroke is 1.0 wide (user ruling 2026-11-26): state shows in
-/// the stroke COLOUR only, never the width — egui Frame
+/// stroke is 1.5 wide (user ruling 2026-11-27, superseding
+/// the 2026-11-26 session's 1.0 figure): state shows in the
+/// stroke COLOUR only, never the width — egui Frame
 /// geometry counts the stroke, so a wider selected stroke
 /// shifted every neighbouring card by the difference.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -10622,11 +10625,11 @@ fn standard_card_v<R>(
         frame = frame.inner_margin(0);
     }
     if selected {
-        frame = frame.stroke(egui::Stroke::new(1.0, ACCENT));
+        frame = frame.stroke(egui::Stroke::new(1.5, ACCENT));
     } else if variant == CardVariant::Rejected {
-        frame = frame.stroke(egui::Stroke::new(1.0, palette_color(ROSE)));
+        frame = frame.stroke(egui::Stroke::new(1.5, palette_color(ROSE)));
     } else if let Some(color) = scope {
-        frame = frame.stroke(egui::Stroke::new(1.0, color));
+        frame = frame.stroke(egui::Stroke::new(1.5, color));
     }
     frame.show(ui, |ui| {
         ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), add)
@@ -13948,7 +13951,7 @@ impl App {
             ui.painter().rect_stroke(
                 rect,
                 0.0,
-                egui::Stroke::new(1.0, ACCENT),
+                egui::Stroke::new(1.5, ACCENT),
                 egui::StrokeKind::Middle,
             );
         } else if resp.hovered() {
