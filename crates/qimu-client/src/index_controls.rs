@@ -153,7 +153,11 @@ impl IndexOverviewControls {
                     palette_color(TEXT_WEAK)
                 };
                 ui.painter().circle_filled(rect.center(), 5.0, color);
-                if response.on_hover_text(tr(scope.label())).clicked() {
+                if response
+                    .on_hover_text(tr(scope.label()))
+                    .on_disabled_hover_text(tr(scope.label()))
+                    .clicked()
+                {
                     self.scope = (!selected).then_some(scope);
                 }
             }

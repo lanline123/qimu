@@ -19277,7 +19277,7 @@ impl App {
                     .color(egui::Color32::from_rgb(0xD9, 0x5F, 0x5F)),
             )
             .on_hover_text(first_error);
-            if ui.small_button("忽略").clicked() {
+            if ui.small_button("忽略").on_hover_text("忽略").clicked() {
                 for pid in &failed {
                     let _ = self.call_work(
                         "POST",
@@ -19309,7 +19309,7 @@ impl App {
         painter.rect_filled(fill, 2.5, ACCENT);
         let turbo = self.lazy_turbo.load(std::sync::atomic::Ordering::Relaxed);
         let label = if turbo { "极速分割·开" } else { "极速分割" };
-        if ui.small_button(label).clicked() {
+        if ui.small_button(label).on_hover_text("极速分割").clicked() {
             let on = !turbo;
             self.lazy_turbo
                 .store(on, std::sync::atomic::Ordering::Relaxed);

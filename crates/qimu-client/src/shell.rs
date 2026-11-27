@@ -392,7 +392,10 @@ impl App {
                                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                                 ui.close();
                             }
-                        });
+                        })
+                        .response
+                        .on_hover_text(tr("文件"))
+                        .on_disabled_hover_text(tr("文件"));
                         self.workspace_edit_menu(ui);
                         ui.menu_button(egui::RichText::new(tr("视图")).size(12.0), |ui| {
                             ui.set_min_width(160.0);
@@ -402,7 +405,10 @@ impl App {
                                     ui.close();
                                 }
                             }
-                        });
+                        })
+                        .response
+                        .on_hover_text(tr("视图"))
+                        .on_disabled_hover_text(tr("视图"));
                         self.workspace_context_menus(ui);
                         ui.menu_button(egui::RichText::new(tr("帮助")).size(12.0), |ui| {
                             ui.set_min_width(160.0);
@@ -414,7 +420,10 @@ impl App {
                                 self.about_open = true;
                                 ui.close();
                             }
-                        });
+                        })
+                        .response
+                        .on_hover_text(tr("帮助"))
+                        .on_disabled_hover_text(tr("帮助"));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             self.workspace_preferences(ui);
                             ui.add_space(6.0);

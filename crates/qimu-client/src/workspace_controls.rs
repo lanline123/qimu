@@ -156,7 +156,10 @@ impl App {
                     self.refresh_guest();
                 }
             }
-        });
+        })
+        .response
+        .on_hover_text(tr("编辑"))
+        .on_disabled_hover_text(tr("编辑"));
     }
 
     pub(super) fn workspace_context_menus(&mut self, ui: &mut egui::Ui) {
@@ -174,14 +177,20 @@ impl App {
                     self.navigate_to(Page::Index);
                 }
             }
-        });
+        })
+        .response
+        .on_hover_text(tr("索引"))
+        .on_disabled_hover_text(tr("索引"));
         ui.menu_button(egui::RichText::new(tr("演示")).size(12.0), |ui| {
             if menu_item(ui, "演示厅") {
                 self.navigate_to(Page::Showroom);
                 self.showroom.zone = "plaza".into();
                 self.showroom.stack.pop_to(0);
             }
-        });
+        })
+        .response
+        .on_hover_text(tr("演示"))
+        .on_disabled_hover_text(tr("演示"));
         ui.menu_button(egui::RichText::new(tr("组织")).size(12.0), |ui| {
             let sections = self.settings_sections();
             for (section, label) in sections.into_iter().enumerate() {
@@ -195,7 +204,10 @@ impl App {
             if self.user.is_none() && menu_item(ui, "登录") {
                 self.login_open = true;
             }
-        });
+        })
+        .response
+        .on_hover_text(tr("组织"))
+        .on_disabled_hover_text(tr("组织"));
         ui.menu_button(egui::RichText::new(tr("窗口")).size(12.0), |ui| {
             if menu_item(ui, "最小化") {
                 ui.ctx()
@@ -218,8 +230,16 @@ impl App {
                 ui.ctx()
                     .send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
             }
-        });
-        if ui.button(tr("设置")).clicked() {
+        })
+        .response
+        .on_hover_text(tr("窗口"))
+        .on_disabled_hover_text(tr("窗口"));
+        if ui
+            .button(tr("设置"))
+            .on_hover_text(tr("设置"))
+            .on_disabled_hover_text(tr("设置"))
+            .clicked()
+        {
             self.navigate_to(Page::Settings);
         }
     }
@@ -548,7 +568,7 @@ impl App {
                         })
                         .stroke(egui::Stroke::NONE)
                         .corner_radius(6);
-                        if ui.add(button).clicked() && !selected {
+                        if ui.add(button).on_hover_text(label).clicked() && !selected {
                             ENGLISH_UI.set(english);
                             save_client_settings(
                                 json!({ "locale": if english { "en-us" } else { "zh-hans" } }),

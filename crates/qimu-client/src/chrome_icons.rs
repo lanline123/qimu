@@ -318,6 +318,14 @@ impl ChromeIcons {
                 })
         })
         .inner
+        // Hover name in BOTH states (user ruling 2026-11-27:
+        // the fixed bars' buttons show their name on hover even
+        // when they cannot be clicked). The enabled-state
+        // tooltip alone leaves greyed buttons nameless — a
+        // disabled scope swallows hover — so the fork's
+        // disabled-hover twin carries the same label whenever
+        // `enabled` greys this button out.
         .on_hover_text(label)
+        .on_disabled_hover_text(label)
     }
 }
