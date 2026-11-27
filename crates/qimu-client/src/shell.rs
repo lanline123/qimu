@@ -424,6 +424,21 @@ impl App {
                         .response
                         .on_hover_text(tr("帮助"))
                         .on_disabled_hover_text(tr("帮助"));
+                        // 申请公开 (user ruling 2026-11-27): the
+                        // menu bar's entry to the organization
+                        // chain — the only publish action that
+                        // needs the server. Always clickable;
+                        // the push dialog and the submission
+                        // chain behind it carry the gates
+                        // (online / identity / pending package),
+                        // and with no index in context the click
+                        // prompts instead of acting.
+                        if ui
+                            .button(egui::RichText::new(tr("申请公开")).size(12.0))
+                            .clicked()
+                        {
+                            self.apply_public();
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             self.workspace_preferences(ui);
                             ui.add_space(6.0);
@@ -721,6 +736,16 @@ impl App {
         } else {
             (Vec::new(), Vec::new())
         };
+        // Index-detail entry selection (user ruling
+        // 2026-11-27): while the index detail is the open
+        // frame, its entry wall's effective selection is a
+        // deck-bar target set of its own — the count, clear,
+        // delete, cut and copy slots act on it.
+        let entry_targets: Vec<usize> = if self.page == Page::Index {
+            self.idx_entry_targets()
+        } else {
+            Vec::new()
+        };
         let has_clip = self.ppt_clip.is_some();
         let can_combine = wall_multi.len() >= 2;
         // 解除组合 target: exactly one effective wall target
@@ -983,7 +1008,7 @@ impl App {
                 .tool(
                     ui,
                     ChromeIcon::BlockPublish,
-                    "保存并发布到演示厅",
+                    "保存并申请公开",
                     edit_dirty,
                     false,
                     true,
@@ -1007,6 +1032,31 @@ impl App {
                 .clicked()
             {
                 self.deckbar_save_block();
+            }
+        }
+        if !editing && self.page == Page::Index {
+            // sdBlockPublish in the index context (user
+            // rulings 2026-11-27): while an index page is
+            // showing, the button is ALWAYS clickable here —
+            // it runs the LOCAL submit （提交到演示）: the
+            // detail submits its own index, the overview its
+            // selected index, and an overview with nothing
+            // selected prompts instead of greying
+            // (button-state standard: clickable + prompt beats
+            // disabled). The organization chain lives in the
+            // menu bar's 申请公开， not here.
+            if ChromeIcons
+                .tool(
+                    ui,
+                    ChromeIcon::BlockPublish,
+                    "提交到演示",
+                    true,
+                    false,
+                    true,
+                )
+                .clicked()
+            {
+                self.deckbar_submit_indexes();
             }
         }
         // The selection / PPT-clipboard group (2026-11-25
@@ -1060,13 +1110,15 @@ impl App {
                 ui,
                 ChromeIcon::CopyPpt,
                 "复制到 PPT 剪贴板",
-                !wall_targets.is_empty() || copy_deck.is_some(),
+                !wall_targets.is_empty() || copy_deck.is_some() || !entry_targets.is_empty(),
                 false,
                 true,
             )
             .clicked()
         {
-            if !wall_targets.is_empty() {
+            if !entry_targets.is_empty() {
+                self.clip_copy_entries(&entry_targets, false);
+            } else if !wall_targets.is_empty() {
                 self.clip_copy_units(&wall_targets, false);
             } else if let Some(deck) = &copy_deck {
                 self.clip_copy_deck(deck);
@@ -1077,16 +1129,25 @@ impl App {
                 ui,
                 ChromeIcon::Cut,
                 "剪切到 PPT 剪贴板",
-                !wall_targets.is_empty(),
+                !wall_targets.is_empty() || !entry_targets.is_empty(),
                 false,
                 true,
             )
             .clicked()
         {
-            // The selection clears only when the cut fully
-            // succeeded (audit N3): a gated or partial failure
-            // keeps the user's selection context.
-            if self.clip_copy_units(&wall_targets, true) {
+            if !entry_targets.is_empty() {
+                // Entry cut: the fragment lands in the
+                // clipboard first, then the entries leave the
+                // source index (clip_copy_entries commits the
+                // removal). Selection clears on full success,
+                // the same audit-N3 rule as the wall cut below.
+                if self.clip_copy_entries(&entry_targets, true) {
+                    if let IndexFrame::Detail(d) = self.index.stack.top_mut() {
+                        d.entry_anchor = None;
+                        d.entry_sel.clear();
+                    }
+                }
+            } else if self.clip_copy_units(&wall_targets, true) {
                 match self.content.stack.top_mut() {
                     ContentFrame::Wall(w) => {
                         w.multi.clear();
@@ -1168,16 +1229,34 @@ impl App {
         // only where nothing is selected — the one objectively
         // unexecutable state.
         let del_targets = self.deckbar_delete_targets();
-        let del_tip = match del_targets.len() {
-            0 => "删除".to_string(),
-            1 => format!("删除「{}」", del_targets[0].label),
-            n => format!("删除选中的 {n} 项"),
+        // An open index detail with entries selected deletes
+        // the ENTRIES (they leave the index through a commit;
+        // the blocks stay in the library) — it takes precedence
+        // over the frame's index-level target.
+        let (del_tip, del_enabled) = if !entry_targets.is_empty() {
+            (
+                format!("删除选中的 {} 个条目", entry_targets.len()),
+                true,
+            )
+        } else {
+            (
+                match del_targets.len() {
+                    0 => "删除".to_string(),
+                    1 => format!("删除「{}」", del_targets[0].label),
+                    n => format!("删除选中的 {n} 项"),
+                },
+                !del_targets.is_empty(),
+            )
         };
         if ChromeIcons
-            .tool(ui, ChromeIcon::Trash, &del_tip, !del_targets.is_empty(), false, true)
+            .tool(ui, ChromeIcon::Trash, &del_tip, del_enabled, false, true)
             .clicked()
         {
-            self.deckbar_delete_selection(del_targets);
+            if !entry_targets.is_empty() {
+                self.idx_remove_selected_entries();
+            } else {
+                self.deckbar_delete_selection(del_targets);
+            }
         }
         // 清空选择 — directly in front of 删除 (added after it
         // in this right-to-left layout): drops the wall's
@@ -1188,7 +1267,7 @@ impl App {
                 ui,
                 ChromeIcon::Refresh,
                 "清空选择",
-                !wall_multi.is_empty(),
+                !wall_multi.is_empty() || !entry_targets.is_empty(),
                 false,
                 true,
             )
@@ -1197,15 +1276,25 @@ impl App {
             if let ContentFrame::Wall(w) = self.content.stack.top_mut() {
                 w.multi.clear();
             }
+            if let IndexFrame::Detail(d) = self.index.stack.top_mut() {
+                d.entry_anchor = None;
+                d.entry_sel.clear();
+            }
         }
         // 已选计数 — a status label, not a button: the one
         // member of the group allowed to appear and disappear
         // (full-set ruling covers buttons). It follows the
         // wall multi-selection exactly as the removed wall
-        // strip's count did.
+        // strip's count did; the index entry selection reads
+        // in 条目.
         if !wall_multi.is_empty() {
             ui.label(
                 egui::RichText::new(format!("已选 {} 个内容块", wall_multi.len()))
+                    .color(palette_color(TEXT_WEAK)),
+            );
+        } else if !entry_targets.is_empty() {
+            ui.label(
+                egui::RichText::new(format!("已选 {} 个条目", entry_targets.len()))
                     .color(palette_color(TEXT_WEAK)),
             );
         }
@@ -1356,6 +1445,136 @@ impl App {
         self.publish_saved_block(pe, &new_version_id, &saved_msg);
     }
 
+    /// The deck bar's index-context submit (user rulings
+    /// 2026-11-27): builds the target set — the detail's own
+    /// index, or the overview's selected index — and runs the
+    /// shared LOCAL submit （提交到演示）. Always clickable
+    /// while an index page is showing; an empty target set
+    /// prompts inside the shared action.
+    fn deckbar_submit_indexes(&mut self) {
+        let targets: Vec<(String, String)> = match self.index.stack.top() {
+            IndexFrame::Detail(d) => {
+                let name = self
+                    .indexes
+                    .iter()
+                    .find(|x| s(x, "id") == d.index_id)
+                    .map(|x| s(x, "name"))
+                    .unwrap_or_default();
+                vec![(d.index_id.clone(), name)]
+            }
+            IndexFrame::Overview(ov) => match &ov.selected {
+                Some(id) => {
+                    let name = self
+                        .indexes
+                        .iter()
+                        .find(|x| s(x, "id") == *id)
+                        .map(|x| s(x, "name"))
+                        .unwrap_or_default();
+                    vec![(id.clone(), name)]
+                }
+                None => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+        self.submit_indexes_to_local_showroom(&targets);
+    }
+
+    /// 提交到演示 (user ruling 2026-11-27): the shared LOCAL
+    /// submit action — the index tool row's Push button runs
+    /// it for its one target, the deck bar for its target set.
+    /// Each target is pinned into this library's own showroom
+    /// list （本地演示） through LocalStore; no network, no
+    /// login. Failures name their index and do not stop the
+    /// rest; the summary reports the split. An empty target
+    /// set prompts — the buttons stay clickable throughout
+    /// (button-state standard).
+    pub(super) fn submit_indexes_to_local_showroom(
+        &mut self,
+        targets: &[(String, String)],
+    ) {
+        if targets.is_empty() {
+            self.msg = "请先选择要提交的索引".into();
+            return;
+        }
+        let mut ok = 0usize;
+        let mut failed: Vec<String> = Vec::new();
+        {
+            let Some(local) = &self.local else {
+                self.msg = "本地库未打开，无法提交到演示".into();
+                return;
+            };
+            for (id, name) in targets {
+                match local.submit_index_to_local_showroom(id) {
+                    Ok(_) => ok += 1,
+                    Err(e) => failed.push(format!("「{name}」{e}")),
+                }
+            }
+        }
+        if ok > 0 {
+            self.refresh_local();
+        }
+        if failed.is_empty() {
+            if targets.len() == 1 {
+                self.msg = format!("已提交到演示：{}（本地演示）", targets[0].1);
+            } else {
+                self.msg = format!("已提交 {ok} 个索引到演示（本地演示）");
+            }
+        } else if ok == 0 {
+            self.msg = format!("提交到演示失败：{}", failed.join("；"));
+        } else {
+            self.msg = format!(
+                "已提交 {ok}/{} 个索引到演示；失败：{}",
+                targets.len(),
+                failed.join("；")
+            );
+        }
+    }
+
+    /// 申请公开 (user ruling 2026-11-27): the menu-bar entry
+    /// to the organization chain — submit the current /
+    /// selected index for admin review through the push
+    /// dialog (the 申请公开 dialog) and push_index_to_showroom.
+    /// This is the one publish action that needs the server;
+    /// the dialog chain carries the existing gates (online,
+    /// identity, pending package, governance), so this entry
+    /// never greys — with no index in context it prompts.
+    fn apply_public(&mut self) {
+        let target: Option<(String, String)> = if self.page == Page::Index {
+            match self.index.stack.top() {
+                IndexFrame::Detail(d) => Some((
+                    d.index_id.clone(),
+                    self.indexes
+                        .iter()
+                        .find(|x| s(x, "id") == d.index_id)
+                        .map(|x| s(x, "name"))
+                        .unwrap_or_default(),
+                )),
+                IndexFrame::Overview(ov) => ov.selected.clone().map(|id| {
+                    let name = self
+                        .indexes
+                        .iter()
+                        .find(|x| s(x, "id") == id)
+                        .map(|x| s(x, "name"))
+                        .unwrap_or_default();
+                    (id, name)
+                }),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        match target {
+            Some((id, title)) => self.open_push_dialog(&id, &title),
+            None => {
+                self.msg = if self.page == Page::Index {
+                    "请先选择要申请公开的索引".into()
+                } else {
+                    "申请公开：请先打开一个索引".into()
+                };
+            }
+        }
+    }
+
     /// The publish half of sdBlockPublish (see
     /// deckbar_publish_block): the candidate search runs in
     /// the local library, the submission's home turf — an
@@ -1475,7 +1694,7 @@ impl App {
         };
         self.push_index_to_showroom(index_id, index_name, &tag_id, &pins, pe.note.trim());
         if self.msg == "已提交，等待审核" {
-            self.msg = format!("{saved_msg}，并已提交到演示厅，等待审核");
+            self.msg = format!("{saved_msg}，并已申请公开，等待审核");
         } else {
             let why = self.msg.clone();
             if why != saved_msg {
@@ -1692,6 +1911,14 @@ impl App {
             return;
         }
         if self.delete_key_dialog_open() {
+            return;
+        }
+        // Index-detail entry selection takes the key first:
+        // Delete removes the selected entries from the index
+        // (the sdDel slot's precedence, same here).
+        if self.page == Page::Index && !self.idx_entry_targets().is_empty() {
+            ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete));
+            self.idx_remove_selected_entries();
             return;
         }
         let targets = self.deckbar_delete_targets();

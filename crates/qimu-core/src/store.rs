@@ -432,6 +432,11 @@ pub struct IndexRec {
     pub lifecycle: String, // active | history | void
     pub scope: String,     // company | parent_org | dept_sub | dept | private
     pub created_ms: i64,
+    /// Free-text note （备注）, edited in place in the index
+    /// detail page's backbar (user ruling 2026-11-27: the index
+    /// name and note are both double-click editable there, the
+    /// same treatment folders got for the content page flow).
+    pub note: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1084,7 +1089,7 @@ CREATE TABLE IF NOT EXISTS versions(id TEXT PRIMARY KEY, rendition_id TEXT NOT N
 CREATE TABLE IF NOT EXISTS version_renumbers(id TEXT PRIMARY KEY, version_id TEXT NOT NULL, from_semver TEXT NOT NULL DEFAULT '', to_semver TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', by TEXT NOT NULL DEFAULT '', at_ms INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS version_use_sel(unit_id TEXT NOT NULL, rendition_id TEXT NOT NULL, version_id TEXT NOT NULL, PRIMARY KEY(unit_id, rendition_id));
 CREATE TABLE IF NOT EXISTS version_lang_mounts(unit_id TEXT NOT NULL, version_id TEXT NOT NULL, lang TEXT NOT NULL, state TEXT NOT NULL, updated_ms INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(unit_id, version_id, lang));
-CREATE TABLE IF NOT EXISTS indexes_tbl(id TEXT PRIMARY KEY, name TEXT NOT NULL, folder_id TEXT, group_id TEXT NOT NULL, maintainer TEXT NOT NULL, lifecycle TEXT NOT NULL DEFAULT 'active', scope TEXT NOT NULL DEFAULT 'company', created_ms INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS indexes_tbl(id TEXT PRIMARY KEY, name TEXT NOT NULL, folder_id TEXT, group_id TEXT NOT NULL, maintainer TEXT NOT NULL, lifecycle TEXT NOT NULL DEFAULT 'active', scope TEXT NOT NULL DEFAULT 'company', created_ms INTEGER NOT NULL, note TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS index_branches(index_id TEXT NOT NULL, name TEXT NOT NULL, head_commit TEXT, PRIMARY KEY(index_id, name));
 CREATE TABLE IF NOT EXISTS index_commits(id TEXT PRIMARY KEY, index_id TEXT NOT NULL, branch TEXT NOT NULL, parent_id TEXT, author TEXT NOT NULL, message TEXT NOT NULL, created_ms INTEGER NOT NULL, entries_json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS index_tags(id TEXT PRIMARY KEY, index_id TEXT NOT NULL, branch TEXT NOT NULL, name TEXT NOT NULL, commit_id TEXT NOT NULL);
@@ -1183,6 +1188,7 @@ impl Store {
             ("folders", "scope", "TEXT NOT NULL DEFAULT ''"),
             ("folders", "color", "TEXT"),
             ("folders", "note", "TEXT NOT NULL DEFAULT ''"),
+            ("indexes_tbl", "note", "TEXT NOT NULL DEFAULT ''"),
             ("folders", "origin", "TEXT NOT NULL DEFAULT ''"),
             ("index_branches", "source_index_id", "TEXT"),
             ("index_branches", "source_branch", "TEXT"),
@@ -5091,11 +5097,36 @@ impl Store {
             lifecycle: r.get(5)?,
             scope: r.get(6)?,
             created_ms: r.get(7)?,
+            note: r.get(8)?,
         })
     }
 
     const INDEX_COLS: &'static str =
-        "id, name, folder_id, group_id, maintainer, lifecycle, scope, created_ms";
+        "id, name, folder_id, group_id, maintainer, lifecycle, scope, created_ms, note";
+
+    pub fn rename_index(&self, id: &str, name: &str) -> SResult<()> {
+        let n = self
+            .conn
+            .execute("UPDATE indexes_tbl SET name=?2 WHERE id=?1", params![id, name])
+            .map_err(db_err)?;
+        if n == 0 {
+            return Err("索引不存在".into());
+        }
+        Ok(())
+    }
+
+    /// Set (or clear, with an empty string) the index's note
+    /// （备注）, edited in place in the detail page's backbar.
+    pub fn set_index_note(&self, id: &str, note: &str) -> SResult<()> {
+        let n = self
+            .conn
+            .execute("UPDATE indexes_tbl SET note=?2 WHERE id=?1", params![id, note])
+            .map_err(db_err)?;
+        if n == 0 {
+            return Err("索引不存在".into());
+        }
+        Ok(())
+    }
 
     /// Create an index. `folder_id` None means the index's home is
     /// 未分类 — the system collection of folder-less indexes
@@ -6108,6 +6139,30 @@ impl Store {
             )
             .map_err(db_err)?;
         Ok(rec)
+    }
+
+    /// Re-point a showroom row at a new source commit (a
+    /// local re-submit updates the standing row's pinning in
+    /// place instead of duplicating it): the title follows
+    /// the source index's current name, and the caller
+    /// rewrites the pins against the new commit.
+    pub fn update_showroom_commit(
+        &self,
+        id: &str,
+        title: &str,
+        commit_id: &str,
+    ) -> SResult<()> {
+        let n = self
+            .conn
+            .execute(
+                "UPDATE showroom SET title=?2, commit_id=?3 WHERE id=?1",
+                params![id, title, commit_id],
+            )
+            .map_err(db_err)?;
+        if n == 0 {
+            return Err("演示条目不存在".into());
+        }
+        Ok(())
     }
 
     pub fn list_showroom(&self, state: Option<&str>) -> SResult<Vec<ShowroomRec>> {

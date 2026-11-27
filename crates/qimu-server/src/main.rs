@@ -1797,6 +1797,32 @@ struct NoteReq {
     note: String,
 }
 
+async fn rename_index(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<RenameReq>,
+) -> Api<Value> {
+    let _ = auth(&st, &headers)?;
+    let store = st.store.lock().unwrap();
+    store.rename_index(&id, &req.name).map_err(bad)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// POST /v1/indexes/:id/note — set the index's note （备注）,
+/// edited in place in the index detail page's backbar.
+async fn set_index_note(
+    State(st): State<St>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<NoteReq>,
+) -> Api<Value> {
+    let _ = auth(&st, &headers)?;
+    let store = st.store.lock().unwrap();
+    store.set_index_note(&id, &req.note).map_err(bad)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
 /// POST /v1/folders/:id/note — set the folder's note （备注）,
 /// edited in place on the content page's folder-flow header.
 async fn set_folder_note(
@@ -7073,6 +7099,8 @@ async fn main() {
         .route("/v1/search", get(search))
         .route("/v1/indexes", get(list_indexes).post(create_index))
         .route("/v1/index-graphs", get(index_graphs))
+        .route("/v1/indexes/:id/rename", post(rename_index))
+        .route("/v1/indexes/:id/note", post(set_index_note))
         .route("/v1/indexes/:id/folder", post(move_index_to_folder))
         .route("/v1/indexes/:id/english", post(create_english_index))
         .route("/v1/indexes/:id", get(get_index))

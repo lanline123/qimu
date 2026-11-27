@@ -2012,6 +2012,11 @@ enum IndexDetailAction {
     Export(&'static str),
     Commit(Vec<Value>, &'static str),
     Insert(usize),
+    /// 重选页面 (prototype #idxRePickBtn, restored as a real
+    /// feature by user ruling 2026-11-27): re-pick the pages of
+    /// the one selected entry through the insert pick channel
+    /// with replace semantics.
+    RePick(usize),
     PickPages(usize, Value, Vec<bool>),
     SwitchVersion(usize, String, String, bool),
 }
@@ -2033,6 +2038,16 @@ enum IndexDetailView {
     Lineage,
 }
 
+/// Which backbar field the in-place editor is open on
+/// (name / note double-click editing, user ruling
+/// 2026-11-27 — the folder flow's treatment, applied to the
+/// index header).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IdxEditKind {
+    Name,
+    Note,
+}
+
 /// 索引详情帧状态：一个打开的索引的全部工作状态，随帧销毁。
 struct IndexDetailState {
     index_id: String,
@@ -2049,11 +2064,39 @@ struct IndexDetailState {
     /// inline 删除 confirmation is armed. The card's × only
     /// arms it; the removal commits from the pop's 确认删除.
     confirm_remove_entry: Option<usize>,
+    /// Entry-wall selection (user ruling 2026-11-27): the SAME
+    /// model as the content wall — `entry_anchor` is the range
+    /// anchor every plain/Ctrl click moves, `entry_sel` is the
+    /// Ctrl-click multi set in click order, a plain click
+    /// clears the set, a Shift+click replaces it with the
+    /// anchor-to-target range, and a blank click clears both.
+    /// The deck bar's count / delete / cut / copy act on the
+    /// effective set (the multi set when non-empty, else the
+    /// anchor as a one-entry set), and 重选页面 enables on an
+    /// effective set of exactly one.
+    entry_anchor: Option<usize>,
+    entry_sel: Vec<usize>,
+    /// Long-press drag state for entry reorder (client-wide
+    /// card drag convention: 400 ms hold arms, insertion seam,
+    /// Esc cancels). `entry_press` is the un-armed candidate
+    /// (position, start time, press origin); `entry_drag` the
+    /// armed moving set (sorted positions); `entry_drop` the
+    /// insertion index in original indexing;
+    /// `entry_suppress_click` keeps the release that ends a
+    /// drag from also landing as a click selection.
+    entry_press: Option<(usize, f64, egui::Pos2)>,
+    entry_drag: Option<Vec<usize>>,
+    entry_drop: usize,
+    entry_suppress_click: bool,
+    /// Backbar in-place edit (name / note), mirroring the
+    /// folder flow's flow_edit: double-click opens, Enter /
+    /// focus loss commits, Esc cancels.
+    idx_edit: Option<(IdxEditKind, String)>,
+    idx_edit_focus: bool,
     /// rendition_id -> versions, semver desc（打开时预取）。
     unit_versions: std::collections::HashMap<String, Vec<Value>>,
     tag_name: String,
     focus_tag: bool,
-    new_branch: String,
     merge_from: String,
     focus_merge: bool,
     merge_preview: Option<Value>,
@@ -2076,10 +2119,17 @@ impl IndexDetailState {
             view: IndexDetailView::Wall,
             selected_commit: None,
             confirm_remove_entry: None,
+            entry_anchor: None,
+            entry_sel: Vec::new(),
+            entry_press: None,
+            entry_drag: None,
+            entry_drop: 0,
+            entry_suppress_click: false,
+            idx_edit: None,
+            idx_edit_focus: false,
             unit_versions: Default::default(),
             tag_name: String::new(),
             focus_tag: false,
-            new_branch: String::new(),
             merge_from: String::new(),
             focus_merge: false,
             merge_preview: None,
@@ -2087,6 +2137,42 @@ impl IndexDetailState {
             include_notes: true,
             closed: false,
         }
+    }
+
+    /// Number of entries the loaded detail currently resolves.
+    fn entry_count(&self) -> usize {
+        self.detail
+            .get("resolved_entries")
+            .and_then(|r| r.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0)
+    }
+
+    /// The effective entry selection the deck bar acts on, in
+    /// wall (ascending) order: the Ctrl-click multi set when
+    /// non-empty, else the anchor as a one-entry set — the
+    /// content wall's exact target rule. Stale positions (past
+    /// a reload that shrank the wall) are dropped.
+    fn entry_targets(&self) -> Vec<usize> {
+        let n = self.entry_count();
+        let mut out: Vec<usize> = if !self.entry_sel.is_empty() {
+            self.entry_sel.clone()
+        } else if let Some(a) = self.entry_anchor {
+            vec![a]
+        } else {
+            Vec::new()
+        };
+        out.retain(|p| *p < n);
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Whether the card at `pos` renders in the selected state:
+    /// the anchor card and every multi-set card show it (the
+    /// content wall's ring rule).
+    fn entry_is_selected(&self, pos: usize) -> bool {
+        self.entry_anchor == Some(pos) || self.entry_sel.contains(&pos)
     }
 }
 
@@ -4538,6 +4624,10 @@ enum PickState {
         index_name: String,
         at: usize,
         selected: Vec<InsertPick>,
+        /// 重选页面 replace mode (user ruling 2026-11-27):
+        /// Some(pos) = the confirm REPLACES the entry at pos
+        /// instead of inserting beside it; None = plain insert.
+        replace: Option<usize>,
     },
 }
 
@@ -5932,6 +6022,7 @@ impl App {
                                 index_name: app.current_index_name(),
                                 at,
                                 selected: Vec::new(),
+                                replace: None,
                             });
                             app.content.stack.pop_to(0);
                             app.page = Page::Content;
@@ -9059,12 +9150,20 @@ impl App {
                             index_name,
                             at,
                             selected,
+                            replace,
                         } => {
                             ui.label(
-                                egui::RichText::new(format!(
-                                    "为索引「{index_name}」插入条目 · 已选 {} 项 · 插入到第 {at} 条之后",
-                                    selected.len()
-                                ))
+                                egui::RichText::new(match replace {
+                                    Some(pos) => format!(
+                                        "为索引「{index_name}」重选页面 · 已选 {} 项 · 将替换第 {} 条",
+                                        selected.len(),
+                                        pos + 1
+                                    ),
+                                    None => format!(
+                                        "为索引「{index_name}」插入条目 · 已选 {} 项 · 插入到第 {at} 条之后",
+                                        selected.len()
+                                    ),
+                                })
                                 .strong()
                                 .size(13.0),
                             );
@@ -9091,14 +9190,20 @@ impl App {
                                     confirm = true;
                                 }
                             }
-                            PickState::Insert { selected, .. } => {
+                            PickState::Insert {
+                                selected, replace, ..
+                            } => {
                                 let enabled = !selected.is_empty();
                                 if ui
                                     .add_enabled(
                                         enabled,
                                         egui::Button::new(
-                                            egui::RichText::new("插入")
-                                                .color(egui::Color32::WHITE),
+                                            egui::RichText::new(if replace.is_some() {
+                                                "确认替换"
+                                            } else {
+                                                "插入"
+                                            })
+                                            .color(egui::Color32::WHITE),
                                         )
                                         .fill(ACCENT)
                                         .corner_radius(6),
@@ -9275,7 +9380,12 @@ impl App {
     }
 
     fn confirm_insert_pick(&mut self) {
-        let Some(PickState::Insert { at, selected, .. }) = self.pick.clone() else {
+        let Some(PickState::Insert {
+            at,
+            selected,
+            replace,
+        }) = self.pick.clone()
+        else {
             return;
         };
         if selected.is_empty() {
@@ -9283,7 +9393,24 @@ impl App {
             return;
         }
         let mut es = self.current_entries();
-        let mut at = at.min(es.len());
+        // 重选页面 (replace mode): the picked entries take the
+        // place of the entry at `replace` — removed first, then
+        // inserted at the same position in pick order. The
+        // cancel path never reaches here, so a cancelled re-pick
+        // leaves the entry untouched.
+        let (mut at, message) = match replace {
+            Some(pos) => {
+                if pos >= es.len() {
+                    self.pick = None;
+                    self.page = Page::Index;
+                    self.msg = "原条目已不存在，无法重选页面".into();
+                    return;
+                }
+                es.remove(pos);
+                (pos, "重选页面")
+            }
+            None => (at.min(es.len()), "插入条目"),
+        };
         for pick in selected {
             es.insert(
                 at,
@@ -9299,7 +9426,272 @@ impl App {
         }
         self.pick = None;
         self.page = Page::Index;
-        self.commit_entries(es, "插入条目");
+        self.commit_entries(es, message);
+    }
+
+    /// The open index detail's effective entry selection, for
+    /// the deck bar (count / delete / cut / copy light on it).
+    fn idx_entry_targets(&self) -> Vec<usize> {
+        match self.index.stack.top() {
+            IndexFrame::Detail(d) => d.entry_targets(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Deck-bar / Delete-key removal of the index detail's
+    /// selected entries: the entries leave the index through a
+    /// commit; the content blocks themselves are untouched —
+    /// entry removal is not a trash operation (the prototype's
+    /// delete-entry semantics, and the five-kind ruling's
+    /// index-entry face).
+    fn idx_remove_selected_entries(&mut self) {
+        let positions = self.idx_entry_targets();
+        if positions.is_empty() {
+            return;
+        }
+        let mut es = self.current_entries();
+        let mut sorted = positions;
+        sorted.sort_unstable_by(|a, b| b.cmp(a));
+        for p in sorted {
+            if p < es.len() {
+                es.remove(p);
+            }
+        }
+        if let IndexFrame::Detail(d) = self.index.stack.top_mut() {
+            d.entry_anchor = None;
+            d.entry_sel.clear();
+            d.confirm_remove_entry = None;
+        }
+        self.commit_entries(es, "删除条目");
+    }
+
+    /// Copy / cut index entries through the PPT clipboard
+    /// channel (user ruling 2026-11-27 — the existing channel,
+    /// not a new one): the fragment is assembled from each
+    /// selected entry's RESOLVED version, restricted to its
+    /// excerpt pages when the entry carries excerpt_slots,
+    /// through the same split + assemble machinery
+    /// clip_bytes_from_units uses. A cut additionally removes
+    /// the entries from the source index once the clipboard
+    /// holds their pages; the content blocks stay in the
+    /// library. Returns full success, like clip_copy_units.
+    fn clip_copy_entries(&mut self, positions: &[usize], cut: bool) -> bool {
+        let what = if cut { "剪切条目" } else { "复制条目" };
+        if !self.need_identity_local(what) {
+            return false;
+        }
+        if positions.is_empty() {
+            self.say("先选中条目");
+            return false;
+        }
+        let detail = match self.index.stack.top() {
+            IndexFrame::Detail(d) => d.detail.clone(),
+            _ => return false,
+        };
+        let resolved = detail
+            .get("resolved_entries")
+            .and_then(|r| r.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut singles: Vec<qimu_core::pptx::Package> = Vec::new();
+        for &pos in positions {
+            let Some(row) = resolved.get(pos) else {
+                self.say("选中的条目已不存在");
+                return false;
+            };
+            let entry = row.get("entry").cloned().unwrap_or(json!({}));
+            let ver = row.get("resolved").cloned().unwrap_or(Value::Null);
+            let name = row
+                .get("unit_name")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            if !ver.is_object() {
+                self.say(format!("条目「{name}」没有可用版本，无法{what}"));
+                return false;
+            }
+            let vid = s(&ver, "id");
+            let frag = match self.version_fragment_bytes(&vid) {
+                Ok(b) => b,
+                Err(e) => {
+                    self.say(format!("{what}失败：{e}"));
+                    return false;
+                }
+            };
+            let effective = match entry.get("excerpt_slots").and_then(|x| x.as_array()) {
+                Some(slots) if !slots.is_empty() => {
+                    let pages = excerpt_positions_json(&ver, slots);
+                    match self.clip_pick_pages(&frag, &pages) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            self.say(format!("{what}失败：{e}"));
+                            return false;
+                        }
+                    }
+                }
+                _ => frag,
+            };
+            let pkg = match qimu_core::pptx::Package::load(&effective) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.say(format!("{what}失败：{e}"));
+                    return false;
+                }
+            };
+            match qimu_core::pptx::split(&pkg) {
+                Ok(parts) => singles.extend(parts),
+                Err(e) => {
+                    self.say(format!("{what}失败：{e}"));
+                    return false;
+                }
+            }
+        }
+        if singles.is_empty() {
+            self.say("没有可复制的页面");
+            return false;
+        }
+        let bytes = match qimu_core::assemble::assemble(&singles)
+            .and_then(|p| p.to_bytes().map_err(|e| e.to_string()))
+        {
+            Ok(b) => b,
+            Err(e) => {
+                self.say(format!("{what}失败：{e}"));
+                return false;
+            }
+        };
+        let label = if positions.len() == 1 {
+            resolved
+                .get(positions[0])
+                .and_then(|r| r.get("unit_name"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string()
+        } else {
+            format!("{} 个条目", positions.len())
+        };
+        if !self.clip_store(&bytes, &label, true) {
+            return false;
+        }
+        if !cut {
+            return true;
+        }
+        let mut es = self.current_entries();
+        let mut sorted = positions.to_vec();
+        sorted.sort_unstable_by(|a, b| b.cmp(a));
+        for p in sorted {
+            if p < es.len() {
+                es.remove(p);
+            }
+        }
+        self.commit_entries(es, "剪切条目");
+        true
+    }
+
+    /// Paste into the open index detail: publish the clipboard
+    /// fragment as content block(s) (clip_paste's own split /
+    /// group shapes and page naming), then append entries for
+    /// the new blocks to the current index through
+    /// commit_entries — the landing confirm_insert_pick uses.
+    /// Like the insert confirm, this records no undo entry:
+    /// entry commits carry their own history in the index's
+    /// commit graph.
+    fn clip_paste_into_index(&mut self, split_into_blocks: bool) {
+        let Some(bytes) = self.clip_source_bytes() else {
+            return;
+        };
+        let source = self
+            .ppt_clip
+            .as_ref()
+            .map(|m| s(m, "source"))
+            .unwrap_or_default();
+        let mut created: Vec<String> = Vec::new();
+        if split_into_blocks {
+            let pkg = match qimu_core::pptx::Package::load(&bytes) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.msg = format!("粘贴失败：{e}");
+                    return;
+                }
+            };
+            let singles = match qimu_core::pptx::split(&pkg) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.msg = format!("粘贴失败：{e}");
+                    return;
+                }
+            };
+            let total = singles.len();
+            let mut failed = 0usize;
+            for (idx, one) in singles.iter().enumerate() {
+                let name = clip_page_name(one, idx);
+                let Ok(b) = one.to_bytes() else {
+                    failed += 1;
+                    continue;
+                };
+                match self.publish_bytes_as_unit(&b, &name, "剪贴板逐页成块") {
+                    Some(nid) => created.push(nid),
+                    None => failed += 1,
+                }
+            }
+            if created.is_empty() {
+                self.say(format!("粘贴失败：{total} 页均未能成块"));
+                return;
+            }
+            if failed > 0 {
+                self.say(format!(
+                    "粘贴未全部完成：{failed} 页成块失败，其余页继续入索引"
+                ));
+            }
+        } else {
+            let name = if source.is_empty() {
+                "剪贴板内容块".to_string()
+            } else {
+                source.clone()
+            };
+            match self.publish_bytes_as_unit(&bytes, &name, "剪贴板整组成块") {
+                Some(nid) => created.push(nid),
+                None => return,
+            }
+        }
+        // Resolve the new blocks' list items into entries (the
+        // same derivation the insert pick uses).
+        let list = match self.call_work("GET", "/v1/units", None) {
+            Ok(v) => v,
+            Err(e) => {
+                self.msg = format!("粘贴失败：{e}");
+                return;
+            }
+        };
+        let items = list
+            .get("units")
+            .and_then(|u| u.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut es = self.current_entries();
+        let mut inserted = 0usize;
+        for uid in &created {
+            let Some(item) = items.iter().find(|it| {
+                it.get("unit")
+                    .map(|u| s(u, "id") == *uid)
+                    .unwrap_or(false)
+            }) else {
+                continue;
+            };
+            if let Some(pick) = self.insert_pick_for_item(item) {
+                es.push(json!({
+                    "unit_id": pick.unit_id,
+                    "rendition_id": pick.rendition_id,
+                    "policy": "follow_latest",
+                    "locked_semver": Value::Null,
+                    "excerpt_slots": Value::Null,
+                }));
+                inserted += 1;
+            }
+        }
+        if inserted == 0 {
+            self.msg = "粘贴失败：新建内容块暂无可用版本".into();
+            return;
+        }
+        self.commit_entries(es, "粘贴条目");
     }
 
     /// Grid-end add card on the content page: blank block, or a block
@@ -9669,6 +10061,17 @@ impl App {
     /// 整组成块 (all pages become one multi-page block).
     fn clip_paste(&mut self, split_into_blocks: bool) {
         if !self.need_identity_local("粘贴") {
+            return;
+        }
+        // In an open index detail the paste lands as ENTRIES of
+        // the current index (user ruling 2026-11-27): the
+        // fragment is published as content blocks through this
+        // function's own machinery, then inserted through the
+        // entry channel confirm_insert_pick lands through.
+        if self.page == Page::Index
+            && matches!(self.index.stack.top(), IndexFrame::Detail(_))
+        {
+            self.clip_paste_into_index(split_into_blocks);
             return;
         }
         let Some(bytes) = self.clip_source_bytes() else {
@@ -17170,7 +17573,7 @@ impl App {
                     // 本地演示: this library's own showroom rows
                     // (local_showroom, fed by refresh_local). Pure
                     // local data — every action below works
-                    // offline; only 提交到组织 leaves the machine,
+                    // offline; only 申请公开 leaves the machine,
                     // through the existing submission chain.
                     self.showroom_cards(
                         ui,
@@ -17259,7 +17662,7 @@ impl App {
                                     }
                                     let src = s(e, "source_index_id");
                                     if !src.is_empty()
-                                        && ui.small_button("提交到组织").clicked()
+                                        && ui.small_button("申请公开").clicked()
                                     {
                                         let title = s(e, "title");
                                         app.open_push_dialog(&src, &title);
@@ -20777,6 +21180,91 @@ impl App {
     /// Losing focus commits (Enter surrenders focus, so it
     /// commits too — the unit-detail header editor's contract);
     /// Esc cancels.
+    /// The index backbar's in-place editor (name / note),
+    /// mirroring flow_edit_field's contract exactly: LEFT_CENTER
+    /// galley alignment in a 26pt box, focus requested once,
+    /// Esc cancels, focus loss (incl. Enter) commits. Returns
+    /// (commit, cancel); the caller commits after the frame
+    /// closes so the state borrow is free.
+    fn idx_edit_field(
+        &mut self,
+        ui: &mut egui::Ui,
+        st: &mut IndexDetailState,
+    ) -> (bool, bool) {
+        let mut commit = false;
+        let mut cancel = false;
+        if let Some((_, text)) = &mut st.idx_edit {
+            let resp = ui.add_sized(
+                [240.0, 26.0],
+                egui::TextEdit::singleline(text).align(egui::Align2::LEFT_CENTER),
+            );
+            if st.idx_edit_focus {
+                resp.request_focus();
+                st.idx_edit_focus = false;
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                cancel = true;
+            } else if resp.lost_focus() {
+                commit = true;
+            }
+        }
+        (commit, cancel)
+    }
+
+    /// Commit a backbar edit: the name goes through the rename
+    /// endpoint, the note through the note endpoint (core store
+    /// on the local dispatch and the server alike — the
+    /// endpoints were added with this feature, mirroring the
+    /// folder pair). An emptied name is refused; an emptied
+    /// note simply clears the note. Returns true when the edit
+    /// landed and the detail should reload.
+    fn idx_edit_commit(&mut self, st: &mut IndexDetailState) -> bool {
+        let Some((kind, text)) = st.idx_edit.take() else {
+            return false;
+        };
+        let id = st.index_id.clone();
+        match kind {
+            IdxEditKind::Name => {
+                let name = text.trim().to_string();
+                if name.is_empty() {
+                    self.msg = "索引名不能为空".into();
+                    return false;
+                }
+                match self.call_work(
+                    "POST",
+                    &format!("/v1/indexes/{id}/rename"),
+                    Some(json!({ "name": name })),
+                ) {
+                    Ok(_) => {
+                        self.msg = "已重命名".into();
+                        true
+                    }
+                    Err(e) => {
+                        self.msg = format!("重命名失败：{e}");
+                        false
+                    }
+                }
+            }
+            IdxEditKind::Note => {
+                let note = text.trim().to_string();
+                match self.call_work(
+                    "POST",
+                    &format!("/v1/indexes/{id}/note"),
+                    Some(json!({ "note": note })),
+                ) {
+                    Ok(_) => {
+                        self.msg = "已保存备注".into();
+                        true
+                    }
+                    Err(e) => {
+                        self.msg = format!("备注保存失败：{e}");
+                        false
+                    }
+                }
+            }
+        }
+    }
+
     fn flow_edit_field(&mut self, ui: &mut egui::Ui, w: &mut WallState, width: f32) {
         let mut commit = false;
         let mut cancel = false;
@@ -25413,15 +25901,13 @@ impl App {
                     }
                 }
                 IndexFrame::Detail(st) => {
-                    let name = self
-                        .indexes
-                        .iter()
-                        .find(|x| s(x, "id") == st.index_id)
-                        .map(|x| s(x, "name"))
-                        .unwrap_or_default();
-                    if crumb_bar(ui, &[tr("索引"), &name]) == Some(0) {
-                        st.closed = true;
-                    }
+                    // No in-body crumb row on this page (audit
+                    // 2026-11-27 against the rendered prototype:
+                    // its #7 editor body starts at the backbar;
+                    // the only crumb-like text is the shell
+                    // chrome's static path label). Return runs
+                    // through the tab double-click hint in the
+                    // backbar and the deck bar's back button.
                     if !st.closed {
                         self.index_detail(ui, st, &mut action);
                         self.index_more_dialog(ui.ctx(), st, &mut action);
@@ -25500,6 +25986,17 @@ impl App {
                         index_name: self.current_index_name(),
                         at,
                         selected: Vec::new(),
+                        replace: None,
+                    });
+                    self.close_unit_detail();
+                    self.page = Page::Content;
+                }
+                Some(IndexDetailAction::RePick(pos)) => {
+                    self.pick = Some(PickState::Insert {
+                        index_name: self.current_index_name(),
+                        at: pos,
+                        selected: Vec::new(),
+                        replace: Some(pos),
                     });
                     self.close_unit_detail();
                     self.page = Page::Content;
@@ -25985,53 +26482,21 @@ impl App {
     ) {
         let detail = st.detail.clone();
         let index = detail.get("index").cloned().unwrap_or(json!({}));
-        let branches = detail
-            .get("branches")
-            .and_then(|b| b.as_array())
-            .cloned()
-            .unwrap_or_default();
         let resolved = detail
             .get("resolved_entries")
             .and_then(|r| r.as_array())
             .cloned()
             .unwrap_or_default();
-        let total_pages: i64 = resolved
-            .iter()
-            .map(|row| {
-                let entry = row.get("entry").cloned().unwrap_or(json!({}));
-                let ver = row.get("resolved").cloned().unwrap_or(Value::Null);
-                index_controls::entry_effective_pages(&entry, &ver)
-            })
-            .sum();
-        // 预计算共享数据
-        let folder_id = s(&index, "folder_id");
-        let folder_coord = if folder_id.is_empty() {
-            "未分类".to_string()
-        } else {
-            let p = index_controls::resolve_folder_path(&self.folders, &folder_id);
-            if p.is_empty() { "未分类".into() } else { p }
-        };
-        let scope = index_controls::IndexScope::of(&index);
-        let current_branch = if st.branch.is_empty() {
-            "main".to_string()
-        } else {
-            st.branch.clone()
-        };
-        // 派生点提示（仅非主线分支有分叉点）
-        let fork_hint = if current_branch == "main" {
-            "仓库主线 · 无分叉点".to_string()
-        } else {
-            format!("分叉点：{current_branch} 基于主线派生")
-        };
-        // 直接子分支（除当前分支外的所有分支）
-        let other_branches: Vec<&str> = branches
-            .iter()
-            .filter_map(|b| b.as_str())
-            .filter(|bs| *bs != current_branch)
-            .collect();
+        // (The folder-coordinate / scope / branch-fork precompute
+        // that used to sit here served only the coordbar and
+        // lineagebar below; both bars were removed in the
+        // 2026-11-27 prototype-render audit — their prototype
+        // renderers are dead code that never paints.)
 
         // ── 1. idx-backbar：索引名称 + 返回总览提示 | flex:1 | 5标签切换 ──────────
         // 对应原型 HTML line 1729–1733，backbar 里不放分支/发布控件，这些在全局工具栏
+        let mut edit_commit = false;
+        let mut edit_cancel = false;
         egui::Frame::new()
             .fill(palette_color(PANEL_BG))
             .stroke(egui::Stroke::new(1.0, palette_color(FIELD_BORDER)))
@@ -26039,13 +26504,58 @@ impl App {
             .inner_margin(egui::Margin { left: 12, right: 12, top: 8, bottom: 8 })
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    // 索引名称（h1，双击可重命名）
-                    ui.label(
-                        egui::RichText::new(s(&index, "name"))
-                            .strong()
-                            .size(17.0)
-                            .color(palette_color(TEXT_MAIN)),
-                    );
+                    // 索引名称 + 备注（双击就地编辑，用户口径
+                    // 2026-11-27，与页面文件夹流的 flow_edit 同
+                    // 一套：双击进入、Enter/失焦提交、Esc 取消、
+                    // 文字垂直居中）。备注跟在名称右侧小字显示，
+                    // 空备注显示浅色「添加备注」作双击靶。
+                    if matches!(st.idx_edit, Some((IdxEditKind::Name, _))) {
+                        let (c, x) = self.idx_edit_field(ui, st);
+                        edit_commit = c;
+                        edit_cancel = x;
+                    } else {
+                        let resp = ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(s(&index, "name"))
+                                    .strong()
+                                    .size(17.0)
+                                    .color(palette_color(TEXT_MAIN)),
+                            )
+                            .sense(egui::Sense::click()),
+                        );
+                        if resp.double_clicked() {
+                            st.idx_edit =
+                                Some((IdxEditKind::Name, s(&index, "name")));
+                            st.idx_edit_focus = true;
+                        }
+                    }
+                    ui.add_space(8.0);
+                    if matches!(st.idx_edit, Some((IdxEditKind::Note, _))) {
+                        let (c, x) = self.idx_edit_field(ui, st);
+                        edit_commit = c;
+                        edit_cancel = x;
+                    } else {
+                        let note = s(&index, "note");
+                        let (txt, col) = if note.is_empty() {
+                            ("添加备注", TEXT_FAINT)
+                        } else {
+                            (note.as_str(), TEXT_WEAK)
+                        };
+                        let resp = ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(txt)
+                                    .size(12.5)
+                                    .color(palette_color(col)),
+                            )
+                            .sense(egui::Sense::click()),
+                        );
+                        if resp.double_clicked() {
+                            st.idx_edit =
+                                Some((IdxEditKind::Note, s(&index, "note")));
+                            st.idx_edit_focus = true;
+                        }
+                    }
+                    ui.add_space(8.0);
                     // 返回总览提示 hint
                     ui.label(
                         egui::RichText::new("双击「索引」页签返回总览")
@@ -26054,10 +26564,34 @@ impl App {
                     );
                     // flex:1 — 把右边的标签推到最右
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // 「重选页面」（原型 #idxRePickBtn）暂不渲染：此前版本是死按钮——
-                        // 启用条件误写成删除确认态、点击体是空 TODO，从未生效。真重选需先有
-                        // 选中条目态 + 经 PickState::Insert / confirm_insert_pick 的替换流程，
-                        // 另立一项再做，不在此处留一个点不动的按钮。
+                        // 「重选页面」（原型 #idxRePickBtn，渲染于
+                        // 标签行之后 = 本簇最右）：仅在恰好选中
+                        // 一个条目时启用（原型 updateBarAvail：
+                        // idxSelEntry >= 0），点击经
+                        // PickState::Insert 的 replace 通道为该
+                        // 条目重选页面（confirm_insert_pick 替换
+                        // 语义，取消则原样不变）。禁用态保留
+                        // 按钮与名称（悬停口径由固定栏统一处理）。
+                        let repick = match st.entry_targets().as_slice() {
+                            [pos] => Some(*pos),
+                            _ => None,
+                        };
+                        if ui
+                            .add_enabled(
+                                repick.is_some(),
+                                egui::Button::new(
+                                    egui::RichText::new("重选页面").size(12.5),
+                                )
+                                .corner_radius(5)
+                                .min_size(egui::vec2(0.0, 26.0)),
+                            )
+                            .clicked()
+                        {
+                            if let Some(pos) = repick {
+                                *action = Some(IndexDetailAction::RePick(pos));
+                                return;
+                            }
+                        }
                         // 5 标签切换（inline，不另起一行）
                         // 注意：这里只渲染标签按钮行，不调用 index_detail_tabs
                         // 以便与 backbar 在同一行内水平排列
@@ -26090,216 +26624,24 @@ impl App {
                     });
                 });
             });
+        if edit_cancel {
+            st.idx_edit = None;
+        }
+        if edit_commit && self.idx_edit_commit(st) {
+            *action = Some(IndexDetailAction::Reload);
+        }
         ui.add_space(8.0);
 
-        // ── 2. idx-coordbar：目录坐标 | ●范围 | 仓库 | 分支select | 派生点hint ───
-        // 对应原型 JS renderIdxCoord()，深色背景（CARD_BG 近似 --panel2）
-        egui::Frame::new()
-            .fill(palette_color(CARD_BG))
-            .stroke(egui::Stroke::new(1.0, palette_color(FIELD_BORDER)))
-            .corner_radius(6)
-            .inner_margin(egui::Margin { left: 12, right: 12, top: 8, bottom: 8 })
-            .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    // 目录坐标
-                    ui.label(
-                        egui::RichText::new("目录坐标：")
-                            .size(13.5)
-                            .color(palette_color(TEXT_WEAK)),
-                    );
-                    ui.label(
-                        egui::RichText::new(&folder_coord)
-                            .size(13.5)
-                            .strong()
-                            .color(palette_color(TEXT_MAIN)),
-                    );
-                    // ● 范围色点 + 范围标签
-                    let (dot_rect, _) =
-                        ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                    ui.painter().circle_filled(dot_rect.center(), 5.0, scope.color());
-                    ui.label(
-                        egui::RichText::new(format!("公开范围：{}", scope.label()))
-                            .size(13.5)
-                            .color(palette_color(TEXT_MAIN)),
-                    );
-                    // 仓库名
-                    ui.label(
-                        egui::RichText::new("仓库：")
-                            .size(13.0)
-                            .color(palette_color(TEXT_WEAK)),
-                    );
-                    ui.label(
-                        egui::RichText::new(s(&index, "name"))
-                            .size(13.0)
-                            .strong()
-                            .color(palette_color(TEXT_MAIN)),
-                    );
-                    // 当前分支 select（ComboBox，原型用 <select>）
-                    ui.label(
-                        egui::RichText::new("当前分支：")
-                            .size(13.0)
-                            .color(palette_color(TEXT_WEAK)),
-                    );
-                    let mut branch = current_branch.clone();
-                    egui::ComboBox::from_id_salt("idx_coordbar_branch")
-                        .width(130.0)
-                        .selected_text(&branch)
-                        .show_ui(ui, |ui| {
-                            for b in &branches {
-                                if let Some(bs) = b.as_str() {
-                                    ui.selectable_value(&mut branch, bs.to_string(), bs);
-                                }
-                            }
-                        });
-                    if branch != current_branch {
-                        *action = Some(IndexDetailAction::ChangeBranch(branch));
-                        return;
-                    }
-                    // 派生点 hint
-                    ui.label(
-                        egui::RichText::new(&fork_hint)
-                            .size(12.0)
-                            .color(palette_color(TEXT_FAINT))
-                            .italics(),
-                    );
-                    // 条目与页数（原型里在 renderIdxWall 中更新 #idxEntryCount/#idxTotalPages）
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "· {} 条目 · {} 页",
-                            resolved.len(),
-                            total_pages
-                        ))
-                        .size(13.0)
-                        .color(palette_color(ACCENT_DEEP)),
-                    );
-                });
-            });
-        ui.add_space(6.0);
-
-        // ── 3. idx-lineagebar：归属与谱系 | 分支·分叉点 | 直接分支chip | EN info | 制作英文版 ──
-        // 对应原型 JS renderIdxLineage()
-        egui::Frame::new()
-            .fill(palette_color(PANEL_BG))
-            .stroke(egui::Stroke::new(1.0, palette_color(FIELD_BORDER)))
-            .corner_radius(6)
-            .inner_margin(egui::Margin { left: 12, right: 12, top: 8, bottom: 8 })
-            .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    // "归属与谱系" 粗体标签
-                    ui.label(
-                        egui::RichText::new("归属与谱系")
-                            .size(13.0)
-                            .strong()
-                            .color(palette_color(TEXT_MAIN)),
-                    );
-                    // 当前分支 · 分叉点
-                    ui.label(
-                        egui::RichText::new(format!("分支：{current_branch} · {fork_hint}"))
-                            .size(12.5)
-                            .color(palette_color(TEXT_WEAK)),
-                    );
-                    // 直接分支 chip 列表
-                    if !other_branches.is_empty() {
-                        ui.label(
-                            egui::RichText::new("直接分支：")
-                                .size(12.5)
-                                .color(palette_color(TEXT_WEAK)),
-                        );
-                        for bs in &other_branches {
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        egui::RichText::new(*bs)
-                                            .size(12.0)
-                                            .color(palette_color(TEXT_MAIN)),
-                                    )
-                                    .fill(palette_color(CHIP_GRAY_BG))
-                                    .corner_radius(5)
-                                    .min_size(egui::vec2(0.0, 28.0)),
-                                )
-                                .clicked()
-                            {
-                                *action =
-                                    Some(IndexDetailAction::ChangeBranch(bs.to_string()));
-                                return;
-                            }
-                        }
-                    }
-                    // 右端：EN 语言对应 + 制作英文版按钮
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("制作英文版")
-                                        .size(12.5)
-                                        .color(palette_color(ACCENT_DEEP)),
-                                )
-                                .fill(CHIP_BLUE_BG)
-                                .corner_radius(5)
-                                .min_size(egui::vec2(0.0, 28.0)),
-                            )
-                            .clicked()
-                        {
-                            st.more_action = Some(index_controls::IndexMoreAction::English(
-                                format!("{} · EN", s(&index, "name")),
-                            ));
-                        }
-                        // EN 对应信息（如果有）
-                        let en_name = s(&index, "en_name");
-                        if !en_name.is_empty() {
-                            ui.label(
-                                egui::RichText::new(format!("语言对应：{en_name}"))
-                                    .size(12.0)
-                                    .color(palette_color(TEXT_WEAK)),
-                            );
-                        }
-                    });
-                });
-            });
-        ui.add_space(8.0);
-
-        // ── 4. 次要操作条：导出 / 拉分支（原型 idxEdTools 更多菜单的次级功能）────
-        ui.horizontal_wrapped(|ui| {
-            ui.checkbox(&mut st.include_notes, "添加备注");
-            ui.separator();
-            if text_action(ui, "导出（个人版）", palette_color(TEXT_MAIN), 13.0) {
-                *action = Some(IndexDetailAction::Export("personal"));
-            }
-            if text_action(ui, "导出（公用版）", palette_color(TEXT_MAIN), 13.0) {
-                *action = Some(IndexDetailAction::Export("company"));
-            }
-            ui.add_space(16.0);
-            ui.add(
-                egui::TextEdit::singleline(&mut st.new_branch)
-                    .hint_text("新分支名")
-                    .desired_width(100.0)
-                    .margin(egui::vec2(8.0, 2.0)),
-            );
-            if text_action_enabled(
-                ui,
-                !st.new_branch.is_empty(),
-                "拉分支",
-                palette_color(TEXT_MAIN),
-                13.0,
-            ) {
-                let id = st.index_id.clone();
-                let r = self.call_work(
-                    "POST",
-                    &format!("/v1/indexes/{id}/branches"),
-                    Some(json!({ "name": st.new_branch, "from": st.branch })),
-                );
-                match r {
-                    Ok(_) => {
-                        self.msg = "已拉分支".into();
-                        *action = Some(IndexDetailAction::Reload);
-                    }
-                    Err(e) => self.msg = e,
-                }
-            }
-        });
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(4.0);
+        // (Removed 2026-11-27, prototype-render audit: the
+        // coordbar, the lineagebar and the secondary action bar
+        // that used to sit between the backbar and the wall have
+        // no counterpart in the rendered prototype — the
+        // prototype's renderIdxCoord / renderIdxLineage are dead
+        // code whose target elements are never created, and its
+        // editor body carries no export / branch row. Exports
+        // live in the deck bar and the exports tab; branch
+        // creation lives in the commit detail. st.include_notes
+        // stays — the export path still consumes it.)
 
         // ── 5. 标签页内容区（标签按钮已内联在 backbar 中，这里只渲染内容）───────────────
         ui.add_space(10.0);
@@ -26317,19 +26659,29 @@ impl App {
                 st.confirm_remove_entry = None;
             }
         }
-        let insert_bar = |ui: &mut egui::Ui, at: usize, action: &mut Option<IndexDetailAction>| {
+        let insert_bar = |ui: &mut egui::Ui,
+                          at: usize,
+                          action: &mut Option<IndexDetailAction>|
+         -> egui::Rect {
             ui.vertical_centered(|ui| {
                 if text_action(ui, "＋ 插入条目", palette_color(TEXT_WEAK), 13.0) {
                     *action = Some(IndexDetailAction::Insert(at));
                 }
-            });
+            })
+            .response
+            .rect
         };
+        // Card rects of this frame (display order) and every
+        // content rect (cards + insert bars): the drag and
+        // blank-click resolution after the loop reads them, the
+        // way the content wall reads its card rects.
+        let mut card_rects: Vec<(usize, egui::Rect)> = Vec::new();
+        let mut content_rects: Vec<egui::Rect> = Vec::new();
         egui::ScrollArea::vertical().id_salt(&st.index_id).show(ui, |ui| {
             let cover_width = if ui.available_width() >= 900.0 { 340.0 } else { 300.0 };
             let card_content_width = (ui.available_width() - 25.0).max(0.0);
             let thumb_gap = ui.spacing().item_spacing.x;
-            let small_width = (cover_width - 2.0 * thumb_gap) / 3.0;
-            insert_bar(ui, 0, action);
+            content_rects.push(insert_bar(ui, 0, action));
             for (pos, re) in resolved.iter().enumerate() {
                 let entry = re.get("entry").cloned().unwrap_or(json!({}));
                 let ver = re.get("resolved").cloned().unwrap_or(Value::Null);
@@ -26341,7 +26693,7 @@ impl App {
                 let rid = s(&entry, "rendition_id");
                 let versions = st.unit_versions.get(&rid).cloned().unwrap_or_default();
                 let newer = index_controls::entry_newer_version(&entry, &ver, &versions);
-                card_frame_square()
+                let frame_resp = card_frame_square()
                     .inner_margin(egui::Margin {
                         left: 10,
                         right: 13,
@@ -26351,37 +26703,51 @@ impl App {
                     .show(ui, |ui| {
                     ui.set_min_width(card_content_width);
                     ui.horizontal(|ui| {
+                        // LEFT — the current version's page
+                        // tiles in one row (prototype
+                        // .entry-thumbs): real rendered
+                        // thumbnails, no page numbers on them.
                         ui.vertical(|ui| {
                             ui.set_width(cover_width);
-                            ui.label(
-                                egui::RichText::new(format!("#{}", pos + 1))
-                                    .size(11.5)
-                                    .color(palette_color(TEXT_WEAK)),
-                            );
                             if ver.is_object() {
                                 let vid = s(&ver, "id");
-                                let total = i(&ver, "page_count");
-                                self.thumb_ui(ui, &vid, 0, cover_width);
-                                if total > 1 {
-                                    ui.horizontal_wrapped(|ui| {
-                                        for page in 1..total.min(7) as usize {
-                                            self.thumb_ui(ui, &vid, page, small_width);
-                                        }
-                                    });
-                                }
+                                let total = i(&ver, "page_count").max(0) as usize;
+                                let n = total.clamp(1, 8);
+                                let tile_w =
+                                    (cover_width - thumb_gap * (n - 1) as f32) / n as f32;
+                                ui.horizontal(|ui| {
+                                    for page in 0..n {
+                                        self.thumb_ui(ui, &vid, page, tile_w);
+                                    }
+                                });
                             } else {
                                 ui.label("无版本");
                             }
                         });
                         ui.add_space(6.0);
                         ui.vertical(|ui| {
+                            // Title row: ordinal badge + name
+                            // (prototype: the position badge
+                            // leads the title line).
                             ui.horizontal_wrapped(|ui| {
+                                chip(
+                                    ui,
+                                    &format!("{}", pos + 1),
+                                    palette_color(ACCENT_DEEP),
+                                    CHIP_BLUE_BG,
+                                );
                                 ui.label(
                                     egui::RichText::new(re.get("unit_name").and_then(|x| x.as_str()).unwrap_or(""))
                                         .strong()
                                         .size(13.5)
                                         .color(palette_color(TEXT_MAIN)),
                                 );
+                            });
+                            // Meta row: form · language ·
+                            // version · pages, then the policy
+                            // badge and the excerpt / substituted
+                            // chips.
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label(
                                     egui::RichText::new(format!(
                                         "{} · {} · {} · {} 页",
@@ -26397,95 +26763,114 @@ impl App {
                                     .size(11.5)
                                     .color(palette_color(TEXT_WEAK)),
                                 );
-                            });
-                            ui.horizontal_wrapped(|ui| {
-                            if ui
-                                .button(
-                                    egui::RichText::new("×")
-                                        .color(palette_color(ROSE))
-                                        .size(17.0)
-                                        .strong(),
-                                )
-                                .on_hover_text("从这个索引移除这个条目（内容块保留）")
-                                .clicked()
-                            {
-                                st.confirm_remove_entry = Some(pos);
-                            }
-                            if ui
-                                .add_enabled(
-                                    pos + 1 < entries.len(),
-                                    egui::Button::new("↓"),
-                                )
-                                .clicked()
-                            {
-                                let mut es = entries.clone();
-                                es.swap(pos, pos + 1);
-                                *action = Some(IndexDetailAction::Commit(es, "调整顺序"));
-                                return;
-                            }
-                            if ui
-                                .add_enabled(pos > 0, egui::Button::new("↑"))
-                                .clicked()
-                            {
-                                let mut es = entries.clone();
-                                es.swap(pos, pos - 1);
-                                *action = Some(IndexDetailAction::Commit(es, "调整顺序"));
-                                return;
-                            }
-                            if ui.button("选页").clicked() {
-                                let total = i(&ver, "page_count") as usize;
-                                let mut sel = vec![true; total];
-                                if let Some(slots) = entry
-                                    .get("excerpt_slots")
-                                    .and_then(|x| x.as_array())
+                                if locked {
+                                    chip(ui, "版本锁定", palette_color(CHIP_ORANGE_FG), CHIP_ORANGE_BG);
+                                } else {
+                                    chip(ui, "跟随最新", palette_color(CHIP_GREEN_FG), CHIP_GREEN_BG);
+                                }
+                                if let Some(slots) =
+                                    entry.get("excerpt_slots").and_then(|x| x.as_array())
                                 {
-                                    sel = vec![false; total];
-                                    for pos in excerpt_positions_json(&ver, slots) {
-                                        sel[pos] = true;
-                                    }
+                                    chip(
+                                        ui,
+                                        &format!("摘录 {} 页", slots.len()),
+                                        palette_color(ACCENT_DEEP),
+                                        CHIP_BLUE_BG,
+                                    );
                                 }
-                                *action = Some(IndexDetailAction::PickPages(pos, re.clone(), sel));
-                            }
-                            let uid = s(&entry, "unit_id");
-                            if ui
-                                .add_enabled(!uid.is_empty(), egui::Button::new("页面维护"))
-                                .on_hover_text("跳到内容页编辑这个内容块")
-                                .clicked()
-                            {
-                                *action = Some(IndexDetailAction::OpenUnit(uid));
-                                return;
-                            }
-                            if locked {
-                                if let Some((latest_id, latest_ver)) = newer {
-                                    if ui
-                                        .button(
-                                            egui::RichText::new(format!("更新到 v{latest_ver}"))
-                                                .color(palette_color(ACCENT_DEEP)),
-                                        )
-                                        .clicked()
-                                    {
-                                        *action = Some(IndexDetailAction::SwitchVersion(
-                                            pos, latest_id, latest_ver, true,
-                                        ));
-                                        return;
-                                    }
+                                if re.get("substituted").and_then(|x| x.as_bool()) == Some(true) {
+                                    chip(ui, "原版已删 · 已替代", palette_color(CHIP_ORANGE_FG), CHIP_ORANGE_BG);
                                 }
+                            });
+                            // Actions row, right-aligned. The
+                            // prototype's four — 更换版本 /
+                            // 保持最新 / 页面维护 / 删除 — sit
+                            // at the right in that order; the
+                            // client's extra actions （选页 /
+                            // 上下移 / 锁定当前版本 / 更新到)
+                            // keep their places to their left.
+                            // (Right-to-left layout: first
+                            // added = rightmost.)
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if ui
-                                    .button(
-                                        egui::RichText::new("解除锁定")
-                                            .color(palette_color(CHIP_GREEN_FG)),
+                                    .add(
+                                        egui::Button::new(
+                                            egui::RichText::new("删除")
+                                                .color(palette_color(ROSE)),
+                                        ),
                                     )
+                                    .on_hover_text("从这个索引移除这个条目（内容块保留）")
                                     .clicked()
                                 {
-                                    let mut es = entries.clone();
-                                    es[pos]["policy"] = json!("follow_latest");
-                                    es[pos]["locked_semver"] = Value::Null;
-                                    *action = Some(IndexDetailAction::Commit(es, "解除锁定"));
+                                    st.confirm_remove_entry = Some(pos);
+                                }
+                                let uid = s(&entry, "unit_id");
+                                if ui
+                                    .add_enabled(!uid.is_empty(), egui::Button::new("页面维护"))
+                                    .on_hover_text("跳到内容页编辑这个内容块")
+                                    .clicked()
+                                {
+                                    *action = Some(IndexDetailAction::OpenUnit(uid));
                                     return;
                                 }
-                                chip(ui, "版本锁定", palette_color(CHIP_ORANGE_FG), CHIP_ORANGE_BG);
-                            } else {
+                                if locked {
+                                    // 保持最新 (prototype
+                                    // follow-btn): releases the
+                                    // lock back to follow-latest —
+                                    // the mutation the old
+                                    // 解除锁定 button performed.
+                                    if ui.button("保持最新").clicked() {
+                                        let mut es = entries.clone();
+                                        es[pos]["policy"] = json!("follow_latest");
+                                        es[pos]["locked_semver"] = Value::Null;
+                                        *action = Some(IndexDetailAction::Commit(es, "保持最新"));
+                                        return;
+                                    }
+                                } else {
+                                    // Already following: the
+                                    // button shows its on state
+                                    // (accent fill), as the
+                                    // prototype's follow-btn.on.
+                                    let _ = ui.add(
+                                        egui::Button::new(
+                                            egui::RichText::new("保持最新")
+                                                .color(egui::Color32::WHITE),
+                                        )
+                                        .fill(ACCENT)
+                                        .corner_radius(5),
+                                    );
+                                }
                                 if ui
+                                    .add(
+                                        egui::Button::new(
+                                            egui::RichText::new("更换版本")
+                                                .color(palette_color(ACCENT_DEEP)),
+                                        ),
+                                    )
+                                    .on_hover_text("打开版本管理，切换这个条目引用的版本")
+                                    .clicked()
+                                {
+                                    self.overlays.push(Overlay::AllVersions {
+                                        entry_pos: pos,
+                                        index_id: st.index_id.clone(),
+                                    });
+                                }
+                                if locked {
+                                    if let Some((latest_id, latest_ver)) = newer.clone() {
+                                        if ui
+                                            .button(
+                                                egui::RichText::new(format!("更新到 v{latest_ver}"))
+                                                    .color(palette_color(ACCENT_DEEP)),
+                                            )
+                                            .clicked()
+                                        {
+                                            *action = Some(IndexDetailAction::SwitchVersion(
+                                                pos, latest_id, latest_ver, true,
+                                            ));
+                                            return;
+                                        }
+                                    }
+                                } else if ui
                                     .add_enabled(
                                         ver.is_object(),
                                         egui::Button::new("锁定当前版本"),
@@ -26501,8 +26886,41 @@ impl App {
                                         return;
                                     }
                                 }
-                                chip(ui, "跟随最新", palette_color(CHIP_GREEN_FG), CHIP_GREEN_BG);
-                            }
+                                if ui.button("选页").clicked() {
+                                    let total = i(&ver, "page_count") as usize;
+                                    let mut sel = vec![true; total];
+                                    if let Some(slots) = entry
+                                        .get("excerpt_slots")
+                                        .and_then(|x| x.as_array())
+                                    {
+                                        sel = vec![false; total];
+                                        for p in excerpt_positions_json(&ver, slots) {
+                                            sel[p] = true;
+                                        }
+                                    }
+                                    *action = Some(IndexDetailAction::PickPages(pos, re.clone(), sel));
+                                }
+                                if ui
+                                    .add_enabled(pos > 0, egui::Button::new("↑"))
+                                    .clicked()
+                                {
+                                    let mut es = entries.clone();
+                                    es.swap(pos, pos - 1);
+                                    *action = Some(IndexDetailAction::Commit(es, "调整顺序"));
+                                    return;
+                                }
+                                if ui
+                                    .add_enabled(
+                                        pos + 1 < entries.len(),
+                                        egui::Button::new("↓"),
+                                    )
+                                    .clicked()
+                                {
+                                    let mut es = entries.clone();
+                                    es.swap(pos, pos + 1);
+                                    *action = Some(IndexDetailAction::Commit(es, "调整顺序"));
+                                    return;
+                                }
                             });
                             if st.confirm_remove_entry == Some(pos) {
                                 ui.add_space(4.0);
@@ -26540,22 +26958,14 @@ impl App {
                                     }
                                 });
                             }
-                            ui.horizontal(|ui| {
-                                if let Some(slots) =
-                                    entry.get("excerpt_slots").and_then(|x| x.as_array())
-                                {
-                                    chip(
-                                        ui,
-                                        &format!("摘录 {} 页", slots.len()),
-                                        palette_color(ACCENT_DEEP),
-                                        CHIP_BLUE_BG,
-                                    );
-                                }
-                                if re.get("substituted").and_then(|x| x.as_bool()) == Some(true) {
-                                    chip(ui, "原版已删 · 已替代", palette_color(CHIP_ORANGE_FG), CHIP_ORANGE_BG);
-                                }
-                            });
-                            if versions.len() > 1 {
+                            // Version quick strip (prototype
+                            // .entry-quick): one small card per
+                            // version of the entry's line, new
+                            // to old — thumbnail + version
+                            // number; the current one carries
+                            // the accent frame; overflow goes
+                            // to the 更多 version manager.
+                            if !versions.is_empty() {
                                 let cur_id = if ver.is_object() {
                                     s(&ver, "id")
                                 } else {
@@ -26588,13 +26998,9 @@ impl App {
                                         });
                                     }
                                     if ui.button("更多").clicked() {
-                                        let cur_index_id = match self.index.stack.top() {
-                                            IndexFrame::Detail(d) => d.index_id.clone(),
-                                            _ => String::new(),
-                                        };
                                         self.overlays.push(Overlay::AllVersions {
                                             entry_pos: pos,
-                                            index_id: cur_index_id,
+                                            index_id: st.index_id.clone(),
                                         });
                                     }
                                 });
@@ -26602,9 +27008,214 @@ impl App {
                         });
                     });
                 });
+                let card_rect = frame_resp.response.rect;
+                card_rects.push((pos, card_rect));
+                content_rects.push(card_rect);
+                // Selected state: accent frame, 1.5px, color
+                // only — no outer ring, no geometry change
+                // (border ruling 2026-11-27).
+                if st.entry_is_selected(pos) {
+                    ui.painter().rect_stroke(
+                        card_rect,
+                        6.0,
+                        egui::Stroke::new(1.5, ACCENT),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+                // Click selection — the content wall's exact
+                // semantics (2026-11-26 ruling): plain click =
+                // fresh single selection (multi cleared, anchor
+                // moves), Ctrl/⌘ toggles in the multi set,
+                // Shift selects the anchor-to-target range
+                // (Ctrl+Shift appends it), anchor stays on
+                // Shift. A release that ends an armed drag is
+                // suppressed — the drag already spoke for it.
+                let resp = ui.interact(
+                    card_rect,
+                    ui.scope_id().with(("idx_entry", pos)),
+                    egui::Sense::click(),
+                );
+                if resp.clicked() && !st.entry_suppress_click {
+                    let mods = ui.input(|i| i.modifiers);
+                    let multi_key = mods.command || mods.ctrl;
+                    if mods.shift {
+                        match st.entry_anchor.filter(|a| *a < entries.len()) {
+                            Some(anchor) => {
+                                let (lo, hi) = if anchor <= pos {
+                                    (anchor, pos)
+                                } else {
+                                    (pos, anchor)
+                                };
+                                if multi_key {
+                                    for p in lo..=hi {
+                                        if !st.entry_sel.contains(&p) {
+                                            st.entry_sel.push(p);
+                                        }
+                                    }
+                                } else {
+                                    st.entry_sel = (lo..=hi).collect();
+                                }
+                            }
+                            None => {
+                                st.entry_sel.clear();
+                                st.entry_anchor = Some(pos);
+                            }
+                        }
+                    } else if multi_key {
+                        if let Some(ix) = st.entry_sel.iter().position(|p| *p == pos) {
+                            st.entry_sel.remove(ix);
+                        } else {
+                            st.entry_sel.push(pos);
+                        }
+                        st.entry_anchor = Some(pos);
+                    } else {
+                        st.entry_sel.clear();
+                        st.entry_anchor = Some(pos);
+                    }
+                }
                 ui.add_space(4.0);
-                insert_bar(ui, pos + 1, action);
+                content_rects.push(insert_bar(ui, pos + 1, action));
                 ui.add_space(4.0);
+            }
+            // ── Drag (long-press) + blank-click resolution ──
+            // Same gate numbers as the card drag on the content
+            // wall: a press arms after 400 ms held within a
+            // 10 pt tolerance; earlier movement past the
+            // tolerance reads as a scroll and drops the
+            // candidate. Esc cancels an armed drag.
+            let now = ui.input(|i| i.time);
+            let primary_down = ui.input(|i| i.pointer.primary_down());
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                st.entry_drag = None;
+                st.entry_press = None;
+            }
+            // Blank click (press + release inside the viewport,
+            // neither on any card or insert bar, ≤ 6 pt of
+            // travel, no drag armed): clear anchor + multi
+            // together (2026-11-26 ruling).
+            if ui.input(|i| i.pointer.primary_released())
+                && st.entry_drag.is_none()
+                && !st.entry_suppress_click
+            {
+                let origin = ui.input(|i| i.pointer.press_origin());
+                let release = ui.input(|i| i.pointer.interact_pos());
+                if let (Some(o), Some(r)) = (origin, release) {
+                    let viewport = ui.clip_rect();
+                    let on_content = content_rects.iter().any(|rect| rect.contains(o))
+                        || content_rects.iter().any(|rect| rect.contains(r));
+                    if viewport.contains(o)
+                        && viewport.contains(r)
+                        && !on_content
+                        && o.distance(r) <= 6.0
+                    {
+                        st.entry_anchor = None;
+                        st.entry_sel.clear();
+                    }
+                }
+            }
+            if let Some(moving) = st.entry_drag.clone() {
+                if primary_down {
+                    if let Some(p) = ui.input(|i| i.pointer.interact_pos()) {
+                        let mut target = entries.len();
+                        for (cp, rect) in &card_rects {
+                            if p.y < rect.center().y {
+                                target = *cp;
+                                break;
+                            }
+                        }
+                        st.entry_drop = target;
+                    }
+                    // Insertion seam at the drop boundary.
+                    if let (Some((_, first)), Some((_, last))) =
+                        (card_rects.first(), card_rects.last())
+                    {
+                        let y = if st.entry_drop < entries.len() {
+                            card_rects
+                                .iter()
+                                .find(|(cp, _)| *cp == st.entry_drop)
+                                .map(|(_, r)| r.top() - 4.0)
+                                .unwrap_or(last.bottom() + 4.0)
+                        } else {
+                            last.bottom() + 4.0
+                        };
+                        ui.painter().rect_filled(
+                            egui::Rect::from_min_max(
+                                egui::pos2(first.left(), y - 1.0),
+                                egui::pos2(first.right(), y + 1.0),
+                            ),
+                            1.0,
+                            ACCENT,
+                        );
+                    }
+                } else {
+                    // Release: commit the reorder (prototype
+                    // drop semantics: the moving block lands at
+                    // the seam; a commit records it).
+                    st.entry_drag = None;
+                    st.entry_press = None;
+                    let target = st.entry_drop.min(entries.len());
+                    let removed: Vec<Value> = moving
+                        .iter()
+                        .filter_map(|p| entries.get(*p).cloned())
+                        .collect();
+                    if !removed.is_empty() {
+                        let rest: Vec<Value> = entries
+                            .iter()
+                            .enumerate()
+                            .filter(|(ix, _)| !moving.contains(ix))
+                            .map(|(_, e)| e.clone())
+                            .collect();
+                        let below = moving.iter().filter(|p| **p < target).count();
+                        let insert_at = target.saturating_sub(below).min(rest.len());
+                        let mut es = rest;
+                        for (off, e) in removed.iter().enumerate() {
+                            es.insert(insert_at + off, e.clone());
+                        }
+                        if es != entries {
+                            if removed.len() == 1 {
+                                st.entry_anchor = Some(insert_at);
+                                st.entry_sel.clear();
+                            } else {
+                                st.entry_sel =
+                                    (insert_at..insert_at + removed.len()).collect();
+                                st.entry_anchor = Some(insert_at);
+                            }
+                            *action =
+                                Some(IndexDetailAction::Commit(es, "排序变更"));
+                        }
+                    }
+                }
+            } else if let Some((press_pos, started, origin)) = st.entry_press {
+                if !primary_down {
+                    st.entry_press = None;
+                } else if let Some(p) = ui.input(|i| i.pointer.interact_pos()) {
+                    if p.distance(origin) > 10.0 {
+                        st.entry_press = None;
+                    } else if now - started >= 0.4 {
+                        let targets = st.entry_targets();
+                        let moving = if targets.len() > 1 && targets.contains(&press_pos) {
+                            targets
+                        } else {
+                            vec![press_pos]
+                        };
+                        st.entry_drop = press_pos;
+                        st.entry_drag = Some(moving);
+                        st.entry_suppress_click = true;
+                        st.entry_press = None;
+                    }
+                }
+            } else if ui.input(|i| i.pointer.primary_pressed()) {
+                if let Some(origin) = ui.input(|i| i.pointer.press_origin()) {
+                    if let Some((cp, _)) =
+                        card_rects.iter().find(|(_, r)| r.contains(origin))
+                    {
+                        let cp = *cp;
+                        st.entry_press = Some((cp, now, origin));
+                    }
+                }
+            }
+            if !primary_down && st.entry_drag.is_none() {
+                st.entry_suppress_click = false;
             }
             let index_id = s(&index, "id");
             if !index_id.is_empty() {

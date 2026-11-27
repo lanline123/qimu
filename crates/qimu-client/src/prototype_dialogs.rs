@@ -733,10 +733,10 @@ impl App {
     }
 
     pub(super) fn open_push_dialog(&mut self, id: &str, title: &str) {
-        if !self.require_org_online("推送到演示厅") {
+        if !self.require_org_online("申请公开") {
             return;
         }
-        if !self.need_identity("推送到演示厅") {
+        if !self.need_identity("申请公开") {
             return;
         }
         let branch = match self.index.stack.top() {
@@ -860,25 +860,25 @@ impl App {
         let mut submit = false;
         let dialog = egui::Modal::new(egui::Id::unique("push-index-check")).show(ctx, |ui| {
             ui.set_width(580.0);
-            ui.heading(format!("{} · {}", tr("推送到演示厅"), state.title));
+            ui.heading(format!("{} · {}", tr("申请公开"), state.title));
             match &state.published_version {
                 Some(version) => {
                     ui.label(format!(
                         "{} {version} · {}",
                         tr("当前发布版"),
-                        tr("上架取当前发布版，演示厅审核通过后生效")
+                        tr("上架取当前发布版，管理员审核通过后生效")
                     ));
                 }
                 None => {
                     ui.label(
-                        egui::RichText::new(tr("尚未发布索引版本，请先发布后再推送。"))
+                        egui::RichText::new(tr("尚未发布索引版本，请先发布后再申请。"))
                             .color(palette_color(ROSE)),
                     );
                 }
             }
             ui.add_space(6.0);
             if state.rows.is_empty() {
-                ui.label(tr("内容块版本没有变化 · 将按当前发布版重新推送。"));
+                ui.label(tr("内容块版本没有变化 · 将按当前发布版重新申请。"));
             } else {
                 ui.label(if state.initial {
                     tr("初次上架 · 全部条目")
@@ -911,7 +911,7 @@ impl App {
             ui.label(tr("发布说明"));
             ui.add_sized(
                 [ui.available_width(), 62.0],
-                egui::TextEdit::multiline(&mut state.note).hint_text(tr("本次推送说明")),
+                egui::TextEdit::multiline(&mut state.note).hint_text(tr("本次申请说明")),
             );
             ui.add_space(10.0);
             ui.horizontal(|ui| {
@@ -919,7 +919,7 @@ impl App {
                     if ui
                         .add_enabled(
                             state.published_tag_id.is_some(),
-                            egui::Button::new(tr("确认推送")),
+                            egui::Button::new(tr("确认申请")),
                         )
                         .clicked()
                     {

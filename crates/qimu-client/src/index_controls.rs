@@ -244,7 +244,7 @@ impl App {
                 .tool(
                     ui,
                     ChromeIcon::Push,
-                    "提交到演示厅",
+                    "提交到演示",
                     push_target.is_some(),
                     false,
                     true,
@@ -270,7 +270,13 @@ impl App {
             }
             if push {
                 if let Some((id, title)) = push_target {
-                    self.open_push_dialog(&id, &title);
+                    // 提交到演示 (user ruling 2026-11-27): the
+                    // LOCAL submit — pin the index into this
+                    // library's own showroom list. The
+                    // organization chain that used to hang off
+                    // this button moved to the menu bar's
+                    // 申请公开 (the push dialog).
+                    self.submit_indexes_to_local_showroom(&[(id, title)]);
                 }
             }
             tool_vsep(ui);
@@ -297,10 +303,10 @@ impl App {
         pinned_versions: &[(IndexEntry, String)],
         note: &str,
     ) {
-        if !self.require_org_online("推送到演示厅") {
+        if !self.require_org_online("申请公开") {
             return;
         }
-        if !self.need_identity("推送到演示厅") {
+        if !self.need_identity("申请公开") {
             return;
         }
         if let Some(local) = &self.local {

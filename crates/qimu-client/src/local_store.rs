@@ -1250,6 +1250,67 @@ impl LocalStore {
             .ok_or_else(|| "副本已保存，但在本地演示列表中未找到".to_string())
     }
 
+    /// 提交到演示 (user ruling 2026-11-27): the LOCAL submit —
+    /// pin an index's current resolution into THIS library's
+    /// own showroom list （本地演示）. Purely local: no network,
+    /// no login, no server. The pin set is the main branch
+    /// head commit's entries resolved now (follow-latest
+    /// resolves to the current latest, locked entries to their
+    /// locked version), written through set_showroom_pins —
+    /// the same pinning the organization landing uses.
+    /// Re-submitting the same index UPDATES the standing row
+    /// (re-pointed at the new head, pins rewritten, title
+    /// follows the index) instead of adding a duplicate —
+    /// the registered repeat-submission rule for this line.
+    /// Returns the showroom row id.
+    pub fn submit_index_to_local_showroom(&self, index_id: &str) -> Result<String, String> {
+        let store = self.store.lock().unwrap();
+        let index = store.get_index(index_id)?;
+        let head = store
+            .branch_head(index_id, "main")?
+            .ok_or_else(|| "索引尚无提交，无法提交到演示".to_string())?;
+        let commit = store.get_commit(&head)?;
+        if commit.entries.is_empty() {
+            return Err("索引没有条目，无法提交到演示".into());
+        }
+        let rows = resolved_entries_pinned(&store, &commit, &[]);
+        let mut pins: Vec<String> = Vec::new();
+        for row in &rows {
+            let vid = row
+                .get("resolved")
+                .and_then(|r| r.get("id"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            if vid.is_empty() {
+                return Err("有条目暂无可用版本，无法提交到演示".into());
+            }
+            pins.push(vid.to_string());
+        }
+        let existing = store
+            .list_showroom(None)?
+            .into_iter()
+            .find(|it| it.source_index_id.as_deref() == Some(index_id));
+        match existing {
+            Some(rec) => {
+                store.update_showroom_commit(&rec.id, &index.name, &head)?;
+                store.set_showroom_pins(&rec.id, &head, &pins)?;
+                Ok(rec.id)
+            }
+            None => {
+                let rec = store.insert_showroom(
+                    &index.name,
+                    "",
+                    Some(index_id),
+                    Some(&head),
+                    &self.owner.display_name,
+                    "live",
+                )?;
+                store.set_showroom_pins(&rec.id, &head, &pins)?;
+                Ok(rec.id)
+            }
+        }
+    }
+
     /// One-lock snapshot of the four working-data lists
     /// (folders / groups / units / indexes — the same shapes the
     /// individual list methods return), taken with `try_lock`:
@@ -2930,6 +2991,16 @@ impl LocalStore {
                         Some(d) => Ok(d),
                         None => Err(NOT_FOUND.to_string()),
                     }
+                }
+                ("POST", ["v1", "indexes", id, "rename"]) => {
+                    let store = self.store.lock().unwrap();
+                    store.rename_index(id, &str_field(&body, "name").unwrap_or_default())?;
+                    Ok(json!({ "ok": true }))
+                }
+                ("POST", ["v1", "indexes", id, "note"]) => {
+                    let store = self.store.lock().unwrap();
+                    store.set_index_note(id, &str_field(&body, "note").unwrap_or_default())?;
+                    Ok(json!({ "ok": true }))
                 }
                 ("GET", ["v1", "indexes", id, "push-preview"]) => {
                     let branch = query_param(q, "branch").unwrap_or_else(|| "main".to_string());
