@@ -16455,7 +16455,6 @@ impl App {
         }
         ui.add_space(8.0);
         let mut act: Option<&'static str> = None;
-        let mut pdf_act: Option<(&'static str, Option<usize>)> = None;
         let cache_key = format!("sr_{}", s(&item, "id"));
         // A stale entry (the formal version moved on or the item
         // was taken down after caching) does not count as cached:
@@ -16495,24 +16494,11 @@ impl App {
                 } else if btn_default(ui, "缓存").clicked() {
                     act = Some("cache");
                 }
-                if self.icon_button(ui, ChromeIcon::Export, "导出") {
-                    act = Some("export");
-                }
-                if self.icon_button(ui, ChromeIcon::Play, "开始演示") {
-                    act = Some("play");
-                }
-                if ChromeIcons
-                    .tool(ui, ChromeIcon::Presenter, "演示者视图", true, false, true)
-                    .clicked()
-                {
-                    act = Some("presenter");
-                }
-                if ChromeIcons
-                    .tool(ui, ChromeIcon::Reading, "普通视图", true, false, true)
-                    .clicked()
-                {
-                    act = Some("reading");
-                }
+                // No view/export icon cluster here (user order
+                // 2026-11-27, #211 prototype parity): the prototype
+                // detail body carries no action buttons — play /
+                // reading / presenter / export live in the bottom
+                // deck bar, which resolves this frame as its target.
             });
         });
         let src_name = self
@@ -16543,71 +16529,18 @@ impl App {
                 .size(11.5)
                 .color(palette_color(TEXT_FAINT)),
         );
-        if text_action(ui, "用系统应用打开", palette_color(TEXT_WEAK), 11.5) {
-            self.present_showroom(&s(&item, "id"), &s(&item, "title"));
-        }
-        // PDF export (Q21): whole deck in the three DeckCraft forms.
-        // The single-page variant lives in the page preview window
-        // below. Anonymous (guest) sessions take the same path — the
-        // server forces the company edition for them, exactly like
-        // the PPTX export.
-        ui.horizontal(|ui| {
-            if ui.small_button("导出 PDF").clicked() {
-                pdf_act = Some(("slides", None));
-            }
-            if ui.small_button("讲义版 PDF").clicked() {
-                pdf_act = Some(("handout", None));
-            }
-            if ui.small_button("备注页 PDF").clicked() {
-                pdf_act = Some(("notes", None));
-            }
-        });
-        ui.add_space(8.0);
+        // No in-body open/export rows (user order 2026-11-27,
+        // #211 prototype parity): the prototype detail body goes
+        // from the meta line straight to the page wall. Opening
+        // with an external app follows the present-engine setting
+        // through the bottom bar's unified open; whole-deck PDF
+        // export is the bottom bar's 导出 PDF. (The handout /
+        // notes whole-deck PDF forms lost their only entry with
+        // this row — see this line's REPORT.)
         match act {
-            Some("play") => {
-                let from = st.selected_page.unwrap_or(0);
-                if !self.present_via_deckcraft(
-                    &s(&item, "id"),
-                    &s(&item, "title"),
-                    DcMode::Play,
-                    from,
-                ) {
-                    self.start_presentation(ui, &item, &st.pages);
-                }
-            }
-            Some("reading") => {
-                let from = st.selected_page.unwrap_or(0);
-                if !self.present_via_deckcraft(
-                    &s(&item, "id"),
-                    &s(&item, "title"),
-                    DcMode::Reading,
-                    from,
-                ) {
-                    // No DeckCraft on this machine: the system app is
-                    // the reading fallback (it opens the same deck).
-                    self.present_showroom(&s(&item, "id"), &s(&item, "title"));
-                }
-            }
-            Some("presenter") => {
-                let from = st.selected_page.unwrap_or(0);
-                if !self.present_via_deckcraft(
-                    &s(&item, "id"),
-                    &s(&item, "title"),
-                    DcMode::Presenter,
-                    from,
-                ) {
-                    // Fallback is the built-in presenter; the user
-                    // can switch its speaker mode on from the menu.
-                    self.start_presentation(ui, &item, &st.pages);
-                }
-            }
-            Some("export") => self.export_showroom_pptx(&item),
             Some("save") => self.save_showroom_to_library(&item),
             Some("cache") => self.cache_showroom_deck(&item),
             _ => {}
-        }
-        if let Some((form, page)) = pdf_act {
-            self.export_showroom_pdf(&item, form, page);
         }
         ui.add_space(8.0);
         self.showroom_deck_pages(ui, st, &item);
@@ -16839,19 +16772,11 @@ impl App {
                 egui::RichText::new(format!("{} 页", pages.len()))
                     .color(palette_color(TEXT_WEAK)),
             );
-            if ui
-                .add_enabled(st.selected_page.is_some(), egui::Button::new("预览所选页"))
-                .clicked()
-            {
-                st.preview_open = true;
-            }
-            if st.view == DeckView::Thumbnails {
-                ui.label(
-                    egui::RichText::new("拖动页卡可调整页序，另存为你的副本")
-                        .size(11.5)
-                        .color(palette_color(TEXT_FAINT)),
-                );
-            }
+            // No 预览所选页 button and no drag hint label here
+            // (user order 2026-11-27, #211 prototype parity —
+            // the same call as the #101 wall-top hint removal):
+            // the page preview opens by double-clicking a page
+            // card, and the prototype wall carries no hint row.
         });
         // N4 reorder bar (user ruling 2026-11-25): invisible
         // until the order actually changes; then the save-as and
@@ -17406,78 +17331,62 @@ impl App {
                         ui,
                         &self.library_refs.clone(),
                         |app, ui, e, width| {
-                            let cover = app.showroom_cover(&s(e, "item_id"));
-                            app.showroom_card(ui, width, &s(e, "title"), &cover, false, |app, ui| {
-                                let folder = s(&e, "folder");
-                                if !folder.is_empty() {
-                                    ui.label(egui::RichText::new(folder).small().weak());
-                                }
-                                if s(&e, "item_kind") == "showroom"
-                                    && !app.org_online()
-                                    && !app.sr_bundle_cached(&s(&e, "item_id"))
-                                {
-                                    // Offline with no complete local
-                                    // bundle (T3 ruling): status
-                                    // label instead of the actions.
-                                    ui.label(
-                                        egui::RichText::new("离线不可用").small().weak(),
-                                    );
-                                    return;
-                                }
-                                if s(&e, "item_kind") == "showroom" {
-                                    if ui.small_button("看整稿").clicked() {
-                                        app.open_deck_for_ref(
-                                            "showroom",
-                                            &s(&e, "item_id"),
-                                            &s(&e, "title"),
+                            let item_id = s(e, "item_id");
+                            let cover = app.showroom_cover(&item_id);
+                            let selected =
+                                app.showroom.selected_card.as_deref() == Some(item_id.as_str());
+                            let cover_rect =
+                                app.showroom_card(ui, width, &s(e, "title"), &cover, selected, |app, ui| {
+                                    let folder = s(&e, "folder");
+                                    if !folder.is_empty() {
+                                        ui.label(egui::RichText::new(folder).small().weak());
+                                    }
+                                    if s(&e, "item_kind") == "showroom"
+                                        && !app.org_online()
+                                        && !app.sr_bundle_cached(&s(&e, "item_id"))
+                                    {
+                                        // Offline with no complete local
+                                        // bundle (T3 ruling): a status
+                                        // label, not an action — opening
+                                        // would land on an empty deck.
+                                        ui.label(
+                                            egui::RichText::new("离线不可用").small().weak(),
                                         );
                                     }
-                                    if ui.small_button("导出 PPT").clicked() {
-                                        let item_id = s(&e, "item_id");
-                                        let title = s(&e, "title");
-                                        if let Some(path) = rfd::FileDialog::new()
-                                            .set_file_name(format!("{title}.pptx"))
-                                            .save_file()
-                                        {
-                                            match app.call(
-                                                "POST",
-                                                &format!("/v1/showroom/{item_id}/export"),
-                                                Some(json!({ "kind": "personal" })),
-                                            ) {
-                                                Ok(v) => {
-                                                    if let Some(data) = v
-                                                        .get("data_base64")
-                                                        .and_then(|x| x.as_str())
-                                                    {
-                                                        if let Ok(bytes) = b64d(data) {
-                                                            // Audit2 E-M10: the write result decides the message — a failed write no longer reports success.
-                                                            app.msg = match std::fs::write(&path, bytes) {
-                                                                Ok(()) => "已导出".into(),
-                                                                Err(e) => format!("导出失败：{e}"),
-                                                            };
-                                                        }
-                                                    }
-                                                }
-                                                Err(e2) => app.msg = format!("导出失败：{e2}"),
-                                            }
-                                        }
-                                    }
-                                }
-                                if ui.small_button("移除").clicked() && app.require_org_online("移除") {
-                                    let lid = s(&e, "id");
-                                    match app.call(
-                                        "POST",
-                                        &format!("/v1/library/{lid}/delete"),
-                                        Some(json!({})),
-                                    ) {
-                                        Ok(_) => {
-                                            app.msg = "已移除".into();
-                                            app.refresh_all();
-                                        }
-                                        Err(e2) => app.msg = format!("移除失败：{e2}"),
-                                    }
-                                }
-                            });
+                                });
+                            // Prototype #3 card form: no visible
+                            // buttons on the card — single click
+                            // selects, double click opens the deck
+                            // (the plaza card's interaction, reused).
+                            // The meta the prototype folds into the
+                            // card tooltip (folder · added time)
+                            // rides the cover hover text.
+                            let folder = s(&e, "folder");
+                            let hover = if folder.is_empty() {
+                                fmt_time(i(&e, "added_ms"))
+                            } else {
+                                format!("{} · {}", folder, fmt_time(i(&e, "added_ms")))
+                            };
+                            let response = ui
+                                .interact(
+                                    cover_rect,
+                                    ui.scope_id().with(("library", &item_id)),
+                                    egui::Sense::click(),
+                                )
+                                .on_hover_text(hover);
+                            if response.clicked() {
+                                app.showroom.selected_card = Some(item_id.clone());
+                            }
+                            if response.double_clicked()
+                                && s(&e, "item_kind") == "showroom"
+                                && (app.org_online() || app.sr_bundle_cached(&item_id))
+                            {
+                                app.open_deck_for_ref(
+                                    "showroom",
+                                    &item_id,
+                                    &s(&e, "title"),
+                                );
+                            }
                         },
                     );
                 }
@@ -17489,42 +17398,37 @@ impl App {
                         ui,
                         &self.cache_entries.clone(),
                         |app, ui, e, width| {
-                            app.showroom_card(ui, width, &s(e, "title"), "", false, |app, ui| {
-                                ui.label(format!(
-                                    "{} 页 · {}",
-                                    i(&e, "page_count"),
-                                    fmt_time(i(&e, "cached_ms"))
-                                ));
-                                if e.get("stale").and_then(|v| v.as_bool()) == Some(true) {
-                                    ui.label(
-                                        egui::RichText::new(
-                                            "已过期：正式版已更新或条目已下架",
-                                        )
-                                        .small()
-                                        .weak(),
-                                    );
-                                }
-                                let key = s(&e, "key");
-                                if ui.button("打开").clicked() {
-                                    app.open_cache(&key);
-                                }
-                                if !s(&e, "index_file").is_empty()
-                                    && ui.button("打开详情").clicked()
-                                {
-                                    let item_id =
-                                        key.strip_prefix("sr_").unwrap_or("").to_string();
-                                    if !item_id.is_empty() {
-                                        app.open_deck_for_ref(
-                                            "showroom",
-                                            &item_id,
-                                            &s(&e, "title"),
+                            let key = s(&e, "key");
+                            let cover_rect =
+                                app.showroom_card(ui, width, &s(e, "title"), "", false, |app, ui| {
+                                    ui.label(format!(
+                                        "{} 页 · {}",
+                                        i(&e, "page_count"),
+                                        fmt_time(i(&e, "cached_ms"))
+                                    ));
+                                    if e.get("stale").and_then(|v| v.as_bool()) == Some(true) {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "已过期：正式版已更新或条目已下架",
+                                            )
+                                            .small()
+                                            .weak(),
                                         );
                                     }
-                                }
-                                if ui.button("移除缓存").clicked() {
-                                    app.remove_cache(&key);
-                                }
-                            });
+                                });
+                            // Prototype #3 card form: no visible
+                            // buttons — double click opens the
+                            // cached deck (the card's primary
+                            // action). Cache removal lives in the
+                            // content cache list, not on this card.
+                            let response = ui.interact(
+                                cover_rect,
+                                ui.scope_id().with(("library-cache", &key)),
+                                egui::Sense::click(),
+                            );
+                            if response.double_clicked() {
+                                app.open_cache(&key);
+                            }
                         },
                     );
                 }
@@ -17536,34 +17440,45 @@ impl App {
                         ui,
                         &self.my_assemblies.clone(),
                         |app, ui, a, width| {
-                            app.showroom_card(ui, width, &s(a, "name"), "", false, |app, ui| {
-                                ui.label(format!(
-                                    "{} 个条目 · {}",
-                                    i(&a, "entry_count"),
-                                    fmt_time(i(&a, "created_ms"))
-                                ));
-                                if ui.button("缓存到本地").clicked() {
-                                    let aid = s(&a, "id");
-                                    let name = s(&a, "name");
-                                    match app.call(
-                                        "POST",
-                                        &format!("/v1/assemblies/{aid}/export"),
-                                        Some(json!({ "kind": "personal" })),
-                                    ) {
-                                        Ok(v) => {
-                                            if let Some(data) =
-                                                v.get("data_base64").and_then(|x| x.as_str())
-                                            {
-                                                if let Ok(bytes) = b64d(data) {
-                                                    let pages = i(&v, "page_count");
-                                                    app.cache_deck(&aid, &name, &bytes, pages);
-                                                }
+                            let aid = s(&a, "id");
+                            let cover_rect =
+                                app.showroom_card(ui, width, &s(a, "name"), "", false, |app, ui| {
+                                    ui.label(format!(
+                                        "{} 个条目 · {}",
+                                        i(&a, "entry_count"),
+                                        fmt_time(i(&a, "created_ms"))
+                                    ));
+                                });
+                            // Prototype #3 card form: no visible
+                            // buttons — double click runs the
+                            // card's only action, caching the
+                            // assembly deck locally (it then
+                            // opens from the 本地缓存 group).
+                            let response = ui.interact(
+                                cover_rect,
+                                ui.scope_id().with(("library-assembly", &aid)),
+                                egui::Sense::click(),
+                            );
+                            if response.double_clicked() {
+                                let name = s(&a, "name");
+                                match app.call(
+                                    "POST",
+                                    &format!("/v1/assemblies/{aid}/export"),
+                                    Some(json!({ "kind": "personal" })),
+                                ) {
+                                    Ok(v) => {
+                                        if let Some(data) =
+                                            v.get("data_base64").and_then(|x| x.as_str())
+                                        {
+                                            if let Ok(bytes) = b64d(data) {
+                                                let pages = i(&v, "page_count");
+                                                app.cache_deck(&aid, &name, &bytes, pages);
                                             }
                                         }
-                                        Err(e) => app.msg = format!("缓存失败：{e}"),
                                     }
+                                    Err(e) => app.msg = format!("缓存失败：{e}"),
                                 }
-                            });
+                            }
                         },
                     );
                 }

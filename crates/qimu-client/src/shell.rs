@@ -73,7 +73,6 @@ impl App {
     pub(super) fn workspace_ui(&mut self, ui: &mut egui::Ui) {
         self.shell_chrome(ui);
         self.shell_sidebar(ui);
-        self.shell_content_head(ui);
         self.page_footer(ui);
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(palette_color(APP_BG)))
@@ -379,7 +378,7 @@ impl App {
         // ====
         // The frame's one page-identity resolution: the menu-row
         // path text below reads from it, and so does the
-        // content-head page chip (page_identity is the client's
+        // deck-bar page chip (page_identity is the client's
         // single resolver — no site computes its own page
         // number or name).
         let crumb_path = self.page_identity().path.join(" · ");
@@ -1280,7 +1279,12 @@ impl App {
         // block's detail, the clicked history version when one
         // is selected and the block itself otherwise. It greys
         // only where nothing is selected — the one objectively
-        // unexecutable state.
+        // unexecutable state. One routing exception (user
+        // ruling 2026-11-27): in the showroom 「我的」 zone a
+        // selected library bookmark makes this same button
+        // un-bookmark instead of trash — the tip below names
+        // that, so the shared icon never reads as deleting
+        // someone else's deck.
         let del_targets = self.deckbar_delete_targets();
         // An open index detail with entries selected deletes
         // the ENTRIES (they leave the index through a commit;
@@ -1295,6 +1299,12 @@ impl App {
             (
                 match del_targets.len() {
                     0 => "删除".to_string(),
+                    // A library target un-bookmarks, it does
+                    // not delete the deck: the tip says so
+                    // verbatim.
+                    1 if del_targets[0].kind == "library" => {
+                        format!("移出我的库「{}」", del_targets[0].label)
+                    }
                     1 => format!("删除「{}」", del_targets[0].label),
                     n => format!("删除选中的 {n} 项"),
                 },
@@ -1764,77 +1774,10 @@ impl App {
                 .any(|overlay| matches!(overlay, Overlay::Light(_)))
     }
 
-    /// Content-column header strip: the resident seat of the
-    /// page-number chip (user ruling 2026-11-27: at the left of
-    /// the right content area — NOT the prototype's bottom-bar
-    /// left end, which would sit under the sidebar here). One
-    /// seat for every page, added after the sidebar panel so it
-    /// spans only the content column. The chip's number and
-    /// name come from page_identity(), the single resolver.
-    fn shell_content_head(&mut self, ui: &mut egui::Ui) {
-        let identity = self.page_identity();
-        egui::Panel::top("content_head")
-            .exact_size(30.0)
-            .frame(
-                egui::Frame::NONE
-                    .fill(palette_color(PANEL_BG))
-                    .inner_margin(egui::Margin::symmetric(10, 0)),
-            )
-            .show_separator_line(false)
-            .show(ui, |ui| {
-                ui.horizontal_centered(|ui| {
-                    // Prototype #pageIdChip form: a quiet badge
-                    // reading "#N"; pages the user has not
-                    // numbered (client-only pages, provisional
-                    // default) read their page name instead.
-                    let text = match &identity.no {
-                        Some(no) => format!("#{no}"),
-                        None => identity.name.clone(),
-                    };
-                    let font = egui::FontId::proportional(11.5);
-                    let galley = ui.painter().layout_no_wrap(
-                        text.clone(),
-                        font.clone(),
-                        palette_color(TEXT_WEAK),
-                    );
-                    let (badge, resp) = ui.allocate_exact_size(
-                        egui::vec2(galley.size().x + 16.0, 26.0),
-                        egui::Sense::hover(),
-                    );
-                    ui.painter().rect(
-                        badge,
-                        6.0,
-                        palette_color(HOVER_BG),
-                        egui::Stroke::new(1.0, palette_color(FIELD_BORDER)),
-                        egui::StrokeKind::Inside,
-                    );
-                    ui.painter().text(
-                        badge.center(),
-                        egui::Align2::CENTER_CENTER,
-                        text,
-                        font,
-                        palette_color(TEXT_WEAK),
-                    );
-                    match &identity.no {
-                        Some(no) => {
-                            resp.on_hover_text(format!("当前页面编号 {no} · {}", identity.name))
-                        }
-                        None => resp.on_hover_text(format!("当前页 · {}", identity.name)),
-                    };
-                });
-                let r = ui.max_rect();
-                ui.painter().hline(
-                    r.x_range(),
-                    r.max.y - 0.5,
-                    egui::Stroke::new(1.0, palette_color(SEPARATOR)),
-                );
-            });
-    }
-
     /// The client's single page-identity resolution (page
     /// identity layer, phase 1): the current page + frame stack
     /// + key state in, (page number, page name, path chain) out.
-    /// The content-head chip and the menu-row path text both
+    /// The deck-bar page chip and the menu-row path text both
     /// read from here; nothing else in the client computes a
     /// page number or name of its own.
     ///
@@ -1846,7 +1789,9 @@ impl App {
     /// prototype: the index detail is split off the overview as
     /// #7c–#7g by its five views (2026-11-27; the prototype
     /// keeps both at #7 and leans on the path text), and the
-    /// chip's seat moved (see shell_content_head).
+    /// chip sits at the bottom bar's left end (2026-11-27,
+    /// final seat — a content-column header strip tried
+    /// earlier the same day was superseded and removed).
     pub(super) fn page_identity(&self) -> PageIdentity {
         let mut id = self.page_frame_identity();
         // Full-page overlays and dialogs resolve first
@@ -2250,7 +2195,8 @@ impl App {
     /// anywhere in the client). Runs the deckbar sdDel path
     /// verbatim — same `deckbar_delete_targets`, same
     /// `deckbar_delete_selection` — so the key inherits the
-    /// button's whole semantics: the five target kinds, trash
+    /// button's whole semantics: the target kinds (a library
+    /// bookmark un-bookmarks instead of trashing), trash
     /// categorisation, the pin-guarded version refusal, the
     /// spoken result line. Three gates, all must pass:
     /// - a plain Delete press, first press only (key repeats
@@ -2706,6 +2652,33 @@ impl App {
                 }
                 SrFrame::Wall => match &self.showroom.selected_card {
                     Some(id) => {
+                        // 「我的」 zone split (user ruling
+                        // 2026-11-27): a selected card that is
+                        // one of my library bookmarks is a
+                        // LIBRARY target, not a showroom one —
+                        // the bottom-bar delete un-bookmarks it
+                        // (deckbar_delete_selection POSTs
+                        // /v1/library/{lid}/delete), it does NOT
+                        // trash the deck itself: the deck is a
+                        // showroom entry, my library row is only
+                        // a bookmark of it. The zone check is
+                        // load-bearing — the same item id
+                        // selected on the plaza wall stays a
+                        // showroom target. The target id is the
+                        // item id (the selected_card value); the
+                        // library row id is resolved from
+                        // library_refs at execution time.
+                        if self.showroom.zone == "library" {
+                            if let Some(e) =
+                                self.library_refs.iter().find(|e| s(e, "item_id") == *id)
+                            {
+                                return vec![DelTarget {
+                                    kind: "library",
+                                    id: id.clone(),
+                                    label: s(e, "title"),
+                                }];
+                            }
+                        }
                         let label = self
                             .showroom_live
                             .iter()
@@ -2733,9 +2706,56 @@ impl App {
     /// deleted kinds, and report: one line for the successes,
     /// every failure named with its reason (a pin-guarded
     /// version refuses, the rest still delete).
+    ///
+    /// Library targets (kind "library", user ruling
+    /// 2026-11-27) split off BEFORE the trash batch:
+    /// un-bookmarking is a server bookmark delete, not a trash
+    /// move — it never reaches trash_add_many (no /v1/trash
+    /// row, nothing lands in the recycle bin, the deck itself
+    /// is untouched and stays on the plaza wall). Each one
+    /// resolves its library row id from library_refs by item
+    /// id and replays the exact call the card's removed
+    /// 「移除」 button used to make. Library successes also
+    /// stay out of the undo recording below: a bookmark
+    /// removal has no local trash row to snapshot and no
+    /// wired inverse (re-adding is the pull dialog's job) —
+    /// the same class as the organization showroom rows that
+    /// drop out inside record_trash_undo.
     fn deckbar_delete_selection(&mut self, targets: Vec<DelTarget>) {
         if targets.is_empty() {
             return;
+        }
+        let (library_targets, targets): (Vec<DelTarget>, Vec<DelTarget>) =
+            targets.into_iter().partition(|t| t.kind == "library");
+        let mut library_succeeded: Vec<DelTarget> = Vec::new();
+        let mut library_failures: Vec<(DelTarget, String)> = Vec::new();
+        for t in &library_targets {
+            let lid = self
+                .library_refs
+                .iter()
+                .find(|e| s(e, "item_id") == t.id)
+                .map(|e| s(e, "id"))
+                .unwrap_or_default();
+            if lid.is_empty() {
+                library_failures.push((t.clone(), "条目已不在我的库中".to_string()));
+                continue;
+            }
+            match self.call(
+                "POST",
+                &format!("/v1/library/{lid}/delete"),
+                Some(json!({})),
+            ) {
+                Ok(_) => {
+                    if self.showroom.selected_card.as_deref() == Some(t.id.as_str()) {
+                        self.showroom.selected_card = None;
+                    }
+                    library_succeeded.push(t.clone());
+                }
+                Err(e) => library_failures.push((t.clone(), e)),
+            }
+        }
+        if !library_succeeded.is_empty() {
+            self.reread_library();
         }
         let failures = self.trash_add_many(&targets);
         let failed: std::collections::HashSet<&str> =
@@ -2841,25 +2861,58 @@ impl App {
                 }
             }
         }
-        match (succeeded.len(), failures.len()) {
-            (1, 0) => self.say("已移入回收站，可随时恢复"),
-            (n, 0) => self.say(format!("已移入回收站 {n} 项，可随时恢复")),
+        // Result lines: the trash family's wording is the
+        // long-standing one below, kept verbatim; the library
+        // family gets its own line (nothing went to the
+        // recycle bin, so it must not claim so). Batches from
+        // deckbar_delete_targets are homogeneous in practice —
+        // the lines simply join if one ever mixes.
+        let mut lines: Vec<String> = Vec::new();
+        if !targets.is_empty() || !failures.is_empty() {
+            match (succeeded.len(), failures.len()) {
+                (1, 0) => lines.push("已移入回收站，可随时恢复".to_string()),
+                (n, 0) => lines.push(format!("已移入回收站 {n} 项，可随时恢复")),
+                (0, _) => {
+                    let list = failures
+                        .iter()
+                        .map(|(t, e)| format!("「{}」：{e}", t.label))
+                        .collect::<Vec<_>>()
+                        .join("；");
+                    lines.push(format!("删除失败：{list}"));
+                }
+                (n, _) => {
+                    let list = failures
+                        .iter()
+                        .map(|(t, e)| format!("「{}」：{e}", t.label))
+                        .collect::<Vec<_>>()
+                        .join("；");
+                    lines.push(format!("已移入回收站 {n} 项；未能删除：{list}"));
+                }
+            }
+        }
+        match (library_succeeded.len(), library_failures.len()) {
+            (0, 0) => {}
+            (1, 0) => lines.push(format!("已移出我的库「{}」", library_succeeded[0].label)),
+            (n, 0) => lines.push(format!("已移出我的库 {n} 项")),
             (0, _) => {
-                let list = failures
+                let list = library_failures
                     .iter()
                     .map(|(t, e)| format!("「{}」：{e}", t.label))
                     .collect::<Vec<_>>()
                     .join("；");
-                self.say(format!("删除失败：{list}"));
+                lines.push(format!("移出我的库失败：{list}"));
             }
             (n, _) => {
-                let list = failures
+                let list = library_failures
                     .iter()
                     .map(|(t, e)| format!("「{}」：{e}", t.label))
                     .collect::<Vec<_>>()
                     .join("；");
-                self.say(format!("已移入回收站 {n} 项；未能删除：{list}"));
+                lines.push(format!("已移出我的库 {n} 项；未能移出：{list}"));
             }
+        }
+        if !lines.is_empty() {
+            self.say(lines.join("；"));
         }
     }
 
@@ -2877,15 +2930,54 @@ impl App {
                 );
                 ui.horizontal_centered(|ui| {
                     ui.add_space(22.0);
-                    // The page-number chip sat here, at the
-                    // bottom bar's left end, until the
-                    // 2026-11-27 ruling moved it to the content
-                    // column's header strip (shell_content_head)
-                    // and gave the numbers to the single
-                    // resolver (page_identity). The coarse
-                    // per-page match that fed it is gone with
-                    // it — the deck bar itself keeps only the
-                    // clipboard chip and the action group.
+                    // Page-number chip (prototype #pageIdChip):
+                    // the deck bar's first element, at its left
+                    // end, ahead of the clipboard chip and the
+                    // action group. Its number and name come
+                    // from page_identity(), the single resolver.
+                    // (User ruling 2026-11-27, final seat: the
+                    // bottom bar's left. A content-column header
+                    // strip tried earlier the same day was
+                    // superseded; the strip is gone.)
+                    // Prototype #pageIdChip form: a quiet badge
+                    // reading "#N"; pages the user has not
+                    // numbered (client-only pages, provisional
+                    // default) read their page name instead.
+                    let identity = self.page_identity();
+                    let text = match &identity.no {
+                        Some(no) => format!("#{no}"),
+                        None => identity.name.clone(),
+                    };
+                    let font = egui::FontId::proportional(11.5);
+                    let galley = ui.painter().layout_no_wrap(
+                        text.clone(),
+                        font.clone(),
+                        palette_color(TEXT_WEAK),
+                    );
+                    let (badge, resp) = ui.allocate_exact_size(
+                        egui::vec2(galley.size().x + 16.0, 26.0),
+                        egui::Sense::hover(),
+                    );
+                    ui.painter().rect(
+                        badge,
+                        6.0,
+                        palette_color(HOVER_BG),
+                        egui::Stroke::new(1.0, palette_color(FIELD_BORDER)),
+                        egui::StrokeKind::Inside,
+                    );
+                    ui.painter().text(
+                        badge.center(),
+                        egui::Align2::CENTER_CENTER,
+                        text,
+                        font,
+                        palette_color(TEXT_WEAK),
+                    );
+                    match &identity.no {
+                        Some(no) => {
+                            resp.on_hover_text(format!("当前页面编号 {no} · {}", identity.name))
+                        }
+                        None => resp.on_hover_text(format!("当前页 · {}", identity.name)),
+                    };
                     // PPT clipboard chip (prototype #deckBar's
                     // left-side tray chip): shown only while the
                     // clipboard holds pages; the text is the
