@@ -9383,22 +9383,45 @@ impl Store {
             .conn
             .prepare("SELECT id, name, entries_json, created_ms FROM assemblies WHERE user_id=?1 ORDER BY created_ms DESC")
             .map_err(db_err)?;
-        let rows = stmt
+        let raw = stmt
             .query_map(params![user_id], |r| {
-                let entries_json: String = r.get(2)?;
-                let count = serde_json::from_str::<Vec<IndexEntry>>(&entries_json)
-                    .map(|v| v.len())
-                    .unwrap_or(0);
-                Ok(serde_json::json!({
-                    "id": r.get::<_, String>(0)?,
-                    "name": r.get::<_, String>(1)?,
-                    "entry_count": count,
-                    "created_ms": r.get::<_, i64>(3)?,
-                }))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
             })
             .map_err(db_err)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(db_err)?;
+        drop(stmt);
+        // The cover is resolved after the statement is dropped:
+        // it reads other tables through the same connection.
+        let rows = raw
+            .into_iter()
+            .map(|(id, name, entries_json, created_ms)| {
+                let entries = serde_json::from_str::<Vec<IndexEntry>>(&entries_json)
+                    .unwrap_or_default();
+                // Cover (three-wall card unification, user ruling
+                // 2026-11-28): the first entry's resolved version
+                // id — the client feeds it to the same thumbnail
+                // machinery every other wall's cover uses. Empty
+                // when no entry resolves.
+                let cover = entries
+                    .first()
+                    .and_then(|e| self.resolve_entry_version(e).ok().flatten())
+                    .map(|v| v.id.0)
+                    .unwrap_or_default();
+                serde_json::json!({
+                    "id": id,
+                    "name": name,
+                    "entry_count": entries.len(),
+                    "created_ms": created_ms,
+                    "cover": cover,
+                })
+            })
+            .collect();
         Ok(rows)
     }
 

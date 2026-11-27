@@ -2685,6 +2685,19 @@ impl App {
                             .find(|it| s(it, "id") == *id)
                             .map(|it| s(it, "title"))
                             .unwrap_or_default();
+                        let label = if label.is_empty() {
+                            // Locally submitted rows never enter
+                            // showroom_live — the 本地演示 cards
+                            // feed selected_card too, and their
+                            // titles live in local_showroom.
+                            self.local_showroom
+                                .iter()
+                                .find(|it| s(it, "id") == *id)
+                                .map(|it| s(it, "title"))
+                                .unwrap_or_default()
+                        } else {
+                            label
+                        };
                         vec![DelTarget {
                             kind: "showroom",
                             id: id.clone(),

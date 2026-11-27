@@ -1234,7 +1234,12 @@ impl App {
                 });
             }
         });
-        ui.add_space(4.0);
+        // No spacer under the section title (top-height
+        // unification, user ruling 2026-11-28): the title row
+        // is followed directly by the thumb grid — the caller
+        // zeroes the item spacing for the first row's junction
+        // below, so the title-to-grid gap carries neither the
+        // old add_space(4) nor the two item spacings around it.
         let picking = st.bind_pick.is_some();
         // Wall page drag (user ruling 2026-11-25 21:22): EVERY
         // shown version's wall is draggable — drafts and the
@@ -1271,6 +1276,12 @@ impl App {
             st.thumb_cell_h.clear();
             st.thumb_cell_w = inner_w;
         }
+        // The first row is placed with item_spacing.y = 0 (see
+        // the title-row comment above); the saved value is
+        // restored as soon as the first row is placed, so the
+        // junctions between rows keep their normal spacing.
+        let saved_spacing_y = ui.spacing().item_spacing.y;
+        ui.spacing_mut().item_spacing.y = 0.0;
         for row_start in (0..page_count).step_by(cols) {
             let row_end = (row_start + cols).min(page_count);
             let row_target = (row_start..row_end)
@@ -1385,8 +1396,14 @@ impl App {
                     }
                 }
             });
+            if row_start == 0 {
+                ui.spacing_mut().item_spacing.y = saved_spacing_y;
+            }
             ui.add_space(12.0);
         }
+        // Idempotent restore: also covers page_count == 0,
+        // where the loop never ran.
+        ui.spacing_mut().item_spacing.y = saved_spacing_y;
         // Page drag resolution (the N4 showroom wall's
         // raw-pointer pattern): the press is tracked against the
         // THUMB rects — a press on the bind bar below a thumb

@@ -457,6 +457,29 @@ fn chip(ui: &mut egui::Ui, text: &str, fg: egui::Color32, bg: egui::Color32) {
     );
 }
 
+/// The tag row of the unified picture card (user ruling
+/// 2026-11-28: the three walls' cards are one card — thumbnail
+/// on top, the name in the middle, tags at the bottom). The
+/// page-count chip leads, the caller's status chips follow, in
+/// the one shared construction and the chip vocabulary the
+/// content wall and the index overview already use — no wall
+/// improvises its own bottom row any more.
+fn card_tag_row(ui: &mut egui::Ui, pages: Option<i64>, add: impl FnOnce(&mut egui::Ui)) {
+    ui.horizontal_wrapped(|ui| {
+        if let Some(n) = pages {
+            if n > 0 {
+                chip(
+                    ui,
+                    &format!("{n} 页"),
+                    palette_color(CHIP_GRAY_FG),
+                    CHIP_GRAY_BG,
+                );
+            }
+        }
+        add(ui);
+    });
+}
+
 /// Type tag from the unified content model (user ruling
 /// 2026-11-25): a unit holding exactly one page IS a 单页; a
 /// unit holding more is a 内容块 (pages composed in order).
@@ -11045,6 +11068,13 @@ fn std_card(ui: &mut egui::Ui, selected: bool, add: impl FnOnce(&mut egui::Ui)) 
     standard_card(ui, selected, None, false, add);
 }
 
+/// The one body height of the unified picture card (user
+/// ruling 2026-11-28): every wall's card is cover + this much
+/// body — title line, tag row, and the frame's padding. The
+/// index overview's long-standing value; the content wall's
+/// larger allowance and the showroom's zero both converge here.
+const CARD_BODY_H: f32 = 74.0;
+
 struct WallCard<'a> {
     width: f32,
     min_height: f32,
@@ -16435,25 +16465,13 @@ impl App {
     fn showroom_deck(&mut self, ui: &mut egui::Ui, st: &mut DeckState) {
         let item = st.item.clone();
         let preview_open = st.preview_open;
-        let return_label = if preview_open {
-            "稿件详情"
-        } else {
-            "演示厅"
-        };
-        let current_label = if preview_open {
-            "单页预览"
-        } else {
-            "稿件详情"
-        };
-        if crumb_bar(ui, &[return_label, current_label]) == Some(0) {
-            if preview_open {
-                st.preview_open = false;
-            } else {
-                st.closed = true;
-            }
-            return;
-        }
-        ui.add_space(8.0);
+        // No crumb row on this page (prototype parity +
+        // top-height unification, user ruling 2026-11-28): the
+        // prototype deck detail starts at the title. Return
+        // rides the bottom bar's back button and Esc, which
+        // route through back_from_showroom_detail — the same
+        // two actions the crumb's first segment performed
+        // (close the page preview, else pop the frame).
         let mut act: Option<&'static str> = None;
         let cache_key = format!("sr_{}", s(&item, "id"));
         // A stale entry (the formal version moved on or the item
@@ -16494,6 +16512,33 @@ impl App {
                 } else if btn_default(ui, "缓存").clicked() {
                     act = Some("cache");
                 }
+                // View switch （逐页缩略图 / 讲稿） rides the
+                // title row (top-height unification, user
+                // ruling 2026-11-28): as its own row above the
+                // wall it pushed the first card ~37pt below the
+                // prototype's first-card line, and the
+                // prototype carries no such row in the detail
+                // body at all. Same visibility conditions the
+                // old row had — wall states only, never over
+                // the page preview or the empty deck.
+                if !preview_open && !st.pages.is_empty() {
+                    if let Some(view) = segmented(
+                        ui,
+                        &["逐页缩略图", "讲稿"],
+                        usize::from(st.view == DeckView::Notes),
+                        SegStyle::Soft,
+                    ) {
+                        st.view = if view == 1 {
+                            DeckView::Notes
+                        } else {
+                            DeckView::Thumbnails
+                        };
+                    }
+                    ui.label(
+                        egui::RichText::new(format!("{} 页", st.pages.len()))
+                            .color(palette_color(TEXT_WEAK)),
+                    );
+                }
                 // No view/export icon cluster here (user order
                 // 2026-11-27, #211 prototype parity): the prototype
                 // detail body carries no action buttons — play /
@@ -16501,48 +16546,26 @@ impl App {
                 // deck bar, which resolves this frame as its target.
             });
         });
-        let src_name = self
-            .indexes
-            .iter()
-            .find(|x| s(x, "id") == s(&item, "source_index_id"))
-            .map(|x| s(x, "name"))
-            .unwrap_or_default();
-        // Back-reference line (unified content model, user
-        // ruling 2026-11-25): this deck is a published index —
-        // name its source index and the published commit (or
-        // its follow state), never let it read as a standalone
-        // product. Source-less items are personal assemblies
-        // and carry no publish segment.
-        let mut head_line = if s(&item, "source_index_id").is_empty() {
-            "个人组装".to_string()
-        } else if src_name.is_empty() {
-            "来源索引".to_string()
-        } else {
-            format!("来源索引 {src_name}")
-        };
-        if !s(&item, "source_index_id").is_empty() {
-            head_line = format!("{head_line} · 发布版 {}", self.deck_commit_label(&item));
-        }
-        head_line = format!("{head_line} · {}", s(&item, "submitted_by"));
-        ui.label(
-            egui::RichText::new(head_line)
-                .size(11.5)
-                .color(palette_color(TEXT_FAINT)),
-        );
+        // No meta line under the title (user ruling
+        // 2026-11-28, superseding the 2026-11-25 in-page
+        // display of the back-reference line): the prototype
+        // deck detail goes from the title straight to the page
+        // wall. The source-index data itself is untouched —
+        // it still drives the bottom bar's deck info (sdInfo)
+        // and the follow/pin state; only this in-body line is
+        // gone.
         // No in-body open/export rows (user order 2026-11-27,
-        // #211 prototype parity): the prototype detail body goes
-        // from the meta line straight to the page wall. Opening
-        // with an external app follows the present-engine setting
-        // through the bottom bar's unified open; whole-deck PDF
-        // export is the bottom bar's 导出 PDF. (The handout /
-        // notes whole-deck PDF forms lost their only entry with
-        // this row — see this line's REPORT.)
+        // #211 prototype parity): opening with an external app
+        // follows the present-engine setting through the
+        // bottom bar's unified open; whole-deck PDF export is
+        // the bottom bar's 导出 PDF. (The handout / notes
+        // whole-deck PDF forms lost their only entry with this
+        // row — see this line's REPORT.)
         match act {
             Some("save") => self.save_showroom_to_library(&item),
             Some("cache") => self.cache_showroom_deck(&item),
             _ => {}
         }
-        ui.add_space(8.0);
         self.showroom_deck_pages(ui, st, &item);
     }
 
@@ -16755,29 +16778,14 @@ impl App {
         // in progress (deck_display_pages); the pinned order in
         // `st.pages` is never mutated.
         let pages = deck_display_pages(st);
-        ui.horizontal(|ui| {
-            if let Some(view) = segmented(
-                ui,
-                &["逐页缩略图", "讲稿"],
-                usize::from(st.view == DeckView::Notes),
-                SegStyle::Soft,
-            ) {
-                st.view = if view == 1 {
-                    DeckView::Notes
-                } else {
-                    DeckView::Thumbnails
-                };
-            }
-            ui.label(
-                egui::RichText::new(format!("{} 页", pages.len()))
-                    .color(palette_color(TEXT_WEAK)),
-            );
-            // No 预览所选页 button and no drag hint label here
-            // (user order 2026-11-27, #211 prototype parity —
-            // the same call as the #101 wall-top hint removal):
-            // the page preview opens by double-clicking a page
-            // card, and the prototype wall carries no hint row.
-        });
+        // No view-switch row above the wall (user ruling
+        // 2026-11-28): the 逐页缩略图 / 讲稿 switch and the
+        // page count ride the title row in showroom_deck —
+        // see there. (The 预览所选页 button and the drag hint
+        // label were already removed from this row on
+        // 2026-11-27: the preview opens by double-clicking a
+        // page card, and the prototype wall carries no hint
+        // row.)
         // N4 reorder bar (user ruling 2026-11-25): invisible
         // until the order actually changes; then the save-as and
         // restore actions live here. After a save, the bar keeps
@@ -16828,7 +16836,6 @@ impl App {
             }
             _ => {}
         }
-        ui.add_space(10.0);
         egui::ScrollArea::vertical()
             .id_salt((item["id"].as_str(), st.view == DeckView::Notes))
             .show(ui, |ui| {
@@ -17332,28 +17339,49 @@ impl App {
                         &self.library_refs.clone(),
                         |app, ui, e, width| {
                             let item_id = s(e, "item_id");
-                            let cover = app.showroom_cover(&item_id);
+                            let cover = app.library_cover(&item_id);
                             let selected =
                                 app.showroom.selected_card.as_deref() == Some(item_id.as_str());
-                            let cover_rect =
-                                app.showroom_card(ui, width, &s(e, "title"), &cover, selected, |app, ui| {
-                                    let folder = s(&e, "folder");
-                                    if !folder.is_empty() {
-                                        ui.label(egui::RichText::new(folder).small().weak());
-                                    }
-                                    if s(&e, "item_kind") == "showroom"
-                                        && !app.org_online()
-                                        && !app.sr_bundle_cached(&s(&e, "item_id"))
-                                    {
-                                        // Offline with no complete local
-                                        // bundle (T3 ruling): a status
-                                        // label, not an action — opening
-                                        // would land on an empty deck.
-                                        ui.label(
-                                            egui::RichText::new("离线不可用").small().weak(),
-                                        );
-                                    }
-                                });
+                            let cover_rect = app.showroom_card(
+                                ui,
+                                width,
+                                &s(e, "title"),
+                                &cover,
+                                selected,
+                                CardVariant::Normal,
+                                |app, ui| {
+                                    let pages = app
+                                        .showroom_live
+                                        .iter()
+                                        .find(|it| s(it, "id") == item_id)
+                                        .map(|it| showroom_pages(it).len() as i64)
+                                        .filter(|n| *n > 0);
+                                    card_tag_row(ui, pages, |ui| {
+                                        if s(&e, "item_kind") == "showroom"
+                                            && !app.org_online()
+                                            && !app.sr_bundle_cached(&item_id)
+                                        {
+                                            // Offline with no complete
+                                            // local bundle (T3 ruling):
+                                            // a status chip, not an
+                                            // action — opening would
+                                            // land on an empty deck.
+                                            chip(
+                                                ui,
+                                                "离线不可用",
+                                                palette_color(CHIP_ORANGE_FG),
+                                                CHIP_ORANGE_BG,
+                                            );
+                                        }
+                                        let folder = s(&e, "folder");
+                                        if !folder.is_empty() {
+                                            ui.label(
+                                                egui::RichText::new(folder).small().weak(),
+                                            );
+                                        }
+                                    });
+                                },
+                            );
                             // Prototype #3 card form: no visible
                             // buttons on the card — single click
                             // selects, double click opens the deck
@@ -17399,23 +17427,43 @@ impl App {
                         &self.cache_entries.clone(),
                         |app, ui, e, width| {
                             let key = s(&e, "key");
-                            let cover_rect =
-                                app.showroom_card(ui, width, &s(e, "title"), "", false, |app, ui| {
-                                    ui.label(format!(
-                                        "{} 页 · {}",
-                                        i(&e, "page_count"),
-                                        fmt_time(i(&e, "cached_ms"))
-                                    ));
-                                    if e.get("stale").and_then(|v| v.as_bool()) == Some(true) {
+                            let cover = app.cache_cover(e);
+                            let cover_rect = app.showroom_card(
+                                ui,
+                                width,
+                                &s(e, "title"),
+                                &cover,
+                                false,
+                                CardVariant::Normal,
+                                |app, ui| {
+                                    card_tag_row(ui, Some(i(&e, "page_count")), |ui| {
+                                        if e.get("stale").and_then(|v| v.as_bool())
+                                            == Some(true)
+                                        {
+                                            chip(
+                                                ui,
+                                                "已过期",
+                                                palette_color(ROSE),
+                                                ROSE_SOFT_BG,
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(
+                                                    "正式版已更新或条目已下架",
+                                                )
+                                                .small()
+                                                .weak(),
+                                            );
+                                        }
                                         ui.label(
-                                            egui::RichText::new(
-                                                "已过期：正式版已更新或条目已下架",
-                                            )
+                                            egui::RichText::new(fmt_time(i(
+                                                &e, "cached_ms",
+                                            )))
                                             .small()
                                             .weak(),
                                         );
-                                    }
-                                });
+                                    });
+                                },
+                            );
                             // Prototype #3 card form: no visible
                             // buttons — double click opens the
                             // cached deck (the card's primary
@@ -17441,14 +17489,37 @@ impl App {
                         &self.my_assemblies.clone(),
                         |app, ui, a, width| {
                             let aid = s(&a, "id");
-                            let cover_rect =
-                                app.showroom_card(ui, width, &s(a, "name"), "", false, |app, ui| {
-                                    ui.label(format!(
-                                        "{} 个条目 · {}",
-                                        i(&a, "entry_count"),
-                                        fmt_time(i(&a, "created_ms"))
-                                    ));
-                                });
+                            let cover = s(&a, "cover");
+                            let variant = if app.user.is_some() {
+                                CardVariant::Mine
+                            } else {
+                                CardVariant::Normal
+                            };
+                            let cover_rect = app.showroom_card(
+                                ui,
+                                width,
+                                &s(a, "name"),
+                                &cover,
+                                false,
+                                variant,
+                                |app, ui| {
+                                    card_tag_row(ui, None, |ui| {
+                                        chip(
+                                            ui,
+                                            &format!("{} 个条目", i(&a, "entry_count")),
+                                            palette_color(CHIP_GRAY_FG),
+                                            CHIP_GRAY_BG,
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(fmt_time(i(
+                                                &a, "created_ms",
+                                            )))
+                                            .small()
+                                            .weak(),
+                                        );
+                                    });
+                                },
+                            );
                             // Prototype #3 card form: no visible
                             // buttons — double click runs the
                             // card's only action, caching the
@@ -17511,57 +17582,94 @@ impl App {
                                         .cloned()
                                         .unwrap_or_default()
                                 });
-                            app.showroom_card(ui, width, &s(e, "title"), &cover, false, |app, ui| {
-                                // Source line: the 本地演示 marker
-                                // keeps these rows distinct from
-                                // organization items on the shared
-                                // 全部 wall; the source index name
-                                // follows deck_source_label.
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "本地演示 · 来源 {}",
-                                        app.deck_source_label(e)
-                                    ))
-                                    .small()
-                                    .weak(),
-                                );
-                                let intro = s(e, "intro");
-                                if !intro.is_empty() {
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(intro).small().weak(),
-                                        )
-                                        .truncate(),
-                                    );
-                                }
-                                let state_label = match s(e, "state").as_str() {
-                                    "pending" => "待审（本地）",
-                                    "rejected" => "已驳回（本地）",
-                                    _ => "正式版（本地）",
-                                };
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{} · {} · {}",
-                                        state_label,
-                                        s(e, "submitted_by"),
-                                        fmt_time(i(e, "created_ms"))
-                                    ))
-                                    .small()
-                                    .weak(),
-                                );
-                                if s(e, "state") == "rejected"
-                                    && !s(e, "review_note").is_empty()
-                                {
+                            let lid = s(e, "id");
+                            let selected =
+                                app.showroom.selected_card.as_deref() == Some(lid.as_str());
+                            let cover_rect = app.showroom_card(
+                                ui,
+                                width,
+                                &s(e, "title"),
+                                &cover,
+                                selected,
+                                app.card_mine(&s(e, "submitted_by")),
+                                |app, ui| {
+                                    // Source line: the 本地演示 marker
+                                    // keeps these rows distinct from
+                                    // organization items on the shared
+                                    // 全部 wall; the source index name
+                                    // follows deck_source_label.
                                     ui.label(
                                         egui::RichText::new(format!(
-                                            "驳回理由：{}",
-                                            s(e, "review_note")
+                                            "本地演示 · 来源 {}",
+                                            app.deck_source_label(e)
                                         ))
                                         .small()
                                         .weak(),
                                     );
-                                }
-                                ui.horizontal_wrapped(|ui| {
+                                    let intro = s(e, "intro");
+                                    if !intro.is_empty() {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(intro).small().weak(),
+                                            )
+                                            .truncate(),
+                                        );
+                                    }
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{} · {}",
+                                            s(e, "submitted_by"),
+                                            fmt_time(i(e, "created_ms"))
+                                        ))
+                                        .small()
+                                        .weak(),
+                                    );
+                                    if s(e, "state") == "rejected"
+                                        && !s(e, "review_note").is_empty()
+                                    {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "驳回理由：{}",
+                                                s(e, "review_note")
+                                            ))
+                                            .small()
+                                            .weak(),
+                                        );
+                                    }
+                                    // The unified tag row: page
+                                    // count + the state chip (the
+                                    // state used to lead the meta
+                                    // line above). The four ruled
+                                    // actions stay on their own row
+                                    // BELOW the tag row — the one
+                                    // sanctioned exception to the
+                                    // three-row form (local
+                                    // showroom is our own addition;
+                                    // its actions are user-ruled).
+                                    let pages = showroom_pages(e).len() as i64;
+                                    card_tag_row(ui, (pages > 0).then_some(pages), |ui| {
+                                        match s(e, "state").as_str() {
+                                            "pending" => chip(
+                                                ui,
+                                                "待审",
+                                                palette_color(CHIP_ORANGE_FG),
+                                                CHIP_ORANGE_BG,
+                                            ),
+                                            "rejected" => chip(
+                                                ui,
+                                                "已驳回",
+                                                palette_color(ROSE),
+                                                ROSE_SOFT_BG,
+                                            ),
+                                            _ => chip(
+                                                ui,
+                                                "正式版",
+                                                palette_color(CHIP_GREEN_FG),
+                                                CHIP_GREEN_BG,
+                                            ),
+                                        }
+                                    });
+                                    ui.horizontal_wrapped(|ui| {
                                     if ui.small_button("打开详情").clicked() {
                                         app.open_showroom_deck(e);
                                     }
@@ -17591,8 +17699,24 @@ impl App {
                                     ) {
                                         app.trash_add("showroom", &s(e, "id"));
                                     }
-                                });
-                            });
+                                    });
+                                },
+                            );
+                            // Selection takes the real value
+                            // (the unified card's selected
+                            // state): a click on the cover marks
+                            // the card, and the bottom bar's
+                            // delete resolves it through the
+                            // same showroom target its own 删除
+                            // action uses.
+                            let response = ui.interact(
+                                cover_rect,
+                                ui.scope_id().with(("library-local", &lid)),
+                                egui::Sense::click(),
+                            );
+                            if response.clicked() {
+                                app.showroom.selected_card = Some(lid.clone());
+                            }
                         },
                     );
                 }
@@ -17626,47 +17750,75 @@ impl App {
                 .library_refs
                 .iter()
                 .any(|entry| entry["item_id"] == item["item_id"]);
-        let cover_response = self.showroom_card(ui, width, &title, &cover, false, |app, ui| {
-            ui.label(
-                egui::RichText::new(format!(
-                    "{} · {}",
-                    s(item, "from_name"),
-                    fmt_time(i(item, "created_ms"))
-                ))
-                .small()
-                .weak(),
-            );
-            let note = s(item, "note");
-            if !note.is_empty() {
+        let cover_response = self.showroom_card(
+            ui,
+            width,
+            &title,
+            &cover,
+            false,
+            CardVariant::Normal,
+            |app, ui| {
                 ui.label(
-                    egui::RichText::new(format!("{}：{note}", tr("分享说明")))
-                        .size(11.5)
-                        .color(palette_color(TEXT_WEAK)),
+                    egui::RichText::new(format!(
+                        "{} · {}",
+                        s(item, "from_name"),
+                        fmt_time(i(item, "created_ms"))
+                    ))
+                    .small()
+                    .weak(),
                 );
-            }
-            if item["item_kind"] == "showroom"
-                && !app.org_online()
-                && !app.sr_bundle_cached(&id)
-            {
-                // Offline with no complete local bundle (T3
-                // ruling): a status label instead of the action
-                // row. Non-showroom shares keep their save action —
-                // the bundle test only speaks for showroom decks.
-                ui.label(egui::RichText::new("离线不可用").small().weak());
-            } else {
-                ui.horizontal_wrapped(|ui| {
-                    if item["item_kind"] == "showroom" && ui.small_button("打开详情").clicked() {
-                        app.open_deck_for_ref("showroom", &id, &title);
-                    }
-                    if saved {
-                        ui.label(egui::RichText::new("已在我的库").small().weak());
-                    } else if app.org_online() && ui.small_button("保存到我的库").clicked() {
-                        let sid = s(item, "id");
-                        app.open_pull_dialog(item, Some(sid));
+                let note = s(item, "note");
+                if !note.is_empty() {
+                    ui.label(
+                        egui::RichText::new(format!("{}：{note}", tr("分享说明")))
+                            .size(11.5)
+                            .color(palette_color(TEXT_WEAK)),
+                    );
+                }
+                let offline = item["item_kind"] == "showroom"
+                    && !app.org_online()
+                    && !app.sr_bundle_cached(&id);
+                let pages = showroom_pages(item).len() as i64;
+                card_tag_row(ui, (pages > 0).then_some(pages), |ui| {
+                    if offline {
+                        // Offline with no complete local bundle
+                        // (T3 ruling): a status chip instead of
+                        // the action row. Non-showroom shares
+                        // keep their save action — the bundle
+                        // test only speaks for showroom decks.
+                        chip(
+                            ui,
+                            "离线不可用",
+                            palette_color(CHIP_ORANGE_FG),
+                            CHIP_ORANGE_BG,
+                        );
+                    } else if saved {
+                        chip(
+                            ui,
+                            "已在我的库",
+                            palette_color(CHIP_GRAY_FG),
+                            CHIP_GRAY_BG,
+                        );
                     }
                 });
-            }
-        });
+                if !offline {
+                    ui.horizontal_wrapped(|ui| {
+                        if item["item_kind"] == "showroom"
+                            && ui.small_button("打开详情").clicked()
+                        {
+                            app.open_deck_for_ref("showroom", &id, &title);
+                        }
+                        if !saved
+                            && app.org_online()
+                            && ui.small_button("保存到我的库").clicked()
+                        {
+                            let sid = s(item, "id");
+                            app.open_pull_dialog(item, Some(sid));
+                        }
+                    });
+                }
+            },
+        );
         let response = ui.interact(
             cover_response,
             ui.scope_id().with(("share", s(item, "id"))),
@@ -19107,21 +19259,40 @@ impl App {
         let title = s(item, "title");
         let cover = self.showroom_cover(&id);
         let selected = self.showroom.selected_card.as_deref() == Some(id.as_str());
-        let cover_rect = self.showroom_card(ui, width, &title, &cover, selected, |app, ui| {
-            let intro = s(item, "intro");
-            if !intro.is_empty() {
-                ui.add(egui::Label::new(egui::RichText::new(intro).small().weak()).truncate());
-            }
-            if !app.org_online() && !app.sr_bundle_cached(&id) {
-                // Offline with no complete local bundle (T3
-                // ruling): the action row is a status label, not
-                // buttons — every action here would land on an
-                // empty deck or a failed request. The cover and
-                // title stay as they are.
-                ui.label(egui::RichText::new("离线不可用").small().weak());
-                return;
-            }
-            ui.horizontal_wrapped(|ui| {
+        let cover_rect = self.showroom_card(
+            ui,
+            width,
+            &title,
+            &cover,
+            selected,
+            self.card_mine(&s(item, "submitted_by")),
+            |app, ui| {
+                let intro = s(item, "intro");
+                if !intro.is_empty() {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(intro).small().weak()).truncate(),
+                    );
+                }
+                let pages = showroom_pages(item).len() as i64;
+                if !app.org_online() && !app.sr_bundle_cached(&id) {
+                    // Offline with no complete local bundle (T3
+                    // ruling): the tag row carries the status
+                    // instead of the action row — every action
+                    // here would land on an empty deck or a
+                    // failed request. The cover and title stay
+                    // as they are.
+                    card_tag_row(ui, Some(pages), |ui| {
+                        chip(
+                            ui,
+                            "离线不可用",
+                            palette_color(CHIP_ORANGE_FG),
+                            CHIP_ORANGE_BG,
+                        );
+                    });
+                    return;
+                }
+                card_tag_row(ui, Some(pages), |_| {});
+                ui.horizontal_wrapped(|ui| {
                 if ui.small_button("打开详情").clicked() {
                     app.open_showroom_deck(item);
                 }
@@ -19239,6 +19410,96 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// Cover for a library （收藏） row whose item is no longer
+    /// in `showroom_live` (delisted items stay in the library):
+    /// the live lookup first, then the item's own cached bundle
+    /// (its first block's version renders through the ordinary
+    /// thumb machinery, offline included), then a local
+    /// showroom row of the same id (locally submitted items
+    /// never enter `showroom_live`). Empty only when no source
+    /// exists at all.
+    fn library_cover(&self, item_id: &str) -> String {
+        let cover = self.showroom_cover(item_id);
+        if !cover.is_empty() {
+            return cover;
+        }
+        let key = format!("sr_{item_id}");
+        if let Some(e) = self.cache_entries.iter().find(|e| s(e, "key") == key) {
+            if let Some(vid) = e
+                .get("blocks")
+                .and_then(|b| b.as_array())
+                .and_then(|a| a.first())
+                .map(|b| s(b, "version_id"))
+                .filter(|v| !v.is_empty())
+            {
+                return vid;
+            }
+            let cover = self
+                .index_covers
+                .get(&s(e, "source_index_id"))
+                .cloned()
+                .unwrap_or_default();
+            if !cover.is_empty() {
+                return cover;
+            }
+        }
+        if let Some(e) = self.local_showroom.iter().find(|e| s(e, "id") == item_id) {
+            let cover = e["resolved_entries"]
+                .as_array()
+                .and_then(|a| a.first())
+                .map(|en| s(&en["resolved"], "id"))
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| {
+                    self.index_covers
+                        .get(&s(e, "source_index_id"))
+                        .cloned()
+                        .unwrap_or_default()
+                });
+            if !cover.is_empty() {
+                return cover;
+            }
+        }
+        String::new()
+    }
+
+    /// Cover for one offline-cache row, by the row's own keys:
+    /// a bundle row leads with its first block's version (the
+    /// thumb machinery renders cached fragments in-process);
+    /// then the source index's cover; a plain showroom snapshot
+    /// falls back to the live item's cover; a plain assembly
+    /// snapshot falls back to the assembly's own cover (the
+    /// `cover` field of the assemblies list).
+    fn cache_cover(&self, e: &Value) -> String {
+        if let Some(vid) = e
+            .get("blocks")
+            .and_then(|b| b.as_array())
+            .and_then(|a| a.first())
+            .map(|b| s(b, "version_id"))
+            .filter(|v| !v.is_empty())
+        {
+            return vid;
+        }
+        let cover = self
+            .index_covers
+            .get(&s(e, "source_index_id"))
+            .cloned()
+            .unwrap_or_default();
+        if !cover.is_empty() {
+            return cover;
+        }
+        let key = s(e, "key");
+        if let Some(item_id) = key.strip_prefix("sr_") {
+            let cover = self.showroom_cover(item_id);
+            if !cover.is_empty() {
+                return cover;
+            }
+        }
+        if let Some(a) = self.my_assemblies.iter().find(|a| s(a, "id") == key) {
+            return s(a, "cover");
+        }
+        String::new()
+    }
+
     fn showroom_cards(
         &mut self,
         ui: &mut egui::Ui,
@@ -19268,22 +19529,45 @@ impl App {
         title: &str,
         cover: &str,
         selected: bool,
+        variant: CardVariant,
         body: impl FnOnce(&mut Self, &mut egui::Ui),
     ) -> egui::Rect {
         self.wall_card(
             ui,
             WallCard {
                 width,
-                min_height: 0.0,
+                // The unified card height (user ruling
+                // 2026-11-28): cover + the one body height,
+                // shared with the content wall and the index
+                // overview. This forwarder used to pin the
+                // height to 0 and swallow the variant; both
+                // now carry the caller's real values.
+                min_height: width * 9.0 / 16.0 + CARD_BODY_H,
                 title,
                 cover,
                 selected,
                 scope: None,
-                variant: CardVariant::Normal,
+                variant,
             },
             body,
         )
         .inner
+    }
+
+    /// The unified card's Mine test, the same one the content
+    /// wall and the index overview apply: the card is maintained
+    /// by the signed-in user (display-name match).
+    fn card_mine(&self, maintainer: &str) -> CardVariant {
+        let my_name = self
+            .user
+            .as_ref()
+            .map(|u| s(u, "display_name"))
+            .unwrap_or_default();
+        if !my_name.is_empty() && maintainer == my_name {
+            CardVariant::Mine
+        } else {
+            CardVariant::Normal
+        }
     }
 
     fn wall_card(
@@ -19954,7 +20238,10 @@ impl App {
                     // (act_import_ppt is wired there).
                 });
             } // pick.is_none() toolbar block
-            ui.add_space(12.0);
+            // No spacer under the (usually empty) toolbar row
+            // (top-height unification, user ruling 2026-11-28):
+            // the first folder head follows the frame's 20pt
+            // top directly, the prototype's mod-band position.
             if let Some(hits) = w.search_hits.clone() {
                 ui.label(egui::RichText::new("搜索结果").strong());
                 if let Some(arr) = hits.get("hits").and_then(|h| h.as_array()) {
@@ -19990,7 +20277,7 @@ impl App {
                     let per_row = ((avail + 12.0) / 232.0).floor().max(1.0);
                     let card_w = (avail + 12.0) / per_row - 12.0;
                     let cover_h = card_w * 9.0 / 16.0;
-                    let card_h = cover_h + 89.0;
+                    let card_h = cover_h + CARD_BODY_H;
                     // Folder flow (user ruling 2026-11-24): the wall
                     // does NOT filter to the sidebar's folder any
                     // more. Every folder renders as one continuous
@@ -26063,7 +26350,11 @@ impl App {
         action: &mut Option<IndexDetailAction>,
     ) -> Option<String> {
         let filter = self.index.overview_folder.clone();
-        ui.add_space(2.0);
+        // No leading spacers (top-height unification, user
+        // ruling 2026-11-28): the overview's first section head
+        // follows the frame top directly — the two add_spaces
+        // that stood here ate the ix frame's tightened 12pt
+        // top and then some.
         if self.deep_source == Some(Page::Home) {
             ui.horizontal(|ui| {
                 if text_action(ui, "‹ 返回主页", palette_color(ACCENT_DEEP), 13.0) {
@@ -26073,7 +26364,6 @@ impl App {
             });
             ui.add_space(6.0);
         }
-        ui.add_space(8.0);
         if self.index.overview_controls.relationships {
             let items: Vec<Value> = self
                 .indexes
@@ -26124,7 +26414,7 @@ impl App {
             let outer_width = ((avail + 12.0) / per_row - 12.0).floor().max(3.0);
             let card_w = outer_width - 2.0;
             let cover_h = card_w * 9.0 / 16.0;
-            let card_h = cover_h + 74.0;
+            let card_h = cover_h + CARD_BODY_H;
             for (idx_sec, sec) in sections.into_iter().enumerate() {
                 if idx_sec > 0 {
                     ui.add_space(6.0);
@@ -26546,7 +26836,9 @@ impl App {
         if edit_commit && self.idx_edit_commit(st) {
             *action = Some(IndexDetailAction::Reload);
         }
-        ui.add_space(8.0);
+        // (The backbar's trailing spacers are merged into the
+        // single add_space(10) below — top-height unification,
+        // user ruling 2026-11-28.)
 
         // (Removed 2026-11-27, prototype-render audit: the
         // coordbar, the lineagebar and the secondary action bar
@@ -26575,18 +26867,55 @@ impl App {
                 st.confirm_remove_entry = None;
             }
         }
-        let insert_bar = |ui: &mut egui::Ui,
-                          at: usize,
-                          action: &mut Option<IndexDetailAction>|
-         -> egui::Rect {
-            ui.vertical_centered(|ui| {
-                if text_action(ui, "＋ 插入条目", palette_color(TEXT_WEAK), 13.0) {
+        // Insert affordance (top-height unification, user
+        // ruling 2026-11-28): in the prototype this is a 26px
+        // inline element inside the grid — it shares the row,
+        // it is not a row of its own. Here it is a slim strip:
+        // 6pt of layout height carrying a painted hairline +
+        // plus, with the click area widened into the card gap
+        // around it (the neighbouring cards are laid out after
+        // it and win the few overlapping points at their own
+        // edges). As a full text row it pushed the first card
+        // ~21pt below the prototype's first-card line.
+        let insert_bar =
+            |ui: &mut egui::Ui, at: usize, action: &mut Option<IndexDetailAction>| -> egui::Rect {
+                let width = ui.available_width();
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(width, 6.0), egui::Sense::hover());
+                let hit = egui::Rect::from_center_size(rect.center(), egui::vec2(200.0, 16.0));
+                let resp = ui.interact(
+                    hit,
+                    ui.scope_id().with(("insert_bar", at)),
+                    egui::Sense::click(),
+                );
+                let color = if resp.hovered() {
+                    ACCENT
+                } else {
+                    palette_color(TEXT_WEAK)
+                };
+                let cy = rect.center().y;
+                let cx = rect.center().x;
+                ui.painter().hline(
+                    egui::Rangef::new(cx - 70.0, cx + 70.0),
+                    cy,
+                    egui::Stroke::new(1.0, color),
+                );
+                ui.painter().rect_filled(
+                    egui::Rect::from_center_size(egui::pos2(cx, cy), egui::vec2(7.0, 1.5)),
+                    0.0,
+                    color,
+                );
+                ui.painter().rect_filled(
+                    egui::Rect::from_center_size(egui::pos2(cx, cy), egui::vec2(1.5, 7.0)),
+                    0.0,
+                    color,
+                );
+                if resp.clicked() {
                     *action = Some(IndexDetailAction::Insert(at));
                 }
-            })
-            .response
-            .rect
-        };
+                resp.on_hover_text("插入条目");
+                rect
+            };
         // Card rects of this frame (display order) and every
         // content rect (cards + insert bars): the drag and
         // blank-click resolution after the loop reads them, the
