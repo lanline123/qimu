@@ -39,10 +39,41 @@ impl Page {
     }
 }
 
+/// One resolved page identity (see App::page_identity): the
+/// number the chip shows, the page name its hover reads, and
+/// the path chain the menu row prints. `no` is None for the
+/// client-only pages the user has not numbered — those show
+/// their name alone until he rules otherwise (provisional
+/// default, phase 1).
+pub(super) struct PageIdentity {
+    pub(super) no: Option<String>,
+    pub(super) name: String,
+    pub(super) path: Vec<String>,
+}
+
+impl PageIdentity {
+    fn new(no: Option<&str>, name: String, path: Vec<String>) -> Self {
+        Self {
+            no: no.map(str::to_owned),
+            name,
+            path,
+        }
+    }
+
+    /// A dialog or client-only window takes the chip over by
+    /// name alone: the number falls away, the path stays the
+    /// underlying page's.
+    fn name_only(&mut self, name: &str) {
+        self.no = None;
+        self.name = name.to_string();
+    }
+}
+
 impl App {
     pub(super) fn workspace_ui(&mut self, ui: &mut egui::Ui) {
         self.shell_chrome(ui);
         self.shell_sidebar(ui);
+        self.shell_content_head(ui);
         self.page_footer(ui);
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(palette_color(APP_BG)))
@@ -346,6 +377,12 @@ impl App {
         // closed by a 1px --line (drawn by hand — the panels' own
         // separator lines stay off).
         // ====
+        // The frame's one page-identity resolution: the menu-row
+        // path text below reads from it, and so does the
+        // content-head page chip (page_identity is the client's
+        // single resolver — no site computes its own page
+        // number or name).
+        let crumb_path = self.page_identity().path.join(" · ");
         // Row 1 — menu bar (.menubar-row): the text menus on the
         // left; on the right, the session cluster in the
         // prototype's slots — the server and account as quiet
@@ -439,6 +476,22 @@ impl App {
                         {
                             self.apply_public();
                         }
+                        // Page path text (prototype #crumbView):
+                        // in the prototype it rides the title bar
+                        // after the brand ("启幕 · 索引总览 ·
+                        // 公司介绍 · 编辑"); the client dropped
+                        // the in-app title bar (ruling 2026-11-24),
+                        // so it is transposed into the menu row,
+                        // after the menus — the menus keep their
+                        // seats no matter how long the path gets.
+                        // Display only this phase (clickable path
+                        // is a phase-2 question).
+                        ui.add_space(10.0);
+                        ui.label(
+                            egui::RichText::new(format!("启幕 · {crumb_path}"))
+                                .size(12.0)
+                                .color(palette_color(TEXT_WEAK)),
+                        );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             self.workspace_preferences(ui);
                             ui.add_space(6.0);
@@ -1711,6 +1764,339 @@ impl App {
                 .any(|overlay| matches!(overlay, Overlay::Light(_)))
     }
 
+    /// Content-column header strip: the resident seat of the
+    /// page-number chip (user ruling 2026-11-27: at the left of
+    /// the right content area — NOT the prototype's bottom-bar
+    /// left end, which would sit under the sidebar here). One
+    /// seat for every page, added after the sidebar panel so it
+    /// spans only the content column. The chip's number and
+    /// name come from page_identity(), the single resolver.
+    fn shell_content_head(&mut self, ui: &mut egui::Ui) {
+        let identity = self.page_identity();
+        egui::Panel::top("content_head")
+            .exact_size(30.0)
+            .frame(
+                egui::Frame::NONE
+                    .fill(palette_color(PANEL_BG))
+                    .inner_margin(egui::Margin::symmetric(10, 0)),
+            )
+            .show_separator_line(false)
+            .show(ui, |ui| {
+                ui.horizontal_centered(|ui| {
+                    // Prototype #pageIdChip form: a quiet badge
+                    // reading "#N"; pages the user has not
+                    // numbered (client-only pages, provisional
+                    // default) read their page name instead.
+                    let text = match &identity.no {
+                        Some(no) => format!("#{no}"),
+                        None => identity.name.clone(),
+                    };
+                    let font = egui::FontId::proportional(11.5);
+                    let galley = ui.painter().layout_no_wrap(
+                        text.clone(),
+                        font.clone(),
+                        palette_color(TEXT_WEAK),
+                    );
+                    let (badge, resp) = ui.allocate_exact_size(
+                        egui::vec2(galley.size().x + 16.0, 26.0),
+                        egui::Sense::hover(),
+                    );
+                    ui.painter().rect(
+                        badge,
+                        6.0,
+                        palette_color(HOVER_BG),
+                        egui::Stroke::new(1.0, palette_color(FIELD_BORDER)),
+                        egui::StrokeKind::Inside,
+                    );
+                    ui.painter().text(
+                        badge.center(),
+                        egui::Align2::CENTER_CENTER,
+                        text,
+                        font,
+                        palette_color(TEXT_WEAK),
+                    );
+                    match &identity.no {
+                        Some(no) => {
+                            resp.on_hover_text(format!("当前页面编号 {no} · {}", identity.name))
+                        }
+                        None => resp.on_hover_text(format!("当前页 · {}", identity.name)),
+                    };
+                });
+                let r = ui.max_rect();
+                ui.painter().hline(
+                    r.x_range(),
+                    r.max.y - 0.5,
+                    egui::Stroke::new(1.0, palette_color(SEPARATOR)),
+                );
+            });
+    }
+
+    /// The client's single page-identity resolution (page
+    /// identity layer, phase 1): the current page + frame stack
+    /// + key state in, (page number, page name, path chain) out.
+    /// The content-head chip and the menu-row path text both
+    /// read from here; nothing else in the client computes a
+    /// page number or name of its own.
+    ///
+    /// Numbering follows the prototype's map (orient audit
+    /// §三): top pages 1–9, content blocks 101+ by wall order,
+    /// showroom decks unified per page kind (detail #211, notes
+    /// #212 — same page, same number, whatever deck is open),
+    /// full-page overlays 401+. Two user rulings override the
+    /// prototype: the index detail is split off the overview as
+    /// #7c–#7g by its five views (2026-11-27; the prototype
+    /// keeps both at #7 and leans on the path text), and the
+    /// chip's seat moved (see shell_content_head).
+    pub(super) fn page_identity(&self) -> PageIdentity {
+        let mut id = self.page_frame_identity();
+        // Full-page overlays and dialogs resolve first
+        // (prototype currentPageNo order: dialog stack → drill
+        // stack → top page). The small modal dialogs carry no
+        // number of their own in the prototype map — they take
+        // the chip over by name only (provisional).
+        if let Some(top) = self.overlays.last() {
+            match top {
+                Overlay::Light(_) => {
+                    id.no = Some("406".to_string());
+                    id.name = "大图预览".to_string();
+                    id.path.push("大图预览".to_string());
+                }
+                Overlay::PageEdit(_) => {
+                    id.no = Some("407".to_string());
+                    id.name = "编辑这一页".to_string();
+                    id.path.push("编辑这一页".to_string());
+                }
+                Overlay::Present(st) => {
+                    let view = if st.speaker {
+                        "演讲者视图"
+                    } else {
+                        "放映页"
+                    };
+                    id.no = Some(if st.speaker { "214" } else { "213" }.to_string());
+                    id.name = format!("演示厅 · {} · {view}", st.title);
+                    id.path.push(view.to_string());
+                }
+                Overlay::AllVersions { .. } => id.name_only("全部历史版本"),
+                Overlay::PickTemplate(_) => id.name_only("从模板新建"),
+                Overlay::DeckInfo(_) => id.name_only("演示稿信息"),
+                Overlay::InsertOrder(_) => id.name_only("调整插入顺序"),
+                Overlay::DraftPublish(_) => id.name_only("发布草稿"),
+                Overlay::Confirm(st) => id.name_only(&st.title),
+            }
+        } else if self.workspace_controls.search_open {
+            // The search-results window floats above the page;
+            // a client-only window, so it takes the chip by
+            // name only and the path stays the page's own.
+            id.name_only("搜索结果");
+        }
+        id
+    }
+
+    /// Identity of the frame the user is actually looking at,
+    /// before the overlay layer has its say.
+    fn page_frame_identity(&self) -> PageIdentity {
+        match self.page {
+            Page::Home => PageIdentity::new(Some("1"), "主页".into(), vec!["主页".into()]),
+            Page::Showroom => match self.showroom.stack.top() {
+                SrFrame::Present(st) => {
+                    let title = s(&st.item, "title");
+                    PageIdentity::new(
+                        Some("212"),
+                        format!("演示厅 · {title} · 讲稿视图"),
+                        vec!["演示厅".into(), title, "讲稿视图".into()],
+                    )
+                }
+                SrFrame::Deck(st) => {
+                    let title = s(&st.item, "title");
+                    let mut path =
+                        vec!["演示厅".to_string(), title.clone(), "稿件详情".to_string()];
+                    if st.preview_open {
+                        path.push("单页预览".to_string());
+                    }
+                    PageIdentity::new(Some("211"), format!("演示厅 · {title} · 详情页"), path)
+                }
+                SrFrame::Wall => {
+                    let (no, zone) = match self.showroom.zone.as_str() {
+                        "library" => ("3", "我的"),
+                        "inbox" => ("4", "分享"),
+                        "groups" => ("5", "群组"),
+                        _ => ("2", "公共"),
+                    };
+                    PageIdentity::new(
+                        Some(no),
+                        format!("演示厅 · {zone}"),
+                        vec!["演示厅".into(), zone.into()],
+                    )
+                }
+            },
+            Page::Content => {
+                let units: Vec<&UnitState> = self
+                    .content
+                    .stack
+                    .frames
+                    .iter()
+                    .filter_map(|f| match f {
+                        ContentFrame::Unit(st) => Some(st),
+                        ContentFrame::Wall(_) => None,
+                    })
+                    .collect();
+                if let Some(top) = units.last() {
+                    let top_name = self.unit_frame_name(top);
+                    let name = if units.len() > 1 {
+                        let parent = self.unit_frame_name(units[units.len() - 2]);
+                        format!("子块 · {top_name}（属「{parent}」） · 下钻页")
+                    } else {
+                        format!("内容块 · {top_name} · 下钻页")
+                    };
+                    let mut path = vec!["页面".to_string()];
+                    path.extend(units.iter().map(|st| self.unit_frame_name(st)));
+                    PageIdentity::new(Some(&self.unit_page_no(&top.unit_id)), name, path)
+                } else if self.content.cache_open {
+                    PageIdentity::new(
+                        Some("6b"),
+                        "本地缓存".into(),
+                        vec!["页面".into(), "本地缓存".into()],
+                    )
+                } else {
+                    PageIdentity::new(Some("6"), "页面 · 目录".into(), vec!["页面".into()])
+                }
+            }
+            Page::Index => match self.index.stack.top() {
+                IndexFrame::Detail(st) => {
+                    // User ruling 2026-11-27: the detail is NOT
+                    // the overview's #7 — it splits by view along
+                    // the figcraft census word list (#7c–#7g).
+                    let (no, view) = match st.view {
+                        IndexDetailView::Wall => ("7c", "条目图墙"),
+                        IndexDetailView::Commits => ("7d", "提交图"),
+                        IndexDetailView::Versions => ("7e", "历史版本"),
+                        IndexDetailView::Exports => ("7f", "导出记录"),
+                        IndexDetailView::Lineage => ("7g", "派生关系"),
+                    };
+                    let mut iname = s(&st.detail["index"], "name");
+                    if iname.is_empty() {
+                        iname = self
+                            .indexes
+                            .iter()
+                            .find(|x| s(x, "id") == st.index_id)
+                            .map(|x| s(x, "name"))
+                            .unwrap_or_else(|| st.index_id.clone());
+                    }
+                    PageIdentity::new(
+                        Some(no),
+                        format!("索引页 · {iname} · {view}"),
+                        vec!["索引总览".into(), iname, view.into()],
+                    )
+                }
+                IndexFrame::Create(_) => PageIdentity::new(
+                    None,
+                    "新建索引".into(),
+                    vec!["索引总览".into(), "新建索引".into()],
+                ),
+                IndexFrame::Overview(_) => {
+                    if self.index.overview_controls.relationships {
+                        PageIdentity::new(
+                            Some("7b"),
+                            "索引页 · 派生关系".into(),
+                            vec!["索引总览".into(), "派生关系".into()],
+                        )
+                    } else {
+                        PageIdentity::new(Some("7"), "索引页".into(), vec!["索引总览".into()])
+                    }
+                }
+            },
+            Page::Trash => match self.trash.stack.top() {
+                TrashFrame::Preview(st) => PageIdentity::new(
+                    None,
+                    "回收站预览".into(),
+                    vec!["回收站".into(), st.title.clone()],
+                ),
+                TrashFrame::List(_) => {
+                    PageIdentity::new(Some("9"), "回收站".into(), vec!["回收站".into()])
+                }
+            },
+            Page::Settings => {
+                let sections = self.settings_sections();
+                let section = sections
+                    .get(self.settings.section)
+                    .copied()
+                    .unwrap_or_default();
+                if section == "审批队列" {
+                    match self.review.stack.top() {
+                        ReviewFrame::Detail(d) => {
+                            let title = self
+                                .find_showroom_item(&d.item_id)
+                                .map(|it| s(&it, "title"))
+                                .filter(|t| !t.is_empty())
+                                .unwrap_or_else(|| d.item_id.clone());
+                            PageIdentity::new(
+                                None,
+                                "审批详情".into(),
+                                vec!["设置".into(), "审批队列".into(), title],
+                            )
+                        }
+                        ReviewFrame::Submission(st) => {
+                            let sub = st
+                                .manifest
+                                .as_ref()
+                                .map(|m| m["submission"].clone())
+                                .unwrap_or(Value::Null);
+                            let mut title = s(&sub, "title");
+                            if title.is_empty() {
+                                title = st.sub_id.clone();
+                            }
+                            PageIdentity::new(
+                                None,
+                                "投稿查看".into(),
+                                vec!["设置".into(), "审批队列".into(), title],
+                            )
+                        }
+                        ReviewFrame::Queue(_) => PageIdentity::new(
+                            Some("8"),
+                            "设置".into(),
+                            vec!["设置".into(), "审批队列".into()],
+                        ),
+                    }
+                } else {
+                    PageIdentity::new(
+                        Some("8"),
+                        "设置".into(),
+                        vec!["设置".into(), section.into()],
+                    )
+                }
+            }
+            Page::Messages => {
+                PageIdentity::new(None, "消息中心".into(), vec!["消息中心".into()])
+            }
+        }
+    }
+
+    /// A drilled block's display name, from its own frame
+    /// payload (the units cache is only the fallback — a deep
+    /// jump can open a block the wall list never loaded).
+    fn unit_frame_name(&self, st: &UnitState) -> String {
+        let name = s(&st.detail["unit"], "name");
+        if !name.is_empty() {
+            return name;
+        }
+        self.unit_name(&st.unit_id)
+    }
+
+    /// A drilled block's page number: 101 + its position in
+    /// the wall's unit list — the prototype numbers blocks by
+    /// their flattened wall order the same way. A block the
+    /// list does not hold (deep jump before the wall loaded)
+    /// takes the prototype's own unnumbered-drill fallback,
+    /// #199.
+    fn unit_page_no(&self, unit_id: &str) -> String {
+        for (pos, item) in self.units.iter().enumerate() {
+            if s(&item["unit"], "id") == unit_id {
+                return (101 + pos).to_string();
+            }
+        }
+        "199".to_string()
+    }
+
     /// sdClose's label for the current state (prototype
     /// updateBarAvail): None on the home page, where the button
     /// greys out entirely.
@@ -2491,45 +2877,15 @@ impl App {
                 );
                 ui.horizontal_centered(|ui| {
                     ui.add_space(22.0);
-                    let pid = match self.page {
-                        Page::Home => "#1",
-                        Page::Showroom => match self.showroom.zone.as_str() {
-                            "library" => "#3",
-                            "inbox" => "#4",
-                            "groups" => "#5",
-                            _ => "#2",
-                        },
-                        Page::Content => {
-                            if self.content_light_open() {
-                                "#406"
-                            } else {
-                                match self.content.stack.top() {
-                                    ContentFrame::Unit(_) => "#101",
-                                    ContentFrame::Wall(_) => "#6",
-                                }
-                            }
-                        }
-                        Page::Index => "#7",
-                        Page::Settings => "#8",
-                        Page::Trash => "#9",
-                        Page::Messages => "#10",
-                    };
-                    let (badge, _) =
-                        ui.allocate_exact_size(egui::vec2(34.0, 26.0), egui::Sense::hover());
-                    ui.painter().rect(
-                        badge,
-                        6.0,
-                        palette_color(HOVER_BG),
-                        egui::Stroke::new(1.0, palette_color(FIELD_BORDER)),
-                        egui::StrokeKind::Inside,
-                    );
-                    ui.painter().text(
-                        badge.center(),
-                        egui::Align2::CENTER_CENTER,
-                        pid,
-                        egui::FontId::proportional(11.5),
-                        palette_color(TEXT_WEAK),
-                    );
+                    // The page-number chip sat here, at the
+                    // bottom bar's left end, until the
+                    // 2026-11-27 ruling moved it to the content
+                    // column's header strip (shell_content_head)
+                    // and gave the numbers to the single
+                    // resolver (page_identity). The coarse
+                    // per-page match that fed it is gone with
+                    // it — the deck bar itself keeps only the
+                    // clipboard chip and the action group.
                     // PPT clipboard chip (prototype #deckBar's
                     // left-side tray chip): shown only while the
                     // clipboard holds pages; the text is the
