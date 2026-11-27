@@ -9384,6 +9384,7 @@ impl App {
             at,
             selected,
             replace,
+            index_name: _,
         }) = self.pick.clone()
         else {
             return;

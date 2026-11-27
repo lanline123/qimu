@@ -101,7 +101,7 @@ struct WorkspaceMessage {
 pub(super) struct WorkspaceControls {
     search_text: String,
     focus_search: bool,
-    search_open: bool,
+    pub(super) search_open: bool,
     search_hits: Vec<(String, SearchTarget)>,
     search_error: Option<String>,
     messages: VecDeque<WorkspaceMessage>,
