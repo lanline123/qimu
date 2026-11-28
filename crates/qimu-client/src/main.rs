@@ -2101,13 +2101,12 @@ struct IndexDetailState {
     entry_sel: Vec<usize>,
     /// Long-press drag state for entry reorder (client-wide
     /// card drag convention: 400 ms hold arms, insertion seam,
-    /// Esc cancels). `entry_press` is the un-armed candidate
-    /// (position, start time, press origin); `entry_drag` the
-    /// armed moving set (sorted positions); `entry_drop` the
-    /// insertion index in original indexing;
+    /// Esc cancels). `entry_press` is the un-armed candidate;
+    /// `entry_drag` the armed moving set (sorted positions);
+    /// `entry_drop` the insertion index in original indexing;
     /// `entry_suppress_click` keeps the release that ends a
     /// drag from also landing as a click selection.
-    entry_press: Option<(usize, f64, egui::Pos2)>,
+    entry_press: Option<EntryPress>,
     entry_drag: Option<Vec<usize>>,
     entry_drop: usize,
     entry_suppress_click: bool,
@@ -4668,11 +4667,21 @@ struct InsertOrderCard {
 }
 
 #[derive(Clone)]
+struct InsertOrderPress {
+    id: u64,
+    pos: usize,
+    title: String,
+    gate: LongPressGate,
+    grab: egui::Vec2,
+    size: egui::Vec2,
+}
+
+#[derive(Clone)]
 struct InsertOrderState {
     cards: Vec<InsertOrderCard>,
-    selected: Option<u64>,
-    clipboard: Vec<InsertPick>,
-    next_id: u64,
+    press: Option<InsertOrderPress>,
+    drag: Option<u64>,
+    drop: usize,
 }
 
 impl InsertOrderState {
@@ -4685,57 +4694,12 @@ impl InsertOrderState {
                 pick,
             })
             .collect();
-        let next_id = cards.len() as u64;
         Self {
             cards,
-            selected: None,
-            clipboard: Vec::new(),
-            next_id,
+            press: None,
+            drag: None,
+            drop: 0,
         }
-    }
-
-    fn selected_pick(&self) -> Option<&InsertPick> {
-        self.cards
-            .iter()
-            .find(|card| Some(card.id) == self.selected)
-            .map(|card| &card.pick)
-    }
-
-    fn copy(&mut self) {
-        if let Some(pick) = self.selected_pick().cloned() {
-            self.clipboard = vec![pick];
-        }
-    }
-
-    fn cut(&mut self) {
-        let Some(id) = self.selected else {
-            return;
-        };
-        if let Some(pos) = self.cards.iter().position(|card| card.id == id) {
-            self.clipboard = vec![self.cards.remove(pos).pick];
-            self.selected = None;
-        }
-    }
-
-    fn paste(&mut self) {
-        if self.clipboard.is_empty() {
-            return;
-        }
-        let at = self
-            .selected
-            .and_then(|id| self.cards.iter().position(|card| card.id == id))
-            .map_or(self.cards.len(), |pos| pos + 1);
-        let picks = self.clipboard.clone();
-        let mut at = at;
-        let mut first = None;
-        for pick in picks {
-            let id = self.next_id;
-            self.next_id += 1;
-            first.get_or_insert(id);
-            self.cards.insert(at, InsertOrderCard { id, pick });
-            at += 1;
-        }
-        self.selected = first;
     }
 
     fn move_card(&mut self, dragged: u64, before: usize) {
@@ -4745,16 +4709,12 @@ impl InsertOrderState {
         let card = self.cards.remove(from);
         let to = if from < before { before - 1 } else { before };
         self.cards.insert(to.min(self.cards.len()), card);
-        self.selected = Some(dragged);
     }
 
     fn picks(&self) -> Vec<InsertPick> {
         self.cards.iter().map(|card| card.pick.clone()).collect()
     }
 }
-
-#[derive(Clone)]
-struct InsertOrderDrag(u64);
 
 fn toggle_insert_pick(selected: &mut Vec<InsertPick>, pick: InsertPick) {
     if selected.iter().any(|item| item.unit_id == pick.unit_id) {
@@ -4807,11 +4767,18 @@ struct CardDrag {
 struct CardPress {
     ids: Vec<String>,
     title: String,
-    since: f64,
-    origin: egui::Pos2,
+    gate: LongPressGate,
     grab: egui::Vec2,
     size: egui::Vec2,
-    armed: bool,
+}
+
+#[derive(Clone)]
+struct EntryPress {
+    pos: usize,
+    title: String,
+    gate: LongPressGate,
+    grab: egui::Vec2,
+    size: egui::Vec2,
 }
 
 /// A finished folder delete, posted by its worker thread:
@@ -4834,19 +4801,144 @@ const FOLDER_LONG_PRESS_SECS: f64 = 0.4;
 /// cancelled, so the sidebar keeps scrolling exactly as before.
 const FOLDER_PRESS_MOVE_TOLERANCE: f32 = 10.0;
 
+#[derive(Clone, Copy)]
+struct LongPressGate {
+    since: f64,
+    origin: egui::Pos2,
+    armed: bool,
+}
+
+enum LongPressStep {
+    Keep,
+    Cancel,
+    Arm,
+}
+
+impl LongPressGate {
+    fn start(now: f64, origin: egui::Pos2) -> Self {
+        Self {
+            since: now,
+            origin,
+            armed: false,
+        }
+    }
+
+    fn update(&mut self, ctx: &egui::Context) -> LongPressStep {
+        if self.armed {
+            return LongPressStep::Keep;
+        }
+        let (down, pos, now) = ctx.input(|i| {
+            (
+                i.pointer.primary_down(),
+                i.pointer.interact_pos().or_else(|| i.pointer.hover_pos()),
+                i.time,
+            )
+        });
+        if !down {
+            return LongPressStep::Cancel;
+        }
+        if pos.is_some_and(|p| p.distance(self.origin) > FOLDER_PRESS_MOVE_TOLERANCE) {
+            return LongPressStep::Cancel;
+        }
+        if now - self.since >= FOLDER_LONG_PRESS_SECS {
+            self.armed = true;
+            LongPressStep::Arm
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(30));
+            LongPressStep::Keep
+        }
+    }
+}
+
 /// One in-progress press on a folder row, tracked by
 /// `App::folder_tree`. Created on the primary-press frame;
-/// `armed` flips when the long-press threshold is reached — only
-/// then is the DragAndDrop payload set and the floating row
+/// `gate.armed` flips when the long-press threshold is reached —
+/// only then is the DragAndDrop payload set and the floating row
 /// painted. Cleared on release, on an early move (scroll), or
 /// when the drag is aborted (Escape clears the payload).
 struct FolderPress {
     id: String,
     name: String,
     depth: usize,
-    since: f64,
-    origin: egui::Pos2,
-    armed: bool,
+    gate: LongPressGate,
+}
+
+fn paint_drag_ghost(ui: &egui::Ui, ghost: egui::Rect, title: &str, count: usize) {
+    let painter = ui.painter();
+    painter.rect_stroke(
+        ghost,
+        6.0,
+        egui::Stroke::new(1.0, palette_color(ACCENT)),
+        egui::StrokeKind::Inside,
+    );
+    let font = egui::FontId::new(12.5, egui::FontFamily::Proportional);
+    let galley = painter.layout_no_wrap(title.to_string(), font.clone(), palette_color(ACCENT));
+    painter.galley(ghost.min + egui::vec2(12.0, 10.0), galley, palette_color(ACCENT));
+    if count > 1 {
+        let galley = painter.layout_no_wrap(
+            format!("共 {count} 张"),
+            font,
+            palette_color(ACCENT),
+        );
+        painter.galley(
+            ghost.min + egui::vec2(12.0, 30.0),
+            galley,
+            palette_color(ACCENT),
+        );
+    }
+}
+
+fn paint_insert_affordance(ui: &egui::Ui, rect: egui::Rect, active: bool) {
+    let color = if active {
+        palette_color(ACCENT)
+    } else {
+        palette_color(TEXT_WEAK)
+    };
+    let line_color = if active {
+        palette_color(ACCENT)
+    } else {
+        palette_color(CARD_BORDER)
+    };
+    let cy = rect.center().y;
+    let cx = rect.center().x;
+    let radius = 11.0;
+    let stroke = egui::Stroke::new(1.0, line_color);
+    ui.painter().line_segment(
+        [
+            egui::pos2(rect.left() + 2.0, cy),
+            egui::pos2(cx - radius - 4.0, cy),
+        ],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [
+            egui::pos2(cx + radius + 4.0, cy),
+            egui::pos2(rect.right() - 2.0, cy),
+        ],
+        stroke,
+    );
+    let button = egui::Rect::from_center_size(egui::pos2(cx, cy), egui::vec2(22.0, 22.0));
+    ui.painter().rect_filled(button, radius, palette_color(PANEL_BG));
+    ui.painter().rect_stroke(
+        button,
+        radius,
+        egui::Stroke::new(1.0, color),
+        egui::StrokeKind::Inside,
+    );
+    ui.painter().line_segment(
+        [
+            egui::pos2(cx - 3.5, cy),
+            egui::pos2(cx + 3.5, cy),
+        ],
+        egui::Stroke::new(1.4, color),
+    );
+    ui.painter().line_segment(
+        [
+            egui::pos2(cx, cy - 3.5),
+            egui::pos2(cx, cy + 3.5),
+        ],
+        egui::Stroke::new(1.4, color),
+    );
 }
 
 // ---------------- server connections (multi-server) -----------------
@@ -17558,10 +17650,7 @@ impl App {
                         ui.add_space(18.0);
                     }
                     // 本地演示: this library's own showroom rows
-                    // (local_showroom, fed by refresh_local). Pure
-                    // local data — every action below works
-                    // offline; only 申请公开 leaves the machine,
-                    // through the existing submission chain.
+                    // (local_showroom, fed by refresh_local).
                     self.showroom_cards(
                         ui,
                         &self.local_showroom.clone(),
@@ -17592,60 +17681,7 @@ impl App {
                                 &cover,
                                 selected,
                                 app.card_mine(&s(e, "submitted_by")),
-                                |app, ui| {
-                                    // Source line: the 本地演示 marker
-                                    // keeps these rows distinct from
-                                    // organization items on the shared
-                                    // 全部 wall; the source index name
-                                    // follows deck_source_label.
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "本地演示 · 来源 {}",
-                                            app.deck_source_label(e)
-                                        ))
-                                        .small()
-                                        .weak(),
-                                    );
-                                    let intro = s(e, "intro");
-                                    if !intro.is_empty() {
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(intro).small().weak(),
-                                            )
-                                            .truncate(),
-                                        );
-                                    }
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "{} · {}",
-                                            s(e, "submitted_by"),
-                                            fmt_time(i(e, "created_ms"))
-                                        ))
-                                        .small()
-                                        .weak(),
-                                    );
-                                    if s(e, "state") == "rejected"
-                                        && !s(e, "review_note").is_empty()
-                                    {
-                                        ui.label(
-                                            egui::RichText::new(format!(
-                                                "驳回理由：{}",
-                                                s(e, "review_note")
-                                            ))
-                                            .small()
-                                            .weak(),
-                                        );
-                                    }
-                                    // The unified tag row: page
-                                    // count + the state chip (the
-                                    // state used to lead the meta
-                                    // line above). The four ruled
-                                    // actions stay on their own row
-                                    // BELOW the tag row — the one
-                                    // sanctioned exception to the
-                                    // three-row form (local
-                                    // showroom is our own addition;
-                                    // its actions are user-ruled).
+                                |_app, ui| {
                                     let pages = showroom_pages(e).len() as i64;
                                     card_tag_row(ui, (pages > 0).then_some(pages), |ui| {
                                         match s(e, "state").as_str() {
@@ -17668,37 +17704,14 @@ impl App {
                                                 CHIP_GREEN_BG,
                                             ),
                                         }
-                                    });
-                                    ui.horizontal_wrapped(|ui| {
-                                    if ui.small_button("打开详情").clicked() {
-                                        app.open_showroom_deck(e);
-                                    }
-                                    if ui.small_button("开始演示").clicked() {
-                                        app.open_showroom_deck(e);
-                                        if !app.present_via_deckcraft(
-                                            &s(e, "id"),
-                                            &s(e, "title"),
-                                            DcMode::Play,
-                                            0,
-                                        ) {
-                                            app.start_present_from_deck(ui);
-                                        }
-                                    }
-                                    let src = s(e, "source_index_id");
-                                    if !src.is_empty()
-                                        && ui.small_button("申请公开").clicked()
-                                    {
-                                        let title = s(e, "title");
-                                        app.open_push_dialog(&src, &title);
-                                    }
-                                    if text_action(
-                                        ui,
-                                        "删除",
-                                        palette_color(BADGE_BAD_FG),
-                                        12.0,
-                                    ) {
-                                        app.trash_add("showroom", &s(e, "id"));
-                                    }
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "演示厅 · {}",
+                                                s(e, "submitted_by")
+                                            ))
+                                            .size(10.5)
+                                            .color(palette_color(TEXT_WEAK)),
+                                        );
                                     });
                                 },
                             );
@@ -17714,8 +17727,35 @@ impl App {
                                 ui.scope_id().with(("library-local", &lid)),
                                 egui::Sense::click(),
                             );
+                            response.context_menu(|ui| {
+                                if ui.button("打开详情").clicked() {
+                                    app.open_showroom_deck(e);
+                                }
+                                if ui.button("开始演示").clicked() {
+                                    app.open_showroom_deck(e);
+                                    if !app.present_via_deckcraft(
+                                        &s(e, "id"),
+                                        &s(e, "title"),
+                                        DcMode::Play,
+                                        0,
+                                    ) {
+                                        app.start_present_from_deck(ui);
+                                    }
+                                }
+                                let src = s(e, "source_index_id");
+                                if !src.is_empty() && ui.button("申请公开").clicked() {
+                                    let title = s(e, "title");
+                                    app.open_push_dialog(&src, &title);
+                                }
+                                if ui.button("删除").clicked() {
+                                    app.trash_add("showroom", &s(e, "id"));
+                                }
+                            });
                             if response.clicked() {
                                 app.showroom.selected_card = Some(lid.clone());
+                            }
+                            if response.double_clicked() {
+                                app.open_showroom_deck(e);
                             }
                         },
                     );
@@ -20157,35 +20197,18 @@ impl App {
             Cancel,
             Arm,
         }
-        let step = match &self.card_press {
+        let step = match &mut self.card_press {
             None => CardPressStep::Keep,
-            Some(press) => {
-                let (down, pos, now) = ui.input(|i| {
-                    (
-                        i.pointer.primary_down(),
-                        i.pointer.interact_pos().or_else(|| i.pointer.hover_pos()),
-                        i.time,
-                    )
-                });
-                if !down || press.armed {
-                    CardPressStep::Keep
-                } else if pos.map_or(false, |p| {
-                    p.distance(press.origin) > FOLDER_PRESS_MOVE_TOLERANCE
-                }) {
-                    // The gesture is a scroll, not a press.
-                    CardPressStep::Cancel
-                } else if now - press.since >= FOLDER_LONG_PRESS_SECS {
-                    CardPressStep::Arm
-                } else {
-                    CardPressStep::Keep
-                }
-            }
+            Some(press) => match press.gate.update(ui.ctx()) {
+                LongPressStep::Keep => CardPressStep::Keep,
+                LongPressStep::Cancel => CardPressStep::Cancel,
+                LongPressStep::Arm => CardPressStep::Arm,
+            },
         };
         match step {
             CardPressStep::Cancel => self.card_press = None,
             CardPressStep::Arm => {
-                if let Some(press) = &mut self.card_press {
-                    press.armed = true;
+                if let Some(press) = &self.card_press {
                     egui::DragAndDrop::set_payload(
                         ui.ctx(),
                         CardDrag {
@@ -20197,7 +20220,7 @@ impl App {
             CardPressStep::Keep => {}
         }
         if let Some(press) = &self.card_press {
-            if press.armed {
+            if press.gate.armed {
                 // Keep the payload warm every frame, the way
                 // dnd_drag_source does for its own drags.
                 egui::DragAndDrop::set_payload(
@@ -20207,13 +20230,11 @@ impl App {
                     },
                 );
             }
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(30));
         }
         // Escape aborts a drag at the plugin level (the payload
         // is cleared at pass start): mirror that in the press
         // state so the ghost disappears too.
-        if matches!(&self.card_press, Some(p) if p.armed)
+        if matches!(&self.card_press, Some(p) if p.gate.armed)
             && egui::DragAndDrop::payload::<CardDrag>(ui.ctx()).is_none()
             && ui.input(|i| i.pointer.primary_down())
         {
@@ -20763,7 +20784,7 @@ impl App {
         let Some(press) = self.card_press.clone() else {
             return;
         };
-        if !press.armed {
+        if !press.gate.armed {
             return;
         }
         let pos = ui.input(|i| i.pointer.interact_pos().or_else(|| i.pointer.hover_pos()));
@@ -20930,36 +20951,7 @@ impl App {
             .y
             .clamp(clip.top(), (clip.bottom() - press.size.y).max(clip.top()));
         let ghost = egui::Rect::from_min_size(top_left, press.size);
-        let painter = ui.painter();
-        painter.rect_stroke(
-            ghost,
-            6.0,
-            egui::Stroke::new(1.0, palette_color(ACCENT)),
-            egui::StrokeKind::Inside,
-        );
-        let font = egui::FontId::new(12.5, egui::FontFamily::Proportional);
-        let galley = painter.layout_no_wrap(
-            press.title.clone(),
-            font.clone(),
-            palette_color(ACCENT),
-        );
-        painter.galley(
-            ghost.min + egui::vec2(12.0, 10.0),
-            galley,
-            palette_color(ACCENT),
-        );
-        if press.ids.len() > 1 {
-            let galley = painter.layout_no_wrap(
-                format!("共 {} 张", press.ids.len()),
-                font,
-                palette_color(ACCENT),
-            );
-            painter.galley(
-                ghost.min + egui::vec2(12.0, 30.0),
-                galley,
-                palette_color(ACCENT),
-            );
-        }
+        paint_drag_ghost(ui, ghost, &press.title, press.ids.len());
         // Perform the drop on release.
         if ui.input(|i| i.pointer.any_released()) {
             match target {
@@ -21712,7 +21704,7 @@ impl App {
             folder.map(|f| f.to_string()),
             outer.response.rect,
         ));
-        let drag_armed = matches!(&self.card_press, Some(p) if p.armed);
+        let drag_armed = matches!(&self.card_press, Some(p) if p.gate.armed);
         if drag_armed
             && self
                 .card_press
@@ -21793,11 +21785,9 @@ impl App {
                 self.card_press = Some(CardPress {
                     ids,
                     title: title.clone(),
-                    since: now,
-                    origin,
+                    gate: LongPressGate::start(now, origin),
                     grab: origin - outer.response.rect.min,
                     size: outer.response.rect.size(),
-                    armed: false,
                 });
             }
         }
@@ -22370,49 +22360,28 @@ impl App {
             Cancel,
             Arm(String),
         }
-        let step = match &self.folder_press {
+        let step = match &mut self.folder_press {
             None => PressStep::Keep,
-            Some(press) => {
-                let (down, pos, now) = ui.input(|i| {
-                    (
-                        i.pointer.primary_down(),
-                        i.pointer.interact_pos().or_else(|| i.pointer.hover_pos()),
-                        i.time,
-                    )
-                });
-                if !down || press.armed {
-                    PressStep::Keep
-                } else if pos.map_or(false, |p| {
-                    p.distance(press.origin) > FOLDER_PRESS_MOVE_TOLERANCE
-                }) {
-                    // The gesture is a scroll, not a press.
-                    PressStep::Cancel
-                } else if now - press.since >= FOLDER_LONG_PRESS_SECS {
-                    PressStep::Arm(press.id.clone())
-                } else {
-                    PressStep::Keep
-                }
-            }
+            Some(press) => match press.gate.update(ui.ctx()) {
+                LongPressStep::Keep => PressStep::Keep,
+                LongPressStep::Cancel => PressStep::Cancel,
+                LongPressStep::Arm => PressStep::Arm(press.id.clone()),
+            },
         };
         match step {
             PressStep::Cancel => self.folder_press = None,
             PressStep::Arm(id) => {
-                if let Some(press) = &mut self.folder_press {
-                    press.armed = true;
-                }
                 *selected = Some(id.clone());
                 egui::DragAndDrop::set_payload(ui.ctx(), FolderDrag(id));
             }
             PressStep::Keep => {}
         }
         if let Some(press) = &self.folder_press {
-            if press.armed {
+            if press.gate.armed {
                 // Keep the payload warm every frame, the way
                 // dnd_drag_source does for its own drags.
                 egui::DragAndDrop::set_payload(ui.ctx(), FolderDrag(press.id.clone()));
             }
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(30));
         }
         let all_icon = ChromeIcon::Settings;
         let width = ui.available_width();
@@ -22551,7 +22520,7 @@ impl App {
         // Escape aborts a drag at the plugin level (the payload
         // is cleared at pass start): mirror that in the press
         // state so the floating row disappears too.
-        if matches!(&self.folder_press, Some(p) if p.armed)
+        if matches!(&self.folder_press, Some(p) if p.gate.armed)
             && drag_id.is_none()
             && ui.input(|i| i.pointer.primary_down())
         {
@@ -22654,7 +22623,7 @@ impl App {
                     .on_hover_text("来自服务器");
                 }
                 let is_dragged =
-                    matches!(&self.folder_press, Some(p) if p.armed && p.id == fid);
+                    matches!(&self.folder_press, Some(p) if p.gate.armed && p.id == fid);
                 if is_dragged {
                     // The lifted copy is painted after the loop;
                     // the row's own slot stays behind, dimmed.
@@ -22683,9 +22652,7 @@ impl App {
                         id: fid.clone(),
                         name: fname.clone(),
                         depth: d,
-                        since: now,
-                        origin,
-                        armed: false,
+                        gate: LongPressGate::start(now, origin),
                     });
                 }
                 if resp.clicked() {
@@ -22961,7 +22928,7 @@ impl App {
         // name only — so the drop seam and the rows underneath
         // stay visible through it (user report 2026-11-25).
         if let Some(press) = &self.folder_press {
-            if press.armed {
+            if press.gate.armed {
                 let slot = row_rects
                     .iter()
                     .find(|(id, _, _)| *id == press.id)
@@ -22974,7 +22941,7 @@ impl App {
                         .first()
                         .map_or(slot.top(), |(_, _, r)| r.top());
                     let bottom_limit = blank.rect.bottom();
-                    let y = (slot.top() + (pos.y - press.origin.y))
+                    let y = (slot.top() + (pos.y - press.gate.origin.y))
                         .clamp(top_limit, (bottom_limit - slot.height()).max(top_limit));
                     let ghost = egui::Rect::from_min_size(
                         egui::pos2(slot.left(), y),
@@ -23606,78 +23573,46 @@ impl App {
         screen: egui::Rect,
         mut state: InsertOrderState,
     ) -> Option<Overlay> {
-        let copy = ui.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::C));
-        let cut = ui.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::X));
-        let paste = ui.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::V));
-        if copy {
-            state.copy();
-        }
-        if cut {
-            state.cut();
-        }
-        if paste {
-            state.paste();
-        }
-
         let mut open = true;
         let mut confirmed = false;
         let mut close = false;
-        let width = (screen.width() - 48.0).clamp(320.0, 900.0);
-        egui::Window::new("调整插入顺序")
+        let width = (screen.width() - 64.0).clamp(560.0, 1120.0);
+        egui::Window::new("调整顺序")
             .open(&mut open)
             .title_bar(false)
             .frame(dlg_frame())
             .collapsible(false)
-            .resizable(true)
+            .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ui.ctx(), |ui| {
                 ui.set_width(width);
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
-                        ui.set_width(width - 60.0);
+                        ui.set_width(width - 112.0);
                         ui.label(
-                            egui::RichText::new("调整插入顺序")
+                            egui::RichText::new("调整顺序")
                                 .strong()
                                 .size(19.0)
                                 .color(palette_color(TEXT_MAIN)),
                         );
-                        ui.label(
-                            egui::RichText::new("拖拽卡片排序，或先选择一张卡片再剪切、复制、粘贴。")
-                                .size(12.0)
-                                .color(palette_color(TEXT_WEAK)),
-                        );
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                        ui.label(
+                            egui::RichText::new(format!("{} 项", state.cards.len()))
+                                .small()
+                                .color(palette_color(TEXT_WEAK)),
+                        );
                         if dlg_close_x(ui) {
                             close = true;
                         }
                     });
                 });
-                ui.add_space(10.0);
-                let has_selection = state.selected_pick().is_some();
-                ui.horizontal(|ui| {
-                    if btn_default_enabled(ui, has_selection, "剪切").clicked() {
-                        state.cut();
-                    }
-                    if btn_default_enabled(ui, has_selection, "复制").clicked() {
-                        state.copy();
-                    }
-                    if btn_default_enabled(ui, !state.clipboard.is_empty(), "粘贴").clicked() {
-                        state.paste();
-                    }
-                    ui.label(
-                        egui::RichText::new(format!("{} 项", state.cards.len()))
-                            .small()
-                            .color(palette_color(TEXT_WEAK)),
-                    );
-                });
-                ui.add_space(10.0);
+                ui.add_space(12.0);
 
-                let mut select = None;
-                let mut drop = None;
+                let mut card_rects: Vec<(usize, egui::Rect)> = Vec::new();
                 egui::ScrollArea::vertical()
                     .id_salt("insert-order-cards")
-                    .max_height((screen.height() - 220.0).max(220.0))
+                    .max_height((screen.height() - 190.0).max(220.0))
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         if state.cards.is_empty() {
@@ -23689,163 +23624,254 @@ impl App {
                             });
                             return;
                         }
-                        let gap = 12.0;
-                        let card_w = 184.0;
-                        let cols = ((ui.available_width() + gap) / (card_w + gap))
+
+                        let gap = 14.0;
+                        let min_card_w = 210.0;
+                        let cols = ((ui.available_width() + gap) / (min_card_w + gap))
                             .floor()
-                            .clamp(1.0, 4.0) as usize;
-                        let card_w = ((ui.available_width() - gap * (cols - 1) as f32) / cols as f32)
+                            .clamp(1.0, 5.0) as usize;
+                        let card_w = ((ui.available_width() - gap * (cols - 1) as f32)
+                            / cols as f32)
                             .max(120.0);
+                        let mut pos = 0;
                         for row in state.cards.chunks(cols) {
                             ui.horizontal_top(|ui| {
-                                for card in row {
-                                    let selected = Some(card.id) == state.selected;
-                                    let frame = if selected {
-                                        card_frame()
-                                            .inner_margin(8)
-                                            .stroke(egui::Stroke::new(1.0, ACCENT))
+                                for (col, card) in row.iter().enumerate() {
+                                    let card_pos = pos;
+                                    pos += 1;
+                                    let item = self.units.iter().find(|item| {
+                                        s(
+                                            &item.get("unit").cloned().unwrap_or(json!({})),
+                                            "id",
+                                        ) == card.pick.unit_id
+                                    });
+                                    let unit = item
+                                        .map(|item| item.get("unit").cloned().unwrap_or(json!({})))
+                                        .unwrap_or(json!({}));
+                                    let title = s(&unit, "name");
+                                    let title = if title.is_empty() {
+                                        card.pick.unit_id.clone()
                                     } else {
-                                        card_frame().inner_margin(8)
+                                        title
                                     };
-                                    let outer = frame.show(ui, |ui| {
-                                        ui.set_width(card_w - 16.0);
-                                        let item = self
-                                            .units
-                                            .iter()
-                                            .find(|item| {
-                                                s(&item.get("unit").cloned().unwrap_or(json!({})), "id")
-                                                    == card.pick.unit_id
+                                    let maintainer = s(&unit, "maintainer");
+                                    let folder = self.folder_name(
+                                        unit.get("folder_id").and_then(|v| v.as_str()).unwrap_or(""),
+                                    );
+                                    let latest = item
+                                        .and_then(|item| item.get("renditions"))
+                                        .and_then(|r| r.as_array())
+                                        .and_then(|arr| {
+                                            arr.iter().find(|r| {
+                                                s(
+                                                    &r.get("rendition")
+                                                        .cloned()
+                                                        .unwrap_or(json!({})),
+                                                    "id",
+                                                ) == card.pick.rendition_id
                                             })
-                                            .cloned()
-                                            .unwrap_or_default();
-                                        let unit = item.get("unit").cloned().unwrap_or(json!({}));
-                                        let title = s(&unit, "name");
-                                        let title = if title.is_empty() {
-                                            card.pick.unit_id.as_str()
-                                        } else {
-                                            title.as_str()
-                                        };
-                                        let latest = item
-                                            .get("renditions")
-                                            .and_then(|r| r.as_array())
-                                            .and_then(|arr| {
-                                                arr.iter()
-                                                    .find(|r| {
-                                                        s(&r.get("rendition").cloned().unwrap_or(json!({})), "id")
-                                                            == card.pick.rendition_id
-                                                    })
-                                            })
-                                            .and_then(|r| r.get("latest"))
-                                            .cloned()
-                                            .unwrap_or(json!({}));
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "第 {} 项",
-                                                    state.cards.iter().position(|c| c.id == card.id).unwrap_or(0) + 1
-                                                ))
-                                                .strong()
-                                                .size(12.0)
-                                                .color(palette_color(TEXT_MAIN)),
-                                            );
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
+                                        })
+                                        .and_then(|r| r.get("latest"))
+                                        .cloned()
+                                        .unwrap_or(json!({}));
+                                    let variant = self.card_mine(&maintainer);
+                                    let outer = self.wall_card(
+                                        ui,
+                                        WallCard {
+                                            width: card_w,
+                                            min_height: card_w * 9.0 / 16.0 + CARD_BODY_H,
+                                            title: &title,
+                                            cover: &card.pick.version_id,
+                                            selected: true,
+                                            scope: None,
+                                            variant,
+                                        },
+                                        |_, ui| {
+                                            ui.horizontal_wrapped(|ui| {
+                                                if latest.is_object() {
+                                                    chip(
+                                                        ui,
+                                                        &format!("v{}", s(&latest, "semver")),
+                                                        palette_color(ACCENT_DEEP),
+                                                        CHIP_BLUE_BG,
+                                                    );
+                                                    if let Some(tag) =
+                                                        unit_kind_tag(i(&latest, "page_count"))
+                                                    {
+                                                        chip(
+                                                            ui,
+                                                            tag,
+                                                            palette_color(CHIP_GRAY_FG),
+                                                            CHIP_GRAY_BG,
+                                                        );
+                                                    }
                                                     ui.label(
-                                                        egui::RichText::new("拖拽")
+                                                        egui::RichText::new(format!(
+                                                            "{} 页",
+                                                            i(&latest, "page_count")
+                                                        ))
+                                                        .small()
+                                                        .color(palette_color(TEXT_WEAK)),
+                                                    );
+                                                } else {
+                                                    ui.label(
+                                                        egui::RichText::new("暂无版本")
                                                             .small()
                                                             .color(palette_color(TEXT_WEAK)),
                                                     );
-                                                },
-                                            );
-                                        });
-                                        ui.add_space(6.0);
-                                        self.thumb_ui(
-                                            ui,
-                                            &card.pick.version_id,
-                                            0,
-                                            card_w - 16.0,
-                                        );
-                                        ui.add_space(6.0);
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(title).strong().size(13.0),
-                                            )
-                                            .truncate(),
-                                        );
-                                        ui.label(
-                                            egui::RichText::new(format!(
-                                                "v{} · {} 页",
-                                                s(&latest, "semver"),
-                                                i(&latest, "page_count")
-                                            ))
-                                            .small()
-                                            .color(palette_color(TEXT_WEAK)),
-                                        );
-                                        ui.label(
-                                            egui::RichText::new(if selected {
-                                                "已选中"
-                                            } else {
-                                                "单击选择"
-                                            })
-                                            .small()
-                                            .color(if selected {
-                                                ACCENT_DEEP
-                                            } else {
-                                                palette_color(TEXT_FAINT)
-                                            }),
-                                        );
-                                    });
-                                    let rect = outer.response.rect;
-                                    let response = ui.interact(
-                                        rect,
-                                        egui::Id::new(("insert-order-card", card.id)),
-                                        egui::Sense::click_and_drag(),
+                                                }
+                                            });
+                                            ui.horizontal(|ui| {
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "{folder} · {maintainer}"
+                                                    ))
+                                                    .small()
+                                                    .color(palette_color(TEXT_WEAK)),
+                                                );
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(egui::Align::Center),
+                                                    |ui| {
+                                                        chip(
+                                                            ui,
+                                                            &format!("第 {} 项", card_pos + 1),
+                                                            palette_color(CHIP_GREEN_FG),
+                                                            CHIP_GREEN_BG,
+                                                        );
+                                                    },
+                                                );
+                                            });
+                                        },
                                     );
-                                    if response.clicked() {
-                                        select = Some(card.id);
-                                    }
-                                    if response.drag_started() {
-                                        egui::DragAndDrop::set_payload(
-                                            ui.ctx(),
-                                            InsertOrderDrag(card.id),
+                                    let rect = outer.response.rect;
+                                    card_rects.push((card_pos, rect));
+                                    if state.drag == Some(card.id) {
+                                        ui.painter().rect_filled(
+                                            rect,
+                                            6.0,
+                                            palette_color(APP_BG).gamma_multiply(0.55),
                                         );
                                     }
-                                    if response.contains_pointer()
-                                        && egui::DragAndDrop::has_payload_of_type::<InsertOrderDrag>(ui.ctx())
-                                    {
-                                        let before = ui
-                                            .input(|input| input.pointer.hover_pos())
-                                            .is_none_or(|pos| pos.y < rect.center().y);
-                                        let y = if before { rect.min.y } else { rect.max.y };
-                                        ui.painter().line_segment(
-                                            [egui::pos2(rect.min.x, y), egui::pos2(rect.max.x, y)],
-                                            egui::Stroke::new(2.0, ACCENT),
-                                        );
-                                        if let Some(dragged) = egui::DragAndDrop::take_payload::<InsertOrderDrag>(ui.ctx())
-                                        {
-                                            drop = Some((
-                                                dragged.0,
-                                                state.cards
-                                                    .iter()
-                                                    .position(|c| c.id == card.id)
-                                                    .unwrap_or(0)
-                                                    + usize::from(!before),
-                                            ));
-                                        }
+                                    if col + 1 < row.len() {
+                                        ui.add_space(gap);
                                     }
-                                    ui.add_space(gap);
                                 }
                             });
                             ui.add_space(gap);
                         }
+
+                        let now = ui.input(|i| i.time);
+                        let primary_down = ui.input(|i| i.pointer.primary_down());
+                        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            state.drag = None;
+                            state.press = None;
+                        }
+                        if let Some(dragged) = state.drag {
+                            if primary_down {
+                                if let Some(pointer) = ui.input(|i| i.pointer.interact_pos()) {
+                                    state.drop = card_rects
+                                        .iter()
+                                        .map(|(pos, rect)| {
+                                            (
+                                                rect.center().distance_sq(pointer),
+                                                *pos + usize::from(pointer.x > rect.center().x),
+                                            )
+                                        })
+                                        .min_by(|a, b| a.0.total_cmp(&b.0))
+                                        .map(|(_, target)| target)
+                                        .unwrap_or(state.cards.len());
+                                }
+                                let seam = if state.drop < card_rects.len() {
+                                    Some((card_rects[state.drop].1.left() - gap * 0.5, card_rects[state.drop].1))
+                                } else {
+                                    card_rects.last().map(|(_, rect)| (rect.right() + gap * 0.5, *rect))
+                                };
+                                if let Some((x, rect)) = seam {
+                                    ui.painter().line_segment(
+                                        [
+                                            egui::pos2(x, rect.top() + 3.0),
+                                            egui::pos2(x, rect.bottom() - 3.0),
+                                        ],
+                                        egui::Stroke::new(2.0, palette_color(ACCENT)),
+                                    );
+                                }
+                                if let Some(press) = &state.press {
+                                    if let Some(pointer) = ui.input(|i| {
+                                        i.pointer.interact_pos().or_else(|| i.pointer.hover_pos())
+                                    }) {
+                                        let clip = ui.clip_rect();
+                                        let mut top_left = pointer - press.grab;
+                                        top_left.x = top_left.x.clamp(
+                                            clip.left(),
+                                            (clip.right() - press.size.x).max(clip.left()),
+                                        );
+                                        top_left.y = top_left.y.clamp(
+                                            clip.top(),
+                                            (clip.bottom() - press.size.y).max(clip.top()),
+                                        );
+                                        let ghost =
+                                            egui::Rect::from_min_size(top_left, press.size);
+                                        paint_drag_ghost(ui, ghost, &press.title, 1);
+                                    }
+                                }
+                            } else {
+                                state.move_card(dragged, state.drop);
+                                state.drag = None;
+                                state.press = None;
+                            }
+                        } else {
+                            let mut cancel = false;
+                            let mut arm = None;
+                            if let Some(press) = &mut state.press {
+                                match press.gate.update(ui.ctx()) {
+                                    LongPressStep::Keep => {}
+                                    LongPressStep::Cancel => cancel = true,
+                                    LongPressStep::Arm => arm = Some((press.id, press.pos)),
+                                }
+                            }
+                            if cancel {
+                                state.press = None;
+                            }
+                            if let Some((id, drop)) = arm {
+                                state.drop = drop;
+                                state.drag = Some(id);
+                            }
+                            if state.press.is_none() && ui.input(|i| i.pointer.primary_pressed()) {
+                                if let Some(origin) = ui.input(|i| i.pointer.press_origin()) {
+                                    if let Some((pos, rect)) = card_rects
+                                        .iter()
+                                        .find(|(_, rect)| rect.contains(origin))
+                                        .copied()
+                                    {
+                                        let card = &state.cards[pos];
+                                        let item = self.units.iter().find(|item| {
+                                            s(
+                                                &item.get("unit").cloned().unwrap_or(json!({})),
+                                                "id",
+                                            ) == card.pick.unit_id
+                                        });
+                                        let unit = item
+                                            .map(|item| item.get("unit").cloned().unwrap_or(json!({})))
+                                            .unwrap_or(json!({}));
+                                        let title = s(&unit, "name");
+                                        let title = if title.is_empty() {
+                                            card.pick.unit_id.clone()
+                                        } else {
+                                            title
+                                        };
+                                        state.press = Some(InsertOrderPress {
+                                            id: card.id,
+                                            pos,
+                                            title,
+                                            gate: LongPressGate::start(now, origin),
+                                            grab: origin - rect.min,
+                                            size: rect.size(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
                     });
-                if let Some(id) = select {
-                    state.selected = Some(id);
-                }
-                if let Some((id, before)) = drop {
-                    state.move_card(id, before);
-                }
                 ui.add_space(12.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
@@ -26867,49 +26893,12 @@ impl App {
                 st.confirm_remove_entry = None;
             }
         }
-        // Insert affordance (top-height unification, user
-        // ruling 2026-11-28): in the prototype this is a 26px
-        // inline element inside the grid — it shares the row,
-        // it is not a row of its own. Here it is a slim strip:
-        // 6pt of layout height carrying a painted hairline +
-        // plus, with the click area widened into the card gap
-        // around it (the neighbouring cards are laid out after
-        // it and win the few overlapping points at their own
-        // edges). As a full text row it pushed the first card
-        // ~21pt below the prototype's first-card line.
         let insert_bar =
             |ui: &mut egui::Ui, at: usize, action: &mut Option<IndexDetailAction>| -> egui::Rect {
                 let width = ui.available_width();
-                let (rect, _) =
-                    ui.allocate_exact_size(egui::vec2(width, 6.0), egui::Sense::hover());
-                let hit = egui::Rect::from_center_size(rect.center(), egui::vec2(200.0, 16.0));
-                let resp = ui.interact(
-                    hit,
-                    ui.scope_id().with(("insert_bar", at)),
-                    egui::Sense::click(),
-                );
-                let color = if resp.hovered() {
-                    ACCENT
-                } else {
-                    palette_color(TEXT_WEAK)
-                };
-                let cy = rect.center().y;
-                let cx = rect.center().x;
-                ui.painter().hline(
-                    egui::Rangef::new(cx - 70.0, cx + 70.0),
-                    cy,
-                    egui::Stroke::new(1.0, color),
-                );
-                ui.painter().rect_filled(
-                    egui::Rect::from_center_size(egui::pos2(cx, cy), egui::vec2(7.0, 1.5)),
-                    0.0,
-                    color,
-                );
-                ui.painter().rect_filled(
-                    egui::Rect::from_center_size(egui::pos2(cx, cy), egui::vec2(1.5, 7.0)),
-                    0.0,
-                    color,
-                );
+                let (rect, resp) =
+                    ui.allocate_exact_size(egui::vec2(width, 28.0), egui::Sense::click());
+                paint_insert_affordance(ui, rect, resp.hovered());
                 if resp.clicked() {
                     *action = Some(IndexDetailAction::Insert(at));
                 }
@@ -26921,12 +26910,15 @@ impl App {
         // blank-click resolution after the loop reads them, the
         // way the content wall reads its card rects.
         let mut card_rects: Vec<(usize, egui::Rect)> = Vec::new();
+        let mut insert_rects: Vec<(usize, egui::Rect)> = Vec::new();
         let mut content_rects: Vec<egui::Rect> = Vec::new();
         egui::ScrollArea::vertical().id_salt(&st.index_id).show(ui, |ui| {
             let cover_width = if ui.available_width() >= 900.0 { 340.0 } else { 300.0 };
             let card_content_width = (ui.available_width() - 25.0).max(0.0);
             let thumb_gap = ui.spacing().item_spacing.x;
-            content_rects.push(insert_bar(ui, 0, action));
+            let first_insert = insert_bar(ui, 0, action);
+            insert_rects.push((0, first_insert));
+            content_rects.push(first_insert);
             for (pos, re) in resolved.iter().enumerate() {
                 let entry = re.get("entry").cloned().unwrap_or(json!({}));
                 let ver = re.get("resolved").cloned().unwrap_or(Value::Null);
@@ -26949,31 +26941,43 @@ impl App {
                     ui.set_min_width(card_content_width);
                     ui.horizontal(|ui| {
                         // LEFT — the current version's page
-                        // tiles in one row (prototype
-                        // .entry-thumbs): real rendered
-                        // thumbnails, no page numbers on them.
+                        // tiles wrap inside the cover column, as in
+                        // the prototype, instead of being squeezed
+                        // into one unreadable row.
                         ui.vertical(|ui| {
                             ui.set_width(cover_width);
                             if ver.is_object() {
                                 let vid = s(&ver, "id");
                                 let total = i(&ver, "page_count").max(0) as usize;
                                 let n = total.clamp(1, 8);
-                                let tile_w =
-                                    (cover_width - thumb_gap * (n - 1) as f32) / n as f32;
-                                ui.horizontal(|ui| {
-                                    for page in 0..n {
-                                        self.thumb_ui(ui, &vid, page, tile_w);
+                                let columns = ((cover_width + thumb_gap) / 144.0)
+                                    .floor()
+                                    .max(1.0) as usize;
+                                let tile_w = if columns == 1 {
+                                    cover_width
+                                } else {
+                                    (cover_width - thumb_gap * (columns - 1) as f32)
+                                        / columns as f32
+                                };
+                                for row in (0..n).step_by(columns) {
+                                    if row > 0 {
+                                        ui.add_space(thumb_gap);
                                     }
-                                });
+                                    ui.horizontal(|ui| {
+                                        for page in row..(row + columns).min(n) {
+                                            self.thumb_ui(ui, &vid, page, tile_w);
+                                        }
+                                    });
+                                }
                             } else {
                                 ui.label("无版本");
                             }
                         });
                         ui.add_space(6.0);
                         ui.vertical(|ui| {
-                            // Title row: ordinal badge + name
-                            // (prototype: the position badge
-                            // leads the title line).
+                            // Title, status and metadata share one
+                            // wrapping row so the card keeps the
+                            // prototype's compact horizontal rhythm.
                             ui.horizontal_wrapped(|ui| {
                                 chip(
                                     ui,
@@ -26986,27 +26990,6 @@ impl App {
                                         .strong()
                                         .size(13.5)
                                         .color(palette_color(TEXT_MAIN)),
-                                );
-                            });
-                            // Meta row: form · language ·
-                            // version · pages, then the policy
-                            // badge and the excerpt / substituted
-                            // chips.
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{} · {} · {} · {} 页",
-                                        re.get("form").and_then(|x| x.as_str()).unwrap_or(""),
-                                        re.get("lang").and_then(|x| x.as_str()).unwrap_or(""),
-                                        if ver.is_object() {
-                                            format!("v{}", s(&ver, "semver"))
-                                        } else {
-                                            "无版本".into()
-                                        },
-                                        eff_pages
-                                    ))
-                                    .size(11.5)
-                                    .color(palette_color(TEXT_WEAK)),
                                 );
                                 if locked {
                                     chip(ui, "版本锁定", palette_color(CHIP_ORANGE_FG), CHIP_ORANGE_BG);
@@ -27026,6 +27009,21 @@ impl App {
                                 if re.get("substituted").and_then(|x| x.as_bool()) == Some(true) {
                                     chip(ui, "原版已删 · 已替代", palette_color(CHIP_ORANGE_FG), CHIP_ORANGE_BG);
                                 }
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{} · {} · {} · {} 页",
+                                        re.get("form").and_then(|x| x.as_str()).unwrap_or(""),
+                                        re.get("lang").and_then(|x| x.as_str()).unwrap_or(""),
+                                        if ver.is_object() {
+                                            format!("v{}", s(&ver, "semver"))
+                                        } else {
+                                            "无版本".into()
+                                        },
+                                        eff_pages
+                                    ))
+                                    .size(11.5)
+                                    .color(palette_color(TEXT_WEAK)),
+                                );
                             });
                             // Actions row, right-aligned. The
                             // prototype's four — 更换版本 /
@@ -27217,8 +27215,12 @@ impl App {
                                     String::new()
                                 };
                                 let latest_id = s(&versions[0], "id");
+                                let max_quick = ((ui.available_width() + 6.0) / 60.0)
+                                    .floor()
+                                    .clamp(1.0, 7.0) as usize;
+                                let shown = max_quick.min(versions.len());
                                 ui.horizontal_wrapped(|ui| {
-                                    for v in versions.iter().take(7) {
+                                    for v in versions.iter().take(shown) {
                                         let vid = s(v, "id");
                                         let is_cur = vid == cur_id;
                                         ui.vertical(|ui| {
@@ -27242,11 +27244,16 @@ impl App {
                                             );
                                         });
                                     }
-                                    if ui.button("更多").clicked() {
-                                        self.overlays.push(Overlay::AllVersions {
-                                            entry_pos: pos,
-                                            index_id: st.index_id.clone(),
-                                        });
+                                    if shown < versions.len() {
+                                        if ui
+                                            .button(format!("更多 · +{}", versions.len() - shown))
+                                            .clicked()
+                                        {
+                                            self.overlays.push(Overlay::AllVersions {
+                                                entry_pos: pos,
+                                                index_id: st.index_id.clone(),
+                                            });
+                                        }
                                     }
                                 });
                             }
@@ -27256,6 +27263,17 @@ impl App {
                 let card_rect = frame_resp.response.rect;
                 card_rects.push((pos, card_rect));
                 content_rects.push(card_rect);
+                if st
+                    .entry_drag
+                    .as_ref()
+                    .is_some_and(|moving| moving.contains(&pos))
+                {
+                    ui.painter().rect_filled(
+                        card_rect,
+                        6.0,
+                        palette_color(APP_BG).gamma_multiply(0.55),
+                    );
+                }
                 // Selected state: accent frame, 1.5px, color
                 // only — no outer ring, no geometry change
                 // (border ruling 2026-11-27).
@@ -27319,7 +27337,9 @@ impl App {
                     }
                 }
                 ui.add_space(4.0);
-                content_rects.push(insert_bar(ui, pos + 1, action));
+                let next_insert = insert_bar(ui, pos + 1, action);
+                insert_rects.push((pos + 1, next_insert));
+                content_rects.push(next_insert);
                 ui.add_space(4.0);
             }
             // ── Drag (long-press) + blank-click resolution ──
@@ -27370,27 +27390,35 @@ impl App {
                         }
                         st.entry_drop = target;
                     }
-                    // Insertion seam at the drop boundary.
-                    if let (Some((_, first)), Some((_, last))) =
-                        (card_rects.first(), card_rects.last())
+                    // The active seam is the insert affordance
+                    // itself, so dragging and clicking share one
+                    // exact insertion line.
+                    if let Some((_, rect)) = insert_rects
+                        .iter()
+                        .find(|(at, _)| *at == st.entry_drop)
                     {
-                        let y = if st.entry_drop < entries.len() {
-                            card_rects
-                                .iter()
-                                .find(|(cp, _)| *cp == st.entry_drop)
-                                .map(|(_, r)| r.top() - 4.0)
-                                .unwrap_or(last.bottom() + 4.0)
-                        } else {
-                            last.bottom() + 4.0
-                        };
-                        ui.painter().rect_filled(
-                            egui::Rect::from_min_max(
-                                egui::pos2(first.left(), y - 1.0),
-                                egui::pos2(first.right(), y + 1.0),
-                            ),
-                            1.0,
-                            ACCENT,
-                        );
+                        paint_insert_affordance(ui, *rect, true);
+                    }
+                    if let Some(press) = &st.entry_press {
+                        if press.gate.armed {
+                            if let Some(pos) = ui.input(|i| {
+                                i.pointer.interact_pos().or_else(|| i.pointer.hover_pos())
+                            }) {
+                                let clip = ui.clip_rect();
+                                let mut top_left = pos - press.grab;
+                                top_left.x = top_left.x.clamp(
+                                    clip.left(),
+                                    (clip.right() - press.size.x).max(clip.left()),
+                                );
+                                top_left.y = top_left.y.clamp(
+                                    clip.top(),
+                                    (clip.bottom() - press.size.y).max(clip.top()),
+                                );
+                                let ghost =
+                                    egui::Rect::from_min_size(top_left, press.size);
+                                paint_drag_ghost(ui, ghost, &press.title, moving.len());
+                            }
+                        }
                     }
                 } else {
                     // Release: commit the reorder (prototype
@@ -27430,32 +27458,51 @@ impl App {
                         }
                     }
                 }
-            } else if let Some((press_pos, started, origin)) = st.entry_press {
-                if !primary_down {
-                    st.entry_press = None;
-                } else if let Some(p) = ui.input(|i| i.pointer.interact_pos()) {
-                    if p.distance(origin) > 10.0 {
-                        st.entry_press = None;
-                    } else if now - started >= 0.4 {
-                        let targets = st.entry_targets();
-                        let moving = if targets.len() > 1 && targets.contains(&press_pos) {
-                            targets
-                        } else {
-                            vec![press_pos]
-                        };
-                        st.entry_drop = press_pos;
-                        st.entry_drag = Some(moving);
-                        st.entry_suppress_click = true;
-                        st.entry_press = None;
+            } else {
+                let mut cancel = false;
+                let mut arm = None;
+                if let Some(press) = &mut st.entry_press {
+                    match press.gate.update(ui.ctx()) {
+                        LongPressStep::Keep => {}
+                        LongPressStep::Cancel => cancel = true,
+                        LongPressStep::Arm => arm = Some(press.pos),
                     }
                 }
-            } else if ui.input(|i| i.pointer.primary_pressed()) {
-                if let Some(origin) = ui.input(|i| i.pointer.press_origin()) {
-                    if let Some((cp, _)) =
-                        card_rects.iter().find(|(_, r)| r.contains(origin))
-                    {
-                        let cp = *cp;
-                        st.entry_press = Some((cp, now, origin));
+                if cancel {
+                    st.entry_press = None;
+                }
+                if let Some(press_pos) = arm {
+                    let targets = st.entry_targets();
+                    let moving = if targets.len() > 1 && targets.contains(&press_pos) {
+                        targets
+                    } else {
+                        vec![press_pos]
+                    };
+                    st.entry_drop = press_pos;
+                    st.entry_drag = Some(moving);
+                    st.entry_suppress_click = true;
+                }
+                if st.entry_press.is_none() && ui.input(|i| i.pointer.primary_pressed()) {
+                    if let Some(origin) = ui.input(|i| i.pointer.press_origin()) {
+                        if let Some((cp, rect)) = card_rects
+                            .iter()
+                            .find(|(_, r)| r.contains(origin))
+                            .copied()
+                        {
+                            let title = resolved
+                                .get(cp)
+                                .and_then(|r| r.get("unit_name"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            st.entry_press = Some(EntryPress {
+                                pos: cp,
+                                title,
+                                gate: LongPressGate::start(now, origin),
+                                grab: origin - rect.min,
+                                size: rect.size(),
+                            });
+                        }
                     }
                 }
             }
@@ -28163,24 +28210,6 @@ mod insert_order_tests {
         assert_eq!(state.picks(), vec![pick("b"), pick("a"), pick("c")]);
         state.move_card(2, 1);
         assert_eq!(state.picks(), vec![pick("c"), pick("b"), pick("a")]);
-    }
-
-    #[test]
-    fn copy_paste_duplicates_and_cut_moves_the_selected_card() {
-        let mut state = InsertOrderState::new(vec![pick("a"), pick("b")]);
-        state.selected = Some(0);
-        state.copy();
-        state.paste();
-        assert_eq!(state.picks(), vec![pick("a"), pick("a"), pick("b")]);
-        let copied_id = state.selected.expect("pasted card selected");
-        state.cut();
-        assert_eq!(state.picks(), vec![pick("a"), pick("b")]);
-        assert_eq!(state.clipboard, vec![pick("a")]);
-        state.paste();
-        // Cut clears the selection, so paste appends at the end ([a, b, a]);
-        // it does not return the card to its cut position.
-        assert_eq!(state.picks(), vec![pick("a"), pick("b"), pick("a")]);
-        assert_ne!(state.selected, Some(copied_id));
     }
 }
 
