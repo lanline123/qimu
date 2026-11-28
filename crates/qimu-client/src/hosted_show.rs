@@ -39,7 +39,7 @@
 
 use base64::Engine as _;
 use deckcraft_engine::Session;
-use deckcraft_ui_egui::{Services, SlideApp};
+use deckcraft_ui_egui::{Services, SlideApp, ViewMode};
 use serde_json::{Value, json};
 
 /// What the load reported about the deck copy: pages or media that
@@ -76,6 +76,25 @@ impl DamageNote {
     }
 }
 
+fn load_slide_app(
+    name: &str,
+    bytes: &[u8],
+    displays: Option<Box<dyn FnMut() -> Option<usize>>>,
+) -> Result<(SlideApp, DamageNote), String> {
+    let mut services = Services::default();
+    services.displays = displays;
+    services.audio_out = std::env::var_os("QIMU_NO_AUDIO")
+        .is_none()
+        .then(|| Box::new(crate::hosted_audio::CpalOut::default()) as Box<dyn deckcraft_media::AudioOut>);
+    let mut app = SlideApp::new(Session::new(), services);
+    let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let opened = app
+        .session
+        .execute("file.openBytes", &json!({ "name": name, "data": data }))
+        .map_err(|e| e.to_string())?;
+    Ok((app, DamageNote::from_open_result(&opened)))
+}
+
 /// One hosted show: a guest `SlideApp` plus the damage reported
 /// when its deck copy was loaded.
 pub struct HostedShow {
@@ -109,34 +128,9 @@ impl HostedShow {
             mode,
             crate::DcMode::Normal | crate::DcMode::Thumbnails | crate::DcMode::Notes
         ) {
-            return Err("普通、缩略图和备注视图需要 DeckCraft 桌面应用".into());
+            return Err("普通视图使用内嵌编辑器；缩略图和备注视图需要 DeckCraft 桌面应用".into());
         }
-        // Every other service stays None: no file pickers, no
-        // read/write bridges and no web presenter-popup host. Audio
-        // is the one service the shell does provide, through the
-        // cpal output ported from DeckCraft's desktop app (see
-        // hosted_audio.rs), wired the way that app wires it —
-        // `QIMU_NO_AUDIO` plays silently instead. A missing or
-        // failing device never blocks the show: the player drops
-        // the output and carries on silently (deckcraft-media's
-        // Player contract, SPIKE.md Q4 item 12 — degradation
-        // retired by user ruling 2026-11-24 16:39).
-        let mut services = Services::default();
-        services.displays = displays;
-        services.audio_out = std::env::var_os("QIMU_NO_AUDIO")
-            .is_none()
-            .then(|| Box::new(crate::hosted_audio::CpalOut::default()) as Box<dyn deckcraft_media::AudioOut>);
-        let mut app = SlideApp::new(Session::new(), services);
-
-        // Load by bytes. `file.openBytes` parses with damage
-        // reporting and binds no path; embedded fonts are installed
-        // by the engine inside the open path.
-        let data = base64::engine::general_purpose::STANDARD.encode(bytes);
-        let opened = app
-            .session
-            .execute("file.openBytes", &json!({ "name": name, "data": data }))
-            .map_err(|e| e.to_string())?;
-        let damage = DamageNote::from_open_result(&opened);
+        let (mut app, damage) = load_slide_app(name, bytes, displays)?;
 
         // `UiState::default()` has `presenter_view: true`, so set the
         // flag explicitly per mode — the same discipline dc_jump
@@ -177,5 +171,45 @@ impl HostedShow {
     pub fn restore_host_ui(ctx: &egui::Context) {
         crate::install_system_fonts(ctx);
         crate::apply_modern_style(ctx);
+    }
+}
+
+pub struct EmbeddedEditor {
+    app: SlideApp,
+    pub damage: DamageNote,
+}
+
+impl EmbeddedEditor {
+    pub fn start(name: &str, bytes: &[u8], from: usize) -> Result<Self, String> {
+        let (mut app, damage) = load_slide_app(name, bytes, None)?;
+        app.ui.view = ViewMode::Normal;
+        app.ui.presenter_view = false;
+        app.ui.notes = false;
+        let slides = app.session.active().map_or(0, |doc| doc.doc.slides.len());
+        if slides > 0 {
+            app.session
+                .execute("slide.go", &json!({ "index": from.min(slides - 1) }))
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(Self { app, damage })
+    }
+
+    pub fn logic(&mut self, ctx: &egui::Context) {
+        self.app.logic(ctx);
+    }
+
+    pub fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        self.app.raw_input_hook(ctx, raw);
+    }
+
+    pub fn ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let host_style = ctx.global_style();
+        self.app.embedded_normal_ui(ui);
+        ctx.set_global_style(host_style);
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.app.session.active().is_some_and(|doc| doc.is_dirty())
     }
 }

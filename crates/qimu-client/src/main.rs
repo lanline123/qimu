@@ -2042,7 +2042,7 @@ enum IndexDetailAction {
         branch: String,
         commit: Option<String>,
     },
-    OpenUnit(String),
+    OpenUnit(String, usize),
     Export(&'static str),
     Commit(Vec<Value>, &'static str),
     Insert(usize),
@@ -3645,6 +3645,7 @@ impl Default for ShowroomState {
 enum SrFrame {
     Wall,
     Deck(DeckState),
+    Preview(SrPreviewState),
     Present(SrPresentState),
 }
 
@@ -3688,7 +3689,7 @@ struct DeckState {
     pages: Vec<ShowroomPage>,
     selected_page: Option<usize>,
     view: DeckView,
-    preview_open: bool,
+    preview_request: Option<usize>,
     /// Set by the detail breadcrumb; the dispatcher pops the frame.
     closed: bool,
     /// N4 personal reorder (user ruling 2026-11-25): the working
@@ -3723,6 +3724,13 @@ struct DeckState {
     /// is taken out of the stack while it renders, so opening
     /// the copy's deck must wait until it is put back / popped).
     jump_to: Option<Value>,
+}
+
+struct SrPreviewState {
+    item: Value,
+    pages: Vec<ShowroomPage>,
+    selected_page: usize,
+    closed: bool,
 }
 
 /// The pages the deck detail displays: the working reorder
@@ -3798,6 +3806,17 @@ enum DeckView {
     Notes,
 }
 
+struct EmbeddedNormalState {
+    unit_id: String,
+    editor: hosted_show::EmbeddedEditor,
+}
+
+struct IndexMaintenanceReturn {
+    index_id: String,
+    branch: String,
+    entry_pos: usize,
+}
+
 #[derive(Clone)]
 enum BarViewTarget {
     Showroom {
@@ -3812,6 +3831,7 @@ enum BarViewTarget {
         from: usize,
     },
     Unit {
+        unit_id: String,
         title: String,
         version: Value,
         from: usize,
@@ -4455,6 +4475,8 @@ struct App {
     /// dropped on the first frame its show has ended, and qimu's
     /// fonts/visuals are restored (hosted_show::restore_host_ui).
     hosted: Option<hosted_show::HostedShow>,
+    embedded_normal: Option<EmbeddedNormalState>,
+    index_maintenance_return: Option<IndexMaintenanceReturn>,
     /// Toast state (the framework has no status bar): the message
     /// currently floating and when it appeared, in egui time.
     workspace_controls: WorkspaceControls,
@@ -5929,6 +5951,8 @@ impl App {
             folder_del_undo: None,
             plaza_item_folders: load_plaza_item_folders(),
             hosted: None,
+            embedded_normal: None,
+            index_maintenance_return: None,
             login_open: false,
             about_open: false,
             local,
@@ -8647,6 +8671,7 @@ impl App {
                 w.selected = Some(unit_id.to_string());
             }
         }
+        self.discard_embedded_normal();
         match self.call_work("GET", &format!("/v1/units/{unit_id}"), None) {
             Ok(v) => {
                 let mut st = UnitState::new(unit_id, v.clone());
@@ -8735,11 +8760,30 @@ impl App {
     /// pop the content stack back to the wall and clear the wall
     /// selection, exactly what the old field pair did.
     fn close_unit_detail(&mut self) {
+        self.index_maintenance_return = None;
         self.overlays.retain(|o| !matches!(o, Overlay::Light(_)));
+        self.discard_embedded_normal();
         self.content.stack.pop_to(0);
         if let ContentFrame::Wall(w) = self.content.stack.root_mut() {
             w.selected = None;
         }
+    }
+
+    fn return_from_index_maintenance(&mut self) -> bool {
+        let Some(ret) = self.index_maintenance_return.take() else {
+            return false;
+        };
+        self.overlays.retain(|o| !matches!(o, Overlay::Light(_)));
+        self.discard_embedded_normal();
+        self.content.stack.pop_to(0);
+        self.page = Page::Index;
+        self.open_index_detail_as(&ret.index_id, ret.branch);
+        if let IndexFrame::Detail(st) = self.index.stack.top_mut() {
+            st.entry_sel.clear();
+            st.entry_anchor = Some(ret.entry_pos);
+        }
+        self.msg = "已返回索引编辑".into();
+        true
     }
 
     fn load_attachments(&mut self, parent_id: &str) {
@@ -13634,6 +13678,9 @@ impl eframe::App for App {
         if let Some(h) = &mut self.hosted {
             h.logic(ctx);
         }
+        if let Some(editor) = &mut self.embedded_normal {
+            editor.editor.logic(ctx);
+        }
     }
 
     /// T2 frame forwarding, part 2: the guest's input hook, exactly
@@ -13641,6 +13688,9 @@ impl eframe::App for App {
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
         if let Some(h) = &mut self.hosted {
             h.raw_input_hook(ctx, raw);
+        }
+        if let Some(editor) = &mut self.embedded_normal {
+            editor.editor.raw_input_hook(ctx, raw);
         }
     }
 
@@ -15269,7 +15319,7 @@ impl App {
         from: usize,
     ) -> Result<(), String> {
         if mode.uses_editor_view() {
-            return Err("普通、缩略图和备注视图需要 DeckCraft 桌面应用".into());
+            return Err("普通视图使用内嵌编辑器；缩略图和备注视图需要 DeckCraft 桌面应用".into());
         }
         let show = hosted_show::HostedShow::start(title, bytes, mode, from, None)?;
         let d = show.damage;
@@ -15579,45 +15629,28 @@ impl App {
         self.present_unit_version_impl(title, version, mode, page, Some(page))
     }
 
-    fn present_unit_version_impl(
-        &mut self,
-        title: &str,
-        version: &Value,
-        mode: DcMode,
-        from: usize,
-        only_page: Option<usize>,
-    ) -> bool {
+    fn load_unit_version_deck(&mut self, version: &Value) -> Result<(Vec<u8>, i64), String> {
         let version_id = s(version, "id");
         let local_outcome = self
             .local
             .as_ref()
             .and_then(|l| l.assemble_version_deck(&version_id));
-        let (mut bytes, mut page_count) = match local_outcome {
-            Some(Ok(v)) => v,
-            Some(Err(e)) => {
-                self.msg = format!("演示失败：{e}");
-                return true;
-            }
+        match local_outcome {
+            Some(Ok(v)) => Ok(v),
+            Some(Err(e)) => Err(e),
             None => {
-                let resp = match self.call_work(
-                    "GET",
-                    &format!("/v1/versions/{version_id}/fragment"),
-                    None,
-                ) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        self.msg = format!("演示失败：{e}");
-                        return true;
-                    }
-                };
-                let Some(data) = resp.get("data_base64").and_then(|x| x.as_str()) else {
-                    self.msg = "演示失败：片段响应缺少数据".into();
-                    return true;
-                };
-                let Ok(raw) = b64d(data) else {
-                    self.msg = "演示失败：片段数据损坏".into();
-                    return true;
-                };
+                let resp = self
+                    .call_work(
+                        "GET",
+                        &format!("/v1/versions/{version_id}/fragment"),
+                        None,
+                    )
+                    .map_err(|e| e.to_string())?;
+                let data = resp
+                    .get("data_base64")
+                    .and_then(|x| x.as_str())
+                    .ok_or_else(|| "片段响应缺少数据".to_string())?;
+                let raw = b64d(data).map_err(|_| "片段数据损坏".to_string())?;
                 let scripts: Vec<String> = version
                     .get("scripts")
                     .and_then(|x| x.as_array())
@@ -15632,11 +15665,7 @@ impl App {
                         Ok(mut pkg) => {
                             for (slot, script) in scripts.iter().enumerate() {
                                 if !script.is_empty() {
-                                    qimu_core::pptx::set_notes_text(
-                                        &mut pkg,
-                                        slot,
-                                        script,
-                                    );
+                                    qimu_core::pptx::set_notes_text(&mut pkg, slot, script);
                                 }
                             }
                             pkg.to_bytes().unwrap_or(raw)
@@ -15646,7 +15675,24 @@ impl App {
                 } else {
                     raw
                 };
-                (bytes, i(version, "page_count"))
+                Ok((bytes, i(version, "page_count")))
+            }
+        }
+    }
+
+    fn present_unit_version_impl(
+        &mut self,
+        title: &str,
+        version: &Value,
+        mode: DcMode,
+        from: usize,
+        only_page: Option<usize>,
+    ) -> bool {
+        let (mut bytes, mut page_count) = match self.load_unit_version_deck(version) {
+            Ok(v) => v,
+            Err(e) => {
+                self.msg = format!("演示失败：{e}");
+                return true;
             }
         };
         if let Some(page) = only_page {
@@ -15679,6 +15725,88 @@ impl App {
             title.to_string()
         };
         self.open_deck_views(&title, &bytes, page_count, mode, from)
+    }
+
+    fn open_embedded_unit_normal(
+        &mut self,
+        unit_id: &str,
+        title: &str,
+        version: &Value,
+        from: usize,
+        single_page: bool,
+    ) {
+        let (mut bytes, mut page_count) = match self.load_unit_version_deck(version) {
+            Ok(v) => v,
+            Err(e) => {
+                self.msg = format!("打开普通视图失败：{e}");
+                return;
+            }
+        };
+        let mut title = title.to_string();
+        let mut from = from;
+        if single_page {
+            let pkg = match qimu_core::pptx::Package::load(&bytes) {
+                Ok(pkg) => pkg,
+                Err(e) => {
+                    self.msg = format!("打开普通视图失败：无法读取单页：{e}");
+                    return;
+                }
+            };
+            let single = match qimu_core::pptx::split_one(&pkg, from) {
+                Ok(single) => single,
+                Err(e) => {
+                    self.msg = format!("打开普通视图失败：无法提取第 {} 页：{e}", from + 1);
+                    return;
+                }
+            };
+            bytes = match single.to_bytes() {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    self.msg = format!("打开普通视图失败：无法生成单页稿件：{e}");
+                    return;
+                }
+            };
+            title = format!("{title} · 第 {} 页", from + 1);
+            page_count = 1;
+            from = 0;
+        }
+        let from = if page_count > 0 {
+            from.min(page_count as usize - 1)
+        } else {
+            0
+        };
+        match hosted_show::EmbeddedEditor::start(&title, &bytes, from) {
+            Ok(editor) => {
+                let damage = editor.damage;
+                self.embedded_normal = Some(EmbeddedNormalState {
+                    unit_id: unit_id.to_string(),
+                    editor,
+                });
+                self.msg = format!("已打开内嵌普通视图：{title}");
+                if damage.lost_slides > 0 || damage.import_warnings > 0 {
+                    self.msg.push_str(&format!(
+                        "（{} 页读取失败，{} 条导入警告）",
+                        damage.lost_slides, damage.import_warnings
+                    ));
+                }
+            }
+            Err(e) => self.msg = format!("打开普通视图失败：{e}"),
+        }
+    }
+
+    fn discard_embedded_normal(&mut self) {
+        if self.embedded_normal.take().is_some() {
+            if let Some(ctx) = &self.egui_ctx {
+                hosted_show::HostedShow::restore_host_ui(ctx);
+            }
+        }
+    }
+
+    fn close_embedded_normal(&mut self) {
+        if self.embedded_normal.is_some() {
+            self.discard_embedded_normal();
+            self.msg = "已返回内容页".into();
+        }
     }
 
     /// Resolve one index to deck bytes and open it in the views.
@@ -15776,6 +15904,7 @@ impl App {
                 version,
                 from,
                 single_page,
+                ..
             } => {
                 if *single_page {
                     self.present_unit_page_version(title, version, mode, *from);
@@ -16145,7 +16274,7 @@ impl App {
                 pages,
                 selected_page: None,
                 view: DeckView::Thumbnails,
-                preview_open: false,
+                preview_request: None,
                 closed: false,
                 reorder: None,
                 saved_copy: None,
@@ -16171,7 +16300,7 @@ impl App {
             pages: Vec::new(),
             selected_page: None,
             view: DeckView::Thumbnails,
-            preview_open: false,
+            preview_request: None,
             closed: false,
             reorder: None,
             saved_copy: None,
@@ -16717,7 +16846,7 @@ impl App {
     fn showroom_detail_toolbar(&mut self, ui: &mut egui::Ui) {
         let (item, reorder_changed, saved_copy) = match self.showroom.stack.top() {
             SrFrame::Deck(st) => (st.item.clone(), deck_reorder_changed(st), st.saved_copy.clone()),
-            SrFrame::Wall | SrFrame::Present(_) => return,
+            SrFrame::Wall | SrFrame::Preview(_) | SrFrame::Present(_) => return,
         };
         let item_id = s(&item, "id");
         let in_library = self
@@ -16776,7 +16905,6 @@ impl App {
     /// in entry order; clicking a page opens the large preview.
     fn showroom_deck(&mut self, ui: &mut egui::Ui, st: &mut DeckState) {
         let item = st.item.clone();
-        let preview_open = st.preview_open;
         // No crumb row on this page (prototype parity +
         // top-height unification, user ruling 2026-11-28): the
         // prototype deck detail starts at the title. Return
@@ -16800,6 +16928,7 @@ impl App {
             .library_refs
             .iter()
             .any(|e| s(e, "item_kind") == "showroom" && s(e, "item_id") == s(&item, "id"));
+        ui.add_space(12.0);
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new(s(&item, "title"))
@@ -16825,7 +16954,7 @@ impl App {
                 // body at all. Same visibility conditions the
                 // old row had — wall states only, never over
                 // the page preview or the empty deck.
-                if !preview_open && !st.pages.is_empty() {
+                if !st.pages.is_empty() {
                     if let Some(view) = segmented(
                         ui,
                         &["逐页缩略图", "讲稿"],
@@ -17073,10 +17202,6 @@ impl App {
             ui.label(egui::RichText::new("该稿件暂无可查看的页面").color(palette_color(TEXT_WEAK)));
             return;
         }
-        if st.preview_open {
-            self.showroom_page_preview(ui, st, item);
-            return;
-        }
         // The wall renders the working order while a reorder is
         // in progress (deck_display_pages); the pinned order in
         // `st.pages` is never mutated.
@@ -17283,7 +17408,7 @@ impl App {
                     deck_move_page(st, from, seam);
                 }
                 if open {
-                    st.preview_open = true;
+                    st.preview_request = Some(st.selected_page.unwrap_or(0));
                 }
             });
     }
@@ -17299,13 +17424,14 @@ impl App {
             .on_hover_text("单击选定，双击预览")
     }
 
-    fn showroom_page_preview(&mut self, ui: &mut egui::Ui, st: &mut DeckState, item: &Value) {
-        // The preview pages through the displayed order (the
-        // working reorder while one is in progress), like the
-        // wall it was opened from.
-        let pages = deck_display_pages(st);
-        let last = pages.len() - 1;
-        let mut index = st.selected_page.unwrap_or(0).min(last);
+    fn showroom_preview(&mut self, ui: &mut egui::Ui, st: &mut SrPreviewState) {
+        if st.pages.is_empty() {
+            ui.label(egui::RichText::new("该稿件暂无可查看的页面").color(palette_color(TEXT_WEAK)));
+            return;
+        }
+        let last = st.pages.len() - 1;
+        st.selected_page = st.selected_page.min(last);
+        let mut index = st.selected_page;
         if ui.input(|input| input.key_pressed(egui::Key::ArrowLeft)) {
             index = index.saturating_sub(1);
         }
@@ -17325,13 +17451,16 @@ impl App {
             {
                 index += 1;
             }
-            ui.label(format!("{} / {}", index + 1, pages.len()));
+            ui.label(format!("{} / {}", index + 1, st.pages.len()));
             if ui.small_button("导出本页 PDF").clicked() {
-                self.export_showroom_pdf(item, "slides", Some(index));
+                self.export_showroom_pdf(&st.item, "slides", Some(index));
+            }
+            if btn_default(ui, "返回稿件详情").clicked() {
+                st.closed = true;
             }
         });
-        st.selected_page = Some(index);
-        let page = &pages[index];
+        st.selected_page = index;
+        let page = &st.pages[index];
         ui.add_space(10.0);
         let width = ui
             .available_width()
@@ -17349,12 +17478,8 @@ impl App {
     }
 
     fn back_from_showroom_detail(&mut self) {
-        if let SrFrame::Deck(st) = self.showroom.stack.top_mut() {
-            if st.preview_open {
-                st.preview_open = false;
-            } else {
-                self.showroom.stack.pop();
-            }
+        if matches!(self.showroom.stack.top(), SrFrame::Deck(_)) {
+            self.showroom.stack.pop();
         }
     }
 
@@ -19384,9 +19509,32 @@ impl App {
             }
             return;
         }
+        if matches!(self.showroom.stack.top(), SrFrame::Preview(_)) {
+            if let SrFrame::Preview(mut preview) =
+                self.showroom.stack.replace_top(SrFrame::Wall)
+            {
+                self.showroom_preview(ui, &mut preview);
+                if preview.closed {
+                    self.showroom.stack.pop();
+                } else {
+                    self.showroom.stack.replace_top(SrFrame::Preview(preview));
+                }
+            }
+            return;
+        }
         if let SrFrame::Deck(mut deck) = self.showroom.stack.replace_top(SrFrame::Wall) {
             self.showroom_deck(ui, &mut deck);
-            if let Some(copy) = deck.jump_to.take() {
+            if let Some(index) = deck.preview_request.take() {
+                let pages = deck_display_pages(&deck);
+                let item = deck.item.clone();
+                self.showroom.stack.replace_top(SrFrame::Deck(deck));
+                self.showroom.stack.push(SrFrame::Preview(SrPreviewState {
+                    item,
+                    pages,
+                    selected_page: index,
+                    closed: false,
+                }));
+            } else if let Some(copy) = deck.jump_to.take() {
                 // N4 「查看我的副本」: the saved reorder copy's
                 // deck replaces this frame — open_showroom_deck
                 // resets the stack to the wall and pushes the
@@ -20327,7 +20475,9 @@ impl App {
         };
         if self.content.stack.depth() == depth {
             if closed {
-                self.content.stack.pop();
+                if !self.return_from_index_maintenance() {
+                    self.content.stack.pop();
+                }
             } else {
                 self.content.stack.replace_top(frame);
             }
@@ -22413,9 +22563,13 @@ impl App {
     }
 
     fn unit_detail(&mut self, ui: &mut egui::Ui, st: &mut UnitState) {
-        if ui.input(|input| input.key_pressed(egui::Key::Escape)) && st.bind_pick.is_some() {
-            st.bind_pick = None;
-            self.msg = "已取消页面挑选".into();
+        if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+            if self.embedded_normal.is_some() {
+                self.close_embedded_normal();
+            } else if st.bind_pick.is_some() {
+                st.bind_pick = None;
+                self.msg = "已取消页面挑选".into();
+            }
         }
         let detail = st.detail.clone();
         let unit = detail.get("unit").cloned().unwrap_or(json!({}));
@@ -22423,6 +22577,30 @@ impl App {
         // directly with the unit header; back navigation rides on the
         // bottom bar back button and Esc (stack pop one level at a time).
         self.unit_header_ui(ui, st, &unit);
+
+        if self
+            .embedded_normal
+            .as_ref()
+            .is_some_and(|state| state.unit_id == st.unit_id)
+        {
+            let Some(mut state) = self.embedded_normal.take() else {
+                return;
+            };
+            egui::Frame::new()
+                .fill(palette_color(PANEL_BG))
+                .stroke(egui::Stroke::new(1.0, palette_color(FIELD_BORDER)))
+                .corner_radius(8)
+                .show(ui, |ui| {
+                    let (rect, _) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), ui.available_height()),
+                        egui::Sense::hover(),
+                    );
+                    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+                    state.editor.ui(&mut child);
+                });
+            self.embedded_normal = Some(state);
+            return;
+        }
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             // pick-pages mode: the entry's currently resolved version,
@@ -26305,8 +26483,7 @@ impl App {
                     // its #7 editor body starts at the backbar;
                     // the only crumb-like text is the shell
                     // chrome's static path label). Return runs
-                    // through the tab double-click hint in the
-                    // backbar and the deck bar's back button.
+                    // through the deck bar's back button.
                     if !st.closed {
                         self.index_detail(ui, st, &mut action);
                         self.index_more_dialog(ui.ctx(), st, &mut action);
@@ -26366,10 +26543,53 @@ impl App {
                         }
                     }
                 }
-                Some(IndexDetailAction::OpenUnit(unit_id)) => {
+                Some(IndexDetailAction::OpenUnit(unit_id, entry_pos)) => {
+                    let (ret, unit_name, policy) = match self.index.stack.top() {
+                        IndexFrame::Detail(st) => {
+                            let re = st
+                                .detail
+                                .get("resolved_entries")
+                                .and_then(|rows| rows.as_array())
+                                .and_then(|rows| rows.get(entry_pos));
+                            (
+                                Some(IndexMaintenanceReturn {
+                                    index_id: st.index_id.clone(),
+                                    branch: st.branch.clone(),
+                                    entry_pos,
+                                }),
+                                re.and_then(|re| re.get("unit_name"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string(),
+                                re.map(|re| {
+                                    entry_policy_view(&re["entry"], &re["resolved"])
+                                }),
+                            )
+                        }
+                        _ => (None, String::new(), None),
+                    };
                     self.close_unit_detail();
+                    self.index_maintenance_return = ret;
                     self.open_unit_detail(&unit_id);
-                    self.page = Page::Content;
+                    let opened = matches!(
+                        self.content.stack.top(),
+                        ContentFrame::Unit(st) if st.unit_id == unit_id
+                    );
+                    if opened {
+                        if let (Some(policy), ContentFrame::Unit(st)) =
+                            (policy, self.content.stack.top_mut())
+                        {
+                            st.entry_policy = Some(policy);
+                        }
+                        self.page = Page::Content;
+                        if unit_name.is_empty() {
+                            self.msg = "已到内容页维护".into();
+                        } else {
+                            self.msg = format!("已到内容页维护「{unit_name}」");
+                        }
+                    } else {
+                        self.index_maintenance_return = None;
+                    }
                 }
                 Some(IndexDetailAction::Export(kind)) => {
                     if let IndexFrame::Detail(st) = self.index.stack.top() {
@@ -26892,7 +27112,7 @@ impl App {
         // 2026-11-27 prototype-render audit — their prototype
         // renderers are dead code that never paints.)
 
-        // ── 1. idx-backbar：索引名称 + 返回总览提示 | flex:1 | 5标签切换 ──────────
+        // ── 1. idx-backbar：索引名称 + 备注 | flex:1 | 5标签切换 ──────────
         // 对应原型 HTML line 1729–1733，backbar 里不放分支/发布控件，这些在全局工具栏
         let mut edit_commit = false;
         let mut edit_cancel = false;
@@ -26955,12 +27175,6 @@ impl App {
                         }
                     }
                     ui.add_space(8.0);
-                    // 返回总览提示 hint
-                    ui.label(
-                        egui::RichText::new("双击「索引」页签返回总览")
-                            .size(12.0)
-                            .color(palette_color(TEXT_FAINT)),
-                    );
                     // flex:1 — 把右边的标签推到最右
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // 「重选页面」（原型 #idxRePickBtn，渲染于
@@ -27080,14 +27294,10 @@ impl App {
         let mut insert_rects: Vec<(usize, egui::Rect)> = Vec::new();
         let mut content_rects: Vec<egui::Rect> = Vec::new();
         egui::ScrollArea::vertical().id_salt(&st.index_id).show(ui, |ui| {
-            let cover_width = if ui.available_width() >= 1200.0 {
-                440.0
-            } else if ui.available_width() >= 900.0 {
-                380.0
-            } else {
-                320.0
-            };
-            let card_content_width = (ui.available_width() - 25.0).max(0.0);
+            let card_inner_width = (ui.available_width() - 24.0).max(0.0);
+            let column_gap = 16.0;
+            let cover_width = ((card_inner_width - column_gap) / 2.0).clamp(240.0, 480.0);
+            let columns_width = cover_width * 2.0 + column_gap;
             let thumb_gap = ui.spacing().item_spacing.x;
             let first_insert = insert_bar(ui, 0, action);
             insert_rects.push((0, first_insert));
@@ -27102,15 +27312,19 @@ impl App {
                 let eff_pages = index_controls::entry_effective_pages(&entry, &ver);
                 let rid = s(&entry, "rendition_id");
                 let versions = st.unit_versions.get(&rid).cloned().unwrap_or_default();
+                let mut blocked_rects: Vec<egui::Rect> = Vec::new();
                 let frame_resp = card_frame_square()
                     .inner_margin(egui::Margin {
-                        left: 10,
-                        right: 13,
+                        left: 12,
+                        right: 12,
                         top: 9,
                         bottom: 9,
                     })
                     .show(ui, |ui| {
-                    ui.set_min_width(card_content_width);
+                    ui.set_min_width(columns_width);
+                    ui.set_min_height(220.0);
+                    ui.vertical_centered(|ui| {
+                    ui.set_width(columns_width);
                     ui.horizontal(|ui| {
                         // LEFT — the current version's page
                         // tiles wrap inside the cover column, as in
@@ -27122,9 +27336,13 @@ impl App {
                                 let vid = s(&ver, "id");
                                 let total = i(&ver, "page_count").max(0) as usize;
                                 let n = total.clamp(1, 8);
-                                let columns = ((cover_width + thumb_gap) / 170.0)
-                                    .floor()
-                                    .max(1.0) as usize;
+                                let columns = if n == 1 {
+                                    1
+                                } else {
+                                    ((cover_width + thumb_gap) / 190.0)
+                                        .floor()
+                                        .max(1.0) as usize
+                                };
                                 let tile_w = if columns == 1 {
                                     cover_width
                                 } else {
@@ -27145,8 +27363,9 @@ impl App {
                                 ui.label("无版本");
                             }
                         });
-                        ui.add_space(6.0);
+                        ui.add_space(column_gap);
                         ui.vertical(|ui| {
+                            ui.set_width(cover_width);
                             let latest_semver = versions
                                 .first()
                                 .map(|v| s(v, "semver"))
@@ -27157,7 +27376,7 @@ impl App {
                             } else {
                                 format!("保持最新 v{latest_semver}")
                             };
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.spacing_mut().item_spacing.x = 6.0;
                                 chip(
                                     ui,
@@ -27165,7 +27384,9 @@ impl App {
                                     palette_color(ACCENT_DEEP),
                                     CHIP_BLUE_BG,
                                 );
-                                ui.add(
+                                let title_w = (ui.available_width() - 150.0).clamp(72.0, 220.0);
+                                ui.add_sized(
+                                    [title_w, 20.0],
                                     egui::Label::new(
                                         egui::RichText::new(
                                             re.get("unit_name")
@@ -27178,42 +27399,64 @@ impl App {
                                     )
                                     .truncate(),
                                 );
+                                if locked {
+                                    chip(
+                                        ui,
+                                        "版本锁定",
+                                        palette_color(CHIP_ORANGE_FG),
+                                        CHIP_ORANGE_BG,
+                                    );
+                                } else {
+                                    chip(
+                                        ui,
+                                        "跟随最新",
+                                        palette_color(CHIP_GREEN_FG),
+                                        CHIP_GREEN_BG,
+                                    );
+                                }
+                                if eff_pages > 0 {
+                                    chip(
+                                        ui,
+                                        &format!("{eff_pages} 页"),
+                                        palette_color(CHIP_GRAY_FG),
+                                        CHIP_GRAY_BG,
+                                    );
+                                }
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
                                         ui.spacing_mut().item_spacing.x = 4.0;
-                                        if ui
+                                        let delete_resp = ui
                                             .button(
                                                 egui::RichText::new("删除")
                                                     .size(11.5)
                                                     .color(palette_color(ROSE)),
                                             )
-                                            .on_hover_text("从这个索引移除这个条目（内容块保留）")
-                                            .clicked()
-                                        {
+                                            .on_hover_text("从这个索引移除这个条目（内容块保留）");
+                                        blocked_rects.push(delete_resp.rect);
+                                        if delete_resp.clicked() {
                                             st.confirm_remove_entry = Some(pos);
                                         }
                                         let uid = s(&entry, "unit_id");
-                                        if ui
+                                        let maint_resp = ui
                                             .add_enabled(
                                                 !uid.is_empty(),
                                                 egui::Button::new(
                                                     egui::RichText::new("页面维护").size(11.5),
                                                 ),
                                             )
-                                            .on_hover_text("跳到内容页编辑这个内容块")
-                                            .clicked()
-                                        {
-                                            *action = Some(IndexDetailAction::OpenUnit(uid));
+                                            .on_hover_text("跳到内容页编辑这个内容块");
+                                        blocked_rects.push(maint_resp.rect);
+                                        if maint_resp.clicked() {
+                                            *action = Some(IndexDetailAction::OpenUnit(uid, pos));
                                             return;
                                         }
                                         if locked {
-                                            if ui
-                                                .button(
-                                                    egui::RichText::new(&follow_label).size(11.5),
-                                                )
-                                                .clicked()
-                                            {
+                                            let follow_resp = ui.button(
+                                                egui::RichText::new(&follow_label).size(11.5),
+                                            );
+                                            blocked_rects.push(follow_resp.rect);
+                                            if follow_resp.clicked() {
                                                 let mut es = entries.clone();
                                                 es[pos]["policy"] = json!("follow_latest");
                                                 es[pos]["locked_semver"] = Value::Null;
@@ -27222,7 +27465,7 @@ impl App {
                                                 return;
                                             }
                                         } else {
-                                            let _ = ui.add(
+                                            let follow_resp = ui.add(
                                                 egui::Button::new(
                                                     egui::RichText::new(&follow_label)
                                                         .size(11.5)
@@ -27231,16 +27474,17 @@ impl App {
                                                 .fill(ACCENT)
                                                 .corner_radius(5),
                                             );
+                                            blocked_rects.push(follow_resp.rect);
                                         }
-                                        if ui
+                                        let version_resp = ui
                                             .button(
                                                 egui::RichText::new("更换版本")
                                                     .size(11.5)
                                                     .color(palette_color(ACCENT_DEEP)),
                                             )
-                                            .on_hover_text("打开版本管理，切换这个条目引用的版本")
-                                            .clicked()
-                                        {
+                                            .on_hover_text("打开版本管理，切换这个条目引用的版本");
+                                        blocked_rects.push(version_resp.rect);
+                                        if version_resp.clicked() {
                                             self.overlays.push(Overlay::AllVersions {
                                                 entry_pos: pos,
                                                 index_id: st.index_id.clone(),
@@ -27250,11 +27494,6 @@ impl App {
                                 );
                             });
                             ui.horizontal_wrapped(|ui| {
-                                if locked {
-                                    chip(ui, "版本锁定", palette_color(CHIP_ORANGE_FG), CHIP_ORANGE_BG);
-                                } else {
-                                    chip(ui, "跟随最新", palette_color(CHIP_GREEN_FG), CHIP_GREEN_BG);
-                                }
                                 if let Some(slots) =
                                     entry.get("excerpt_slots").and_then(|x| x.as_array())
                                 {
@@ -27268,21 +27507,6 @@ impl App {
                                 if re.get("substituted").and_then(|x| x.as_bool()) == Some(true) {
                                     chip(ui, "原版已删 · 已替代", palette_color(CHIP_ORANGE_FG), CHIP_ORANGE_BG);
                                 }
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{} · {} · {} · {} 页",
-                                        re.get("form").and_then(|x| x.as_str()).unwrap_or(""),
-                                        re.get("lang").and_then(|x| x.as_str()).unwrap_or(""),
-                                        if ver.is_object() {
-                                            format!("v{}", s(&ver, "semver"))
-                                        } else {
-                                            "无版本".into()
-                                        },
-                                        eff_pages
-                                    ))
-                                    .size(11.5)
-                                    .color(palette_color(TEXT_WEAK)),
-                                );
                             });
                             if st.confirm_remove_entry == Some(pos) {
                                 ui.add_space(4.0);
@@ -27305,10 +27529,14 @@ impl App {
                                     .color(palette_color(TEXT_WEAK)),
                                 );
                                 ui.horizontal(|ui| {
-                                    if btn_weak(ui, "取消").clicked() {
+                                    let cancel_resp = btn_weak(ui, "取消");
+                                    blocked_rects.push(cancel_resp.rect);
+                                    if cancel_resp.clicked() {
                                         st.confirm_remove_entry = None;
                                     }
-                                    if btn_danger(ui, "确认删除").clicked() {
+                                    let confirm_resp = btn_danger(ui, "确认删除");
+                                    blocked_rects.push(confirm_resp.rect);
+                                    if confirm_resp.clicked() {
                                         let mut es = entries.clone();
                                         es.remove(pos);
                                         *action = Some(IndexDetailAction::Commit(
@@ -27343,7 +27571,10 @@ impl App {
                                         let vid = s(v, "id");
                                         let is_cur = vid == cur_id;
                                         ui.vertical(|ui| {
-                                            if self.thumb_button(ui, &vid, 0, 82.0, is_cur) {
+                                            let thumb_resp =
+                                                self.thumb_response(ui, &vid, 0, 82.0, is_cur);
+                                            blocked_rects.push(thumb_resp.rect);
+                                            if thumb_resp.clicked() {
                                                 let is_latest = vid == latest_id;
                                                 *action = Some(IndexDetailAction::SwitchVersion(
                                                     pos, vid, s(v, "semver"), is_latest,
@@ -27364,10 +27595,12 @@ impl App {
                                         });
                                     }
                                     if shown < versions.len() {
-                                        if ui
-                                            .button(format!("更多 · +{}", versions.len() - shown))
-                                            .clicked()
-                                        {
+                                        let more_resp = ui.button(format!(
+                                            "更多 · +{}",
+                                            versions.len() - shown
+                                        ));
+                                        blocked_rects.push(more_resp.rect);
+                                        if more_resp.clicked() {
                                             self.overlays.push(Overlay::AllVersions {
                                                 entry_pos: pos,
                                                 index_id: st.index_id.clone(),
@@ -27377,6 +27610,7 @@ impl App {
                                 });
                             }
                         });
+                    });
                     });
                 });
                 let card_rect = frame_resp.response.rect;
@@ -27412,47 +27646,52 @@ impl App {
                 // (Ctrl+Shift appends it), anchor stays on
                 // Shift. A release that ends an armed drag is
                 // suppressed — the drag already spoke for it.
-                let resp = ui.interact(
-                    card_rect,
-                    ui.scope_id().with(("idx_entry", pos)),
-                    egui::Sense::click(),
-                );
-                if resp.clicked() && !st.entry_suppress_click {
-                    let mods = ui.input(|i| i.modifiers);
-                    let multi_key = mods.command || mods.ctrl;
-                    if mods.shift {
-                        match st.entry_anchor.filter(|a| *a < entries.len()) {
-                            Some(anchor) => {
-                                let (lo, hi) = if anchor <= pos {
-                                    (anchor, pos)
-                                } else {
-                                    (pos, anchor)
-                                };
-                                if multi_key {
-                                    for p in lo..=hi {
-                                        if !st.entry_sel.contains(&p) {
-                                            st.entry_sel.push(p);
+                let interact_pos = ui.input(|i| i.pointer.interact_pos());
+                let over_child = interact_pos
+                    .is_some_and(|p| blocked_rects.iter().any(|rect| rect.contains(p)));
+                if !over_child {
+                    let resp = ui.interact(
+                        card_rect,
+                        ui.scope_id().with(("idx_entry", pos)),
+                        egui::Sense::click(),
+                    );
+                    if resp.clicked() && !st.entry_suppress_click {
+                        let mods = ui.input(|i| i.modifiers);
+                        let multi_key = mods.command || mods.ctrl;
+                        if mods.shift {
+                            match st.entry_anchor.filter(|a| *a < entries.len()) {
+                                Some(anchor) => {
+                                    let (lo, hi) = if anchor <= pos {
+                                        (anchor, pos)
+                                    } else {
+                                        (pos, anchor)
+                                    };
+                                    if multi_key {
+                                        for p in lo..=hi {
+                                            if !st.entry_sel.contains(&p) {
+                                                st.entry_sel.push(p);
+                                            }
                                         }
+                                    } else {
+                                        st.entry_sel = (lo..=hi).collect();
                                     }
-                                } else {
-                                    st.entry_sel = (lo..=hi).collect();
+                                }
+                                None => {
+                                    st.entry_sel.clear();
+                                    st.entry_anchor = Some(pos);
                                 }
                             }
-                            None => {
-                                st.entry_sel.clear();
-                                st.entry_anchor = Some(pos);
+                        } else if multi_key {
+                            if let Some(ix) = st.entry_sel.iter().position(|p| *p == pos) {
+                                st.entry_sel.remove(ix);
+                            } else {
+                                st.entry_sel.push(pos);
                             }
-                        }
-                    } else if multi_key {
-                        if let Some(ix) = st.entry_sel.iter().position(|p| *p == pos) {
-                            st.entry_sel.remove(ix);
+                            st.entry_anchor = Some(pos);
                         } else {
-                            st.entry_sel.push(pos);
+                            st.entry_sel.clear();
+                            st.entry_anchor = Some(pos);
                         }
-                        st.entry_anchor = Some(pos);
-                    } else {
-                        st.entry_sel.clear();
-                        st.entry_anchor = Some(pos);
                     }
                 }
                 ui.add_space(4.0);

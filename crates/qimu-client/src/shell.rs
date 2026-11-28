@@ -93,6 +93,8 @@ impl App {
 
     pub(super) fn navigate_to(&mut self, page: Page) {
         self.overlays.retain(|o| !matches!(o, Overlay::Light(_)));
+        self.discard_embedded_normal();
+        self.index_maintenance_return = None;
         self.page = page;
         self.deep_source = None;
         self.review.jump_source = None;
@@ -541,9 +543,6 @@ impl App {
                             self.page == page,
                             false,
                         );
-                        if page == Page::Index && tab.double_clicked() {
-                            self.index.stack.pop_to(0);
-                        }
                         if tab.clicked() {
                             self.navigate_to(page);
                         }
@@ -642,6 +641,20 @@ impl App {
                     cached,
                 )
             }
+            SrFrame::Preview(st) => {
+                let cache_key = format!("sr_{}", s(&st.item, "id"));
+                let cached = self
+                    .cache_entries
+                    .iter()
+                    .any(|e| s(e, "key") == cache_key);
+                (
+                    Some(st.item.clone()),
+                    Some(st.pages.clone()),
+                    st.selected_page,
+                    DeckView::Thumbnails,
+                    cached,
+                )
+            }
             _ => (None, None, 0, DeckView::Thumbnails, false),
         };
         let deck_open = item.is_some();
@@ -687,6 +700,7 @@ impl App {
                             .and_then(|entry| {
                                 let version = entry.get("resolved")?;
                                 (i(version, "page_count") >= 1).then(|| BarViewTarget::Unit {
+                                    unit_id: s(entry, "unit_id"),
                                     title: entry
                                         .get("unit_name")
                                         .and_then(Value::as_str)
@@ -754,6 +768,7 @@ impl App {
                     selected.and_then(|uid| {
                         let version = self.unit_latest_version(&uid)?;
                         (i(&version, "page_count") >= 1).then(|| BarViewTarget::Unit {
+                            unit_id: uid.clone(),
                             title: self.unit_name(&uid),
                             version,
                             from: 0,
@@ -782,6 +797,7 @@ impl App {
                             name
                         };
                         Some(BarViewTarget::Unit {
+                            unit_id: st.unit_id.clone(),
                             title,
                             version: t.version,
                             from: st
@@ -797,6 +813,7 @@ impl App {
             None
         };
         let views_open = view_target.is_some();
+        let normal_open = self.embedded_normal.is_some();
         // Editor snapshot for sdBlockSave / sdBlockPublish: the
         // two buttons exist only while the page editor is the
         // topmost overlay (prototype: hidden outside the editing
@@ -990,11 +1007,44 @@ impl App {
             }
         }
         if ChromeIcons
-            .tool(ui, ChromeIcon::Reading, "普通视图", views_open, false, true)
+            .tool(
+                ui,
+                ChromeIcon::Reading,
+                "普通视图",
+                views_open || normal_open,
+                normal_open,
+                true,
+            )
             .clicked()
         {
-            if let Some(target) = &view_target {
-                self.open_bar_view(ui, target, DcMode::Normal);
+            if normal_open {
+                self.close_embedded_normal();
+            } else if let Some(target) = &view_target {
+                match target {
+                    BarViewTarget::Unit {
+                        unit_id,
+                        title,
+                        version,
+                        from,
+                        single_page,
+                    } => {
+                        let (unit_id, title, version, from, single_page) = (
+                            unit_id.clone(),
+                            title.clone(),
+                            version.clone(),
+                            *from,
+                            *single_page,
+                        );
+                        self.open_embedded_unit_normal(
+                            &unit_id,
+                            &title,
+                            &version,
+                            from,
+                            single_page,
+                        );
+                    }
+                    _ => self.open_bar_view(ui, target, DcMode::Normal),
+                }
             }
         }
         tool_vsep(ui);
@@ -1839,14 +1889,21 @@ impl App {
                         vec!["演示厅".into(), title, "讲稿视图".into()],
                     )
                 }
+                SrFrame::Preview(st) => {
+                    let title = s(&st.item, "title");
+                    PageIdentity::new(
+                        Some("406"),
+                        format!("演示厅 · {title} · 大图预览"),
+                        vec!["演示厅".into(), title, "大图预览".into()],
+                    )
+                }
                 SrFrame::Deck(st) => {
                     let title = s(&st.item, "title");
-                    let mut path =
-                        vec!["演示厅".to_string(), title.clone(), "稿件详情".to_string()];
-                    if st.preview_open {
-                        path.push("单页预览".to_string());
-                    }
-                    PageIdentity::new(Some("211"), format!("演示厅 · {title} · 详情页"), path)
+                    PageIdentity::new(
+                        Some("211"),
+                        format!("演示厅 · {title} · 详情页"),
+                        vec!["演示厅".to_string(), title, "稿件详情".to_string()],
+                    )
                 }
                 SrFrame::Wall => {
                     let (no, zone) = match self.showroom.zone.as_str() {
@@ -2038,15 +2095,14 @@ impl App {
             Page::Home => None,
             Page::Showroom => match self.showroom.stack.top() {
                 SrFrame::Present(_) => Some("关闭当前整页视图"),
-                SrFrame::Deck(st) => Some(if st.preview_open {
-                    "返回稿件详情"
-                } else {
-                    "关闭条目详情"
-                }),
+                SrFrame::Preview(_) => Some("返回稿件详情"),
+                SrFrame::Deck(_) => Some("关闭条目详情"),
                 SrFrame::Wall => Some("回主页"),
             },
             Page::Content => match self.content.stack.top() {
-                ContentFrame::Unit(_) => Some(if self.content_light_open() {
+                ContentFrame::Unit(_) => Some(if self.embedded_normal.is_some() {
+                    "返回内容页"
+                } else if self.content_light_open() {
                     // Prototype updateBarAvail: while a full-page
                     // view (#406) tops the stack, sdClose reads
                     // 关闭当前整页视图 — the close still lands
@@ -2104,6 +2160,8 @@ impl App {
                     };
                     self.showroom.stack.pop();
                     self.sync_present_notes(notes);
+                } else if matches!(self.showroom.stack.top(), SrFrame::Preview(_)) {
+                    self.showroom.stack.pop();
                 } else if matches!(self.showroom.stack.top(), SrFrame::Deck(_)) {
                     self.back_from_showroom_detail();
                 } else {
@@ -2111,7 +2169,9 @@ impl App {
                 }
             }
             Page::Content => {
-                if let Some(pos) = self
+                if self.embedded_normal.is_some() {
+                    self.close_embedded_normal();
+                } else if let Some(pos) = self
                     .overlays
                     .iter()
                     .rposition(|o| matches!(o, Overlay::Light(_)))
