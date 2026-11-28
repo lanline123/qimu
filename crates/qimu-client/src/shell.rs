@@ -550,19 +550,18 @@ impl App {
                     }
                     tool_vsep(ui);
                     self.workspace_search_box(ui);
-                    // Page tool slots: only actions the page already
-                    // has (the pages keep their in-body buttons; these
-                    // call the same methods) — showroom refreshes,
-                    // content imports, index creates.
+                    // Page tool slots: showroom refresh and detail
+                    // actions, content imports, index creates.
                     match self.page {
                         Page::Showroom => {
-                            if self.tool_slot(ui, false, tr("刷新"), ChromeIcon::Refresh) {
+                            if self.tool_slot(ui, true, false, tr("刷新"), ChromeIcon::Refresh) {
                                 if self.user.is_some() {
                                     self.refresh_all();
                                 } else {
                                     self.refresh_guest();
                                 }
                             }
+                            self.showroom_detail_toolbar(ui);
                         }
                         Page::Content => {
                             // 智能分块导入 is the AI-analysis split
@@ -577,17 +576,17 @@ impl App {
                                 ChromeIcon::Split,
                             );
                             ui.add_space(2.0);
-                            if self.tool_slot(ui, false, tr("导入 PPT"), ChromeIcon::Import) {
+                            if self.tool_slot(ui, true, false, tr("导入 PPT"), ChromeIcon::Import) {
                                 self.act_import_ppt();
                             }
                             ui.add_space(2.0);
-                            if self.tool_slot(ui, false, tr("粘贴新建"), ChromeIcon::Clipboard)
+                            if self.tool_slot(ui, true, false, tr("粘贴新建"), ChromeIcon::Clipboard)
                             {
                                 self.create_unit_from_paste();
                             }
                         }
                         Page::Index => {
-                            if self.tool_slot(ui, false, tr("新建索引"), ChromeIcon::NewIndex) {
+                            if self.tool_slot(ui, true, false, tr("新建索引"), ChromeIcon::NewIndex) {
                                 self.act_new_index();
                             }
                         }
@@ -646,99 +645,153 @@ impl App {
             _ => (None, None, 0, DeckView::Thumbnails, false),
         };
         let deck_open = item.is_some();
-        // View target (views unification, user ruling
-        // 2026-11-25): the bottom-bar views （播放 / 普通视图 /
-        // 演示者视图） are ONE action — "open an index" — so
-        // they light on any detail whose object resolves to at
-        // least one page, not only on an open showroom deck: the
-        // open index detail (its branch head's resolved page
-        // count) and the open content block (the version its
-        // pages wall is showing) join the showroom deck here.
-        // The tabs beside the trio （备注视图 / 缩略视图 /
-        // 预览·讲稿） keep the deck frame as their target — they
-        // re-slice an open deck, they do not open anything.
-        enum BarViewTarget {
-            Showroom,
-            Index,
-            Unit {
-                title: String,
-                version: Value,
-                from: usize,
-            },
-        }
+        // View target: the open deck first, then the card selected
+        // on the current page. Showroom and index cards open their
+        // whole presentation; content-page cards open one page.
         let view_target: Option<BarViewTarget> = if deck_open {
-            Some(BarViewTarget::Showroom)
+            Some(BarViewTarget::Showroom {
+                item: item.clone().unwrap(),
+                pages: pages.clone().unwrap(),
+                from,
+            })
+        } else if self.page == Page::Showroom {
+            self.showroom
+                .selected_card
+                .as_deref()
+                .and_then(|id| self.find_showroom_item(id))
+                .map(|item| BarViewTarget::Showroom {
+                    pages: showroom_pages(&item),
+                    item,
+                    from: 0,
+                })
         } else if self.page == Page::Index {
             match self.index.stack.top() {
-                IndexFrame::Detail(d) => {
-                    let pages: i64 = d
-                        .detail
-                        .get("resolved_entries")
-                        .and_then(Value::as_array)
-                        .map(|entries| {
-                            entries
-                                .iter()
-                                .map(|e| {
-                                    let total = e
-                                        .get("resolved")
-                                        .map(|r| i(r, "page_count"))
-                                        .unwrap_or(0);
-                                    match e
-                                        .get("entry")
-                                        .and_then(|en| en.get("excerpt_slots"))
-                                        .and_then(Value::as_array)
-                                    {
-                                        Some(slots) if !slots.is_empty() => {
-                                            (slots.len() as i64).min(total)
-                                        }
-                                        _ => total,
-                                    }
-                                })
-                                .sum()
+                IndexFrame::Overview(ov) => ov.selected.as_deref().and_then(|id| {
+                    self.indexes
+                        .iter()
+                        .find(|index| s(index, "id") == id)
+                        .map(|index| BarViewTarget::Index {
+                            index_id: s(index, "id"),
+                            branch: "main".into(),
+                            name: s(index, "name"),
+                            from: 0,
                         })
-                        .unwrap_or(0);
-                    (pages >= 1).then_some(BarViewTarget::Index)
+                }),
+                IndexFrame::Detail(d) => {
+                    let targets = d.entry_targets();
+                    if targets.len() == 1 {
+                        d.detail
+                            .get("resolved_entries")
+                            .and_then(Value::as_array)
+                            .and_then(|entries| entries.get(targets[0]))
+                            .and_then(|entry| {
+                                let version = entry.get("resolved")?;
+                                (i(version, "page_count") >= 1).then(|| BarViewTarget::Unit {
+                                    title: entry
+                                        .get("unit_name")
+                                        .and_then(Value::as_str)
+                                        .filter(|name| !name.is_empty())
+                                        .map(str::to_string)
+                                        .unwrap_or_else(|| s(version, "name")),
+                                    version: version.clone(),
+                                    from: 0,
+                                    single_page: false,
+                                })
+                            })
+                    } else if targets.is_empty() {
+                        let pages: i64 = d
+                            .detail
+                            .get("resolved_entries")
+                            .and_then(Value::as_array)
+                            .map(|entries| {
+                                entries
+                                    .iter()
+                                    .map(|e| {
+                                        let total = e
+                                            .get("resolved")
+                                            .map(|r| i(r, "page_count"))
+                                            .unwrap_or(0);
+                                        match e
+                                            .get("entry")
+                                            .and_then(|en| en.get("excerpt_slots"))
+                                            .and_then(Value::as_array)
+                                        {
+                                            Some(slots) if !slots.is_empty() => {
+                                                (slots.len() as i64).min(total)
+                                            }
+                                            _ => total,
+                                        }
+                                    })
+                                    .sum()
+                            })
+                            .unwrap_or(0);
+                        (pages >= 1).then(|| BarViewTarget::Index {
+                            index_id: d.index_id.clone(),
+                            branch: if d.branch.is_empty() {
+                                "main".to_string()
+                            } else {
+                                d.branch.clone()
+                            },
+                            name: s(&d.detail["index"], "name"),
+                            from: 0,
+                        })
+                    } else {
+                        None
+                    }
                 }
                 _ => None,
             }
         } else if self.page == Page::Content {
             match self.content.stack.top() {
-                ContentFrame::Unit(st) => {
-                    super::content_detail::resolve_unit_bar_version(st).and_then(
-                        |(t, non_latest)| {
-                            let page_count = i(&t.version, "page_count");
-                            if page_count < 1 {
-                                return None;
-                            }
-                            let unit = st.detail.get("unit");
-                            let name = unit.map(|u| s(u, "name")).unwrap_or_default();
-                            // A picked history version or working draft names itself
-                            // in the show title, so what is playing is never
-                            // mistaken for the latest published version.
-                            let title = if non_latest {
-                                let ver_tag = if s(&t.version, "status") == "working"
-                                    || s(&t.version, "semver").is_empty()
-                                {
-                                    "草稿".to_string()
-                                } else {
-                                    format!("v{}", s(&t.version, "semver"))
-                                };
-                                format!("{name} · {ver_tag}")
-                            } else {
-                                name
-                            };
-                            Some(BarViewTarget::Unit {
-                                title,
-                                version: t.version,
-                                from: st
-                                    .selected_page
-                                    .unwrap_or(0)
-                                    .min(page_count as usize - 1),
-                            })
-                        },
-                    )
+                ContentFrame::Wall(w) => {
+                    let selected = if w.multi.len() == 1 {
+                        w.multi.first().cloned()
+                    } else if w.multi.is_empty() {
+                        w.selected.clone()
+                    } else {
+                        None
+                    };
+                    selected.and_then(|uid| {
+                        let version = self.unit_latest_version(&uid)?;
+                        (i(&version, "page_count") >= 1).then(|| BarViewTarget::Unit {
+                            title: self.unit_name(&uid),
+                            version,
+                            from: 0,
+                            single_page: true,
+                        })
+                    })
                 }
-                _ => None,
+                ContentFrame::Unit(st) => {
+                    super::content_detail::resolve_unit_bar_version(st).and_then(|(t, non_latest)| {
+                        let page_count = i(&t.version, "page_count");
+                        if page_count < 1 {
+                            return None;
+                        }
+                        let unit = st.detail.get("unit");
+                        let name = unit.map(|u| s(u, "name")).unwrap_or_default();
+                        let title = if non_latest {
+                            let ver_tag = if s(&t.version, "status") == "working"
+                                || s(&t.version, "semver").is_empty()
+                            {
+                                "草稿".to_string()
+                            } else {
+                                format!("v{}", s(&t.version, "semver"))
+                            };
+                            format!("{name} · {ver_tag}")
+                        } else {
+                            name
+                        };
+                        Some(BarViewTarget::Unit {
+                            title,
+                            version: t.version,
+                            from: st
+                                .selected_page
+                                .unwrap_or(0)
+                                .min(page_count as usize - 1),
+                            single_page: true,
+                        })
+                    })
+                }
             }
         } else {
             None
@@ -883,31 +936,8 @@ impl App {
             .tool(ui, ChromeIcon::Play, "开始演示", views_open, true, true)
             .clicked()
         {
-            match &view_target {
-                Some(BarViewTarget::Showroom) => {
-                    let (item, pages) = (item.clone().unwrap(), pages.clone().unwrap());
-                    if !self.present_via_deckcraft(
-                        &s(&item, "id"),
-                        &s(&item, "title"),
-                        DcMode::Play,
-                        from,
-                    ) {
-                        self.start_presentation(ui, &item, &pages);
-                    }
-                }
-                Some(BarViewTarget::Unit {
-                    title,
-                    version,
-                    from,
-                }) => {
-                    let (title, version, from) =
-                        (title.clone(), version.clone(), *from);
-                    self.present_unit_version(&title, &version, DcMode::Play, from);
-                }
-                Some(BarViewTarget::Index) => {
-                    self.present_index_views(DcMode::Play);
-                }
-                None => {}
+            if let Some(target) = &view_target {
+                self.open_bar_view(ui, target, DcMode::Play);
             }
         }
         if ChromeIcons
@@ -921,31 +951,8 @@ impl App {
             )
             .clicked()
         {
-            match &view_target {
-                Some(BarViewTarget::Showroom) => {
-                    let (item, pages) = (item.clone().unwrap(), pages.clone().unwrap());
-                    if !self.present_via_deckcraft(
-                        &s(&item, "id"),
-                        &s(&item, "title"),
-                        DcMode::Presenter,
-                        from,
-                    ) {
-                        self.start_presentation(ui, &item, &pages);
-                    }
-                }
-                Some(BarViewTarget::Unit {
-                    title,
-                    version,
-                    from,
-                }) => {
-                    let (title, version, from) =
-                        (title.clone(), version.clone(), *from);
-                    self.present_unit_version(&title, &version, DcMode::Presenter, from);
-                }
-                Some(BarViewTarget::Index) => {
-                    self.present_index_views(DcMode::Presenter);
-                }
-                None => {}
+            if let Some(target) = &view_target {
+                self.open_bar_view(ui, target, DcMode::Presenter);
             }
         }
         if ChromeIcons
@@ -953,7 +960,7 @@ impl App {
                 ui,
                 ChromeIcon::Notes,
                 "备注视图",
-                deck_open,
+                views_open,
                 view == DeckView::Notes,
                 true,
             )
@@ -961,6 +968,8 @@ impl App {
         {
             if let SrFrame::Deck(st) = self.showroom.stack.top_mut() {
                 st.view = DeckView::Notes;
+            } else if let Some(target) = &view_target {
+                self.open_bar_view(ui, target, DcMode::Notes);
             }
         }
         if ChromeIcons
@@ -968,7 +977,7 @@ impl App {
                 ui,
                 ChromeIcon::Thumbs,
                 "缩略视图",
-                deck_open,
+                views_open,
                 view == DeckView::Thumbnails,
                 true,
             )
@@ -976,37 +985,16 @@ impl App {
         {
             if let SrFrame::Deck(st) = self.showroom.stack.top_mut() {
                 st.view = DeckView::Thumbnails;
+            } else if let Some(target) = &view_target {
+                self.open_bar_view(ui, target, DcMode::Thumbnails);
             }
         }
         if ChromeIcons
             .tool(ui, ChromeIcon::Reading, "普通视图", views_open, false, true)
             .clicked()
         {
-            match &view_target {
-                Some(BarViewTarget::Showroom) => {
-                    let item = item.clone().unwrap();
-                    if !self.present_via_deckcraft(
-                        &s(&item, "id"),
-                        &s(&item, "title"),
-                        DcMode::Reading,
-                        from,
-                    ) {
-                        self.present_showroom(&s(&item, "id"), &s(&item, "title"));
-                    }
-                }
-                Some(BarViewTarget::Unit {
-                    title,
-                    version,
-                    from,
-                }) => {
-                    let (title, version, from) =
-                        (title.clone(), version.clone(), *from);
-                    self.present_unit_version(&title, &version, DcMode::Reading, from);
-                }
-                Some(BarViewTarget::Index) => {
-                    self.present_index_views(DcMode::Reading);
-                }
-                None => {}
+            if let Some(target) = &view_target {
+                self.open_bar_view(ui, target, DcMode::Normal);
             }
         }
         tool_vsep(ui);

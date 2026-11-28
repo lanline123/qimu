@@ -105,6 +105,12 @@ impl HostedShow {
         from: usize,
         displays: Option<Box<dyn FnMut() -> Option<usize>>>,
     ) -> Result<Self, String> {
+        if matches!(
+            mode,
+            crate::DcMode::Normal | crate::DcMode::Thumbnails | crate::DcMode::Notes
+        ) {
+            return Err("普通、缩略图和备注视图需要 DeckCraft 桌面应用".into());
+        }
         // Every other service stays None: no file pickers, no
         // read/write bridges and no web presenter-popup host. Audio
         // is the one service the shell does provide, through the
@@ -136,8 +142,7 @@ impl HostedShow {
         // flag explicitly per mode — the same discipline dc_jump
         // applies to the persisted flag over the control protocol.
         app.ui.presenter_view = matches!(mode, crate::DcMode::Presenter);
-        let reading = matches!(mode, crate::DcMode::Reading);
-        app.start_show(from, reading);
+        app.start_show(from, false);
         if app.show.is_none() {
             return Err("DeckCraft did not start a show (no active document)".into());
         }

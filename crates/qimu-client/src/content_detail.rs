@@ -987,7 +987,7 @@ impl App {
         // intro · 当前 vX · 跟随最新/锁定版本 — and the status
         // badges ride the same line). egui has no baseline
         // layout; bottom-of-line-box alignment is the closest
-        // faithful form (for the 20px title against the 13px
+        // faithful form (for the 17px title against the 13px
         // hint it lands within ~2px of the shared baseline,
         // where the old centered wrapped row visibly floated
         // the hint high). The hint segments therefore sit in
@@ -998,112 +998,123 @@ impl App {
         // over the whole remaining viewport height: `Align::BOTTOM` inside
         // an unbounded `max_rect` places the header at the bottom edge of
         // the window and collapses the ScrollArea below it to 0px height.
-        ui.allocate_ui_with_layout(
-            egui::vec2(ui.available_width(), 28.0),
-            egui::Layout::left_to_right(egui::Align::BOTTOM).with_main_wrap(true),
-            |ui| {
-                ui.spacing_mut().item_spacing.x = 12.0;
-                if matches!(&st.meta_edit, Some((MetaField::Name, _))) {
-                    self.meta_edit_ui(ui, st, MetaField::Name);
-                } else {
-                    let title = ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(s(unit, "name")).size(20.0).strong(),
-                        )
-                        .wrap()
-                        .sense(egui::Sense::click()),
-                    );
-                    if title.double_clicked() {
-                        st.meta_edit = Some((MetaField::Name, s(unit, "name")));
-                        st.meta_edit_focus = true;
-                    }
-                }
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    let mut hint_has_intro = false;
-                    if matches!(&st.meta_edit, Some((MetaField::Description, _))) {
-                        hint_has_intro = true;
-                        self.meta_edit_ui(ui, st, MetaField::Description);
-                    } else if !s(unit, "description").is_empty() {
-                        hint_has_intro = true;
-                        let intro = ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(s(unit, "description"))
+        egui::Frame::new()
+            .fill(palette_color(PANEL_BG))
+            .stroke(egui::Stroke::new(1.0, palette_color(FIELD_BORDER)))
+            .corner_radius(8)
+            .inner_margin(egui::Margin { left: 12, right: 12, top: 8, bottom: 8 })
+            .show(ui, |ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 28.0),
+                    egui::Layout::left_to_right(egui::Align::BOTTOM).with_main_wrap(true),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.x = 12.0;
+                        if matches!(&st.meta_edit, Some((MetaField::Name, _))) {
+                            self.meta_edit_ui(ui, st, MetaField::Name);
+                        } else {
+                            let title = ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(s(unit, "name"))
+                                        .strong()
+                                        .size(17.0)
+                                        .color(palette_color(TEXT_MAIN)),
+                                )
+                                .wrap()
+                                .sense(egui::Sense::click()),
+                            )
+                            .on_hover_text("双击重命名");
+                            if title.double_clicked() {
+                                st.meta_edit = Some((MetaField::Name, s(unit, "name")));
+                                st.meta_edit_focus = true;
+                            }
+                        }
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            let mut hint_has_intro = false;
+                            if matches!(&st.meta_edit, Some((MetaField::Description, _))) {
+                                hint_has_intro = true;
+                                self.meta_edit_ui(ui, st, MetaField::Description);
+                            } else if !s(unit, "description").is_empty() {
+                                hint_has_intro = true;
+                                let intro = ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(s(unit, "description"))
+                                            .size(13.0)
+                                            .color(palette_color(TEXT_FAINT)),
+                                    )
+                                    .sense(egui::Sense::click()),
+                                );
+                                if intro.double_clicked() {
+                                    st.meta_edit =
+                                        Some((MetaField::Description, s(unit, "description")));
+                                    st.meta_edit_focus = true;
+                                }
+                            }
+                            let head_semver = s(&head_ver, "semver");
+                            let head_ver_label = if !head_semver.is_empty() {
+                                Some(format!("当前 v{head_semver}"))
+                            } else if s(&head_ver, "status") == "working" {
+                                Some("当前 草稿".to_string())
+                            } else {
+                                None
+                            };
+                            if let Some(ver_txt) = &head_ver_label {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{}{}",
+                                        if hint_has_intro { " · " } else { "" },
+                                        ver_txt
+                                    ))
                                     .size(13.0)
                                     .color(palette_color(TEXT_FAINT)),
-                            )
-                            .sense(egui::Sense::click()),
-                        );
-                        if intro.double_clicked() {
-                            st.meta_edit =
-                                Some((MetaField::Description, s(unit, "description")));
-                            st.meta_edit_focus = true;
-                        }
-                    }
-                    let head_semver = s(&head_ver, "semver");
-                    let head_ver_label = if !head_semver.is_empty() {
-                        Some(format!("当前 v{head_semver}"))
-                    } else if s(&head_ver, "status") == "working" {
-                        Some("当前 草稿".to_string())
-                    } else {
-                        None
-                    };
-                    if let Some(ver_txt) = &head_ver_label {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{}{}",
-                                if hint_has_intro { " · " } else { "" },
-                                ver_txt
-                            ))
-                            .size(13.0)
-                            .color(palette_color(TEXT_FAINT)),
-                        );
-                    }
-                    let policy_text = match &st.entry_policy {
-                        Some(EntryPolicyView::Locked { semver }) if !semver.is_empty() => {
-                            format!("锁定版本 v{semver}")
-                        }
-                        Some(EntryPolicyView::Locked { .. }) => "锁定版本".to_string(),
-                        _ => "跟随最新".to_string(),
-                    };
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{}{policy_text}",
-                            if hint_has_intro || head_ver_label.is_some() {
-                                " · "
-                            } else {
-                                ""
+                                );
                             }
-                        ))
-                        .size(13.0)
-                        .color(palette_color(TEXT_FAINT)),
-                    );
-                });
-                // Status badges (prototype .h-badges, right after the
-                // hint): derived server/core-side from the unit's
-                // rendition state and shipped on the payload — ok
-                // badges take the info form, warn badges the warn
-                // form. The 编辑中 badge has no state source in the
-                // client and is not fabricated (REPORT).
-                if let Some(badges) = st
-                    .detail
-                    .get("status_badges")
-                    .and_then(Value::as_array)
-                {
-                    for badge in badges {
-                        let text = s(badge, "text");
-                        if text.is_empty() {
-                            continue;
+                            let policy_text = match &st.entry_policy {
+                                Some(EntryPolicyView::Locked { semver }) if !semver.is_empty() => {
+                                    format!("锁定版本 v{semver}")
+                                }
+                                Some(EntryPolicyView::Locked { .. }) => "锁定版本".to_string(),
+                                _ => "跟随最新".to_string(),
+                            };
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{}{policy_text}",
+                                    if hint_has_intro || head_ver_label.is_some() {
+                                        " · "
+                                    } else {
+                                        ""
+                                    }
+                                ))
+                                .size(13.0)
+                                .color(palette_color(TEXT_FAINT)),
+                            );
+                        });
+                        // Status badges (prototype .h-badges, right after the
+                        // hint): derived server/core-side from the unit's
+                        // rendition state and shipped on the payload — ok
+                        // badges take the info form, warn badges the warn
+                        // form. The 编辑中 badge has no state source in the
+                        // client and is not fabricated (REPORT).
+                        if let Some(badges) = st
+                            .detail
+                            .get("status_badges")
+                            .and_then(Value::as_array)
+                        {
+                            for badge in badges {
+                                let text = s(badge, "text");
+                                if text.is_empty() {
+                                    continue;
+                                }
+                                if s(badge, "kind") == "warn" {
+                                    chip(ui, &text, palette_color(CHIP_ORANGE_FG), CHIP_ORANGE_BG);
+                                } else {
+                                    chip(ui, &text, palette_color(ACCENT_DEEP), CHIP_BLUE_BG);
+                                }
+                            }
                         }
-                        if s(badge, "kind") == "warn" {
-                            chip(ui, &text, palette_color(CHIP_ORANGE_FG), CHIP_ORANGE_BG);
-                        } else {
-                            chip(ui, &text, palette_color(ACCENT_DEEP), CHIP_BLUE_BG);
-                        }
-                    }
-                }
-            },
-        );
+                    },
+                );
+            });
         if missing_lang {
             ui.add_space(10.0);
             egui::Frame::NONE

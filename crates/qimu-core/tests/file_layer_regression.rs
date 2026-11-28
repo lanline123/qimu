@@ -273,6 +273,20 @@ mod parity {
     }
 
     #[test]
+    fn split_one_matches_selected_split_fragment() {
+        let pkg = Package::load(&deck_bytes()).unwrap();
+        let fragments = pptx::split(&pkg).unwrap();
+        for (index, fragment) in fragments.iter().enumerate() {
+            let single = pptx::split_one(&pkg, index).unwrap();
+            assert_eq!(single.parts, fragment.parts);
+            let reloaded = Package::load(&single.to_bytes().unwrap()).unwrap();
+            assert_eq!(pptx::slides(&reloaded).unwrap().len(), 1);
+            assert!(pptx::structural_errors(&reloaded).is_empty());
+        }
+        assert!(pptx::split_one(&pkg, fragments.len()).is_err());
+    }
+
+    #[test]
     fn assemble_split_deck_ok() {
         let pkg = Package::load(&deck_bytes()).unwrap();
         let frags = pptx::split(&pkg).unwrap();

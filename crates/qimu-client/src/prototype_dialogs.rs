@@ -186,273 +186,296 @@ impl App {
         let mut submit = false;
         let mut copy_link = false;
         let mut want_link_gen = false;
-        let dialog = egui::Modal::new(egui::Id::unique("share-deck")).show(ctx, |ui| {
-            ui.set_width(620.0);
-            ui.heading(tr("分享这套演示稿"));
-            ui.label(
-                egui::RichText::new(format!("「{}」· {}", state.title, state.meta))
-                    .size(12.0)
-                    .color(palette_color(TEXT_WEAK)),
-            );
-            ui.add_space(8.0);
-            let previous_mode = state.mode;
-            ui.horizontal(|ui| {
-                for (mode, label) in [
-                    (ShareMode::Person, "个人"),
-                    (ShareMode::Department, "部门"),
-                    (ShareMode::Group, "群组"),
-                    (ShareMode::Link, "链接"),
-                ] {
-                    ui.selectable_value(&mut state.mode, mode, tr(label));
+        let subtitle = format!("「{}」 · {}", state.title, state.meta);
+        let dialog = super::modal_kit::show(
+            ctx,
+            super::modal_kit::ModalSpec::new(
+                egui::Id::unique("share-deck"),
+                tr("分享这套演示稿"),
+                ChromeIcon::Share,
+            )
+            .subtitle(&subtitle)
+            .width(680.0),
+            |ui| {
+                let previous_mode = state.mode;
+                if let Some(view) = segmented(
+                    ui,
+                    &["个人", "部门", "群组", "链接"],
+                    match state.mode {
+                        ShareMode::Person => 0,
+                        ShareMode::Department => 1,
+                        ShareMode::Group => 2,
+                        ShareMode::Link => 3,
+                    },
+                    SegStyle::Soft,
+                ) {
+                    state.mode = match view {
+                        0 => ShareMode::Person,
+                        1 => ShareMode::Department,
+                        2 => ShareMode::Group,
+                        _ => ShareMode::Link,
+                    };
                 }
-            });
-            if state.mode != previous_mode {
-                state.target.clear();
-                state.search.clear();
-                state.reload_contacts = state.mode == ShareMode::Person;
-            }
-            // The 链接 form generates its artifact after the
-            // modal, in the same deferred slot as the contacts
-            // reload: generation may assemble the deck and call
-            // the server fallback, neither of which belongs in
-            // the modal closure.
-            want_link_gen = state.mode == ShareMode::Link
-                && state.link.is_empty()
-                && state.link_error.is_empty();
-            ui.add_space(6.0);
-            match state.mode {
-                ShareMode::Person => {
-                    ui.horizontal(|ui| {
-                        let response = ui.add_sized(
-                            [ui.available_width() - 78.0, 28.0],
-                            egui::TextEdit::singleline(&mut state.search)
-                                .hint_text(tr("搜索公司通讯录姓名或账号")),
-                        );
-                        if (response.lost_focus()
-                            && ui.input(|input| input.key_pressed(egui::Key::Enter)))
-                            || ui.button(tr("搜索")).clicked()
-                        {
-                            state.reload_contacts = true;
-                        }
-                    });
-                    ui.label(
-                        egui::RichText::new(tr("公司通讯录"))
-                            .size(11.5)
-                            .color(palette_color(TEXT_WEAK)),
-                    );
-                    if !self.my_contacts.is_empty() {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(
-                                egui::RichText::new(tr("常用联系人："))
-                                    .size(11.0)
-                                    .color(palette_color(TEXT_WEAK)),
+                if state.mode != previous_mode {
+                    state.target.clear();
+                    state.search.clear();
+                    state.reload_contacts = state.mode == ShareMode::Person;
+                }
+                // The 链接 form generates its artifact after the
+                // modal, in the same deferred slot as the contacts
+                // reload: generation may assemble the deck and call
+                // the server fallback, neither of which belongs in
+                // the modal closure.
+                want_link_gen = state.mode == ShareMode::Link
+                    && state.link.is_empty()
+                    && state.link_error.is_empty();
+                ui.add_space(14.0);
+                match state.mode {
+                    ShareMode::Person => {
+                        super::modal_kit::section_label(ui, tr("选择收件人"));
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            let response = ui.add_sized(
+                                [ui.available_width() - 78.0, 28.0],
+                                egui::TextEdit::singleline(&mut state.search)
+                                    .hint_text(tr("搜索公司通讯录姓名或账号")),
                             );
-                            for name in &self.my_contacts {
-                                let matched = state.contacts.iter().find(|c| {
-                                    s(c, "display_name") == *name || s(c, "username") == *name
-                                });
-                                let selected = matched
-                                    .map(|c| s(c, "id") == state.target)
-                                    .unwrap_or(false);
-                                if ui.selectable_label(selected, name).clicked() {
-                                    if let Some(c) = matched {
-                                        state.target = s(c, "id");
-                                    } else {
-                                        state.search = name.clone();
-                                        state.reload_contacts = true;
-                                    }
-                                }
+                            if (response.lost_focus()
+                                && ui.input(|input| input.key_pressed(egui::Key::Enter)))
+                                || ui.button(tr("搜索")).clicked()
+                            {
+                                state.reload_contacts = true;
                             }
                         });
-                        ui.add_space(4.0);
-                    }
-                    egui::ScrollArea::vertical()
-                        .id_salt("share-contacts")
-                        .max_height(190.0)
-                        .show(ui, |ui| {
-                            if state.contacts.is_empty() {
-                                if self.role() == "member" {
-                                    ui.label(tr("普通成员不可浏览公司通讯录，可切换到群组分享。"));
-                                } else {
-                                    ui.label(tr("没有匹配的同事"));
+                        super::modal_kit::section_label(ui, tr("公司通讯录"));
+                        if !self.my_contacts.is_empty() {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    egui::RichText::new(tr("常用联系人："))
+                                        .size(11.0)
+                                        .color(palette_color(TEXT_WEAK)),
+                                );
+                                for name in &self.my_contacts {
+                                    let matched = state.contacts.iter().find(|c| {
+                                        s(c, "display_name") == *name || s(c, "username") == *name
+                                    });
+                                    let selected = matched
+                                        .map(|c| s(c, "id") == state.target)
+                                        .unwrap_or(false);
+                                    if ui.selectable_label(selected, name).clicked() {
+                                        if let Some(c) = matched {
+                                            state.target = s(c, "id");
+                                        } else {
+                                            state.search = name.clone();
+                                            state.reload_contacts = true;
+                                        }
+                                    }
                                 }
-                            }
-                            for contact in &state.contacts {
-                                let id = s(contact, "id");
-                                let selected = state.target == id;
-                                let text = format!(
-                                    "{}  ·  {}",
-                                    s(contact, "display_name"),
-                                    if s(contact, "dept_name").is_empty() {
+                            });
+                            ui.add_space(4.0);
+                        }
+                        egui::ScrollArea::vertical()
+                            .id_salt("share-contacts")
+                            .max_height(210.0)
+                            .show(ui, |ui| {
+                                if state.contacts.is_empty() {
+                                    if self.role() == "member" {
+                                        ui.label(tr(
+                                            "普通成员不可浏览公司通讯录，可切换到群组分享。",
+                                        ));
+                                    } else {
+                                        ui.label(tr("没有匹配的同事"));
+                                    }
+                                }
+                                for contact in &state.contacts {
+                                    let id = s(contact, "id");
+                                    let selected = state.target == id;
+                                    let name = s(contact, "display_name");
+                                    let detail = if s(contact, "dept_name").is_empty() {
                                         s(contact, "username")
                                     } else {
                                         s(contact, "dept_name")
+                                    };
+                                    if super::modal_kit::choice_row(ui, &name, &detail, selected) {
+                                        state.target = id;
                                     }
-                                );
-                                if ui
-                                    .add(
-                                        egui::Button::new(egui::RichText::new(text).color(
-                                            palette_color(if selected {
-                                                ACCENT_DEEP
-                                            } else {
-                                                TEXT_MAIN
-                                            }),
-                                        ))
-                                        .fill(
-                                            if selected {
-                                                palette_color(SEL_BG)
-                                            } else {
-                                                egui::Color32::TRANSPARENT
-                                            },
-                                        ),
-                                    )
-                                    .clicked()
-                                {
-                                    state.target = id;
+                                    ui.add_space(4.0);
                                 }
-                            }
-                        });
-                }
-                ShareMode::Department => {
-                    let departments = self.org["departments"]
-                        .as_array()
-                        .cloned()
-                        .unwrap_or_default();
-                    egui::ScrollArea::vertical()
-                        .id_salt("share-departments")
-                        .max_height(220.0)
-                        .show(ui, |ui| {
-                            for dept in departments {
-                                let id = s(&dept, "id");
-                                let depth = department_depth(
-                                    self.org["departments"]
+                            });
+                    }
+                    ShareMode::Department => {
+                        super::modal_kit::section_label(ui, tr("选择部门"));
+                        ui.label(
+                            egui::RichText::new(tr("部门全体成员（含子部门）可见。"))
+                                .size(11.5)
+                                .color(palette_color(TEXT_WEAK)),
+                        );
+                        ui.add_space(6.0);
+                        let departments = self.org["departments"]
+                            .as_array()
+                            .cloned()
+                            .unwrap_or_default();
+                        egui::ScrollArea::vertical()
+                            .id_salt("share-departments")
+                            .max_height(220.0)
+                            .show(ui, |ui| {
+                                for dept in departments {
+                                    let id = s(&dept, "id");
+                                    let depth = department_depth(
+                                        self.org["departments"]
+                                            .as_array()
+                                            .map(Vec::as_slice)
+                                            .unwrap_or_default(),
+                                        &id,
+                                    );
+                                    let selected = state.target == id;
+                                    let name =
+                                        format!("{}{}", "　".repeat(depth), s(&dept, "name"));
+                                    if super::modal_kit::choice_row(ui, &name, "", selected) {
+                                        state.target = id;
+                                    }
+                                    ui.add_space(4.0);
+                                }
+                            });
+                    }
+                    ShareMode::Group => {
+                        super::modal_kit::section_label(ui, tr("选择群组"));
+                        ui.label(
+                            egui::RichText::new(tr("群组全体成员可见可用。"))
+                                .size(11.5)
+                                .color(palette_color(TEXT_WEAK)),
+                        );
+                        ui.add_space(6.0);
+                        egui::ScrollArea::vertical()
+                            .id_salt("share-groups")
+                            .max_height(220.0)
+                            .show(ui, |ui| {
+                                if self.my_teams.is_empty() {
+                                    ui.label(tr("还没有加入任何群组"));
+                                }
+                                for group in &self.my_teams {
+                                    let id = s(group, "id");
+                                    let selected = state.target == id;
+                                    let member_count = group["members"]
                                         .as_array()
-                                        .map(Vec::as_slice)
-                                        .unwrap_or_default(),
-                                    &id,
-                                );
-                                let selected = state.target == id;
-                                if ui
-                                    .add(
-                                        egui::Button::new(format!(
-                                            "{}{}",
-                                            "　".repeat(depth),
-                                            s(&dept, "name")
-                                        ))
-                                        .fill(
-                                            if selected {
-                                                palette_color(SEL_BG)
-                                            } else {
-                                                egui::Color32::TRANSPARENT
-                                            },
-                                        ),
-                                    )
-                                    .clicked()
-                                {
-                                    state.target = id;
+                                        .map(Vec::len)
+                                        .unwrap_or_default();
+                                    let name = s(group, "name");
+                                    let detail = format!("{member_count} 位成员");
+                                    if super::modal_kit::choice_row(ui, &name, &detail, selected) {
+                                        state.target = id;
+                                    }
+                                    ui.add_space(4.0);
                                 }
-                            }
-                        });
+                            });
+                    }
+                    ShareMode::Link => {
+                        egui::Frame::new()
+                            .fill(palette_color(FIELD_BG))
+                            .stroke(egui::Stroke::new(1.0, palette_color(FIELD_BORDER)))
+                            .corner_radius(12)
+                            .inner_margin(egui::Margin::same(14))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    let (icon_rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(36.0, 36.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().rect_filled(
+                                        icon_rect,
+                                        9,
+                                        palette_color(ACCENT_SOFT),
+                                    );
+                                    ChromeIcons.paint(
+                                        ui,
+                                        ChromeIcon::Link,
+                                        icon_rect.center(),
+                                        18.0,
+                                        ACCENT_DEEP,
+                                    );
+                                    ui.add_space(10.0);
+                                    ui.vertical(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(tr("本地分享文件"))
+                                                .strong()
+                                                .size(13.5)
+                                                .color(palette_color(TEXT_MAIN)),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(tr(
+                                                "无需登录，把文件发给同事后导入即可打开。",
+                                            ))
+                                            .size(11.5)
+                                            .color(palette_color(TEXT_WEAK)),
+                                        );
+                                    });
+                                });
+                                ui.add_space(12.0);
+                                if !state.link.is_empty() {
+                                    ui.horizontal(|ui| {
+                                        let mut shown = state.link.clone();
+                                        ui.add_sized(
+                                            [ui.available_width() - 92.0, 30.0],
+                                            egui::TextEdit::singleline(&mut shown),
+                                        );
+                                        if ui.button(tr("复制链接")).clicked() {
+                                            copy_link = true;
+                                        }
+                                    });
+                                } else if !state.link_error.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "分享文件生成失败：{}",
+                                            state.link_error
+                                        ))
+                                        .size(12.0)
+                                        .color(palette_color(ROSE)),
+                                    );
+                                    if ui.button(tr("重新生成")).clicked() {
+                                        state.link_error.clear();
+                                    }
+                                } else {
+                                    ui.horizontal(|ui| {
+                                        ui.spinner();
+                                        ui.label(tr("正在生成分享文件…"));
+                                    });
+                                }
+                            });
+                    }
                 }
-                ShareMode::Group => {
-                    egui::ScrollArea::vertical()
-                        .id_salt("share-groups")
-                        .max_height(220.0)
+                if state.mode != ShareMode::Link {
+                    ui.add_space(14.0);
+                    super::modal_kit::section_label(ui, tr("附言（可选）"));
+                    ui.add_space(6.0);
+                    egui::Frame::new()
+                        .fill(palette_color(FIELD_BG))
+                        .stroke(egui::Stroke::new(1.0, palette_color(FIELD_BORDER)))
+                        .corner_radius(8)
+                        .inner_margin(egui::Margin::symmetric(10, 8))
                         .show(ui, |ui| {
-                            if self.my_teams.is_empty() {
-                                ui.label(tr("还没有加入任何群组"));
-                            }
-                            for group in &self.my_teams {
-                                let id = s(group, "id");
-                                let selected = state.target == id;
-                                let member_count = group["members"]
-                                    .as_array()
-                                    .map(Vec::len)
-                                    .unwrap_or_default();
-                                if ui
-                                    .add(
-                                        egui::Button::new(format!(
-                                            "{} · {} 位成员",
-                                            s(group, "name"),
-                                            member_count
-                                        ))
-                                        .fill(
-                                            if selected {
-                                                palette_color(SEL_BG)
-                                            } else {
-                                                egui::Color32::TRANSPARENT
-                                            },
-                                        ),
-                                    )
-                                    .clicked()
-                                {
-                                    state.target = id;
-                                }
-                            }
-                        });
-                }
-                ShareMode::Link => {
-                    if !state.link.is_empty() {
-                        ui.horizontal(|ui| {
-                            let mut shown = state.link.clone();
                             ui.add_sized(
-                                [ui.available_width() - 92.0, 28.0],
-                                egui::TextEdit::singleline(&mut shown),
+                                [ui.available_width(), 62.0],
+                                egui::TextEdit::multiline(&mut state.note)
+                                    .hint_text(tr("给收件人补充说明")),
                             );
-                            if ui.button(tr("复制链接")).clicked() {
-                                copy_link = true;
-                            }
                         });
-                        ui.label(
-                            egui::RichText::new(tr(
-                                "链接指向本机生成的分享文件；把文件发给同事，对方导入即可打开。",
-                            ))
-                            .size(11.5)
-                            .color(palette_color(TEXT_WEAK)),
-                        );
-                    } else if !state.link_error.is_empty() {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "分享文件生成失败：{}",
-                                state.link_error
-                            ))
-                            .size(12.0)
-                            .color(palette_color(TEXT_WEAK)),
-                        );
-                        if ui.button(tr("重新生成")).clicked() {
-                            state.link_error.clear();
-                        }
-                    } else {
-                        ui.label(tr("正在生成分享文件…"));
-                    }
                 }
-            }
-            ui.add_space(8.0);
-            ui.label(tr("附言（可选）"));
-            ui.add_sized(
-                [ui.available_width(), 68.0],
-                egui::TextEdit::multiline(&mut state.note).hint_text(tr("给收件人补充说明")),
-            );
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let can_send = if state.mode == ShareMode::Link {
-                        !state.link.is_empty()
+                let can_send = if state.mode == ShareMode::Link {
+                    !state.link.is_empty()
+                } else {
+                    !state.target.is_empty()
+                };
+                submit = super::modal_kit::footer(
+                    ui,
+                    if state.mode == ShareMode::Link {
+                        tr("复制链接")
                     } else {
-                        !state.target.is_empty()
-                    };
-                    if ui
-                        .add_enabled(can_send, egui::Button::new(tr("发送分享")))
-                        .clicked()
-                    {
-                        submit = true;
-                    }
-                    if btn_default(ui, tr("取消")).clicked() {
-                        ui.close();
-                    }
-                });
-            });
-        });
+                        tr("发送分享")
+                    },
+                    can_send,
+                );
+            },
+        );
         if copy_link {
             ctx.copy_text(state.link.clone());
             self.msg = "链接已复制".into();
@@ -652,41 +675,47 @@ impl App {
             return;
         };
         let mut submit = false;
-        let dialog = egui::Modal::new(egui::Id::unique("pull-into-library")).show(ctx, |ui| {
-            ui.set_width(460.0);
-            ui.heading(format!("{} · {}", tr("保存到我的库"), state.title));
-            ui.label(
-                egui::RichText::new(format!("{} · 引用，跟随来源更新", state.meta))
-                    .size(12.0)
-                    .color(palette_color(TEXT_WEAK)),
-            );
-            ui.add_space(8.0);
-            ui.label(tr("选择“我的哪个目录”"));
-            let mut folders = state.folders.clone();
-            if !folders.iter().any(|folder| folder == &state.folder) {
-                folders.push(state.folder.clone());
-            }
-            for folder in folders {
-                ui.selectable_value(&mut state.folder, folder.clone(), folder);
-            }
-            ui.add_space(6.0);
-            ui.label(tr("或输入新目录"));
-            ui.add_sized(
-                [ui.available_width(), 28.0],
-                egui::TextEdit::singleline(&mut state.new_folder).hint_text(tr("新目录名称")),
-            );
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if btn_primary(ui, tr("保存到这个目录")).clicked() {
-                        submit = true;
+        let subtitle = format!("{} · {} · 引用，跟随来源更新", state.title, state.meta);
+        let dialog = super::modal_kit::show(
+            ctx,
+            super::modal_kit::ModalSpec::new(
+                egui::Id::unique("pull-into-library"),
+                tr("保存到我的库"),
+                ChromeIcon::Download,
+            )
+            .subtitle(&subtitle)
+            .width(520.0),
+            |ui| {
+                super::modal_kit::section_label(ui, tr("选择“我的哪个目录”"));
+                ui.add_space(6.0);
+                let mut folders = state.folders.clone();
+                if !folders.iter().any(|folder| folder == &state.folder) {
+                    folders.push(state.folder.clone());
+                }
+                for folder in folders {
+                    if super::modal_kit::choice_row(ui, &folder, "", state.folder == folder) {
+                        state.folder = folder;
                     }
-                    if btn_default(ui, tr("取消")).clicked() {
-                        ui.close();
-                    }
-                });
-            });
-        });
+                    ui.add_space(4.0);
+                }
+                ui.add_space(10.0);
+                super::modal_kit::section_label(ui, tr("或输入新目录"));
+                ui.add_space(6.0);
+                egui::Frame::new()
+                    .fill(palette_color(FIELD_BG))
+                    .stroke(egui::Stroke::new(1.0, palette_color(FIELD_BORDER)))
+                    .corner_radius(8)
+                    .inner_margin(egui::Margin::symmetric(10, 7))
+                    .show(ui, |ui| {
+                        ui.add_sized(
+                            [ui.available_width(), 30.0],
+                            egui::TextEdit::singleline(&mut state.new_folder)
+                                .hint_text(tr("新目录名称")),
+                        );
+                    });
+                submit = super::modal_kit::footer(ui, tr("保存到这个目录"), true);
+            },
+        );
         if dialog.should_close() {
             return;
         }

@@ -24,6 +24,7 @@ mod hosted_show;
 mod hosted_audio;
 mod local_render;
 mod local_store;
+mod modal_kit;
 use prototype_dialogs::{PullDialogState, PushDialogState, ShareDialogState};
 
 use chrome_icons::{ChromeIcon, ChromeIcons};
@@ -1165,10 +1166,20 @@ fn spawn_open(path: &std::path::Path) -> std::io::Result<std::process::Child> {
 enum DcMode {
     /// Full-screen slide show (`show.start {reading: false}`).
     Play,
-    /// Windowed reading view (`show.start {reading: true}`).
-    Reading,
+    /// DeckCraft's editable Normal view (`ui.set {view: "normal"}`).
+    Normal,
     /// Full-screen show + presenter window (`show.presenter {on: true}`).
     Presenter,
+    /// DeckCraft's slide sorter (`ui.set {view: "sorter"}`).
+    Thumbnails,
+    /// DeckCraft's notes-page view (`ui.set {view: "notesPage"}`).
+    Notes,
+}
+
+impl DcMode {
+    fn uses_editor_view(self) -> bool {
+        matches!(self, Self::Normal | Self::Thumbnails | Self::Notes)
+    }
 }
 
 /// Events the DeckCraft watcher thread reports back to the UI thread.
@@ -2040,7 +2051,6 @@ enum IndexDetailAction {
     /// the one selected entry through the insert pick channel
     /// with replace semantics.
     RePick(usize),
-    PickPages(usize, Value, Vec<bool>),
     SwitchVersion(usize, String, String, bool),
 }
 
@@ -3694,8 +3704,8 @@ struct DeckState {
     /// wall shows the pinned order again.
     reorder: Option<Vec<ShowroomPage>>,
     /// The copy saved by the last successful save-as on this
-    /// frame (list_local_showroom shape), kept so the reorder
-    /// bar can offer a jump into it; a fresh adjustment clears
+    /// frame (list_local_showroom shape), kept so the top toolbar
+    /// can offer a jump into it; a fresh adjustment clears
     /// it (the note belongs to the previous arrangement).
     saved_copy: Option<Value>,
     /// Page-card drag state on the thumbnails wall: the display
@@ -3786,6 +3796,27 @@ fn deck_drag_target(rects: &[(usize, egui::Rect)], pos: egui::Pos2) -> usize {
 enum DeckView {
     Thumbnails,
     Notes,
+}
+
+#[derive(Clone)]
+enum BarViewTarget {
+    Showroom {
+        item: Value,
+        pages: Vec<ShowroomPage>,
+        from: usize,
+    },
+    Index {
+        index_id: String,
+        branch: String,
+        name: String,
+        from: usize,
+    },
+    Unit {
+        title: String,
+        version: Value,
+        from: usize,
+        single_page: bool,
+    },
 }
 
 #[derive(Clone)]
@@ -10427,7 +10458,7 @@ impl App {
         uid.to_string()
     }
 
-    fn unit_latest_version_id(&self, uid: &str) -> Option<String> {
+    fn unit_latest_version(&self, uid: &str) -> Option<Value> {
         for item in &self.units {
             let Some(unit) = item.get("unit") else {
                 continue;
@@ -10436,13 +10467,17 @@ impl App {
                 continue;
             }
             let rends = item.get("renditions")?.as_array()?;
-            let id = s(rends.first()?.get("latest")?, "id");
-            if id.is_empty() {
+            let latest = rends.first()?.get("latest")?;
+            if !latest.is_object() || s(latest, "id").is_empty() {
                 return None;
             }
-            return Some(id);
+            return Some(latest.clone());
         }
         None
+    }
+
+    fn unit_latest_version_id(&self, uid: &str) -> Option<String> {
+        self.unit_latest_version(uid).map(|v| s(&v, "id"))
     }
 
     /// Page count of a block's lead rendition's latest version,
@@ -15233,13 +15268,16 @@ impl App {
         mode: DcMode,
         from: usize,
     ) -> Result<(), String> {
+        if mode.uses_editor_view() {
+            return Err("普通、缩略图和备注视图需要 DeckCraft 桌面应用".into());
+        }
         let show = hosted_show::HostedShow::start(title, bytes, mode, from, None)?;
         let d = show.damage;
         self.hosted = Some(show);
         let mut msg = match mode {
             DcMode::Play => format!("已开始演示：{title}"),
-            DcMode::Reading => format!("已打开普通视图：{title}"),
             DcMode::Presenter => format!("已开始演示：{title}（演示者视图）"),
+            DcMode::Normal | DcMode::Thumbnails | DcMode::Notes => unreachable!(),
         };
         let mut notes = Vec::new();
         if d.lost_slides > 0 {
@@ -15336,6 +15374,10 @@ impl App {
         mode: DcMode,
         from: usize,
     ) -> bool {
+        if matches!(mode, DcMode::Thumbnails | DcMode::Notes) {
+            self.msg = "PowerPoint 打开方式不支持缩略图或备注视图，请在 设置 → 演示偏好 切换到 DeckCraft".into();
+            return true;
+        }
         let dir = cache_dir();
         let path = dir.join(format!("present-{}.pptx", dc_content_stamp64(bytes)));
         if let Err(e) =
@@ -15346,17 +15388,19 @@ impl App {
         }
         let pmode = match mode {
             DcMode::Play => qimu_bridge::PresentMode::Play,
-            DcMode::Reading => qimu_bridge::PresentMode::Reading,
+            DcMode::Normal => qimu_bridge::PresentMode::Reading,
             DcMode::Presenter => qimu_bridge::PresentMode::Presenter,
+            DcMode::Thumbnails | DcMode::Notes => unreachable!(),
         };
         match qimu_bridge::platform_bridge().open_and_present(&path, pmode, from) {
             Ok(()) => {
                 self.msg = match mode {
                     DcMode::Play => format!("已在 PowerPoint 开始演示：{title}"),
-                    DcMode::Reading => format!("已在 PowerPoint 打开：{title}"),
+                    DcMode::Normal => format!("已在 PowerPoint 打开：{title}"),
                     DcMode::Presenter => {
                         format!("已在 PowerPoint 开始演示：{title}（演示者视图）")
                     }
+                    DcMode::Thumbnails | DcMode::Notes => unreachable!(),
                 };
             }
             Err(e) => {
@@ -15522,14 +15566,34 @@ impl App {
         mode: DcMode,
         from: usize,
     ) -> bool {
+        self.present_unit_version_impl(title, version, mode, from, None)
+    }
+
+    fn present_unit_page_version(
+        &mut self,
+        title: &str,
+        version: &Value,
+        mode: DcMode,
+        page: usize,
+    ) -> bool {
+        self.present_unit_version_impl(title, version, mode, page, Some(page))
+    }
+
+    fn present_unit_version_impl(
+        &mut self,
+        title: &str,
+        version: &Value,
+        mode: DcMode,
+        from: usize,
+        only_page: Option<usize>,
+    ) -> bool {
         let version_id = s(version, "id");
-        let page_count = i(version, "page_count");
         let local_outcome = self
             .local
             .as_ref()
             .and_then(|l| l.assemble_version_deck(&version_id));
-        let bytes = match local_outcome {
-            Some(Ok((bytes, _))) => bytes,
+        let (mut bytes, mut page_count) = match local_outcome {
+            Some(Ok(v)) => v,
             Some(Err(e)) => {
                 self.msg = format!("演示失败：{e}");
                 return true;
@@ -15563,7 +15627,7 @@ impl App {
                             .collect()
                     })
                     .unwrap_or_default();
-                if scripts.iter().any(|t| !t.is_empty()) {
+                let bytes = if scripts.iter().any(|t| !t.is_empty()) {
                     match qimu_core::pptx::Package::load(&raw) {
                         Ok(mut pkg) => {
                             for (slot, script) in scripts.iter().enumerate() {
@@ -15581,42 +15645,62 @@ impl App {
                     }
                 } else {
                     raw
-                }
+                };
+                (bytes, i(version, "page_count"))
             }
         };
-        self.open_deck_views(title, &bytes, page_count, mode, from)
+        if let Some(page) = only_page {
+            let pkg = match qimu_core::pptx::Package::load(&bytes) {
+                Ok(pkg) => pkg,
+                Err(e) => {
+                    self.msg = format!("演示失败：无法读取单页：{e}");
+                    return true;
+                }
+            };
+            let single = match qimu_core::pptx::split_one(&pkg, page) {
+                Ok(single) => single,
+                Err(e) => {
+                    self.msg = format!("演示失败：无法提取第 {} 页：{e}", page + 1);
+                    return true;
+                }
+            };
+            bytes = match single.to_bytes() {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    self.msg = format!("演示失败：无法生成单页稿件：{e}");
+                    return true;
+                }
+            };
+            page_count = 1;
+        }
+        let title = if only_page.is_some() {
+            format!("{title} · 第 {} 页", from + 1)
+        } else {
+            title.to_string()
+        };
+        self.open_deck_views(&title, &bytes, page_count, mode, from)
     }
 
-    /// Resolve the open index detail to deck bytes and open it in
-    /// the views (views unification, user ruling 2026-11-25): the
-    /// branch the detail is standing on, at its head commit — the
-    /// same resolution the detail's own export runs. The local
-    /// library assembles in-process without registering an export
-    /// (`assemble_index_deck`); an organization-side index takes
-    /// the REST export path (which does register the export, as
-    /// any export run from the detail does).
-    fn present_index_views(&mut self, mode: DcMode) -> bool {
-        let (index_id, branch, name) = match self.index.stack.top() {
-            IndexFrame::Detail(d) => (
-                d.index_id.clone(),
-                if d.branch.is_empty() {
-                    "main".to_string()
-                } else {
-                    d.branch.clone()
-                },
-                s(&d.detail["index"], "name"),
-            ),
-            _ => return false,
-        };
+    /// Resolve one index to deck bytes and open it in the views.
+    /// The local library assembles in-process without registering an
+    /// export; an organization-side index takes the REST export path.
+    fn present_index_id_views(
+        &mut self,
+        index_id: &str,
+        branch: &str,
+        name: &str,
+        mode: DcMode,
+        from: usize,
+    ) -> bool {
         let title = if name.is_empty() {
             "索引".to_string()
         } else {
-            name
+            name.to_string()
         };
         let local_outcome = self
             .local
             .as_ref()
-            .and_then(|l| l.assemble_index_deck(&index_id, &branch));
+            .and_then(|l| l.assemble_index_deck(index_id, branch));
         let (bytes, page_count) = match local_outcome {
             Some(Ok(v)) => v,
             Some(Err(e)) => {
@@ -15650,7 +15734,56 @@ impl App {
                 (bytes, i(&resp, "page_count"))
             }
         };
-        self.open_deck_views(&title, &bytes, page_count, mode, 0)
+        self.open_deck_views(&title, &bytes, page_count, mode, from)
+    }
+
+    fn open_bar_view(&mut self, ui: &mut egui::Ui, target: &BarViewTarget, mode: DcMode) {
+        match target {
+            BarViewTarget::Showroom { item, pages, from } => {
+                let (item, pages, from) = (item.clone(), pages.clone(), *from);
+                let id = s(&item, "id");
+                let title = s(&item, "title");
+                if !self.present_via_deckcraft(&id, &title, mode, from) {
+                    match mode {
+                        DcMode::Thumbnails | DcMode::Notes => {
+                            self.open_showroom_deck(&item);
+                            if let SrFrame::Deck(st) = self.showroom.stack.top_mut() {
+                                st.view = if matches!(mode, DcMode::Thumbnails) {
+                                    DeckView::Thumbnails
+                                } else {
+                                    DeckView::Notes
+                                };
+                                st.selected_page = Some(from);
+                            }
+                        }
+                        DcMode::Normal => self.present_showroom(&id, &title),
+                        DcMode::Play | DcMode::Presenter => {
+                            self.start_presentation(ui, &item, &pages)
+                        }
+                    }
+                }
+            }
+            BarViewTarget::Index {
+                index_id,
+                branch,
+                name,
+                from,
+            } => {
+                self.present_index_id_views(index_id, branch, name, mode, *from);
+            }
+            BarViewTarget::Unit {
+                title,
+                version,
+                from,
+                single_page,
+            } => {
+                if *single_page {
+                    self.present_unit_page_version(title, version, mode, *from);
+                } else {
+                    self.present_unit_version(title, version, mode, *from);
+                }
+            }
+        }
     }
 
     /// Present an already-local deck file (offline cached decks).
@@ -15699,10 +15832,10 @@ impl App {
     /// (design §2.3): reuse the instance when its control channel
     /// answers, otherwise launch it with `--control` on a free port;
     /// if the channel never comes up, degrade to a plain
-    /// `deckcraft --show` launch and say so. The jump sequence is
-    /// `app.open` → presenter flag for this mode → `show.start` →
-    /// `ui.focus`; the presenter flag is set explicitly every jump
-    /// because it is a persisted DeckCraft preference.
+    /// `deckcraft --show` launch and say so. Editor views use
+    /// `app.open` → `ui.set` → slide selection → `ui.focus`; shows
+    /// set the presenter flag, then use `show.start`. The presenter
+    /// flag is explicit because it is a persisted DeckCraft preference.
     /// Returns true when DeckCraft actually took the show
     /// (managed jump or the degraded plain launch); false when it
     /// could not be started at all — the doors above use this to
@@ -15772,6 +15905,10 @@ impl App {
                     live = Some((ctl, v));
                 }
                 None => {
+                    if mode.uses_editor_view() {
+                        self.msg = "DeckCraft 控制通道不可用，无法打开普通、缩略图或备注视图".into();
+                        return false;
+                    }
                     // The channel never answered (e.g. the port was
                     // taken and DeckCraft only logged the failed
                     // bind): drop our instance and degrade to the
@@ -15816,12 +15953,24 @@ impl App {
                         json!({ "command": "show.presenter", "params": { "on": true } }),
                     )?;
                 }
-                DcMode::Reading => {}
+                DcMode::Normal => {
+                    ctl.call("ui.set", json!({ "view": "normal" }))?;
+                }
+                DcMode::Thumbnails => {
+                    ctl.call("ui.set", json!({ "view": "sorter" }))?;
+                }
+                DcMode::Notes => {
+                    ctl.call("ui.set", json!({ "view": "notesPage" }))?;
+                }
             }
-            ctl.call(
-                "show.start",
-                json!({ "from": from, "reading": mode == DcMode::Reading }),
-            )?;
+            if mode.uses_editor_view() {
+                ctl.call(
+                    "command",
+                    json!({ "command": "slide.selectSlides", "params": { "indices": [from] } }),
+                )?;
+            } else {
+                ctl.call("show.start", json!({ "from": from, "reading": false }))?;
+            }
             let _ = ctl.call("ui.focus", json!({}));
             Ok(())
         })();
@@ -15829,15 +15978,17 @@ impl App {
             Ok(()) => {
                 self.msg = match mode {
                     DcMode::Play => format!("已在 DeckCraft 开始演示：{title}"),
-                    DcMode::Reading => format!("已在 DeckCraft 打开普通视图：{title}"),
+                    DcMode::Normal => format!("已在 DeckCraft 打开普通视图：{title}"),
                     DcMode::Presenter => format!(
                         "已在 DeckCraft 开始演示：{title}（演示者视图需第二显示器，将在副屏打开）"
                     ),
+                    DcMode::Thumbnails => format!("已在 DeckCraft 打开缩略视图：{title}"),
+                    DcMode::Notes => format!("已在 DeckCraft 打开备注视图：{title}"),
                 };
                 // A fresh watcher for this jump (auto-quit sessions
                 // only); bumping the generation retires any watcher
                 // from an earlier session.
-                if self.dc_auto_quit {
+                if self.dc_auto_quit && !mode.uses_editor_view() {
                     let gen = self
                         .dc_gen
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -16269,17 +16420,19 @@ impl App {
     fn tool_slot(
         &mut self,
         ui: &mut egui::Ui,
+        enabled: bool,
         active: bool,
         label: &str,
         icon: ChromeIcon,
     ) -> bool {
-        self.tool_slot_sized(ui, active, label, icon, 26.0)
+        self.tool_slot_sized(ui, enabled, active, label, icon, 26.0)
             .clicked()
     }
 
     fn tool_slot_sized(
         &mut self,
         ui: &mut egui::Ui,
+        enabled: bool,
         active: bool,
         label: &str,
         icon: ChromeIcon,
@@ -16290,20 +16443,29 @@ impl App {
             stroke: egui::Stroke::NONE,
             icon,
         };
+        let icon_tint = if enabled {
+            palette_color(ICON_TINT)
+        } else {
+            palette_color(TEXT_WEAK).gamma_multiply(0.5)
+        };
         let style = craft_ui::buttons::IconButtonStyle {
-            normal: visuals(egui::Color32::TRANSPARENT, palette_color(ICON_TINT)),
-            hovered: visuals(palette_color(ICON_HOVER), palette_color(ICON_TINT)),
+            normal: visuals(egui::Color32::TRANSPARENT, icon_tint),
+            hovered: visuals(palette_color(ICON_HOVER), icon_tint),
             pressed: None,
             selected: visuals(ACCENT, egui::Color32::WHITE),
             corner_radius: egui::CornerRadius::same(6),
             focus_stroke: egui::Stroke::new(1.0, ACCENT),
         };
-        let resp = craft_ui::buttons::IconButton::new(label, egui::vec2(28.0, height), &style)
-            .selected(active)
-            .show(ui, |ui, rect, icon_tint| {
-                ChromeIcons.paint(ui, icon, rect.center(), 15.0, icon_tint);
-            });
-        resp.on_hover_text(label)
+        let resp = ui
+            .add_enabled_ui(enabled, |ui| {
+                craft_ui::buttons::IconButton::new(label, egui::vec2(28.0, height), &style)
+                    .selected(active)
+                    .show(ui, |ui, rect, icon_tint| {
+                        ChromeIcons.paint(ui, icon, rect.center(), 15.0, icon_tint);
+                    })
+            })
+            .inner;
+        resp.on_hover_text(label).on_disabled_hover_text(label)
     }
 
     /// Toolbar placeholder slot: a tool whose feature is not
@@ -16552,6 +16714,64 @@ impl App {
         }
     }
 
+    fn showroom_detail_toolbar(&mut self, ui: &mut egui::Ui) {
+        let (item, reorder_changed, saved_copy) = match self.showroom.stack.top() {
+            SrFrame::Deck(st) => (st.item.clone(), deck_reorder_changed(st), st.saved_copy.clone()),
+            SrFrame::Wall | SrFrame::Present(_) => return,
+        };
+        let item_id = s(&item, "id");
+        let in_library = self
+            .library_refs
+            .iter()
+            .any(|e| s(e, "item_kind") == "showroom" && s(e, "item_id") == item_id);
+        let from_org = self.org_online()
+            && !item_id.is_empty()
+            && !self
+                .local_showroom
+                .iter()
+                .any(|item| s(item, "id") == item_id);
+        if self.tool_slot(
+            ui,
+            from_org && !in_library,
+            false,
+            "保存到我的库",
+            ChromeIcon::Download,
+        ) {
+            self.save_showroom_to_library(&item);
+        }
+        if reorder_changed {
+            if self.tool_slot(
+                ui,
+                true,
+                false,
+                "另存为我的演示",
+                ChromeIcon::CopyPpt,
+            ) {
+                if let SrFrame::Deck(mut deck) =
+                    self.showroom.stack.replace_top(SrFrame::Wall)
+                {
+                    self.save_reordered_copy(&mut deck);
+                    self.showroom.stack.replace_top(SrFrame::Deck(deck));
+                }
+            }
+            if self.tool_slot(ui, true, false, "恢复排序", ChromeIcon::History) {
+                if let SrFrame::Deck(st) = self.showroom.stack.top_mut() {
+                    st.reorder = None;
+                    st.selected_page = None;
+                    st.page_press = None;
+                    st.page_drag = None;
+                }
+            }
+        }
+        if saved_copy.is_some()
+            && self.tool_slot(ui, true, false, "查看我的副本", ChromeIcon::FolderOpen)
+        {
+            if let SrFrame::Deck(st) = self.showroom.stack.top_mut() {
+                st.jump_to = saved_copy;
+            }
+        }
+    }
+
     /// Whole-deck page view inside the showroom: every page of the deck
     /// in entry order; clicking a page opens the large preview.
     fn showroom_deck(&mut self, ui: &mut egui::Ui, st: &mut DeckState) {
@@ -16574,12 +16794,8 @@ impl App {
             s(e, "key") == cache_key
                 && e.get("stale").and_then(|v| v.as_bool()) != Some(true)
         });
-        // T1 transforming button (user rulings 2026-11-24 16:09 and
-        // 16:10): this header's save/cache control is ONE button —
-        // 保存到我的库 while the deck is not in my library, 缓存
-        // once it is, 已缓存（点击更新缓存）in the accent fill once
-        // cached. It never greys out: there is no disabled
-        // "already saved" state.
+        // The save-to-library action lives in the top toolbar. This
+        // header keeps only the cache state for decks already saved.
         let in_library = self
             .library_refs
             .iter()
@@ -16593,15 +16809,11 @@ impl App {
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
-                if !in_library {
-                    if btn_default(ui, "保存到我的库").clicked() {
-                        act = Some("save");
-                    }
-                } else if already_cached {
+                if in_library && already_cached {
                     if btn_primary(ui, "已缓存（点击更新缓存）").clicked() {
                         act = Some("cache");
                     }
-                } else if btn_default(ui, "缓存").clicked() {
+                } else if in_library && btn_default(ui, "缓存").clicked() {
                     act = Some("cache");
                 }
                 // View switch （逐页缩略图 / 讲稿） rides the
@@ -16654,7 +16866,6 @@ impl App {
         // whole-deck PDF forms lost their only entry with this
         // row — see this line's REPORT.)
         match act {
-            Some("save") => self.save_showroom_to_library(&item),
             Some("cache") => self.cache_showroom_deck(&item),
             _ => {}
         }
@@ -16878,56 +17089,6 @@ impl App {
         // 2026-11-27: the preview opens by double-clicking a
         // page card, and the prototype wall carries no hint
         // row.)
-        // N4 reorder bar (user ruling 2026-11-25): invisible
-        // until the order actually changes; then the save-as and
-        // restore actions live here. After a save, the bar keeps
-        // the jump into the copy until the next adjustment.
-        let mut bar_act: Option<&'static str> = None;
-        if deck_reorder_changed(st) {
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("页序已调整")
-                        .color(palette_color(TEXT_WEAK)),
-                );
-                if btn_primary(ui, "另存为我的演示").clicked() {
-                    bar_act = Some("save");
-                }
-                if btn_default(ui, "恢复原序").clicked() {
-                    bar_act = Some("restore");
-                }
-                ui.label(
-                    egui::RichText::new("原演示不受影响，调整只存入你的副本")
-                        .size(11.5)
-                        .color(palette_color(TEXT_FAINT)),
-                );
-            });
-        } else if st.saved_copy.is_some() {
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("已另存为我的演示")
-                        .color(palette_color(TEXT_WEAK)),
-                );
-                if btn_default(ui, "查看我的副本").clicked() {
-                    bar_act = Some("jump");
-                }
-            });
-        }
-        match bar_act {
-            Some("save") => self.save_reordered_copy(st),
-            Some("restore") => {
-                st.reorder = None;
-                st.selected_page = None;
-                st.page_press = None;
-                st.page_drag = None;
-            }
-            Some("jump") => {
-                st.jump_to = st.saved_copy.clone();
-                return;
-            }
-            _ => {}
-        }
         egui::ScrollArea::vertical()
             .id_salt((item["id"].as_str(), st.view == DeckView::Notes))
             .show(ui, |ui| {
@@ -17250,7 +17411,7 @@ impl App {
         }
     }
 
-    /// 保存到我的库 for the deck in the detail header (T1): the
+    /// 保存到我的库 for the deck in the top toolbar (T1): the
     /// action is saving someone else's shared content into my
     /// library. When the deck reached me as an inbox share, the
     /// save IS accepting that share — the very op the inbox
@@ -17567,7 +17728,15 @@ impl App {
                                 egui::Sense::click(),
                             );
                             if response.double_clicked() {
-                                app.open_cache(&key);
+                                if let Some(item_id) = key.strip_prefix("sr_") {
+                                    app.open_deck_for_ref(
+                                        "showroom",
+                                        item_id,
+                                        &s(&e, "title"),
+                                    );
+                                } else {
+                                    app.open_cache(&key);
+                                }
                             }
                         },
                     );
@@ -18097,6 +18266,7 @@ impl App {
             .iter()
             .chain(self.review.records.iter())
             .chain(self.showroom_live.iter())
+            .chain(self.local_showroom.iter())
             .find(|x| s(x, "id") == id)
             .cloned()
     }
@@ -19363,7 +19533,7 @@ impl App {
                     } else {
                         "缓存到本地"
                     };
-                    if app.tool_slot(ui, cached, label, ChromeIcon::Download) {
+                    if app.tool_slot(ui, true, cached, label, ChromeIcon::Download) {
                         app.cache_showroom_deck(item);
                     }
                 }
@@ -26230,9 +26400,6 @@ impl App {
                     self.close_unit_detail();
                     self.page = Page::Content;
                 }
-                Some(IndexDetailAction::PickPages(pos, entry, selected)) => {
-                    self.start_pick_pages(pos, &entry, selected);
-                }
                 Some(IndexDetailAction::SwitchVersion(pos, id, semver, is_latest)) => {
                     self.switch_entry_version(pos, &id, &semver, is_latest);
                 }
@@ -26913,7 +27080,13 @@ impl App {
         let mut insert_rects: Vec<(usize, egui::Rect)> = Vec::new();
         let mut content_rects: Vec<egui::Rect> = Vec::new();
         egui::ScrollArea::vertical().id_salt(&st.index_id).show(ui, |ui| {
-            let cover_width = if ui.available_width() >= 900.0 { 340.0 } else { 300.0 };
+            let cover_width = if ui.available_width() >= 1200.0 {
+                440.0
+            } else if ui.available_width() >= 900.0 {
+                380.0
+            } else {
+                320.0
+            };
             let card_content_width = (ui.available_width() - 25.0).max(0.0);
             let thumb_gap = ui.spacing().item_spacing.x;
             let first_insert = insert_bar(ui, 0, action);
@@ -26929,7 +27102,6 @@ impl App {
                 let eff_pages = index_controls::entry_effective_pages(&entry, &ver);
                 let rid = s(&entry, "rendition_id");
                 let versions = st.unit_versions.get(&rid).cloned().unwrap_or_default();
-                let newer = index_controls::entry_newer_version(&entry, &ver, &versions);
                 let frame_resp = card_frame_square()
                     .inner_margin(egui::Margin {
                         left: 10,
@@ -26950,7 +27122,7 @@ impl App {
                                 let vid = s(&ver, "id");
                                 let total = i(&ver, "page_count").max(0) as usize;
                                 let n = total.clamp(1, 8);
-                                let columns = ((cover_width + thumb_gap) / 144.0)
+                                let columns = ((cover_width + thumb_gap) / 170.0)
                                     .floor()
                                     .max(1.0) as usize;
                                 let tile_w = if columns == 1 {
@@ -26975,22 +27147,109 @@ impl App {
                         });
                         ui.add_space(6.0);
                         ui.vertical(|ui| {
-                            // Title, status and metadata share one
-                            // wrapping row so the card keeps the
-                            // prototype's compact horizontal rhythm.
-                            ui.horizontal_wrapped(|ui| {
+                            let latest_semver = versions
+                                .first()
+                                .map(|v| s(v, "semver"))
+                                .filter(|v| !v.is_empty())
+                                .unwrap_or_else(|| s(&ver, "semver"));
+                            let follow_label = if latest_semver.is_empty() {
+                                "保持最新".to_string()
+                            } else {
+                                format!("保持最新 v{latest_semver}")
+                            };
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
                                 chip(
                                     ui,
                                     &format!("{}", pos + 1),
                                     palette_color(ACCENT_DEEP),
                                     CHIP_BLUE_BG,
                                 );
-                                ui.label(
-                                    egui::RichText::new(re.get("unit_name").and_then(|x| x.as_str()).unwrap_or(""))
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(
+                                            re.get("unit_name")
+                                                .and_then(|x| x.as_str())
+                                                .unwrap_or(""),
+                                        )
                                         .strong()
                                         .size(13.5)
                                         .color(palette_color(TEXT_MAIN)),
+                                    )
+                                    .truncate(),
                                 );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.spacing_mut().item_spacing.x = 4.0;
+                                        if ui
+                                            .button(
+                                                egui::RichText::new("删除")
+                                                    .size(11.5)
+                                                    .color(palette_color(ROSE)),
+                                            )
+                                            .on_hover_text("从这个索引移除这个条目（内容块保留）")
+                                            .clicked()
+                                        {
+                                            st.confirm_remove_entry = Some(pos);
+                                        }
+                                        let uid = s(&entry, "unit_id");
+                                        if ui
+                                            .add_enabled(
+                                                !uid.is_empty(),
+                                                egui::Button::new(
+                                                    egui::RichText::new("页面维护").size(11.5),
+                                                ),
+                                            )
+                                            .on_hover_text("跳到内容页编辑这个内容块")
+                                            .clicked()
+                                        {
+                                            *action = Some(IndexDetailAction::OpenUnit(uid));
+                                            return;
+                                        }
+                                        if locked {
+                                            if ui
+                                                .button(
+                                                    egui::RichText::new(&follow_label).size(11.5),
+                                                )
+                                                .clicked()
+                                            {
+                                                let mut es = entries.clone();
+                                                es[pos]["policy"] = json!("follow_latest");
+                                                es[pos]["locked_semver"] = Value::Null;
+                                                *action =
+                                                    Some(IndexDetailAction::Commit(es, "保持最新"));
+                                                return;
+                                            }
+                                        } else {
+                                            let _ = ui.add(
+                                                egui::Button::new(
+                                                    egui::RichText::new(&follow_label)
+                                                        .size(11.5)
+                                                        .color(egui::Color32::WHITE),
+                                                )
+                                                .fill(ACCENT)
+                                                .corner_radius(5),
+                                            );
+                                        }
+                                        if ui
+                                            .button(
+                                                egui::RichText::new("更换版本")
+                                                    .size(11.5)
+                                                    .color(palette_color(ACCENT_DEEP)),
+                                            )
+                                            .on_hover_text("打开版本管理，切换这个条目引用的版本")
+                                            .clicked()
+                                        {
+                                            self.overlays.push(Overlay::AllVersions {
+                                                entry_pos: pos,
+                                                index_id: st.index_id.clone(),
+                                            });
+                                        }
+                                    },
+                                );
+                            });
+                            ui.horizontal_wrapped(|ui| {
                                 if locked {
                                     chip(ui, "版本锁定", palette_color(CHIP_ORANGE_FG), CHIP_ORANGE_BG);
                                 } else {
@@ -27024,146 +27283,6 @@ impl App {
                                     .size(11.5)
                                     .color(palette_color(TEXT_WEAK)),
                                 );
-                            });
-                            // Actions row, right-aligned. The
-                            // prototype's four — 更换版本 /
-                            // 保持最新 / 页面维护 / 删除 — sit
-                            // at the right in that order; the
-                            // client's extra actions （选页 /
-                            // 上下移 / 锁定当前版本 / 更新到)
-                            // keep their places to their left.
-                            // (Right-to-left layout: first
-                            // added = rightmost.)
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            egui::RichText::new("删除")
-                                                .color(palette_color(ROSE)),
-                                        ),
-                                    )
-                                    .on_hover_text("从这个索引移除这个条目（内容块保留）")
-                                    .clicked()
-                                {
-                                    st.confirm_remove_entry = Some(pos);
-                                }
-                                let uid = s(&entry, "unit_id");
-                                if ui
-                                    .add_enabled(!uid.is_empty(), egui::Button::new("页面维护"))
-                                    .on_hover_text("跳到内容页编辑这个内容块")
-                                    .clicked()
-                                {
-                                    *action = Some(IndexDetailAction::OpenUnit(uid));
-                                    return;
-                                }
-                                if locked {
-                                    // 保持最新 (prototype
-                                    // follow-btn): releases the
-                                    // lock back to follow-latest —
-                                    // the mutation the old
-                                    // 解除锁定 button performed.
-                                    if ui.button("保持最新").clicked() {
-                                        let mut es = entries.clone();
-                                        es[pos]["policy"] = json!("follow_latest");
-                                        es[pos]["locked_semver"] = Value::Null;
-                                        *action = Some(IndexDetailAction::Commit(es, "保持最新"));
-                                        return;
-                                    }
-                                } else {
-                                    // Already following: the
-                                    // button shows its on state
-                                    // (accent fill), as the
-                                    // prototype's follow-btn.on.
-                                    let _ = ui.add(
-                                        egui::Button::new(
-                                            egui::RichText::new("保持最新")
-                                                .color(egui::Color32::WHITE),
-                                        )
-                                        .fill(ACCENT)
-                                        .corner_radius(5),
-                                    );
-                                }
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            egui::RichText::new("更换版本")
-                                                .color(palette_color(ACCENT_DEEP)),
-                                        ),
-                                    )
-                                    .on_hover_text("打开版本管理，切换这个条目引用的版本")
-                                    .clicked()
-                                {
-                                    self.overlays.push(Overlay::AllVersions {
-                                        entry_pos: pos,
-                                        index_id: st.index_id.clone(),
-                                    });
-                                }
-                                if locked {
-                                    if let Some((latest_id, latest_ver)) = newer.clone() {
-                                        if ui
-                                            .button(
-                                                egui::RichText::new(format!("更新到 v{latest_ver}"))
-                                                    .color(palette_color(ACCENT_DEEP)),
-                                            )
-                                            .clicked()
-                                        {
-                                            *action = Some(IndexDetailAction::SwitchVersion(
-                                                pos, latest_id, latest_ver, true,
-                                            ));
-                                            return;
-                                        }
-                                    }
-                                } else if ui
-                                    .add_enabled(
-                                        ver.is_object(),
-                                        egui::Button::new("锁定当前版本"),
-                                    )
-                                    .clicked()
-                                {
-                                    if ver.is_object() {
-                                        let mut es = entries.clone();
-                                        es[pos]["policy"] = json!({ "locked": { "version_id": s(&ver, "id") } });
-                                        es[pos]["locked_semver"] =
-                                            json!(s(&ver, "semver"));
-                                        *action = Some(IndexDetailAction::Commit(es, "锁定版本"));
-                                        return;
-                                    }
-                                }
-                                if ui.button("选页").clicked() {
-                                    let total = i(&ver, "page_count") as usize;
-                                    let mut sel = vec![true; total];
-                                    if let Some(slots) = entry
-                                        .get("excerpt_slots")
-                                        .and_then(|x| x.as_array())
-                                    {
-                                        sel = vec![false; total];
-                                        for p in excerpt_positions_json(&ver, slots) {
-                                            sel[p] = true;
-                                        }
-                                    }
-                                    *action = Some(IndexDetailAction::PickPages(pos, re.clone(), sel));
-                                }
-                                if ui
-                                    .add_enabled(pos > 0, egui::Button::new("↑"))
-                                    .clicked()
-                                {
-                                    let mut es = entries.clone();
-                                    es.swap(pos, pos - 1);
-                                    *action = Some(IndexDetailAction::Commit(es, "调整顺序"));
-                                    return;
-                                }
-                                if ui
-                                    .add_enabled(
-                                        pos + 1 < entries.len(),
-                                        egui::Button::new("↓"),
-                                    )
-                                    .clicked()
-                                {
-                                    let mut es = entries.clone();
-                                    es.swap(pos, pos + 1);
-                                    *action = Some(IndexDetailAction::Commit(es, "调整顺序"));
-                                    return;
-                                }
                             });
                             if st.confirm_remove_entry == Some(pos) {
                                 ui.add_space(4.0);
@@ -27215,16 +27334,16 @@ impl App {
                                     String::new()
                                 };
                                 let latest_id = s(&versions[0], "id");
-                                let max_quick = ((ui.available_width() + 6.0) / 60.0)
+                                let max_quick = ((ui.available_width() + 8.0) / 90.0)
                                     .floor()
-                                    .clamp(1.0, 7.0) as usize;
+                                    .clamp(1.0, 6.0) as usize;
                                 let shown = max_quick.min(versions.len());
                                 ui.horizontal_wrapped(|ui| {
                                     for v in versions.iter().take(shown) {
                                         let vid = s(v, "id");
                                         let is_cur = vid == cur_id;
                                         ui.vertical(|ui| {
-                                            if self.thumb_button(ui, &vid, 0, 54.0, is_cur) {
+                                            if self.thumb_button(ui, &vid, 0, 82.0, is_cur) {
                                                 let is_latest = vid == latest_id;
                                                 *action = Some(IndexDetailAction::SwitchVersion(
                                                     pos, vid, s(v, "semver"), is_latest,

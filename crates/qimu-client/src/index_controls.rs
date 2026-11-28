@@ -650,29 +650,6 @@ pub(super) fn entry_effective_pages(entry: &Value, ver: &Value) -> i64 {
     }
 }
 
-/// For a version-locked entry, returns `(latest_version_id, latest_semver)` if
-/// `versions` (newest-first) has a newer version than `current_ver`.
-pub(super) fn entry_newer_version(
-    entry: &Value,
-    current_ver: &Value,
-    versions: &[Value],
-) -> Option<(String, String)> {
-    let locked = entry
-        .get("policy")
-        .is_some_and(|p| p.get("locked").is_some());
-    if !locked || versions.is_empty() || !current_ver.is_object() {
-        return None;
-    }
-    let cur_id = s(current_ver, "id");
-    let latest_id = s(&versions[0], "id");
-    let latest_semver = s(&versions[0], "semver");
-    if !latest_id.is_empty() && latest_id != cur_id {
-        Some((latest_id, latest_semver))
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -713,21 +690,11 @@ mod tests {
     }
 
     #[test]
-    fn entry_pages_and_newer_version_detection() {
+    fn entry_effective_pages_uses_excerpt_slots() {
         let entry_full = json!({"policy": "follow_latest"});
         let ver = json!({"id": "v1", "semver": "1.0.0", "page_count": 5});
         assert_eq!(entry_effective_pages(&entry_full, &ver), 5);
         let entry_excerpt = json!({"policy": {"locked": {"version_id": "v1"}}, "excerpt_slots": ["s1", "s3"]});
         assert_eq!(entry_effective_pages(&entry_excerpt, &ver), 2);
-
-        let versions = vec![
-            json!({"id": "v2", "semver": "1.2.0"}),
-            json!({"id": "v1", "semver": "1.0.0"}),
-        ];
-        assert_eq!(
-            entry_newer_version(&entry_excerpt, &ver, &versions),
-            Some(("v2".into(), "1.2.0".into()))
-        );
-        assert_eq!(entry_newer_version(&entry_full, &ver, &versions), None);
     }
 }
